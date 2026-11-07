@@ -40,8 +40,12 @@ class FakeQR:
         self.url = URL
         self.expires = datetime.now(timezone.utc) + timedelta(seconds=30)
         self.recreated = 0
+        self.timeouts: list[float | None] = []
+        self._resp = None
+        self.resp_after_recreate = None
 
     async def wait(self, timeout=None):
+        self.timeouts.append(timeout)
         outcome = self.outcomes.pop(0)
         if isinstance(outcome, BaseException):
             raise outcome
@@ -49,12 +53,17 @@ class FakeQR:
 
     async def recreate(self):
         self.recreated += 1
+        self._resp = self.resp_after_recreate
 
 
 class FakeClient:
     def __init__(self, qr: FakeQR) -> None:
         self.qr = qr
         self.signed_password = None
+        self.passwords_tried: list[str] = []
+        self.wrong_passwords: set[str] = set()
+        self.qr_login_error: BaseException | None = None
+        self.logged_in_user = None
         self.session = SimpleNamespace()
 
     async def connect(self):
@@ -67,10 +76,20 @@ class FakeClient:
         return False
 
     async def qr_login(self):
+        if self.qr_login_error is not None:
+            raise self.qr_login_error
         return self.qr
 
     async def sign_in(self, password=None):
+        from telethon import errors
+
+        self.passwords_tried.append(password)
+        if password in self.wrong_passwords:
+            raise errors.PasswordHashInvalidError(request=None)
         self.signed_password = password
+
+    async def _on_login(self, user):
+        self.logged_in_user = user
 
     async def get_me(self):
         return SimpleNamespace(bot=False, id=1, first_name="Owner", last_name=None, title=None, username=None)
@@ -111,3 +130,79 @@ async def test_qr_login_asks_2fa_password(monkeypatch, cfg) -> None:
     monkeypatch.setattr(listener, "_ask", fake_ask)
     assert await listener.interactive_qr_login(cfg) == "SESSION"
     assert client.signed_password == "pw123"
+
+
+async def test_qr_wait_timeout_ignores_vps_clock_skew(monkeypatch, cfg) -> None:
+    """A VPS clock running ahead of Telegram must not make wait() time out instantly and spin."""
+    qr = FakeQR([asyncio.TimeoutError(), SimpleNamespace(id=1)])
+    qr.expires = datetime.now(timezone.utc) - timedelta(seconds=60)    # "already expired" by the local clock
+    client = FakeClient(qr)
+    _patch(monkeypatch, client)
+    await listener.interactive_qr_login(cfg)
+    assert qr.timeouts and all(t is not None and 10.0 <= t <= 30.0 for t in qr.timeouts)
+
+
+async def test_scan_accepted_during_recreate_completes_login(monkeypatch, cfg) -> None:
+    from telethon.tl import types
+
+    qr = FakeQR([asyncio.TimeoutError()])     # second wait() is never reached
+    user = types.User(id=42)
+    qr.resp_after_recreate = types.auth.LoginTokenSuccess(authorization=types.auth.Authorization(user=user))
+    client = FakeClient(qr)
+    _patch(monkeypatch, client)
+    assert await listener.interactive_qr_login(cfg) == "SESSION"
+    assert client.logged_in_user is user
+
+
+async def test_wrong_2fa_password_is_asked_again(monkeypatch, cfg, capsys) -> None:
+    from telethon import errors
+
+    qr = FakeQR([errors.SessionPasswordNeededError(request=None)])
+    client = FakeClient(qr)
+    client.wrong_passwords = {"typo"}
+    _patch(monkeypatch, client)
+    answers = iter(["typo", "right"])
+
+    async def fake_ask(prompt: str, secret: bool = False) -> str:
+        return next(answers)
+
+    monkeypatch.setattr(listener, "_ask", fake_ask)
+    assert await listener.interactive_qr_login(cfg) == "SESSION"
+    assert client.passwords_tried == ["typo", "right"] and client.signed_password == "right"
+    assert "Şifre yanlış" in capsys.readouterr().out
+
+
+async def test_rerun_after_unfinished_2fa_goes_straight_to_password(monkeypatch, cfg) -> None:
+    from telethon import errors
+
+    client = FakeClient(FakeQR([]))
+    client.qr_login_error = errors.SessionPasswordNeededError(request=None)
+    _patch(monkeypatch, client)
+
+    async def fake_ask(prompt: str, secret: bool = False) -> str:
+        return "pw"
+
+    monkeypatch.setattr(listener, "_ask", fake_ask)
+    assert await listener.interactive_qr_login(cfg) == "SESSION"
+    assert client.signed_password == "pw"
+
+
+def test_cli_login_uses_qr_by_default_and_code_with_flag(monkeypatch, tmp_path) -> None:
+    from copytrader import __main__ as cli
+
+    used: list[str] = []
+
+    async def fake_qr(tg):
+        used.append("qr")
+        return "S"
+
+    async def fake_code(tg):
+        used.append("code")
+        return "S"
+
+    monkeypatch.setattr(listener, "interactive_qr_login", fake_qr)
+    monkeypatch.setattr(listener, "interactive_login", fake_code)
+    monkeypatch.setattr(cli, "_telegram_config", lambda path: SimpleNamespace(session_path="data/x"))
+    assert cli.main(["login"]) == 0
+    assert cli.main(["login", "--code"]) == 0
+    assert used == ["qr", "code"]

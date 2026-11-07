@@ -19,7 +19,7 @@ from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any
 
-from telethon import TelegramClient, errors, events, utils
+from telethon import TelegramClient, errors, events, functions, utils
 from telethon.sessions import StringSession
 from telethon.tl import types
 
@@ -692,8 +692,7 @@ async def interactive_login(config: TelegramConfig) -> str:
             try:
                 await client.sign_in(number, code, phone_code_hash=sent.phone_code_hash)
             except errors.SessionPasswordNeededError:
-                password = await _ask("İki adımlı doğrulama şifresi: ", secret=True)
-                await client.sign_in(password=password)
+                await _sign_in_password(client)
         me = await client.get_me()
         if getattr(me, "bot", False):
             raise RuntimeError("Bot hesabıyla giriş yapılamaz; kendi kullanıcı hesabınızı kullanın.")
@@ -746,6 +745,30 @@ QR_HELP_TR = (
 )
 
 
+async def _sign_in_password(client: TelegramClient) -> None:
+    """Ask for the 2FA password until it is right (typos are easy: nothing is shown while typing)."""
+    while True:
+        password = await _ask("İki adımlı doğrulama şifresi: ", secret=True)
+        try:
+            await client.sign_in(password=password)
+            return
+        except errors.PasswordHashInvalidError:
+            print("Şifre yanlış, tekrar deneyin.")
+
+
+async def _qr_accepted_during_recreate(client: TelegramClient, resp: Any) -> bool:
+    """A scan accepted between two wait() calls shows up in recreate()'s response.
+
+    Finish the login the same way QRLogin.wait() does (incl. the DC switch)."""
+    if isinstance(resp, types.auth.LoginTokenMigrateTo):
+        await client._switch_dc(resp.dc_id)
+        resp = await client(functions.auth.ImportLoginTokenRequest(resp.token))
+    if isinstance(resp, types.auth.LoginTokenSuccess):
+        await client._on_login(resp.authorization.user)
+        return True
+    return False
+
+
 async def interactive_qr_login(config: TelegramConfig, *, max_minutes: float = 10.0) -> str:
     """Login by scanning a QR code with the already logged-in Telegram app (no login code needed).
 
@@ -753,41 +776,53 @@ async def interactive_qr_login(config: TelegramConfig, *, max_minutes: float = 1
     The QR refreshes about every 30 seconds. Saves the session file and returns a StringSession string."""
     from pathlib import Path
 
+    try:
+        import segno
+    except ImportError as exc:
+        raise TelegramAuthError(
+            "QR girişi için 'segno' paketi gerekli: 'pip install -r requirements.txt' çalıştırın "
+            "(ya da kodla giriş: python -m copytrader login --code)."
+        ) from exc
+
     client = make_user_client(config, prefer_file=True)
     png_path = Path(config.session_path).parent / "login_qr.png"
     try:
         await client.connect()
         if not await client.is_user_authorized():
-            import segno
-
-            qr = await client.qr_login()
-            deadline = time.monotonic() + max_minutes * 60
-            while True:
-                if time.monotonic() > deadline:
-                    raise TelegramAuthError(
-                        f"QR {max_minutes:.0f} dakika içinde okutulmadı. Komutu tekrar çalıştırın."
-                    )
-                _clear_screen()
-                print(render_qr_text(qr.url))
-                print()
-                print(QR_HELP_TR)
-                try:
-                    png_path.parent.mkdir(parents=True, exist_ok=True)
-                    segno.make(qr.url, error="l").save(str(png_path), scale=10, border=4)
-                    print(f"Daha büyük görmek için resim dosyası: {png_path.resolve()}")
-                except OSError:
-                    pass
-                left = int((qr.expires - datetime.now(timezone.utc)).total_seconds())
-                print(f"Bu QR yaklaşık {max(left, 0)} saniye geçerli; süresi dolunca kendiliğinden yenilenir.")
-                try:
-                    await qr.wait()
-                    break
-                except (asyncio.TimeoutError, TimeoutError):
-                    await qr.recreate()
-                except errors.SessionPasswordNeededError:
-                    password = await _ask("İki adımlı doğrulama şifresi: ", secret=True)
-                    await client.sign_in(password=password)
-                    break
+            try:
+                qr = await client.qr_login()
+                deadline = time.monotonic() + max_minutes * 60
+                while True:
+                    if time.monotonic() > deadline:
+                        raise TelegramAuthError(
+                            f"QR {max_minutes:.0f} dakika içinde okutulmadı. Komutu tekrar çalıştırın."
+                        )
+                    _clear_screen()
+                    print(render_qr_text(qr.url))
+                    print()
+                    print(QR_HELP_TR)
+                    try:
+                        png_path.parent.mkdir(parents=True, exist_ok=True)
+                        segno.make(qr.url, error="l").save(str(png_path), scale=10, border=4)
+                        print(f"Daha büyük görmek için resim dosyası: {png_path.resolve()}")
+                    except OSError:
+                        pass
+                    # Do not trust the VPS clock against Telegram's (a clock running ahead would make
+                    # wait() time out instantly and spin): tokens live about 30 seconds.
+                    left = (qr.expires - datetime.now(timezone.utc)).total_seconds()
+                    left = min(max(left, 10.0), 30.0)
+                    print(f"Bu QR yaklaşık {left:.0f} saniye geçerli; süresi dolunca kendiliğinden yenilenir.")
+                    try:
+                        await qr.wait(timeout=left)
+                        break
+                    except (asyncio.TimeoutError, TimeoutError):
+                        await qr.recreate()
+                        if await _qr_accepted_during_recreate(client, getattr(qr, "_resp", None)):
+                            break
+            except errors.SessionPasswordNeededError:
+                # Raised by qr_login()/wait()/recreate() once the scan is accepted on a 2FA account,
+                # and by qr_login() on a rerun after an unfinished 2FA step.
+                await _sign_in_password(client)
             try:
                 png_path.unlink()
             except OSError:

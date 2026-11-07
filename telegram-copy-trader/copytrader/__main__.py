@@ -279,6 +279,13 @@ _COMMANDS = {"login": cmd_login, "chats": cmd_chats, "run": cmd_run, "check": cm
 
 
 def main(argv: list[str] | None = None) -> int:
+    # Redirected output (file, Tee-Object, PowerShell ISE) uses a legacy code page without
+    # emoji / block characters: replace them instead of crashing.
+    for stream in (sys.stdout, sys.stderr):
+        try:
+            stream.reconfigure(errors="replace")
+        except (AttributeError, ValueError):
+            pass
     args = build_parser().parse_args(argv)
     if args.command != "run":   # run sets up console + file logging itself
         logging.basicConfig(level=logging.WARNING, format="%(levelname)s %(name)s: %(message)s")
