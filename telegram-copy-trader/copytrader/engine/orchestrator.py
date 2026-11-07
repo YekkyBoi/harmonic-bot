@@ -12,7 +12,14 @@ Safety rules kept here:
 * Every position write for a trade happens under that trade's lock (shared
   with the monitor).
 * Anything doubtful becomes a confirmation; unanswered confirmations expire
-  without trading.
+  without trading. The outcome of every confirmation is remembered per source
+  message: a later action built on a rejected / expired / pending / already
+  decided message is asked again, never executed automatically.
+* Order flows (open / manage) run as shielded "critical" tasks: cancelling the
+  caller never interrupts them, and shutdown waits for them before closing
+  the brokers.
+* Adapter problems (``pos.error``, a position without a stop) are always
+  reported to the owner, whatever ``notify_on_execution`` says.
 """
 
 from __future__ import annotations
@@ -25,7 +32,7 @@ import uuid
 from collections.abc import Callable, Coroutine
 from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
-from typing import Any, Literal
+from typing import Any, Literal, TypeVar
 
 from ..brokers.base import Broker, BrokerError
 from ..config import AppConfig
@@ -58,11 +65,20 @@ from ..parsing.symbols import canonical_asset, normalize_symbol
 from ..risk import guards, sizing
 from ..telegram import formatting as fmt
 from ..telegram.formatting import esc, fmt_price
-from .monitor import ACTIVE_POSITION, ACTIVE_TRADE, Monitor, rollup_status, utc
+from .monitor import (
+    ACTIVE_POSITION,
+    ACTIVE_TRADE,
+    Monitor,
+    protection_problem,
+    rollup_status,
+    unprotected_alert_text,
+    utc,
+)
 from .prices import PriceOracle
 
 logger = logging.getLogger(__name__)
 
+T = TypeVar("T")
 ConfKind = Literal["open", "manage", "incomplete"]
 _Key = tuple[int, int | None]   # (chat_id, sender_id)
 
@@ -73,6 +89,12 @@ NONE_ASK_BELOW_CONFIDENCE = 0.6
 CONNECT_TIMEOUT_SEC = 180.0
 READ_TIMEOUT_SEC = 20.0
 EXCERPT_CHARS = 300
+SHUTDOWN_GRACE_SEC = 45.0          # shutdown waits this long for running order flows before closing brokers
+EDIT_REPROCESS_MAX_AGE_SEC = 900.0  # an edit turning a non-signal message into a signal is re-read this long
+MSG_OUTCOME_MAX = 2000              # remembered confirmation outcomes per chat
+MSG_OUTCOME_TTL_DAYS = 14
+TP_MATCH_REL_TOL = 0.005            # a broker's filled TP price (tick-rounded) vs the trade's level
+SHUTDOWN_TEXT = "⏳ Bot kapanıyor; şu an işlem yapılamıyor. Bot yeniden başlayınca tekrar deneyin."
 
 _CONF_STATUS_TR = {
     ConfirmationStatus.PENDING: "beklemede",
@@ -112,7 +134,7 @@ class Evaluation:
 @dataclass
 class BrokerOutcome:
     broker: str
-    kind: Literal["ok", "unsupported", "skipped", "error"]
+    kind: Literal["ok", "partial", "unsupported", "skipped", "error"]   # partial: applied, adapter reported a problem
     text: str                                # HTML line for the owner
     position: BrokerPosition | None = None
 
@@ -223,6 +245,56 @@ def scaled_take_profits(tps: list[TakeProfit], m: float) -> list[TakeProfit]:
     return [TakeProfit(price=tp.price * m, close_fraction=tp.close_fraction) for tp in tps]
 
 
+def filled_tp_prices(pos: BrokerPosition) -> list[float]:
+    """Take-profit prices (signal scale) that already filled on this broker position, from adapter data:
+    ccxt ``tp_order_ids`` / paper ``tps`` (status "filled"), MetaTrader legs closed by their TP and
+    emulated netting TPs marked done."""
+    d = pos.data or {}
+    raw: list[Any] = []
+    for key in ("tp_order_ids", "tps"):
+        for tp in d.get(key) or []:
+            if isinstance(tp, dict) and tp.get("status") == "filled":
+                raw.append(tp.get("price"))
+    for leg in d.get("legs") or []:
+        if isinstance(leg, dict) and leg.get("state") == "closed" and leg.get("reason") == "tp":
+            raw.append(leg.get("tp"))
+    for e in d.get("emulated_tps") or []:
+        if isinstance(e, dict) and e.get("done"):
+            raw.append(e.get("price"))
+    mult = price_multiplier(d)
+    out: list[float] = []
+    for p in raw:
+        try:
+            v = float(p)
+        except (TypeError, ValueError):
+            continue
+        if math.isfinite(v) and v > 0:
+            out.append(v / mult)
+    return out
+
+
+def _match_levels(levels: list[float], filled: list[float]) -> list[bool]:
+    """Which of ``levels`` filled: each filled price marks its nearest level (within TP_MATCH_REL_TOL)."""
+    hit = [False] * len(levels)
+    for f in filled:
+        best: int | None = None
+        for i, lv in enumerate(levels):
+            if lv > 0 and abs(lv - f) / lv <= TP_MATCH_REL_TOL and (best is None or abs(lv - f) < abs(levels[best] - f)):
+                best = i
+        if best is not None:
+            hit[best] = True
+    return hit
+
+
+def tp_progress(trade: TradeRecord, positions: list[BrokerPosition]) -> tuple[list[bool], float | None]:
+    """(hit flag per current TP level on any broker, share of the filled size still open or None)."""
+    filled = [f for p in positions for f in filled_tp_prices(p)]
+    hit = _match_levels([tp.price for tp in trade.current_take_profits], filled)
+    shares = [p.remaining_quantity / p.filled_quantity for p in positions
+              if p.status is PositionStatus.OPEN and p.filled_quantity > 0]
+    return hit, (max(shares) if shares else None)
+
+
 def _price_problem(side: Side, quote: Quote, stop: float, tp1: float | None) -> str | None:
     """Live price already beyond the stop (or beyond TP1 when given)? Turkish text or None."""
     long = side is Side.LONG
@@ -278,6 +350,11 @@ class Engine:
         self.monitor = Monitor(config, db, lambda: self.brokers, notifier,
                                trade_lock=self.trade_lock, clock=self._clock)
         self._monitor_task: asyncio.Task[None] | None = None
+        self._accepting = True                     # False once shutdown began: no new work is started
+        self._brokers_closed = False
+        self._critical: set[asyncio.Task[Any]] = set()   # running order flows (never cancelled)
+        self._outcome_lock = asyncio.Lock()
+        self.shutdown_grace_sec = SHUTDOWN_GRACE_SEC
 
     # ------------------------------------------------------------------ utils
     def _now(self) -> datetime:
@@ -304,6 +381,39 @@ class Engine:
         if not task.cancelled() and task.exception() is not None:
             logger.error("Engine task %s failed", task.get_name(), exc_info=task.exception())
 
+    async def _critical_section(self, coro: Coroutine[Any, Any, T], name: str) -> T:
+        """Run an order flow so that cancelling the caller (shutdown, listener stop) never interrupts it
+        half-way (e.g. after the entry filled but before the stop was placed). Shutdown waits for it."""
+        if self._brokers_closed:
+            coro.close()
+            raise BrokerError("Bot kapanıyor; brokerlar kapatıldı, emir gönderilmedi.")
+        task: asyncio.Task[T] = asyncio.ensure_future(coro)
+        task.set_name(name)
+        self._critical.add(task)
+        task.add_done_callback(self._critical_done)
+        try:
+            return await asyncio.shield(task)
+        except asyncio.CancelledError:
+            if not task.done():
+                logger.warning("%s: caller cancelled; the order flow continues until it completes", name)
+                task.add_done_callback(self._orphan_done)
+            raise
+
+    def _critical_done(self, task: asyncio.Task[Any]) -> None:
+        self._critical.discard(task)
+        if not task.cancelled():
+            task.exception()       # retrieved here; the awaiting caller (if any) reports it
+
+    @staticmethod
+    def _orphan_done(task: asyncio.Task[Any]) -> None:
+        if not task.cancelled() and task.exception() is not None:
+            logger.error("Order flow %s failed after its caller was cancelled", task.get_name(),
+                         exc_info=task.exception())
+
+    @property
+    def accepting(self) -> bool:
+        return self._accepting
+
     def _broker(self, name: str) -> Broker | None:
         return next((b for b in self.brokers if b.name == name), None)
 
@@ -323,7 +433,21 @@ class Engine:
         return bool(await self.db.get_state("paused", False))
 
     async def _open_trade_summaries(self) -> list[dict[str, Any]]:
-        return [t.summary() for t in await self.db.active_trades()]
+        """OPEN TRADES context: levels with their close fractions, which TPs already hit, share still open."""
+        out: list[dict[str, Any]] = []
+        for t in await self.db.active_trades():
+            try:
+                hit, open_fraction = tp_progress(t, await self.db.broker_positions(t.id))
+            except Exception:
+                logger.exception("TP progress of trade %s failed", t.id)
+                hit, open_fraction = None, None   # type: ignore[assignment]
+            out.append(t.summary(tp_hit=hit, open_fraction=open_fraction))
+        return out
+
+    async def _filled_tp_levels(self, trade: TradeRecord) -> list[float]:
+        """Exact prices of the trade's current TP levels that already filled on some broker."""
+        hit, _share = tp_progress(trade, await self.db.broker_positions(trade.id))
+        return [tp.price for tp, h in zip(trade.current_take_profits, hit) if h]
 
     async def _price(self, base: str | None, quote: str | None, market_type: MarketType | None,
                      raw_symbol: str | None = None, *, fresh: bool = False) -> float | None:
@@ -360,8 +484,34 @@ class Engine:
         if monitor and (self._monitor_task is None or self._monitor_task.done()):
             self._monitor_task = asyncio.ensure_future(self.monitor.run())
         await self._notify(await self._startup_text(), Severity.INFO)
+        await self._warn_open_senders()
         logger.info("Engine started: %d/%d broker(s) connected, dry_run=%s",
                     len(self.brokers), len(self.configured_brokers), self.config.dry_run)
+
+    async def _warn_open_senders(self) -> None:
+        """Empty allowed_sender_ids: every member's trade in a group is copied. Log at every start,
+        tell the owner once (per set of source chats)."""
+        tg = self.config.telegram
+        if tg.allowed_sender_ids:
+            return
+        logger.warning(
+            "telegram.allowed_sender_ids is empty: trade messages from ANY sender in the source chats are copied. "
+            "Set allowed_sender_ids to the trader's user id for groups where members can post."
+        )
+        marker = sorted(str(c) for c in tg.source_chats)
+        try:
+            if await self.db.get_state("open_senders_warned") == marker:
+                return
+            await self.db.set_state("open_senders_warned", marker)
+        except Exception:
+            logger.exception("open_senders_warned state")
+        await self._notify(
+            "⚠️ <b>telegram.allowed_sender_ids boş</b>: kaynak gruplarda yazan HERKESİN işlem mesajı "
+            "kopyalanır (yalnızca yöneticilerin yazabildiği kanallarda sorun yok). Grup üyeleri de yazabiliyorsa "
+            "sadece trader'ı kopyalamak için config.yaml'da <code>allowed_sender_ids: [trader_id]</code> ayarlayın. "
+            "(Bu uyarı bir kez gönderilir.)",
+            Severity.WARNING,
+        )
 
     async def connect_brokers(self) -> None:
         """Connect every configured broker; failures are reported and excluded. No other side effects
@@ -442,7 +592,46 @@ class Engine:
             lines.append("⏸ Yeni işlem açma DURAKLATILMIŞ (/devam ile açın).")
         return "\n".join(lines)
 
-    async def stop(self) -> None:
+    def begin_shutdown(self) -> None:
+        """Stop accepting new work (message batches, edits, approvals, corrections, /kapat); running
+        order flows and the monitor's current pass are left to finish. Idempotent."""
+        if self._accepting:
+            logger.info("Engine: shutdown requested; no new work is accepted")
+        self._accepting = False
+        self.monitor.request_stop()
+
+    def _busy(self) -> bool:
+        if any(not t.done() for t in self._critical):
+            return True
+        if self._open_lock.locked() or any(lock.locked() for lock in self._trade_locks.values()):
+            return True
+        return self._monitor_task is not None and not self._monitor_task.done()
+
+    async def drain(self, timeout: float) -> bool:
+        """Wait until no order flow, trade lock or monitor pass is running. False on timeout."""
+        loop = asyncio.get_running_loop()
+        deadline = loop.time() + max(0.0, timeout)
+        while self._busy():
+            if loop.time() >= deadline:
+                return False
+            await asyncio.sleep(0.05)
+        return True
+
+    async def stop(self, *, grace_sec: float | None = None) -> None:
+        """Graceful stop: no new work, wait (up to ``grace_sec``) for running order flows and the
+        monitor's current pass, then cancel timers and close the brokers."""
+        self.begin_shutdown()
+        grace = self.shutdown_grace_sec if grace_sec is None else grace_sec
+        if not await self.drain(grace):
+            running = sorted(t.get_name() for t in self._critical if not t.done())
+            logger.error("Shutdown: order flows still running after %.0fs: %s", grace, running)
+            await self._notify(
+                f"⚠️ Kapanırken süren emir işlemleri {fmt.fmt_number(float(grace))} sn içinde bitmedi "
+                f"({esc(', '.join(running) or 'izleme')}). Bot yeniden başlayınca açık pozisyonları ve stopları "
+                "borsada/brokerda kontrol edin.",
+                Severity.WARNING,
+            )
+        self._brokers_closed = True       # set right after the drain check: no new order flow can start
         tasks: list[asyncio.Task[Any]] = []
         if self._monitor_task is not None:
             tasks.append(self._monitor_task)
@@ -469,6 +658,10 @@ class Engine:
 
     # ------------------------------------------------------------------ incoming messages
     async def on_messages_ready(self, chat_id: int, sender_id: int | None) -> None:
+        if not self._accepting:
+            # Left unconsumed: the listener re-triggers recent unprocessed messages after the restart.
+            logger.info("Shutting down: batch of %s/%s not processed", chat_id, sender_id)
+            return
         key: _Key = (chat_id, sender_id)
         async with self._sender_lock(key):
             await self._process_batch(key)
@@ -586,16 +779,28 @@ class Engine:
             self._retry_tasks[key] = self._spawn(self._retry_later(key, delay), f"parse-retry-{chat_id}")
             return
         self._parse_failures.pop(key, None)
-        await self._log("parse_failed", {"chat_id": chat_id, "message_ids": [m.message_id for m in msgs],
+        ids = [m.message_id for m in msgs]
+        await self._log("parse_failed", {"chat_id": chat_id, "message_ids": ids,
                                          "error": str(err), "transient": transient})
+        # Given up: consume, so the stale signal can never be picked up by a later batch and executed
+        # silently; and remember it, so an action built on it later (a reply) is asked, never automatic.
+        await self.db.mark_consumed(chat_id, ids)
+        await self._remember_outcome(chat_id, ids, "parse_failed", None)
+        if transient:
+            await self._notify(
+                f"Sinyal {attempt + 1} denemede okunamadı (geçici hata: {esc(err) or esc(type(err).__name__)}).\n"
+                f"Mesaj: <i>{esc(_excerpt(msgs))}</i>\n"
+                "Tekrar denenmeyecek: bu mesajdan işlem açılmadı ve sonradan otomatik açılmayacak. Gerekiyorsa "
+                "işlemi elle açın (sonraki bir mesaj bu sinyale dayanırsa önce size sorulur).",
+                Severity.WARNING,
+            )
+            return
         await self._notify(
             f"Sinyal okunamadı: {esc(err) or esc(type(err).__name__)}\n"
             f"Mesaj: <i>{esc(_excerpt(msgs))}</i>\n"
             "İşlem açılmadı; gerekiyorsa elle kontrol edin.",
             Severity.WARNING,
         )
-        if not transient:
-            await self.db.mark_consumed(chat_id, [m.message_id for m in msgs])
 
     async def _retry_later(self, key: _Key, delay: float) -> None:
         await asyncio.sleep(delay)
@@ -653,20 +858,22 @@ class Engine:
 
     # ------------------------------------------------------------------ evaluation
     async def evaluate(
-        self, action: ParsedAction, chat_id: int, *, reply_to: StoredMessage | None = None
+        self, action: ParsedAction, chat_id: int, *, reply_to: StoredMessage | None = None,
+        exclude_conf: str | None = None,
     ) -> Evaluation | None:
-        """Validate one action without side effects. None for NONE actions."""
+        """Validate one action without side effects. None for NONE actions.
+        ``exclude_conf``: the confirmation being corrected / re-read (not a conflict with itself)."""
         if action.action is ActionType.OPEN:
-            return await self._evaluate_open(action, chat_id)
+            return await self._evaluate_open(action, chat_id, exclude_conf=exclude_conf)
         if action.action is ActionType.INCOMPLETE:
             return await self._evaluate_incomplete(
                 action, chat_id, "Sinyal eksik: varlık, yön veya stop bilgisi tamamlanmadı."
             )
         if action.action in MANAGEMENT_ACTIONS:
-            return await self._evaluate_management(action, chat_id, reply_to)
+            return await self._evaluate_management(action, chat_id, reply_to, exclude_conf=exclude_conf)
         return None
 
-    async def _evaluate_open(self, action: ParsedAction, chat_id: int) -> Evaluation:
+    async def _evaluate_open(self, action: ParsedAction, chat_id: int, *, exclude_conf: str | None = None) -> Evaluation:
         now = self._now()
         base, quote, market_type = asset_of(action)
         market = await self._price(base, quote, market_type, action.symbol)
@@ -676,7 +883,7 @@ class Engine:
         )
         issues = merge_issues(issues, validator.low_confidence_issues(action, self.config.llm))
         if plan is not None:
-            issues = merge_issues(issues, await self._portfolio_issues(plan, chat_id))
+            issues = merge_issues(issues, await self._portfolio_issues(plan, chat_id, exclude_conf=exclude_conf))
         return Evaluation("open", action, plan, issues, market)
 
     async def _evaluate_incomplete(self, action: ParsedAction, chat_id: int, reason: str) -> Evaluation:
@@ -689,7 +896,20 @@ class Engine:
         return Evaluation("incomplete", action, None, merge_issues([_issue("incomplete_signal", reason, True)], issues),
                           market)
 
-    async def _portfolio_issues(self, plan: TradePlan, chat_id: int) -> list[ValidationIssue]:
+    async def _portfolio_issues(
+        self, plan: TradePlan, chat_id: int, *, exclude_conf: str | None = None
+    ) -> list[ValidationIssue]:
+        """Everything that makes a NEW trade doubtful beyond the signal itself: existing trades
+        (duplicate / opposite / same message), pending confirmations of the same messages or a similar
+        signal, and earlier confirmation outcomes of its messages."""
+        return merge_issues(
+            await self._trade_issues(plan, chat_id),
+            await self._pending_issues(plan, chat_id, exclude_conf),
+            await self._outcome_issues(chat_id, plan.source_message_ids, exclude_conf),
+        )
+
+    async def _trade_issues(self, plan: TradePlan, chat_id: int) -> list[ValidationIssue]:
+        """Conflicts with trades that exist (re-checked at approval time)."""
         now = self._now()
         risk = self.config.risk
         out: list[ValidationIssue] = []
@@ -714,6 +934,122 @@ class Engine:
             if t is not None and t.status not in (TradeStatus.FAILED, TradeStatus.CANCELLED):
                 out.append(_issue("message_already_traded", f"Bu mesajdan zaten işlem açılmış (#{t.id})."))
                 break
+        return out
+
+    async def _pending_issues(
+        self, plan: TradePlan | None, chat_id: int, exclude_conf: str | None,
+        ids: list[int] | None = None,
+    ) -> list[ValidationIssue]:
+        """A pending confirmation built on the same messages, or (``plan``) on a similar signal (a repost):
+        executing now and approving that one later would open the same signal twice."""
+        risk = self.config.risk
+        ids = list(plan.source_message_ids) if ids is None and plan is not None else list(ids or [])
+        out: list[ValidationIssue] = []
+        similar: list[TradeRecord] = []
+        by_plan: dict[str, PendingConfirmation] = {}
+        for conf in await self.db.pending_confirmations():
+            if conf.id == exclude_conf or conf.source_chat_id != chat_id:
+                continue
+            shared = sorted(set(ids) & set(conf.source_message_ids))
+            if shared:
+                out.append(_issue(
+                    "pending_confirmation",
+                    f"Bu mesaj için bekleyen bir onay var (#{conf.id}); ikisi de uygulanırsa aynı talimat iki kez "
+                    "işlenir.",
+                ))
+                continue
+            if plan is not None and isinstance(conf.plan, TradePlan):
+                by_plan[conf.plan.plan_id] = conf
+                similar.append(TradeRecord(
+                    id=0, plan=conf.plan, status=TradeStatus.OPENING, current_stop_loss=conf.plan.stop_loss,
+                    current_take_profits=list(conf.plan.take_profits), created_at=conf.created_at,
+                    updated_at=conf.created_at,
+                ))
+        if plan is not None and similar:
+            dup = guards.find_duplicate(plan, similar, window_sec=risk.duplicate_window_sec, now=self._now())
+            if dup is not None:
+                conf = by_plan[dup.plan.plan_id]
+                out.append(_issue(
+                    "duplicate_pending_signal",
+                    f"Benzer bir sinyal için bekleyen bir onay var (#{conf.id} {dup.plan.base_asset} "
+                    f"{dup.plan.side.value.upper()}, giriş {fmt_price(dup.plan.entry_price)}); sinyal tekrar "
+                    "paylaşılmış olabilir.",
+                ))
+        return out
+
+    # ------------------------------------------------------------------ confirmation outcomes per message
+    @staticmethod
+    def _outcome_key(chat_id: int) -> str:
+        return f"msg_outcomes:{chat_id}"
+
+    async def _remember_outcome(self, chat_id: int, ids: list[int], status: str, conf_id: str | None) -> None:
+        """Remember how a confirmation (or a given-up parse) about these source messages ended."""
+        ids = [int(i) for i in dict.fromkeys(ids) if i]
+        if not ids:
+            return
+        now = self._now()
+        async with self._outcome_lock:
+            try:
+                data = await self.db.get_state(self._outcome_key(chat_id), {}) or {}
+                if not isinstance(data, dict):
+                    data = {}
+                for mid in ids:
+                    data[str(mid)] = {"status": status, "conf": conf_id, "at": now.isoformat()}
+                cutoff = (now - timedelta(days=MSG_OUTCOME_TTL_DAYS)).isoformat()
+                kept = sorted(((k, v) for k, v in data.items()
+                               if isinstance(v, dict) and str(v.get("at", "")) >= cutoff),
+                              key=lambda kv: str(kv[1].get("at", "")))[-MSG_OUTCOME_MAX:]
+                await self.db.set_state(self._outcome_key(chat_id), dict(kept))
+            except Exception:
+                logger.exception("Could not remember the outcome of messages %s", ids)
+
+    async def _record_confirmation_outcome(self, conf: PendingConfirmation) -> None:
+        if conf.status in (ConfirmationStatus.PENDING, ConfirmationStatus.SUPERSEDED):
+            return      # a superseding confirmation carries the same messages
+        if conf.action.action is ActionType.NONE:
+            return      # "is this a trade at all?" - a later explicit instruction is new information
+        ids = list(conf.source_message_ids)
+        if conf.kind == "manage":
+            if conf.status is ConfirmationStatus.APPROVED:
+                return  # like an automatic change; only declined / unanswered ones must not run later
+            # The managed trade's own signal messages are not "decided" by a management question.
+            trade_id = conf.plan.trade_id if isinstance(conf.plan, ManagementPlan) else conf.action.target_trade_id
+            trade = await self.db.get_trade(trade_id) if trade_id is not None else None
+            if trade is not None:
+                ids = [i for i in ids if i not in trade.plan.source_message_ids]
+        await self._remember_outcome(conf.source_chat_id, ids, conf.status.value, conf.id)
+
+    async def _outcome_issues(
+        self, chat_id: int, ids: list[int], exclude_conf: str | None
+    ) -> list[ValidationIssue]:
+        """An action built on a message whose earlier confirmation was rejected / expired / approved (or
+        whose parse was given up) is asked again, never executed automatically."""
+        if not ids:
+            return []
+        try:
+            data = await self.db.get_state(self._outcome_key(chat_id), {}) or {}
+        except Exception:
+            logger.exception("Could not read message outcomes")
+            return []
+        if not isinstance(data, dict):
+            return []
+        out: list[ValidationIssue] = []
+        for mid in dict.fromkeys(ids):
+            rec = data.get(str(mid))
+            if not isinstance(rec, dict) or (exclude_conf is not None and rec.get("conf") == exclude_conf):
+                continue
+            conf = rec.get("conf")
+            status = rec.get("status")
+            ref = f" (onay #{esc(conf)})" if conf else ""
+            text = {
+                "rejected": f"Bu mesajdaki talimat için daha önce onay sorulmuş ve reddedilmişti{ref}.",
+                "expired": f"Bu mesajdaki talimat için daha önce onay sorulmuş, yanıt gelmeden süresi dolmuştu{ref}.",
+                "approved": f"Bu mesajdaki talimat daha önce onaylanıp uygulanmıştı{ref}; aynı talimat ikinci kez "
+                            "uygulanmak üzere olabilir.",
+                "parse_failed": "Bu mesaj daha önce okunamamış ve otomatik işlenmemek üzere bırakılmıştı.",
+            }.get(str(status))
+            if text:
+                out.append(_issue("message_previously_decided", text))
         return out
 
     async def _resolve_trade(
@@ -757,17 +1093,31 @@ class Engine:
         return trade, candidates, extra
 
     async def _evaluate_management(
-        self, action: ParsedAction, chat_id: int, reply_to: StoredMessage | None
+        self, action: ParsedAction, chat_id: int, reply_to: StoredMessage | None, *,
+        exclude_conf: str | None = None,
     ) -> Evaluation:
         trade, candidates, extra = await self._resolve_trade(action, chat_id, reply_to)
         market = None
+        filled: list[float] = []
         if trade is not None:
             market = await self._price(trade.plan.base_asset, trade.plan.quote_asset, trade.plan.market_type)
+            if action.action is ActionType.MOVE_TP:
+                try:
+                    filled = await self._filled_tp_levels(trade)
+                except Exception:
+                    logger.exception("Filled TP levels of trade %s", trade.id)
         plan, issues = validator.build_management_plan(
             action, trade=trade, candidates=candidates, market_price=market,
-            source_chat_id=chat_id, now=self._now(),
+            source_chat_id=chat_id, now=self._now(), filled_tp_prices=filled,
         )
-        issues = merge_issues(extra, issues, validator.low_confidence_issues(action, self.config.llm))
+        # Messages other than the managed trade's own signal: earlier questions about them still count.
+        own = set(trade.plan.source_message_ids) if trade is not None else set()
+        ids = [i for i in action.used_message_ids if i not in own]
+        issues = merge_issues(
+            extra, issues, validator.low_confidence_issues(action, self.config.llm),
+            await self._pending_issues(None, chat_id, exclude_conf, ids),
+            await self._outcome_issues(chat_id, ids, exclude_conf),
+        )
         return Evaluation("manage", action, plan, issues, market, trade)
 
     # ------------------------------------------------------------------ open
@@ -793,7 +1143,11 @@ class Engine:
             await self.execute_open(ev.plan, raw_symbol=action.symbol)
 
     async def execute_open(self, plan: TradePlan, *, raw_symbol: str | None = None) -> str:
-        """Open ``plan`` on every broker that can trade it. Returns an HTML result text."""
+        """Open ``plan`` on every broker that can trade it. Returns an HTML result text.
+        Runs as a critical section: never interrupted half-way by a cancelled caller or shutdown."""
+        return await self._critical_section(self._execute_open(plan, raw_symbol), f"open-{plan.plan_id}")
+
+    async def _execute_open(self, plan: TradePlan, raw_symbol: str | None) -> str:
         trade = await self.db.create_trade(plan)
         async with self.trade_lock(trade.id):
             await self._log("open_start", {"trade_id": trade.id, "plan": plan.model_dump(mode="json")})
@@ -816,7 +1170,8 @@ class Engine:
             await self._notify(head + "\n" + "\n".join(lines), Severity.ERROR)
         else:
             word = "limit emri yerleştirildi" if status is TradeStatus.PENDING else "açıldı"
-            head = f"✅ <b>{label} {word}</b>"
+            icon = "⚠️" if any(o.kind in ("partial", "error") for o in outcomes) else "✅"
+            head = f"{icon} <b>{label} {word}</b>"
             if self.config.dry_run:
                 head += " <i>(dry-run: gerçek emir yok)</i>"
             if self.config.notifier.notify_on_execution:
@@ -896,6 +1251,7 @@ class Engine:
             if pos.status is PositionStatus.FAILED:
                 text = f"{esc(name)}: <code>{esc(pos.error or 'işlem açılamadı')}</code>"
                 await self._notify(text, Severity.ERROR)
+                self.monitor.note_alerted(trade.id, pos)
                 return BrokerOutcome(name, "error", text, pos)
             fill = f", giriş ~{fmt_price(pos.avg_entry_price)}" if pos.avg_entry_price else ""
             text = (f"{esc(name)}: {_qty(pos.quantity)} {esc(sym.broker_symbol)} "
@@ -903,6 +1259,9 @@ class Engine:
                     f"{fill}")
             if size.warnings:
                 text += " ⚠️ " + esc("; ".join(size.warnings))
+            if await self._report_position_problem(trade, pos, None):
+                text += f" 🚨 <code>{esc(pos.error or protection_problem(pos) or '')}</code>"
+                return BrokerOutcome(name, "partial", text, pos)
             return BrokerOutcome(name, "ok", text, pos)
         except BrokerError as exc:
             text = f"{esc(name)}: <code>{esc(exc)}</code>"
@@ -913,6 +1272,27 @@ class Engine:
             text = f"{esc(name)}: beklenmeyen hata <code>{esc(exc)}</code>"
             await self._notify(text, Severity.ERROR)
             return BrokerOutcome(name, "error", text)
+
+    async def _report_position_problem(
+        self, trade: TradeRecord, pos: BrokerPosition, previous_error: str | None
+    ) -> bool:
+        """Tell the owner (ERROR, always - independent of notify_on_execution) when an adapter returned a
+        position without a working stop, or a new ``pos.error`` (TP not placed, SL not resized,
+        emergency close...). True if something was reported."""
+        problem = protection_problem(pos)
+        if problem is not None:
+            await self._notify(unprotected_alert_text(trade, pos, problem), Severity.ERROR)
+            self.monitor.note_alerted(trade.id, pos)
+            return True
+        if pos.error and pos.error != previous_error:
+            await self._notify(
+                f"⚠️ {esc(pos.broker)}: #{trade.id} {esc(trade.plan.base_asset)} {trade.plan.side.value.upper()} "
+                f"({_POS_STATUS_TR.get(pos.status, pos.status.value)}): <code>{esc(pos.error)}</code>",
+                Severity.ERROR,
+            )
+            self.monitor.note_alerted(trade.id, pos)
+            return True
+        return False
 
     # ------------------------------------------------------------------ management
     async def _handle_management(
@@ -926,7 +1306,12 @@ class Engine:
         await self.execute_management(ev.plan)
 
     async def execute_management(self, plan: ManagementPlan, *, notify: bool = True) -> str:
-        """Apply ``plan`` to every active broker position of the trade. Returns an HTML result text."""
+        """Apply ``plan`` to every active broker position of the trade. Returns an HTML result text.
+        Runs as a critical section (see :meth:`execute_open`)."""
+        return await self._critical_section(self._execute_management(plan, notify),
+                                            f"manage-{plan.trade_id}-{plan.plan_id}")
+
+    async def _execute_management(self, plan: ManagementPlan, notify: bool) -> str:
         async with self.trade_lock(plan.trade_id):
             trade = await self.db.get_trade(plan.trade_id)
             if trade is None:
@@ -940,7 +1325,7 @@ class Engine:
             ) if active else []
             changed = {o.position.broker: o.position for o in outcomes if o.position is not None}
             merged = [changed.get(p.broker, p) for p in positions]
-            ok = any(o.kind == "ok" for o in outcomes)
+            ok = any(o.kind in ("ok", "partial") for o in outcomes)
             update: dict[str, Any] = {}
             if ok and plan.action is ActionType.MOVE_SL:
                 new_sl = plan.new_stop_loss if plan.new_stop_loss is not None else trade.plan.entry_price
@@ -959,7 +1344,7 @@ class Engine:
         lines = [f"• {o.text}" for o in outcomes] or ["• Aktif broker pozisyonu yok."]
         if not outcomes:
             head = f"⚠️ {label}: uygulanacak pozisyon yok"
-        elif ok and all(o.kind != "error" for o in outcomes):
+        elif ok and all(o.kind not in ("error", "partial") for o in outcomes):
             head = f"✅ {label}: {esc(plan.summary_tr or plan.action.value)}"
         elif ok:
             head = f"⚠️ {label}: kısmen uygulandı"
@@ -1012,9 +1397,17 @@ class Engine:
                 new = await broker.update_stop_loss(pos, sl)
                 text = f"{esc(name)}: stop {fmt_price(sl)}"
             elif plan.action is ActionType.MOVE_TP:
-                tps = scaled_take_profits(plan.take_profits, mult)
+                # Never re-arm a level that already filled on THIS position (the rest is split over the others).
+                done = _match_levels([tp.price for tp in plan.take_profits], filled_tp_prices(pos))
+                levels = [tp for tp, hit in zip(plan.take_profits, done) if not hit]
+                if not levels:
+                    return BrokerOutcome(name, "skipped",
+                                         f"{esc(name)}: hedeflerin hepsi bu hesapta zaten gerçekleşmiş; TP değişmedi")
+                tps = scaled_take_profits(levels, mult)
                 new = await broker.update_take_profits(pos, tps)
                 text = f"{esc(name)}: TP " + " / ".join(fmt_price(tp.price) for tp in tps)
+                if len(levels) < len(plan.take_profits):
+                    text += " (gerçekleşen hedef tekrar konmadı)"
             elif plan.action is ActionType.CLOSE:
                 frac = plan.close_fraction if plan.close_fraction is not None else 1.0
                 if pos.status is PositionStatus.PENDING:
@@ -1041,6 +1434,10 @@ class Engine:
             await self.db.save_broker_position(trade.id, new)
             if new.realized_pnl is not None and new.status not in ACTIVE_POSITION:
                 text += f" (K/Z {new.realized_pnl:+.2f})"
+            if await self._report_position_problem(trade, new, pos.error):
+                # Applied, but the adapter reported a problem (some legs failed, TP not placed, no stop...).
+                text += f" 🚨 <code>{esc(new.error or protection_problem(new) or '')}</code>"
+                return BrokerOutcome(name, "partial", text, new)
             return BrokerOutcome(name, "ok", text, new)
         except BrokerError as exc:
             text = f"{esc(name)}: <code>{esc(exc)}</code>"
@@ -1128,6 +1525,7 @@ class Engine:
             conf.status = ConfirmationStatus.EXPIRED
             conf.awaiting_correction = False
             await self.db.save_confirmation(conf)
+            await self._record_confirmation_outcome(conf)
             text = ("⌛ Süre doldu, değişiklik uygulanmadı." if conf.kind == "manage"
                     else "⌛ Süre doldu, işlem açılmadı.")
             try:
@@ -1140,6 +1538,7 @@ class Engine:
         conf.status = status
         conf.awaiting_correction = False
         await self.db.save_confirmation(conf)
+        await self._record_confirmation_outcome(conf)
         self._disarm_expiry(conf.id)
         try:
             await self.notifier.close_confirmation(conf, text)
@@ -1148,6 +1547,8 @@ class Engine:
         await self._log("confirmation_" + status.value, {"id": conf.id, "result": text})
 
     async def handle_confirmation(self, conf_id: str, approved: bool) -> str:
+        if approved and not self._accepting:
+            return SHUTDOWN_TEXT     # stays pending: restored (with its expiry) after the restart
         async with self._conf_lock(conf_id):
             conf = await self.db.get_confirmation(conf_id)
             if conf is None:
@@ -1174,11 +1575,20 @@ class Engine:
             await self._finish(conf, ConfirmationStatus.REJECTED, text)
             return text
         async with self._open_lock:
+            if not self._accepting:
+                return SHUTDOWN_TEXT
             limit = self.config.risk.max_open_trades
             if guards.max_open_trades_reached(await self.db.active_trades(), limit):
                 text = f"⛔ Açık işlem sınırına ({limit}) ulaşıldı; işlem açılmadı."
                 await self._finish(conf, ConfirmationStatus.REJECTED, text)
                 return text
+            # Re-check existing trades like the automatic path does: since the question was asked, the
+            # same signal may have been executed (a repost, or a reply built on the same message).
+            known = {(i.code, i.message_tr) for i in conf.issues}
+            fresh = [i for i in await self._trade_issues(plan, conf.source_chat_id)
+                     if (i.code, i.message_tr) not in known]
+            if fresh:
+                return await self._reask_open(conf, plan, fresh)
             problem = await self._approval_price_problem(plan, conf.action.symbol)
             if problem:
                 text = f"⛔ {esc(problem)} — işlem açılmadı."
@@ -1196,6 +1606,21 @@ class Engine:
                 result = f"🚨 İşlem açılırken hata: <code>{esc(exc)}</code>"
         await self._finish(conf, ConfirmationStatus.APPROVED, result)
         return result
+
+    async def _reask_open(self, conf: PendingConfirmation, plan: TradePlan, fresh: list[ValidationIssue]) -> str:
+        """Something new conflicts with an approved signal: do not execute; ask again showing it."""
+        new_id = await self._new_conf_id()
+        reasons = " ".join(i.message_tr for i in fresh)
+        text = (f"♻️ Onay beklerken durum değişti: {esc(reasons)} İşlem açılmadı; yeni onay #{new_id} gönderildi "
+                "(yine de açılsın istiyorsanız orada onaylayın).")
+        await self._finish(conf, ConfirmationStatus.SUPERSEDED, text)
+        market = await self._price(plan.base_asset, plan.quote_asset, plan.market_type, conf.action.symbol)
+        ev = Evaluation("open", conf.action, plan, merge_issues(fresh, conf.issues),
+                        market if market is not None else conf.market_price)
+        await self._ask(ev.kind, ev.action, ev.plan, ev.issues, ev.market_price, conf.source_chat_id,
+                        list(conf.source_message_ids), conf_id=new_id)
+        await self._log("approval_reasked", {"id": conf.id, "new_id": new_id, "issues": [i.code for i in fresh]})
+        return text
 
     async def _approval_price_problem(self, plan: TradePlan, raw_symbol: str | None) -> str | None:
         price = await self._price(plan.base_asset, plan.quote_asset, plan.market_type, raw_symbol, fresh=True)
@@ -1224,6 +1649,8 @@ class Engine:
         return result
 
     async def request_correction(self, conf_id: str) -> str:
+        if not self._accepting:
+            return SHUTDOWN_TEXT
         # Only one confirmation waits for a correction text at a time.
         for other in await self.db.pending_confirmations():
             if other.awaiting_correction and other.id != conf_id:
@@ -1253,6 +1680,8 @@ class Engine:
         text = (correction_text or "").strip()
         if not text:
             return "Düzeltme metni boş."
+        if not self._accepting:
+            return SHUTDOWN_TEXT
         async with self._conf_lock(conf_id):
             conf = await self.db.get_confirmation(conf_id)
             if conf is None or conf.status is not ConfirmationStatus.PENDING:
@@ -1275,7 +1704,7 @@ class Engine:
             action = actions[0]
             if not action.used_message_ids:
                 action = action.model_copy(update={"used_message_ids": list(conf.source_message_ids)})
-            ev = await self.evaluate(action, conf.source_chat_id, reply_to=reply_to)
+            ev = await self.evaluate(action, conf.source_chat_id, reply_to=reply_to, exclude_conf=conf.id)
             assert ev is not None
             if len(actions) > 1:
                 ev.issues.append(_issue("multiple_actions",
@@ -1296,22 +1725,74 @@ class Engine:
 
     # ------------------------------------------------------------------ edits
     async def on_message_edited(self, msg: StoredMessage) -> None:
+        if not self._accepting:
+            logger.info("Shutting down: edit of %s/%s not processed", msg.chat_id, msg.message_id)
+            return
         try:
+            # A batch of this sender may be parsing / executing this very message right now. Wait for it,
+            # so the lookups below see the trade or confirmation it created and the edit is never lost.
+            async with self._sender_lock((msg.chat_id, msg.sender_id)):
+                fresh = await self.db.get_message(msg.chat_id, msg.message_id)
+            current = fresh or msg
             trade = await self.db.find_trade_by_message(msg.chat_id, msg.message_id)
             if trade is not None:
                 if trade.status in ACTIVE_TRADE:
-                    await self._edited_trade_signal(trade, msg)
+                    await self._edited_trade_signal(trade, current)
                 return
             for conf in await self.db.pending_confirmations():
                 if conf.source_chat_id == msg.chat_id and msg.message_id in conf.source_message_ids:
                     await self._edited_confirmation(conf.id)
                     return
-            fresh = await self.db.get_message(msg.chat_id, msg.message_id)
             if fresh is not None and not fresh.consumed:
                 await self.on_messages_ready(msg.chat_id, msg.sender_id)
+                return
+            await self._edited_consumed_message(current)
         except Exception as exc:
             logger.exception("on_message_edited failed for %s/%s", msg.chat_id, msg.message_id)
             await self._notify(f"Düzenlenen mesaj işlenemedi: <code>{esc(exc)}</code>", Severity.ERROR)
+
+    async def _edited_consumed_message(self, msg: StoredMessage) -> None:
+        """An already handled message with no trade and no pending question was edited (e.g. read as
+        "none" or dropped by the prefilter, then edited into a signal). Read the current version again;
+        anything it now says is ASKED, never executed automatically."""
+        age = (self._now() - utc(msg.date)).total_seconds()
+        if age > EDIT_REPROCESS_MAX_AGE_SEC:
+            logger.info("Edit of old message %s/%s (%.0fs) ignored", msg.chat_id, msg.message_id, age)
+            return
+        if self.config.llm.prefilter and not prefilter.looks_relevant(msg):
+            logger.debug("Edit of %s/%s: prefilter says not relevant", msg.chat_id, msg.message_id)
+            return
+        reply_to = await self._reply_context(msg.chat_id, [msg])
+        ctx = ParseContext(now=self._now(), open_trades=await self._open_trade_summaries(), reply_to=reply_to)
+        try:
+            result = await self.parser.parse([msg], ctx)
+        except Exception as exc:
+            await self._notify(
+                f"Daha önce işlem talimatı sayılmayan bir mesaj düzenlendi ama okunamadı ({esc(exc)}).\n"
+                f"Mesaj: <i>{esc(_excerpt([msg]))}</i>\nİşlem yapılmadı; gerekiyorsa elle kontrol edin.",
+                Severity.WARNING,
+            )
+            return
+        actions = self._fill_used_ids([a for a in result.actions if a.action is not ActionType.NONE],
+                                      [msg.message_id])
+        if not actions:
+            logger.info("Edit of %s/%s is still not a trading instruction", msg.chat_id, msg.message_id)
+            return
+        edited = _issue("edited_after_read",
+                        "Daha önce işlenmiş bir mesaj sonradan düzenlendi; yeni hali otomatik uygulanmaz, size "
+                        "soruluyor.")
+        await self._log("edited_reparsed", {"chat_id": msg.chat_id, "message_id": msg.message_id,
+                                            "actions": [a.model_dump(mode="json") for a in actions]})
+        for action in actions:
+            if action.action is ActionType.OPEN and await self._is_paused():
+                await self._notify(f"Duraklatıldı: düzenlenen sinyal atlandı ({esc(action.summary_tr or '?')})",
+                                   Severity.INFO)
+                continue
+            ev = await self.evaluate(action, msg.chat_id, reply_to=reply_to)
+            if ev is None:
+                continue
+            ev.issues = merge_issues([edited], ev.issues)
+            await self._ask_eval(ev, msg.chat_id)
 
     async def _edited_trade_signal(self, trade: TradeRecord, msg: StoredMessage) -> None:
         """Never auto-apply edits: build MOVE_SL / MOVE_TP proposals and ask."""
@@ -1401,7 +1882,7 @@ class Engine:
             action = actions[0]
             if not action.used_message_ids:
                 action = action.model_copy(update={"used_message_ids": list(conf.source_message_ids)})
-            ev = await self.evaluate(action, conf.source_chat_id, reply_to=reply_to)
+            ev = await self.evaluate(action, conf.source_chat_id, reply_to=reply_to, exclude_conf=conf.id)
             assert ev is not None
             ev.issues = merge_issues([_issue("signal_edited", "Sinyal mesajı düzenlendi.")], ev.issues)
             new_id = await self._new_conf_id()
@@ -1437,7 +1918,9 @@ class Engine:
         for t in trades:
             lines.append("")
             lines.append(fmt.format_trade_line(t))
-            tps = " / ".join(fmt_price(tp.price) for tp in t.current_take_profits) or "yok"
+            hit, _share = tp_progress(t, await self.db.broker_positions(t.id))
+            tps = " / ".join(fmt_price(tp.price) + (" ✔" if h else "")
+                             for tp, h in zip(t.current_take_profits, hit)) or "yok"
             price = await self._price(t.plan.base_asset, t.plan.quote_asset, t.plan.market_type)
             lines.append(f"🎯 TP: {tps}" + (f" · 💹 anlık {fmt_price(price)}" if price else ""))
             for p in await self.db.broker_positions(t.id):
@@ -1485,6 +1968,8 @@ class Engine:
         return "▶️ Yeni sinyaller tekrar kopyalanacak."
 
     async def close_all(self) -> str:
+        if not self._accepting:
+            return SHUTDOWN_TEXT
         trades = await self.db.active_trades()
         if not trades:
             return "Kapatılacak açık işlem yok."
@@ -1578,4 +2063,5 @@ class Engine:
         return lines
 
 
-__all__ = ["Engine", "Evaluation", "BrokerOutcome", "asset_of", "merge_issues", "is_transient_parse_error"]
+__all__ = ["Engine", "Evaluation", "BrokerOutcome", "asset_of", "merge_issues", "is_transient_parse_error",
+           "filled_tp_prices", "tp_progress"]

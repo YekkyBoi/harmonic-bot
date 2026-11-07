@@ -35,7 +35,8 @@ WORKED_EXAMPLE_OUTPUT: dict[str, Any] = {
             "used_message_ids": [501, 502],
             "evidence": (
                 "Sembol: başlıktaki ETHUSDT.P (perp, USDT). Yön: kırmızı bölge girişin altında = long, "
-                "metin 'long' ile uyumlu. Giriş 2232.18 = iki bölgenin sınırındaki yeşil etiket. "
+                "metin 'long' ile uyumlu. Giriş 2232.18 = yeşil etiket (sınırdaki siyah anlık fiyat etiketiyle "
+                "çakışmasın diye biraz aşağı kaydırılmış; değeri iki bölgenin sınırına uyuyor). "
                 "SL 2205.11 = kırmızı bölgenin alt kenarındaki kırmızı etiket. TP 2310.60 = gri bölgenin "
                 "üst kenarındaki gri etiket. 2232.85 + 07:11 siyah etiket = anlık fiyat, giriş değil; "
                 "girişe %0.03 uzak, bu yüzden market. Risk '1R' msg 502 metninden. R:R = 78.42/27.07 ≈ 2.9."
@@ -134,10 +135,10 @@ The trader usually draws the trade with TradingView's "Long Position" / "Short P
 - the PROFIT zone (green / teal / blue / grey: these colours are customizable; the risk zone is the reddish one) spans from the entry to the take profit.
 LONG tool: profit zone ABOVE the entry, risk zone BELOW. SHORT tool: profit zone BELOW the entry, risk zone ABOVE.
 When the tool is selected, TradingView shows a filled price label on the right-hand price axis for each of its three edges:
-- ENTRY = the label level with the boundary line between the two zones (often green, blue or grey background);
-- STOP LOSS = the label level with the far edge of the red zone (red background);
-- TAKE PROFIT = the label level with the far edge of the profit zone (often grey, green or teal background).
-Match each label to an edge by its vertical position, then check: long -> stop < entry < take profit; short -> take profit < entry < stop. If the text says long but the tool is a short (or the reverse), or the numbers fail the check, re-read the image; if the conflict remains, report what you read with confidence below 0.6 and an ambiguity. Never silently swap numbers.
+- ENTRY = the label of the boundary line between the two zones (often green, blue or grey background);
+- STOP LOSS = the label of the far edge of the red zone (red background);
+- TAKE PROFIT = the label of the far edge of the profit zone (often grey, green or teal background).
+Labels on the price axis never overlap: when two would cover each other, TradingView pushes one of them up or down until they no longer touch, so a label can sit a full label height or more away from the edge it belongs to. This happens most often to the entry label, because the CURRENT PRICE label (described further down) usually sits at the same height when the trade is drawn at the current price; it also happens to a stop or target label when the stop or target is tight or close to another label. So do not pair labels and edges by exact height. Identify each label by its colour and by the ORDER of the labels along the axis, read the NUMBER printed in it, and check that the number fits its edge on the axis scale (the plain tick values next to that edge). Then check: long -> stop < entry < take profit; short -> take profit < entry < stop. If the text says long but the tool is a short (or the reverse), or the numbers fail the check, re-read the image; if the conflict remains, report what you read with confidence below 0.6 and an ambiguity. Never silently swap numbers.
 Labels that are NOT trade levels:
 - The CURRENT PRICE label: usually black / dark (or the green/red candle colour) with a countdown timer below it such as "07:11" or "1:02:45" (time left in the candle), next to a dotted horizontal line at the last candle. Its value equals the last price in the header. It often sits right next to the entry label because the trade was drawn at the current price. It is NOT the entry, but it tells you whether the entry is at market.
 - Plain grey numbers without a filled background on the price axis are scale ticks ("2.300,00", "2.240,00"); ignore them. A tick partly hidden behind a tool label is not a level.
@@ -178,7 +179,7 @@ When an OWNER CORRECTION section is present, the owner (whose money this is, not
 
 # Examples
 ## 1. Position-tool screenshot + text (the most common pattern)
-msg 501 (photo, no text): TradingView mobile, header "ETHUSDT.P" with "2,85 -4,35 (-0,19%)" under it. A long position tool: light grey zone above, pink/red zone below. Right-axis labels: "2.310,60" on grey at the top edge of the grey zone; "2.232,85" on black with "07:11" under it, at a dotted line through the last candle; "2.232,18" on green exactly at the border between the grey and the red zone; "2.205,11" on red at the bottom edge of the red zone. Plain axis ticks "2.320,00", "2.300,00", "2.240,00", "2.213,00" are around them.
+msg 501 (photo, no text): TradingView mobile, header "ETHUSDT.P" with "2,85 -4,35 (-0,19%)" under it. A long position tool: light grey zone above, pink/red zone below. Right-axis labels, top to bottom: "2.310,60" on grey at the top edge of the grey zone; "2.232,85" on black with "07:11" under it, level with the border between the grey and the red zone and with a dotted line through the last candle; "2.232,18" on green directly below the black label, pushed down from the border so the two labels do not overlap (its value, not its height, makes it the entry); "2.205,11" on red at the bottom edge of the red zone. Plain axis ticks "2.320,00", "2.300,00", "2.240,00", "2.213,00" are around them.
 msg 502, seconds later: "eth 1R long"
 Output:
 """

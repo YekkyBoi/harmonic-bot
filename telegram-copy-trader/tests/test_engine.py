@@ -789,7 +789,8 @@ async def test_restart_flags_interrupted_openings(db: Database) -> None:
     try:
         assert (await db.get_trade(stuck.id)).status is TradeStatus.FAILED  # type: ignore[union-attr]
         assert (await db.get_trade(half.id)).status is TradeStatus.OPEN  # type: ignore[union-attr]
-        warnings = notifier.texts(Severity.WARNING)
+        # (the one-time "allowed_sender_ids is empty" startup warning is not about the restart)
+        warnings = [w for w in notifier.texts(Severity.WARNING) if "allowed_sender_ids" not in w]
         assert len(warnings) == 2 and all("elle kontrol" in w for w in warnings)
     finally:
         await engine.stop()

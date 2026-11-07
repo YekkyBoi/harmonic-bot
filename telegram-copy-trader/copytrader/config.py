@@ -11,6 +11,7 @@ import os
 import re
 from pathlib import Path
 from typing import Annotated, Any, Literal, Union
+from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
 import yaml
 from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator
@@ -161,6 +162,21 @@ class AppConfig(_Base):
     llm: LLMConfig = Field(default_factory=LLMConfig)
     risk: RiskConfig = Field(default_factory=RiskConfig)
     brokers: list[BrokerConfig] = Field(default_factory=list)
+
+    @field_validator("timezone")
+    @classmethod
+    def _valid_timezone(cls, v: str) -> str:
+        # A typo here would only surface at execution time (daily-loss guard) and fail every trade.
+        name = (v or "").strip()
+        try:
+            if not name:
+                raise ValueError(name)
+            ZoneInfo(name)
+        except (ZoneInfoNotFoundError, ValueError, TypeError, OSError):
+            raise ValueError(
+                f"geçersiz saat dilimi (timezone): {v!r}. IANA adı yazın, örneğin 'Europe/Istanbul' veya 'UTC'."
+            ) from None
+        return name
 
     @field_validator("brokers")
     @classmethod

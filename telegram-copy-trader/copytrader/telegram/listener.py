@@ -116,6 +116,16 @@ def _reply_to_id(message: Any) -> int | None:
     return getattr(header, "reply_to_msg_id", None)
 
 
+def _newer(current: Any, candidate: Any) -> Any:
+    """The later of two versions of the same message (by edit_date; the candidate when unknown)."""
+    if current is None:
+        return candidate
+    old, new = getattr(current, "edit_date", None), getattr(candidate, "edit_date", None)
+    if isinstance(old, datetime) and isinstance(new, datetime) and _as_utc(new) < _as_utc(old):
+        return current
+    return candidate
+
+
 def _is_sticker(doc: Any) -> bool:
     return any(isinstance(a, types.DocumentAttributeSticker) for a in getattr(doc, "attributes", None) or [])
 
@@ -145,8 +155,11 @@ def make_user_client(config: TelegramConfig, *, prefer_file: bool = False) -> Te
     if config.session_string and not prefer_file:
         try:
             session: Any = StringSession(config.session_string.strip())
-        except ValueError as exc:
-            raise TelegramAuthError("TG_SESSION_STRING geçersiz. " + LOGIN_HINT_TR) from exc
+        except Exception as exc:   # ValueError, binascii.Error, struct.error (truncated string)...
+            raise TelegramAuthError(
+                "TG_SESSION_STRING geçersiz (eksik veya bozuk kopyalanmış olabilir; tek satır ve "
+                "boşluksuz olmalı). " + LOGIN_HINT_TR
+            ) from exc
     else:
         session = _session_file(config.session_path)
     return TelegramClient(
@@ -183,6 +196,8 @@ class TelegramListener:
         self._inflight: dict[DebounceKey, int] = {}   # messages still being downloaded/saved
         self._tasks: set[asyncio.Task[Any]] = set()   # running handlers / callbacks
         self._seen: OrderedDict[tuple[int, int], None] = OrderedDict()
+        # Messages being downloaded/stored right now -> newest edit that arrived meanwhile (or None).
+        self._storing: dict[tuple[int, int], Any] = {}
         self._media_ids: OrderedDict[tuple[int, int], int | None] = OrderedDict()
         self._last_ids: dict[int, int] = {}
         self._stopping = False
@@ -355,22 +370,50 @@ class TelegramListener:
         dkey: DebounceKey = (chat_id, getattr(message, "sender_id", None))
         if trigger:
             self._debounce_hold(dkey)
+        self._storing[key] = None
+        late_edit: Any = None
         try:
             stored = await self._build_stored(message, consumed=consumed)
+            # Edited while the image was downloading (nothing stored yet, so nothing was built from
+            # it): store the newest version instead; the debounce is still held, so the engine only
+            # ever sees the edited text.
+            while (edit := self._storing.get(key)) is not None:
+                self._storing[key] = None
+                media_changed = self._media_changed(stored, image_info(edit))
+                if not media_changed and (getattr(edit, "message", None) or "") == stored.text:
+                    continue                                # e.g. only reactions changed
+                stored = await self._build_stored(
+                    edit,
+                    consumed=consumed,
+                    edited=True,
+                    download=media_changed,
+                    keep_media=(stored.media_path, stored.media_type),
+                )
             await self._db.save_message(stored)
         except Exception:
             log.exception("Could not store message %s/%s", chat_id, message.id)
         finally:
+            late_edit = self._storing.pop(key, None)
             if trigger:
                 self._debounce_release(dkey)
         await self._persist_last_id(chat_id)
+        if late_edit is not None:
+            # Arrived while the row was being written: apply it as a normal edit now.
+            await self.handle_edit(late_edit)
 
     async def handle_edit(self, message: Any) -> None:
         """Edited message: store the new version, then ``on_edit``."""
         if not self._accepts(message):
             return
         chat_id, msg_id = message.chat_id, message.id
-        existing = await self._db.get_message(chat_id, msg_id)
+        key = (chat_id, msg_id)
+        existing = None if key in self._storing else await self._db.get_message(chat_id, msg_id)
+        if existing is None and key in self._storing:
+            # The original is still being downloaded/stored: handle_message stores this version
+            # (or, if its row is already written, applies it as a normal edit right after).
+            self._storing[key] = _newer(self._storing[key], message)
+            log.debug("Edit of %s/%s arrived while storing; queued", chat_id, msg_id)
+            return
         if existing is None:
             date = _as_utc(message.date)
             if should_process_catchup(date, datetime.now(timezone.utc), self._config.catchup_max_age_sec):

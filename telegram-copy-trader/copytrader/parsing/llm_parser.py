@@ -40,6 +40,11 @@ logger = logging.getLogger(__name__)
 FALLBACK_BETA = "server-side-fallback-2026-07-01"   # pairs with fallbacks="default"
 MAX_IMAGE_B64_BYTES = 5 * 1024 * 1024               # API per-image limit (base64 payload)
 _LOW_CONFIDENCE_CAP = 0.6                           # cap when post-processing had to fix the output
+# The engine owns retries (it notifies the owner and re-reads the messages): the SDK retries a
+# failed HTTP attempt at most once, and the whole create() call is bounded by one overall deadline.
+SDK_MAX_RETRIES = 1
+CONNECT_TIMEOUT_SEC = 10.0
+_MIN_DEADLINE_SEC = 0.1
 
 # --------------------------------------------------------------------------- #
 # Wire schema (structured output). Strict: every object lists all properties
@@ -107,7 +112,8 @@ _ACTION_SCHEMA["required"] = list(_ACTION_SCHEMA["properties"])
 
 WIRE_SCHEMA: dict[str, Any] = {
     "type": "object",
-    "properties": {"actions": {"type": "array", "items": _ACTION_SCHEMA}},
+    # minItems 1 (supported by structured outputs): "no instruction" is one "none" action, never [].
+    "properties": {"actions": {"type": "array", "items": _ACTION_SCHEMA, "minItems": 1}},
     "required": ["actions"],
     "additionalProperties": False,
 }
@@ -157,6 +163,9 @@ class _WireResult(BaseModel):
 # Turkish error texts (shown to the owner)
 # --------------------------------------------------------------------------- #
 _ERR_REFUSAL = "Yapay zekâ bu mesajı işlemeyi reddetti; sinyali lütfen kendin kontrol et."
+_ERR_REFUSAL_BUSY = (
+    "Yapay zekâ bu mesajı reddetti ve yedek model şu an meşgul (geçici durum); sinyal okunamadı."
+)
 _ERR_MAX_TOKENS = "Yapay zekâ yanıtı yarıda kesildi (token limiti); sinyal okunamadı."
 _ERR_STOP = "Yapay zekâ yanıtı beklenmedik şekilde bitti ({reason}); sinyal okunamadı."
 _ERR_NO_TEXT = "Yapay zekâ boş yanıt döndürdü; sinyal okunamadı."
@@ -164,10 +173,25 @@ _ERR_BAD_JSON = "Yapay zekâ geçersiz bir yanıt döndürdü; sinyal okunamadı
 _ERR_TIMEOUT = "Yapay zekâ servisi zamanında yanıt vermedi; sinyal okunamadı."
 _ERR_CONNECTION = "Yapay zekâ servisine bağlanılamadı; sinyal okunamadı."
 _ERR_RATE_LIMIT = "Yapay zekâ servisi istek limitine takıldı; sinyal okunamadı."
+_ERR_SPEND_LIMIT = (
+    "Anthropic API aylık harcama limiti doldu; limit Claude Console'da (Settings → Limits) "
+    "yükseltilene kadar sinyaller okunamaz."
+)
 _ERR_AUTH = "Anthropic API anahtarı geçersiz veya yetkisiz; ayarları kontrol et."
+_ERR_NO_KEY = (
+    "Anthropic API anahtarı bulunamadı: config.yaml'da llm.api_key ya da ANTHROPIC_API_KEY "
+    "ortam değişkenini ayarla."
+)
 _ERR_BAD_REQUEST = "Yapay zekâ isteği reddetti (HTTP 400); sinyal okunamadı."
 _ERR_STATUS = "Yapay zekâ servisi hata döndürdü (HTTP {code}); sinyal okunamadı."
 _ERR_OTHER = "Yapay zekâ servisine erişilemedi (yapılandırma hatası); sinyal okunamadı."
+
+# Ambiguities added by post-processing (shown to the owner; any ambiguity makes the engine ask).
+_AMB_NO_ACTIONS = "Yapay zekâ bu mesajlar için hiçbir sonuç döndürmedi; işlem talimatı olup olmadığını kontrol et."
+_AMB_IDS_GUESSED = (
+    "Yapay zekâ bu talimatın hangi mesajdan geldiğini belirtmedi; aynı yanıtta başka talimatlar da var."
+)
+_SPEND_LIMIT_CODE = "enforced_spend_limit_reached"
 
 _MANAGEMENT = {ActionType.MOVE_SL, ActionType.MOVE_TP, ActionType.CLOSE, ActionType.CANCEL}
 _NEEDS_IDS = _MANAGEMENT | {ActionType.OPEN, ActionType.INCOMPLETE}
@@ -176,14 +200,35 @@ _NEEDS_IDS = _MANAGEMENT | {ActionType.OPEN, ActionType.INCOMPLETE}
 class ClaudeSignalParser:
     """Turns Telegram signal messages into ``ParsedAction``s with Claude."""
 
-    def __init__(self, config: LLMConfig, client: Any | None = None) -> None:
-        """``client``: an anthropic.AsyncAnthropic (injected in tests); created from config if None."""
+    def __init__(
+        self, config: LLMConfig, client: Any | None = None, *, deadline_sec: float | None = None
+    ) -> None:
+        """``client``: an anthropic.AsyncAnthropic (injected in tests); created from config if None.
+
+        One ``parse()`` API call never takes longer than ``config.timeout_sec`` in total (SDK retry
+        included), or ``deadline_sec`` when that is smaller (callers pass something well below
+        ``telegram.context_window_sec`` so the engine's retry still finds the messages).
+        Raises ``ParserError`` when it has to build the client and no API credentials are configured."""
         self._config = config
         self._owns_client = client is None
-        # api_key=None lets the SDK resolve ANTHROPIC_API_KEY (or other env credentials).
-        self._client: Any = client or anthropic.AsyncAnthropic(
-            api_key=config.api_key, timeout=config.timeout_sec
-        )
+        timeout = max(_MIN_DEADLINE_SEC, float(config.timeout_sec))
+        self._deadline_sec = timeout if deadline_sec is None else max(_MIN_DEADLINE_SEC, min(timeout, deadline_sec))
+        if client is None:
+            # api_key=None lets the SDK resolve ANTHROPIC_API_KEY (or other env credentials).
+            api_key = config.api_key.strip() if config.api_key and config.api_key.strip() else None
+            try:
+                client = anthropic.AsyncAnthropic(
+                    api_key=api_key,
+                    timeout=anthropic.Timeout(timeout, connect=min(CONNECT_TIMEOUT_SEC, timeout)),
+                    max_retries=SDK_MAX_RETRIES,
+                )
+            except (anthropic.AnthropicError, ValueError) as e:   # e.g. a broken credentials profile
+                logger.error("Cannot set up Anthropic credentials: %s", e)
+                raise ParserError(_ERR_NO_KEY, transient=False) from e
+            if not _has_credentials(client):
+                logger.error("No Anthropic API credentials (llm.api_key / ANTHROPIC_API_KEY)")
+                raise ParserError(_ERR_NO_KEY, transient=False)
+        self._client: Any = client
 
     async def aclose(self) -> None:
         """Close the HTTP client if this parser created it."""
@@ -202,7 +247,12 @@ class ClaudeSignalParser:
         request = self.build_request(content)
 
         try:
-            response = await self._client.beta.messages.create(**request)
+            response = await asyncio.wait_for(
+                self._client.beta.messages.create(**request), self._deadline_sec
+            )
+        except TimeoutError as e:   # overall deadline (asyncio.TimeoutError is TimeoutError)
+            logger.warning("Claude request exceeded the %.0fs deadline", self._deadline_sec)
+            raise ParserError(_ERR_TIMEOUT, transient=True) from e
         except anthropic.APITimeoutError as e:
             logger.warning("Claude request timed out: %s", e)
             raise ParserError(_ERR_TIMEOUT, transient=True) from e
@@ -210,20 +260,30 @@ class ClaudeSignalParser:
             logger.warning("Claude connection error: %s", e)
             raise ParserError(_ERR_CONNECTION, transient=True) from e
         except anthropic.RateLimitError as e:
+            if _is_spend_limit(e):
+                logger.error("Anthropic spend limit reached: %s", e)
+                raise ParserError(_ERR_SPEND_LIMIT, transient=False) from e
             logger.warning("Claude rate limited: %s", e)
             raise ParserError(_ERR_RATE_LIMIT, transient=True) from e
         except (anthropic.AuthenticationError, anthropic.PermissionDeniedError) as e:
             logger.error("Claude auth error: %s", e)
-            raise ParserError(_ERR_AUTH) from e
+            raise ParserError(_ERR_AUTH, transient=False) from e
         except anthropic.BadRequestError as e:
             logger.error("Claude rejected the request (400): %s", e)
-            raise ParserError(_ERR_BAD_REQUEST) from e
+            raise ParserError(_ERR_BAD_REQUEST, transient=False) from e
         except anthropic.APIStatusError as e:
             logger.warning("Claude API error %s: %s", e.status_code, e)
-            raise ParserError(_ERR_STATUS.format(code=e.status_code), transient=e.status_code >= 500 or None) from e
+            transient = e.status_code >= 500 or e.status_code in (408, 409)
+            raise ParserError(_ERR_STATUS.format(code=e.status_code), transient=transient) from e
         except anthropic.AnthropicError as e:
             logger.error("Claude client error: %s", e)
-            raise ParserError(_ERR_OTHER) from e
+            raise ParserError(_ERR_OTHER, transient=False) from e
+        except TypeError as e:
+            # The SDK raises a bare TypeError when no API key / credentials could be resolved.
+            if "authentication" not in str(e).lower():
+                raise
+            logger.error("No Anthropic API credentials: %s", e)
+            raise ParserError(_ERR_NO_KEY, transient=False) from e
 
         return self._handle_response(response, messages, context)
 
@@ -333,29 +393,33 @@ class ClaudeSignalParser:
 
         if stop_reason == "refusal":
             details = getattr(response, "stop_details", None)
+            recommended = getattr(details, "recommended_model", None)
             logger.warning(
-                "Claude refused (model=%s, request_id=%s, category=%s)",
-                model, request_id, getattr(details, "category", None),
+                "Claude refused (model=%s, request_id=%s, category=%s, recommended_model=%s)",
+                model, request_id, getattr(details, "category", None), recommended,
             )
-            raise ParserError(_ERR_REFUSAL)
+            if recommended:
+                # The fallback model could not run (rate limited / overloaded): a later retry can succeed.
+                raise ParserError(_ERR_REFUSAL_BUSY, transient=True)
+            raise ParserError(_ERR_REFUSAL, transient=False)
         if stop_reason == "max_tokens":
             logger.warning("Claude hit max_tokens=%s (request_id=%s)", self._config.max_tokens, request_id)
-            raise ParserError(_ERR_MAX_TOKENS)
+            raise ParserError(_ERR_MAX_TOKENS, transient=False)
         if stop_reason not in ("end_turn", "stop_sequence"):
             logger.warning("Unexpected stop_reason %r (request_id=%s)", stop_reason, request_id)
-            raise ParserError(_ERR_STOP.format(reason=stop_reason))
+            raise ParserError(_ERR_STOP.format(reason=stop_reason), transient=False)
 
         text = _final_text(getattr(response, "content", None) or [])
         if text is None:
             logger.warning("Claude response has no text block (request_id=%s)", request_id)
-            raise ParserError(_ERR_NO_TEXT)
+            raise ParserError(_ERR_NO_TEXT, transient=False)
 
         try:
             data = json.loads(text, parse_constant=_reject_constant)
             wire = _WireResult.model_validate(data)
         except (ValueError, ValidationError) as e:   # JSONDecodeError is a ValueError
             logger.warning("Claude output does not match the schema: %s; raw=%.500s", e, text)
-            raise ParserError(_ERR_BAD_JSON) from e
+            raise ParserError(_ERR_BAD_JSON, transient=False) from e
 
         usage = getattr(response, "usage", None)
         if usage is not None:
@@ -366,12 +430,45 @@ class ClaudeSignalParser:
                 getattr(usage, "cache_creation_input_tokens", None),
             )
 
-        actions = [_to_action(w, messages, context) for w in wire.actions]
+        if wire.actions:
+            actions = _fill_missing_ids(
+                [_to_action(w, messages, context) for w in wire.actions], [m.message_id for m in messages]
+            )
+        else:
+            # Schema-valid but against the rules ("no instruction" is one "none"): never consume the
+            # messages silently; an unsure "none" makes the engine ask the owner.
+            logger.warning("Claude returned no actions (request_id=%s)", request_id)
+            actions = [ParsedAction(
+                action=ActionType.NONE, confidence=0.0, ambiguities=[_AMB_NO_ACTIONS],
+                summary_tr="Yapay zekâ sonuç döndürmedi",
+            )]
         logger.info(
             "Parsed %d message(s) -> %s (model=%s)",
             len(messages), [f"{a.action.value}:{a.base_asset}:{a.confidence:.2f}" for a in actions], model,
         )
         return ParseResult(actions=actions, model=model, raw_response=text)
+
+
+# --------------------------------------------------------------------------- #
+# Client / error helpers
+# --------------------------------------------------------------------------- #
+def _has_credentials(client: Any) -> bool:
+    """True if the SDK client resolved an API key, auth token, credential provider or auth header."""
+    if any(getattr(client, name, None) for name in ("api_key", "auth_token", "credentials")):
+        return True
+    try:
+        headers = dict(getattr(client, "default_headers", None) or {})
+    except Exception:   # pragma: no cover - defensive; never block startup on introspection
+        return True
+    return any(str(k).lower() in ("authorization", "x-api-key") and isinstance(v, str) and v for k, v in headers.items())
+
+
+def _is_spend_limit(err: BaseException) -> bool:
+    """429 because the organization's monthly spend limit is reached (retrying cannot help)."""
+    cls = getattr(anthropic, "EnforcedSpendLimitReachedError", None)
+    if cls is not None and isinstance(err, cls):
+        return True
+    return _SPEND_LIMIT_CODE in (getattr(err, "error_code", None), getattr(err, "type", None))
 
 
 # --------------------------------------------------------------------------- #
@@ -526,8 +623,7 @@ def _to_action(w: _WireAction, messages: list[StoredMessage], context: ParseCont
     dropped = [i for i in w.used_message_ids if i not in allowed_used]
     if dropped:
         logger.warning("Dropping unknown used_message_ids %s", dropped)
-    if not used and action in _NEEDS_IDS:
-        used = list(provided)
+    # No usable ids: left empty here; _fill_missing_ids assigns them knowing the other actions.
 
     known_refs = set(allowed_used)
     known_refs.update(m.reply_to_message_id for m in messages if m.reply_to_message_id is not None)
@@ -594,6 +690,37 @@ def _to_action(w: _WireAction, messages: list[StoredMessage], context: ParseCont
     if not parsed.summary_tr:
         parsed.summary_tr = _fallback_summary(parsed)
     return parsed
+
+
+def _fill_missing_ids(actions: list[ParsedAction], provided: list[int]) -> list[ParsedAction]:
+    """Give actions that need message ids but got none from the model the batch messages no OTHER
+    action claims. When no other instruction claims any message it simply gets all of them (or
+    those a "none" left over). When other instructions claim some, the split is a guess: it never
+    takes messages an "incomplete" action keeps (if it can avoid it), and it gets an ambiguity
+    plus a confidence cap so the owner is asked."""
+    out: list[ParsedAction] = []
+    for idx, a in enumerate(actions):
+        if a.used_message_ids or a.action not in _NEEDS_IDS:
+            out.append(a)
+            continue
+        others = [b for j, b in enumerate(actions) if j != idx]
+        claimed = {i for b in others for i in b.used_message_ids}
+        free = [i for i in provided if i not in claimed]
+        update: dict[str, Any]
+        if not any(b.used_message_ids for b in others if b.action is not ActionType.NONE):
+            update = {"used_message_ids": free or list(provided)}
+        else:
+            held = {i for b in others if b.action is ActionType.INCOMPLETE for i in b.used_message_ids}
+            ids = free or [i for i in provided if i not in held] or list(provided)
+            logger.warning("%s action without used_message_ids next to other actions; assigned %s",
+                           a.action.value, ids)
+            update = {
+                "used_message_ids": ids,
+                "ambiguities": [*a.ambiguities, _AMB_IDS_GUESSED],
+                "confidence": min(a.confidence, _LOW_CONFIDENCE_CAP),
+            }
+        out.append(a.model_copy(update=update))
+    return out
 
 
 def _clean_take_profits(raw: list[_WireTakeProfit], issues: list[str]) -> list[TakeProfit]:

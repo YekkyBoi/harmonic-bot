@@ -133,6 +133,91 @@ def _normalize_take_profits(
     return [TakeProfit(price=p, close_fraction=f) for p, f in zip(prices, out)], explicit and not valid_explicit
 
 
+def _same_level(a: float, b: float) -> bool:
+    return math.isclose(a, b, rel_tol=1e-9, abs_tol=1e-12)
+
+
+def _is_filled(price: float, filled: list[float]) -> bool:
+    return any(_same_level(price, f) for f in filled)
+
+
+def _uniform(fractions: list[float]) -> bool:
+    return not fractions or max(fractions) - min(fractions) <= 1e-6
+
+
+def _move_tp_levels(
+    incoming: list[TakeProfit], trade: TradeRecord, filled: list[float], side: Side
+) -> tuple[list[TakeProfit], list[TakeProfit], ValidationIssue | None]:
+    """New TP list for MOVE_TP that keeps the trade's split. Returns (levels, filled_levels, issue).
+
+    * Levels already filled (``filled``: exact prices of the trade's current levels that hit) are never
+      re-armed: they stay in the list with their recorded fraction (the engine skips them on every broker
+      position where they filled), whether or not the model copied them.
+    * An explicit valid split in ``incoming`` is kept (as weights of the levels still open).
+    * Otherwise (all fractions 1.0 = "not stated") the trade's current fractions are carried over: an
+      unchanged price keeps its fraction, a replaced level takes the fraction of the level it replaces
+      (paired nearest-first). Only when the number of open levels changed and the old split was not
+      equal does it fall back to an equal split, with an issue (ask).
+    """
+    current = list(trade.current_take_profits)
+    filled_levels = [tp for tp in current if _is_filled(tp.price, filled)]
+    open_current = [tp for tp in current if not _is_filled(tp.price, filled)]
+    merged: dict[float, float] = {}
+    for tp in incoming:
+        if not _is_filled(tp.price, filled):
+            merged.setdefault(tp.price, 0.0)
+            merged[tp.price] += tp.close_fraction
+    prices = sorted(merged, reverse=side is Side.SHORT)
+    if not prices:
+        return [], filled_levels, None
+
+    fractions = [tp.close_fraction for tp in incoming]
+    explicit = any(f != 1.0 for f in fractions)
+    valid_explicit = (
+        explicit
+        and all(math.isfinite(f) and 0 < f <= 1 for f in fractions)
+        and abs(sum(fractions) - 1.0) <= _SPLIT_SUM_TOLERANCE + 1e-9
+    )
+    issue: ValidationIssue | None = None
+    weights: dict[float, float] = {}
+    if valid_explicit:
+        weights = {p: merged[p] for p in prices}
+    else:
+        if explicit:
+            issue = ValidationIssue(code="tp_split_invalid", message_tr="TP kapatma oranları geçersiz; eşit bölündü.")
+        else:
+            old = {tp.price: tp.close_fraction for tp in open_current}
+            unmatched_new = [p for p in prices if not any(_same_level(p, o) for o in old)]
+            for p in prices:
+                for o, f in old.items():
+                    if _same_level(p, o):
+                        weights[p] = f
+            unmatched_old = sorted((o for o in old if not any(_same_level(o, p) for p in prices)),
+                                   reverse=side is Side.SHORT)
+            if len(unmatched_new) == len(unmatched_old):
+                for p, o in zip(unmatched_new, unmatched_old):
+                    weights[p] = old[o]
+            else:
+                if len(prices) > 1 and not _uniform([tp.close_fraction for tp in open_current]):
+                    issue = ValidationIssue(
+                        code="tp_split_changed",
+                        message_tr="Hedef sayısı değişti; işlemin TP kapatma oranları korunamadı, açık hedefler "
+                                   "eşit bölündü.",
+                    )
+                weights = {}
+        if not weights or any(not (math.isfinite(w) and w > 0) for w in weights.values()):
+            weights = {p: 1.0 for p in prices}
+    total_w = sum(weights[p] for p in prices)
+    done = sum(tp.close_fraction for tp in filled_levels if math.isfinite(tp.close_fraction) and tp.close_fraction > 0)
+    share = 1.0 - done if 0 <= done < 1.0 else 1.0
+    levels = [TakeProfit(price=p, close_fraction=share * weights[p] / total_w) for p in prices]
+    combined = sorted(filled_levels + levels, key=lambda tp: tp.price, reverse=side is Side.SHORT)
+    total = sum(tp.close_fraction for tp in combined)
+    out = [TakeProfit(price=tp.price, close_fraction=tp.close_fraction / total) for tp in combined]
+    out[-1] = TakeProfit(price=out[-1].price, close_fraction=1.0 - sum(tp.close_fraction for tp in out[:-1]))
+    return out, filled_levels, issue
+
+
 def _side_word(side: Side) -> str:
     return "Long" if side is Side.LONG else "Short"
 
@@ -396,8 +481,12 @@ def build_management_plan(
     source_chat_id: int,
     now: datetime,
     plan_id: str | None = None,
+    filled_tp_prices: list[float] | None = None,
 ) -> tuple[ManagementPlan | None, list[ValidationIssue]]:
     """Validate MOVE_SL / MOVE_TP / CLOSE / CANCEL against the matched trade.
+
+    ``filled_tp_prices``: prices of the trade's current take profits that already filled on a broker
+    (MOVE_TP keeps them as done and never re-arms them; see ``_move_tp_levels``).
 
     ``trade`` is the resolved target (None if it could not be resolved);
     ``candidates`` are the active trades that could match (used in messages).
@@ -481,9 +570,13 @@ def build_management_plan(
             issues.block("invalid_price", "Geçersiz hedef (TP) fiyatı.")
         if not action.take_profits:
             issues.block("missing_take_profits", "Yeni hedef (TP) seviyeleri belirtilmedi.")
-        take_profits, split_invalid = _normalize_take_profits(valid, side, "equal")
-        if split_invalid:
-            issues.warn("tp_split_invalid", "TP kapatma oranları geçersiz; eşit bölündü.")
+        filled = list(filled_tp_prices or [])
+        take_profits, _done, split_issue = _move_tp_levels(valid, trade, filled, side)
+        if split_issue is not None:
+            issues.warn(split_issue.code, split_issue.message_tr)
+        if valid and not any(not _is_filled(tp.price, filled) for tp in take_profits):
+            issues.block("tp_all_filled", "Yeni hedeflerin hepsi zaten gerçekleşmiş seviyeler; değiştirilecek açık "
+                                          "hedef yok.")
         above = "üstünde" if side is Side.LONG else "altında"
         refs: list[tuple[str, float]] = [("mevcut stop", trade.current_stop_loss)]
         if market is not None:
@@ -491,6 +584,8 @@ def build_management_plan(
         if pending and plan_entry is not None:
             refs.append(("giriş", plan_entry))
         for tp in take_profits:
+            if _is_filled(tp.price, filled):
+                continue      # already done: not re-placed, so its side vs the market does not matter
             for name, ref in refs:
                 if not _profit_side(side, tp.price, ref):
                     issues.block(
@@ -501,7 +596,9 @@ def build_management_plan(
                     break
         if market is None and take_profits:
             issues.warn("market_price_unknown", "Piyasa fiyatı alınamadı; yeni hedefler piyasaya göre kontrol edilemedi.")
-        summary = f"{label}: yeni hedefler " + (" / ".join(_fmt(tp.price) for tp in take_profits) or "yok")
+        summary = f"{label}: yeni hedefler " + (" / ".join(
+            _fmt(tp.price) + (" (gerçekleşti)" if _is_filled(tp.price, filled) else "") for tp in take_profits
+        ) or "yok")
 
     elif action.action is ActionType.CLOSE:
         close_fraction = action.close_fraction

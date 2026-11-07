@@ -71,6 +71,11 @@ _ALREADY_SET_RE = re.compile(
 )
 _CANCELED = ("canceled", "cancelled", "expired", "rejected")
 _TP_PLACE_ATTEMPTS = 3
+# pos.error is a " | "-joined list of notes; these markers find the notes that clear themselves.
+_ERR_SEP = " | "
+_STALE_MARK = "eski stop emri"
+_UNCONFIRMED_MARK = "sonucu okunamadı"
+_CRITICAL_MARK = "KRİTİK"
 
 
 # --------------------------------------------------------------------------- #
@@ -277,6 +282,20 @@ def _fmt(x: float | None) -> str:
     if x is None:
         return "-"
     return format(Decimal(f"{x:.10g}").normalize(), "f")
+
+
+def _join_error(old: str | None, msg: str) -> str:
+    """Add ``msg`` to an existing error text (once)."""
+    if not old:
+        return msg
+    return old if msg in old.split(_ERR_SEP) else old + _ERR_SEP + msg
+
+
+def _drop_error(old: str | None, marker: str) -> str | None:
+    """Remove the notes containing ``marker``; None when nothing is left."""
+    if not old:
+        return old
+    return _ERR_SEP.join(p for p in old.split(_ERR_SEP) if marker not in p) or None
 
 
 # --------------------------------------------------------------------------- #
@@ -963,8 +982,60 @@ class CcxtBroker(Broker):
                 logger.error("%s: SL order attempt %d failed: %s", self.name, attempt + 1, e)
         return None, last
 
-    async def _emergency_close(self, pos: BrokerPosition, qty: float) -> bool:
+    async def _exit_fill(self, order: dict[str, Any], symbol: str, qty: float) -> tuple[float | None, float | None]:
+        """(executed size, average price) of a reduce-only market exit. Executed None = unknown.
+
+        Venues end a market order early (slippage / price-band protection, thin book): bybit
+        'PartiallyFilledCanceled' is reported as 'closed', binance/okx expire the rest. So the
+        executed size is the order's ``filled``, never the requested size."""
+        oid = str(order.get("id"))
+        state = await self._await_fill(order, symbol, "close")
+        if (state is not None and state.status == "open"
+                and not (state.filled and state.amount and state.filled >= state.amount - 1e-12)):
+            # still working after polling: stop it so the executed size becomes final
+            await self._cancel_quiet(oid, symbol, "close")
+            try:
+                state = await self._order_state(oid, symbol, "close")
+            except cx.BaseError as e:
+                logger.warning("%s: exit order %s state unknown after cancel: %s", self.name, oid, e)
+        if state is None:
+            return None, None
+        if state.status == "open":
+            if state.filled and state.amount and state.filled >= state.amount - 1e-12:
+                return min(state.filled, qty), state.average
+            return None, state.average
+        if state.status == "filled":
+            executed = state.filled if state.filled else qty
+        else:
+            executed = state.filled or 0.0          # cancelled / expired / rejected: only what executed
+        return min(executed, qty), state.average
+
+    async def _book_exit_order(self, pos: BrokerPosition, order: dict[str, Any], qty: float, kind: str) -> float | None:
+        """Book what a reduce-only market exit really executed. None = result unknown; the order is
+        then kept in ``unconfirmed_closes`` and settled by the next sync (the stop stays as it is)."""
         d = pos.data
+        oid = str(order.get("id"))
+        self._remember(d, oid)
+        executed, avg = await self._exit_fill(order, pos.broker_symbol, qty)
+        if executed is None:
+            size = await self._venue_position_size(pos.broker_symbol, pos.side)
+            if size is not None and size < self._market_rules(pos)[0] / 2:
+                executed = qty                      # nothing in our direction is left on the venue
+            else:
+                logger.error("%s: result of exit order %s on %s unknown; re-checked on next sync",
+                             self.name, oid, pos.broker_symbol)
+                d.setdefault("unconfirmed_closes", []).append({"order_id": oid, "qty": qty, "kind": kind})
+                return None
+        executed = min(executed, pos.remaining_quantity)
+        if executed > 0:
+            self._record_exit(pos, oid, executed, avg, kind)
+        return executed
+
+    async def _emergency_close(self, pos: BrokerPosition, qty: float) -> tuple[bool, float | None]:
+        """Reduce-only market close. Returns (sent, executed size; None = unknown)."""
+        d = pos.data
+        if qty <= 0:
+            return True, 0.0
         d["close_seq"] = int(d.get("close_seq", 0)) + 1
         cid = self._client_id(d.get("client_tag", "ct"), f"x{d['close_seq']}")
         try:
@@ -973,12 +1044,26 @@ class CcxtBroker(Broker):
             )
         except cx.BaseError as e:
             logger.critical("%s: EMERGENCY CLOSE FAILED for %s: %s", self.name, pos.broker_symbol, e)
-            return False
-        self._remember(d, str(order.get("id")))
-        state = await self._await_fill(order, pos.broker_symbol, "close")
-        closed = (state.filled if state and state.filled else qty)
-        self._record_exit(pos, str(order.get("id")), closed, state.average if state else None, "emergency")
-        return True
+            return False, None
+        executed = await self._book_exit_order(pos, order, qty, "emergency")
+        if pos.remaining_quantity > 0:
+            logger.critical("%s: EMERGENCY CLOSE of %s incomplete (executed %s of %s)",
+                            self.name, pos.broker_symbol, executed, qty)
+        return True, executed
+
+    def _unprotected_error(self, pos: BrokerPosition, why: str, sent: bool, executed: float | None,
+                           requested: float) -> str:
+        left = _fmt(pos.remaining_quantity)
+        if not sent:
+            detail = "pozisyon kapatılamadı"
+        elif executed is None:
+            detail = f"acil kapatma emrinin sonucu okunamadı ({left} açık olabilir)"
+        elif executed > 0:
+            detail = f"pozisyon yalnızca kısmen kapatılabildi ({_fmt(executed)}/{_fmt(requested)}); {left} STOPSUZ açık"
+        else:
+            detail = f"acil kapatma emri gerçekleşmedi; {left} STOPSUZ açık"
+        return (f"{_CRITICAL_MARK} {self.name}: stop emri yerleştirilemedi ve {detail}! "
+                f"{pos.broker_symbol} pozisyonunu borsada hemen kontrol edin. ({why})")
 
     async def _protect_new_fill(self, pos: BrokerPosition, *, emergency_status: PositionStatus) -> BrokerPosition:
         """Place (or resize) SL for the open size, then TPs. Rule 1 on SL failure."""
@@ -987,32 +1072,33 @@ class CcxtBroker(Broker):
         old_sl = d.get("sl_order_id")
         new_id, err = await self._place_sl(pos, qty, float(d["sl_price"]))
         if new_id is None:
-            if not d.get("entry_done"):
-                await self._cancel_entry_quiet(pos)
-                await self._refresh_entry_fill(pos)
-                d["entry_done"] = True
-            closed = await self._emergency_close(pos, pos.remaining_quantity)
-            if closed:
-                leftovers_ok = await self._cancel_protection(pos, include_sl=bool(old_sl))
-                pos.remaining_quantity = 0.0
-                pos.status = emergency_status
-                pos.realized_pnl = await self._realized_pnl(pos)
-                pos.error = (f"{self.name}: stop emri yerleştirilemedi ({_short(err or Exception())}); "
-                             f"pozisyon piyasa fiyatından kapatıldı."
-                             + ("" if leftovers_ok else " Bazı eski emirler iptal edilemedi, borsayı kontrol edin."))
-            else:
+            entry_ok = await self._stop_entry(pos)
+            requested = pos.remaining_quantity
+            sent, executed = await self._emergency_close(pos, requested)
+            why = _short(err or Exception())
+            if pos.remaining_quantity > 0:
+                # Part (or all) of it is still open without a stop: keep OPEN so every sync retries.
                 d["unprotected"] = True
-                pos.error = (f"KRİTİK {self.name}: stop emri yerleştirilemedi ve pozisyon kapatılamadı! "
-                             f"{pos.broker_symbol} pozisyonunu borsada hemen kontrol edin. ({_short(err or Exception())})")
+                pos.error = self._unprotected_error(pos, why, sent, executed, requested)
+                return pos
+            d["unprotected"] = False
+            leftovers_ok = await self._cancel_protection(pos, include_sl=bool(old_sl))
+            pos.realized_pnl = await self._realized_pnl(pos)
+            pos.error = f"{self.name}: stop emri yerleştirilemedi ({why}); pozisyon piyasa fiyatından kapatıldı."
+            if leftovers_ok and entry_ok:
+                pos.status = emergency_status
+            else:
+                # A live entry / reduce-only order must not be forgotten: keep syncing until it is gone.
+                d.update(closing=True, closed_reason="emergency", final_status=emergency_status.value)
+                pos.error += " Bazı eski emirler iptal edilemedi; tekrar denenecek, borsayı kontrol edin."
             return pos
         old_qty = float(d.get("protected_qty") or 0.0)
         d.update(sl_order_id=new_id, protected_qty=qty, unprotected=False)
         pos.stop_loss = float(d["sl_price"])
-        self._remember(d, old_sl)
-        if old_sl and not await self._cancel_quiet(old_sl, pos.broker_symbol, "sl"):
-            await self._check_old_sl_filled(pos, old_sl, old_qty)
-            if self._done(pos):
-                return pos
+        pos.error = _drop_error(pos.error, _CRITICAL_MARK)
+        await self._retire_old_sl(pos, old_sl, old_qty)
+        if self._done(pos):
+            return pos
         await self._cleanup_attached(pos)
         levels = [TakeProfit(**lv) for lv in self._unfilled_levels(pos)]
         await self._replace_take_profits(pos, levels, pos.remaining_quantity)
@@ -1045,10 +1131,10 @@ class CcxtBroker(Broker):
                     continue
                 self._remember(d, tp["id"])
                 if not cancelled:
-                    await self._check_vanished_tp(pos, tp)
+                    executed = await self._check_vanished_tp(pos, tp)
                     if tp.get("status") == "filled":
                         kept.append(tp)
-                        total_qty = max(0.0, _dec_sub(total_qty, float(tp["qty"])))
+                        total_qty = max(0.0, _dec_sub(total_qty, executed))
         d["tp_order_ids"] = kept
         step, min_qty, _, _ = self._market_rules(pos)
         qtys = split_quantities(total_qty, [lv.close_fraction for lv in levels], step, min_qty)
@@ -1081,6 +1167,23 @@ class CcxtBroker(Broker):
         self._known_order_ids.add(entry["id"])
         return None
 
+    def _rearm_tp_rest(self, pos: BrokerPosition, tp: dict[str, Any], executed: float, rest: float,
+                       min_qty: float) -> None:
+        """A TP order ended with only part of its size executed: the rest is still open. Queue a TP at
+        the same price for it (placed by the retry in sync) and tell the owner."""
+        note = (f"{self.name}: TP {_fmt(tp['price'])} kısmen gerçekleşti ({_fmt(executed)}/{_fmt(float(tp['qty']))}); "
+                f"kalan {_fmt(rest)} açık, stop onu koruyor")
+        if rest >= min_qty:
+            planned = float(tp["qty"]) or 1.0
+            pos.data["tp_order_ids"].append({
+                "id": None, "price": tp["price"], "qty": rest, "status": "failed", "attempts": 0,
+                "fraction": float(tp.get("fraction") or 0.0) * rest / planned, "rest_of": tp.get("id"),
+            })
+            note += "; kalan için kâr al emri yeniden kuruluyor."
+        else:
+            note += " (TP emri için minimum miktarın altında)."
+        pos.error = _join_error(pos.error, note)
+
     async def _cancel_quiet(self, order_id: str | None, symbol: str, kind: str) -> bool:
         """Cancel, logging instead of raising. True = cancelled now."""
         try:
@@ -1089,13 +1192,25 @@ class CcxtBroker(Broker):
             logger.error("%s: %s", self.name, e)
             return False
 
-    async def _cancel_entry_quiet(self, pos: BrokerPosition) -> None:
+    async def _stop_entry(self, pos: BrokerPosition) -> bool:
+        """Cancel a still-working entry and pick up its last fills. False = it may still be live
+        (the caller must not forget it: a later fill would be an unprotected position)."""
         d = pos.data
-        if d.get("entry_order_id") and not d.get("entry_done"):
-            await self._cancel_quiet(d["entry_order_id"], pos.broker_symbol, "entry")
+        if d.get("entry_done") or not d.get("entry_order_id"):
+            return True
+        try:
+            await self._cancel(d["entry_order_id"], pos.broker_symbol, "entry")
+        except BrokerError as e:
+            logger.error("%s: %s", self.name, e)
+            return False
+        state = await self._refresh_entry_fill(pos)
+        if state is None or state.status == "open":
+            return False
+        d["entry_done"] = True
+        return True
 
     async def _cancel_protection(self, pos: BrokerPosition, *, include_sl: bool = True) -> bool:
-        """Cancel our SL / open TPs (+ attached children). False if some order may still be live."""
+        """Cancel our SL / open TPs / stale stops (+ attached children). False if some order may still be live."""
         d = pos.data
         ok = True
         if include_sl and d.get("sl_order_id") and not d.get("sl_cancelled"):
@@ -1113,14 +1228,24 @@ class CcxtBroker(Broker):
                 except BrokerError as e:
                     logger.error("%s: %s", self.name, e)
                     ok = False
-        await self._cleanup_attached(pos)
-        return ok
+        for so in list(d.get("stale_orders") or []):
+            try:
+                await self._cancel(so["id"], pos.broker_symbol, so.get("kind") or "sl")
+            except BrokerError as e:
+                logger.error("%s: stale order still live: %s", self.name, e)
+                ok = False
+                continue
+            d["stale_orders"] = [s for s in d["stale_orders"] if s["id"] != so["id"]]
+        if not d.get("stale_orders"):
+            pos.error = _drop_error(pos.error, _STALE_MARK)
+        return await self._cleanup_attached(pos) and ok
 
-    async def _cleanup_attached(self, pos: BrokerPosition) -> None:
-        """Cancel the venue-created children of an attached SL/TP once our own orders exist."""
+    async def _cleanup_attached(self, pos: BrokerPosition) -> bool:
+        """Cancel the venue-created children of an attached SL/TP once our own orders exist.
+        False while some child may still be live."""
         d = pos.data
         if not d.get("attached") or d.get("attached_cleaned") or pos.filled_quantity <= 0:
-            return  # children appear per fill, so this re-runs until the entry is complete
+            return True  # children appear per fill, so this re-runs until the entry is complete
         targets = [p for p in (d.get("attached_sl_price"), d.get("attached_tp_price")) if p]
         _, _, tick, _ = self._market_rules(pos)
         tol = max(tick / 2, 1e-12)
@@ -1130,7 +1255,7 @@ class CcxtBroker(Broker):
             orders = await self._list_open_protective(pos.broker_symbol)
         except cx.BaseError as e:
             logger.warning("%s: cannot list orders to clean attached SL/TP: %s", self.name, e)
-            return
+            return False
         ok = True
         for o in orders:
             oid = str(o.get("id"))
@@ -1149,6 +1274,7 @@ class CcxtBroker(Broker):
                 else:
                     ok = False
         d["attached_cleaned"] = ok and bool(d.get("entry_done"))
+        return ok
 
     async def _list_open_protective(self, symbol: str) -> list[dict[str, Any]]:
         ex, fam = self.exchange, self._family
@@ -1181,55 +1307,116 @@ class CcxtBroker(Broker):
             return
         new_id, err = await self._place_sl(pos, pos.remaining_quantity, float(d["sl_price"]))
         if new_id is None:
-            pos.error = f"{self.name}: stop miktarı güncellenemedi (eski stop aktif): {_short(err or Exception())}"
+            if d.get("sl_order_id"):
+                pos.error = f"{self.name}: stop miktarı güncellenemedi (eski stop aktif): {_short(err or Exception())}"
+            else:
+                d["unprotected"] = True     # nothing protects the open size: next sync retries / closes
+                pos.error = (f"{_CRITICAL_MARK} {self.name}: {pos.broker_symbol} için stop emri yerleştirilemedi; "
+                             f"{_fmt(pos.remaining_quantity)} STOPSUZ açık. ({_short(err or Exception())})")
             return
         old = d.get("sl_order_id")
         old_qty = float(d.get("protected_qty") or 0.0)
-        d.update(sl_order_id=new_id, protected_qty=pos.remaining_quantity)
-        self._remember(d, old)
-        if old and not await self._cancel_quiet(old, pos.broker_symbol, "sl"):
-            await self._check_old_sl_filled(pos, old, old_qty)
+        d.update(sl_order_id=new_id, protected_qty=pos.remaining_quantity, unprotected=False)
+        await self._retire_old_sl(pos, old, old_qty)
 
-    async def _check_old_sl_filled(self, pos: BrokerPosition, old_id: str, old_qty: float) -> None:
-        """A replaced SL could not be cancelled: it may have filled in the meantime."""
+    async def _retire_old_sl(self, pos: BrokerPosition, old_id: str | None, old_qty: float) -> None:
+        """Cancel a replaced stop. One that may still be live is kept in ``stale_orders`` and retried on
+        every sync (and before the trade may close): a forgotten reduce-only stop could later close
+        another position on the same symbol."""
+        if not old_id:
+            return
+        self._remember(pos.data, old_id)
+        try:
+            if await self._cancel(old_id, pos.broker_symbol, "sl"):
+                return
+        except BrokerError as e:
+            logger.error("%s: %s", self.name, e)
+        state = await self._check_old_sl_filled(pos, old_id, old_qty)
+        if state is None or state.status == "open":
+            self._add_stale(pos, old_id, "sl", old_qty)
+
+    def _add_stale(self, pos: BrokerPosition, order_id: str, kind: str, qty: float) -> None:
+        d = pos.data
+        stale = d.setdefault("stale_orders", [])
+        if not any(str(s["id"]) == str(order_id) for s in stale):
+            stale.append({"id": str(order_id), "kind": kind, "qty": qty})
+        pos.error = _join_error(pos.error, f"{self.name}: {_STALE_MARK} ({order_id}) iptal edilemedi, borsada "
+                                           f"hâlâ aktif olabilir; her kontrolde tekrar denenecek.")
+
+    async def _retry_stale_orders(self, pos: BrokerPosition) -> None:
+        d = pos.data
+        for so in list(d.get("stale_orders") or []):
+            if self._done(pos):
+                break                     # finalizing: _cancel_protection takes the rest
+            d["stale_orders"] = [s for s in d["stale_orders"] if s["id"] != so["id"]]
+            await self._retire_old_sl(pos, so["id"], float(so.get("qty") or 0.0))
+        if not d.get("stale_orders"):
+            pos.error = _drop_error(pos.error, _STALE_MARK)
+
+    async def _check_old_sl_filled(self, pos: BrokerPosition, old_id: str, old_qty: float) -> OrderState | None:
+        """A replaced SL could not be cancelled: read it and book its fill if it filled.
+        Returns its state (status 'missing' if the venue does not know it), None if unreadable."""
         try:
             state = await self._order_state(old_id, pos.broker_symbol, "sl", pos.data.get("opened_at"))
-        except cx.BaseError:
-            return
-        if state.status != "filled":
-            return
-        self._record_exit(pos, old_id, min(old_qty or pos.remaining_quantity, pos.remaining_quantity),
-                          state.average, "sl")
+        except cx.OrderNotFound:
+            return OrderState("missing")
+        except cx.BaseError as e:
+            logger.warning("%s: replaced stop %s unreadable: %s", self.name, old_id, e)
+            return None
+        booked = any(str(e.get("order_id")) == str(old_id) for e in pos.data.get("exits") or [])
+        if state.status != "filled" or booked or self._done(pos) or pos.remaining_quantity <= 0:
+            return state
+        executed = min(state.filled or old_qty or pos.remaining_quantity, pos.remaining_quantity)
+        self._record_exit(pos, old_id, executed, state.average, "sl")
         if pos.remaining_quantity <= 0:
             await self._finalize_closed(pos, "stop_replaced")   # also cancels the new SL
         else:
             await self._resize_sl(pos)
+        return state
 
-    async def _check_vanished_tp(self, pos: BrokerPosition, tp: dict[str, Any]) -> None:
+    async def _check_vanished_tp(self, pos: BrokerPosition, tp: dict[str, Any]) -> float:
+        """A TP we wanted to cancel is gone. Returns the size it executed (0 if none / unknown)."""
         try:
             state = await self._order_state(tp["id"], pos.broker_symbol, "tp", pos.data.get("opened_at"))
         except cx.BaseError:
-            return
+            return 0.0
         if state.status == "filled":
             tp["status"] = "filled"
-            self._record_exit(pos, tp["id"], float(tp["qty"]), state.average or tp["price"], "tp")
-        elif state.status == "canceled":
+            executed = min(state.filled or float(tp["qty"]), float(tp["qty"]), pos.remaining_quantity)
+            tp["filled_qty"] = executed
+            self._record_exit(pos, tp["id"], executed, state.average or tp["price"], "tp")
+            return executed
+        if state.status == "canceled":
             tp["status"] = "canceled"
+        return 0.0
 
     async def _finalize_closed(self, pos: BrokerPosition, reason: str) -> None:
+        """The trade is over (remaining 0): stop the entry, cancel what is left, mark CLOSED.
+
+        Stays OPEN with ``closing`` while some order may still be live, and closes any size the
+        entry filled meanwhile instead of zeroing it."""
         d = pos.data
-        await self._cancel_entry_quiet(pos)
-        d["entry_done"] = True
-        pos.remaining_quantity = 0.0
         d["closed_reason"] = reason
-        if not await self._cancel_protection(pos, include_sl=reason != "stop"):
+        entry_ok = await self._stop_entry(pos)
+        if pos.remaining_quantity > 0:
+            # The entry filled more while the trade was ending: that size is open and must go too.
+            requested = pos.remaining_quantity
+            sent, executed = await self._emergency_close(pos, requested)
+            if pos.remaining_quantity > 0:
+                d.update(closing=False, unprotected=True)
+                pos.error = (f"{_CRITICAL_MARK} {self.name}: işlem kapanırken giriş emri {_fmt(requested)} daha doldu "
+                             f"ve kapatılamadı ({_fmt(executed or 0.0)} kapatıldı); {_fmt(pos.remaining_quantity)} "
+                             f"STOPSUZ açık olabilir. {pos.broker_symbol} pozisyonunu borsada hemen kontrol edin.")
+                return
+        if not (await self._cancel_protection(pos, include_sl=reason != "stop") and entry_ok):
             # Keep it OPEN (size 0) so the next sync retries: a forgotten reduce-only order could
-            # later shrink another trade on the same symbol.
+            # later shrink another trade on the same symbol, a live entry could open a new one.
             d["closing"] = True
             pos.error = f"{self.name}: pozisyon kapandı ama kalan emirler iptal edilemedi; tekrar denenecek."
             return
         d["closing"] = False
-        pos.status = PositionStatus.CLOSED
+        d["unprotected"] = False
+        pos.status = PositionStatus(d.pop("final_status", None) or PositionStatus.CLOSED.value)
         d["closed_at"] = self._now_ms()
         pos.realized_pnl = await self._realized_pnl(pos)
         logger.info("%s: %s %s closed (%s), pnl=%s", self.name, pos.broker_symbol, pos.side.value, reason, pos.realized_pnl)
@@ -1299,9 +1486,8 @@ class CcxtBroker(Broker):
         old_qty = float(d.get("protected_qty") or 0.0)
         d.update(sl_order_id=new_id, sl_price=price, protected_qty=pos.remaining_quantity, unprotected=False)
         pos.stop_loss = price
-        self._remember(d, old)
-        if old and not await self._cancel_quiet(old, pos.broker_symbol, "sl"):
-            await self._check_old_sl_filled(pos, old, old_qty)
+        pos.error = _drop_error(pos.error, _CRITICAL_MARK)
+        await self._retire_old_sl(pos, old, old_qty)
         return pos
 
     async def update_take_profits(self, pos: BrokerPosition, take_profits: list[TakeProfit]) -> BrokerPosition:
@@ -1318,6 +1504,19 @@ class CcxtBroker(Broker):
             return pos
         if pos.status is not PositionStatus.OPEN:
             raise BrokerError(f"{self.name}: pozisyon açık değil ({pos.status.value}); kâr al güncellenemedi.")
+        # A level that already filled is done: re-placing it would close another slice of the
+        # remaining size there (the trader's message usually still lists it).
+        filled = [float(t["price"]) for t in d.get("tp_order_ids") or [] if t.get("status") == "filled"]
+        tol = tick / 2 if tick > 0 else 1e-9
+        dropped = [lv.price for lv in levels if any(abs(lv.price - p) <= tol for p in filled)]
+        if dropped:
+            levels = [lv for lv in levels if lv.price not in dropped]
+            if not levels:
+                raise BrokerError(
+                    f"{self.name}: yeni kâr al seviyeleri ({', '.join(_fmt(p) for p in dropped)}) zaten gerçekleşti; "
+                    f"kalan miktar için yeni seviye yok, kâr al değiştirilmedi."
+                )
+            d["warnings"].append(f"Zaten gerçekleşmiş TP seviyeleri yeniden kurulmadı: {', '.join(_fmt(p) for p in dropped)}")
         d["tp_levels"] = [lv.model_dump() for lv in levels]
         before = pos.remaining_quantity
         await self._replace_take_profits(pos, levels, pos.remaining_quantity)
@@ -1336,12 +1535,17 @@ class CcxtBroker(Broker):
             return await self.cancel_entry(pos)
         if pos.status is not PositionStatus.OPEN:
             return pos
+        if d.get("closing"):                 # already flat; only leftover orders remain
+            await self._finalize_closed(pos, d.get("closed_reason") or "manual_close")
+            return pos
+        if d.get("unconfirmed_closes"):      # an earlier exit's result first (it may have closed it)
+            await self._settle_unconfirmed(pos)
+            if self._done(pos):
+                return pos
         step, min_qty, _, _ = self._market_rules(pos)
         full = fraction >= 0.999
-        if not d.get("entry_done") and full:
-            await self._cancel_entry_quiet(pos)
-            await self._refresh_entry_fill(pos)
-            d["entry_done"] = True
+        if full:
+            await self._stop_entry(pos)      # if it may still be live, _finalize_closed retries it
         target = min(pos.remaining_quantity, pos.filled_quantity * max(0.0, fraction))
         qty = pos.remaining_quantity if full else floor_to_step(target, step)
         if not full and pos.remaining_quantity - qty < max(min_qty, step):
@@ -1354,17 +1558,27 @@ class CcxtBroker(Broker):
             "kapatma emri reddedildi",
             self.exchange.create_order(pos.broker_symbol, "market", self._close_side(pos.side), qty, None, self._close_params(cid)),
         )
-        self._remember(d, str(order.get("id")))
-        state = await self._await_fill(order, pos.broker_symbol, "close")
-        closed = state.filled if state and state.filled else qty
-        self._record_exit(pos, str(order.get("id")), closed, state.average if state else None, "close")
-        if full or pos.remaining_quantity <= 0:
+        executed = await self._book_exit_order(pos, order, qty, "close")
+        if executed is None:
+            pos.error = _join_error(pos.error, f"{self.name}: kapatma emri gönderildi ama {_UNCONFIRMED_MARK}; stop "
+                                               f"yerinde bırakıldı, sonraki kontrolde doğrulanacak.")
+            return pos
+        if pos.remaining_quantity <= 0:
             await self._finalize_closed(pos, "manual_close")
             return pos
-        await self._resize_sl(pos)
-        levels = [TakeProfit(**lv) for lv in self._unfilled_levels(pos)]
-        if levels:
-            await self._replace_take_profits(pos, levels, pos.remaining_quantity)
+        # Only what really executed is closed (the venue may end a market order early); the rest
+        # stays OPEN with its stop re-sized to it.
+        if executed > 0:
+            await self._resize_sl(pos)
+            levels = [TakeProfit(**lv) for lv in self._unfilled_levels(pos)]
+            if levels and not self._done(pos):
+                await self._replace_take_profits(pos, levels, pos.remaining_quantity)
+        if _dec_sub(qty, executed) > step / 2:
+            left = _fmt(pos.remaining_quantity)
+            what = (f"kısmen gerçekleşti ({_fmt(executed)}/{_fmt(qty)}); {left} hâlâ açık, stop kalan miktarı koruyor"
+                    if executed > 0 else f"gerçekleşmedi (borsa emri iptal etti); {left} hâlâ açık, stop yerinde")
+            pos.error = _join_error(pos.error, f"{self.name}: kapatma emri {what}. Kapatmayı tekrar deneyin veya "
+                                               f"borsayı kontrol edin.")
         return pos
 
     async def cancel_entry(self, pos: BrokerPosition) -> BrokerPosition:
@@ -1386,6 +1600,24 @@ class CcxtBroker(Broker):
             # Filled between our last sync and the cancel: it was never protected by our own orders.
             pos.status = PositionStatus.OPEN
         return await self.close_position(pos, 1.0)
+
+    async def cancel_entry_remainder(self, pos: BrokerPosition) -> BrokerPosition:
+        """Cancel only the unfilled rest of a partly filled limit entry (pending-entry expiry).
+        The filled size stays open; fills that arrived before the cancel get their stop now."""
+        self._require_real(pos)
+        pos = pos.model_copy(deep=True)
+        self._register(pos)
+        d = pos.data
+        if pos.status is not PositionStatus.OPEN or d.get("entry_done") or d.get("closing"):
+            return pos
+        prev = pos.filled_quantity
+        await self._cancel(d.get("entry_order_id"), pos.broker_symbol, "entry")   # BrokerError if it fails
+        state = await self._refresh_entry_fill(pos)
+        if state is not None and state.status != "open":
+            d["entry_done"] = True
+        if pos.filled_quantity > prev:
+            await self._protect_new_fill(pos, emergency_status=PositionStatus.CLOSED)
+        return pos
 
     async def _refresh_entry_fill(self, pos: BrokerPosition) -> OrderState | None:
         """Re-read the entry order and apply any NEW fills to filled/remaining/avg."""
@@ -1444,9 +1676,11 @@ class CcxtBroker(Broker):
             pos.filled_quantity = actual
             pos.remaining_quantity = max(0.0, float(Decimal(str(actual)) - Decimal(str(d.get("closed_qty", 0.0)))))
             if actual <= 0:
-                await self._cancel_protection(pos)
-                pos.status = PositionStatus.FAILED
                 pos.error = f"{self.name}: piyasa emri gerçekleşmedi; koruma emirleri iptal edildi."
+                if await self._cancel_protection(pos):
+                    pos.status = PositionStatus.FAILED
+                else:   # keep syncing until the leftover reduce-only orders are gone
+                    d.update(closing=True, closed_reason="no_fill", final_status=PositionStatus.FAILED.value)
                 return
             await self._resize_sl(pos)
             await self._replace_take_profits(pos, [TakeProfit(**lv) for lv in self._unfilled_levels(pos)],
@@ -1458,6 +1692,8 @@ class CcxtBroker(Broker):
             if prev <= 0:
                 d["opened_at"] = self._now_ms()
             pos.status = PositionStatus.OPEN
+            if d.get("closing"):
+                return                  # the trade is ending: _finalize_closed closes this new size
             await self._protect_new_fill(pos, emergency_status=PositionStatus.FAILED)
         elif pos.filled_quantity <= 0 and state.status == "canceled":
             pos.status = PositionStatus.CANCELLED
@@ -1473,12 +1709,59 @@ class CcxtBroker(Broker):
             logger.warning("%s: could not read order %s: %s", self.name, order_id, e)
             return None
 
+    async def _settle_unconfirmed(self, pos: BrokerPosition) -> None:
+        """Book exit orders whose result could not be read when they were sent."""
+        d, symbol = pos.data, pos.broker_symbol
+        keep: list[dict[str, Any]] = []
+        kinds: set[str] = set()
+        for u in list(d.get("unconfirmed_closes") or []):
+            st = await self._try_state(str(u["order_id"]), symbol, "close", d.get("opened_at"))
+            if st is None:
+                keep.append(u)
+                continue
+            if st.status == "open":
+                await self._cancel_quiet(str(u["order_id"]), symbol, "close")   # make its size final
+                keep.append(u)
+                continue
+            if st.status == "missing":
+                logger.warning("%s: exit order %s unknown to the venue; assuming nothing executed",
+                               self.name, u["order_id"])
+                continue
+            executed = (st.filled or float(u["qty"])) if st.status == "filled" else (st.filled or 0.0)
+            executed = min(executed, float(u["qty"]), pos.remaining_quantity)
+            if executed > 0:
+                self._record_exit(pos, str(u["order_id"]), executed, st.average, u.get("kind") or "close")
+                kinds.add(u.get("kind") or "close")
+        d["unconfirmed_closes"] = keep
+        if not keep:
+            pos.error = _drop_error(pos.error, _UNCONFIRMED_MARK)
+        if not kinds:
+            return
+        if pos.remaining_quantity <= 0:
+            emergency = "emergency" in kinds
+            await self._finalize_closed(pos, "emergency" if emergency else "manual_close")
+            if emergency and pos.status is PositionStatus.CLOSED:
+                pos.error = f"{self.name}: stop emri yerleştirilemediği için pozisyon piyasa fiyatından kapatıldı."
+        elif not d.get("unprotected") and d.get("sl_order_id"):
+            await self._resize_sl(pos)
+            levels = [TakeProfit(**lv) for lv in self._unfilled_levels(pos)]
+            if levels and not self._done(pos):
+                await self._replace_take_profits(pos, levels, pos.remaining_quantity)
+
     async def _sync_open(self, pos: BrokerPosition) -> None:
         d, symbol = pos.data, pos.broker_symbol
         since = d.get("opened_at")
+        if d.get("unconfirmed_closes") and not d.get("closing"):
+            await self._settle_unconfirmed(pos)
+            if self._done(pos):
+                return
+        if d.get("stale_orders") and not d.get("closing"):
+            await self._retry_stale_orders(pos)
+            if self._done(pos):
+                return
         if d.get("closing"):
             await self._finalize_closed(pos, d.get("closed_reason") or "closing")
-            if pos.status is PositionStatus.CLOSED:
+            if pos.status is PositionStatus.CLOSED and d.get("closed_reason") != "emergency":
                 pos.error = None
             return
 
@@ -1491,9 +1774,22 @@ class CcxtBroker(Broker):
         if sl is None:
             return
         if sl.status == "filled":
+            sl_id = str(d["sl_order_id"])
             d.setdefault("linked_order_ids", []).extend(sl.linked_ids)
-            self._record_exit(pos, d["sl_order_id"], pos.remaining_quantity, sl.average or pos.stop_loss, "sl")
-            await self._finalize_closed(pos, "stop")
+            # Book what the stop really executed: a triggered market order can end early.
+            executed = min(sl.filled or pos.remaining_quantity, pos.remaining_quantity)
+            self._record_exit(pos, sl_id, executed, sl.average or pos.stop_loss, "sl")
+            self._remember(d, sl_id)
+            d.update(sl_order_id=None, protected_qty=0.0)     # consumed: never cancel / re-book it
+            if pos.remaining_quantity <= 0:
+                await self._finalize_closed(pos, "stop")
+                return
+            left = pos.remaining_quantity
+            logger.error("%s: SL %s on %s filled only %s; %s still open", self.name, sl_id, symbol, executed, left)
+            await self._protect_new_fill(pos, emergency_status=PositionStatus.CLOSED)
+            if not self._done(pos) and not d.get("unprotected"):
+                pos.error = _join_error(pos.error, f"{self.name}: stop emri kısmen gerçekleşti ({_fmt(executed)}); "
+                                                   f"kalan {_fmt(left)} için yeni stop konuldu.")
             return
         if sl.status in ("canceled", "missing"):
             logger.error("%s: our SL %s on %s is %s; re-placing", self.name, d["sl_order_id"], symbol, sl.status)
@@ -1505,28 +1801,40 @@ class CcxtBroker(Broker):
                 return
 
         changed = False
-        for tp in d.get("tp_order_ids") or []:
+        step, min_qty, _, _ = self._market_rules(pos)
+        for tp in d.get("tp_order_ids") or []:      # entries appended below (re-armed rest) are visited too
             if tp.get("status") == "open" and tp.get("id"):
                 st = await self._try_state(str(tp["id"]), symbol, "tp", since)
                 if st is not None and st.status == "filled":
                     tp["status"] = "filled"
                     d.setdefault("linked_order_ids", []).extend(st.linked_ids)
-                    self._record_exit(pos, tp["id"], float(tp["qty"]), st.average or tp["price"], "tp")
+                    planned = float(tp["qty"])
+                    executed = min(st.filled or planned, planned, pos.remaining_quantity)
+                    tp["filled_qty"] = executed
+                    self._record_exit(pos, tp["id"], executed, st.average or tp["price"], "tp")
                     changed = True
+                    rest = min(_dec_sub(planned, executed), pos.remaining_quantity)
+                    if rest > step / 2:
+                        self._rearm_tp_rest(pos, tp, executed, rest, min_qty)
                 elif st is not None and st.status == "canceled":
                     logger.warning("%s: TP %s vanished; re-placing", self.name, tp["id"])
                     self._remember(d, tp["id"])
                     tp.update(status="failed", id=None, attempts=0)
             retry = tp.get("status") == "failed" and int(tp.get("attempts", 0)) < _TP_PLACE_ATTEMPTS and tp.get("qty")
             if retry and await self._place_tp(pos, tp) is None and pos.error and "kâr al" in pos.error:
-                pos.error = None
+                pos.error = _drop_error(pos.error, "kâr al")
 
         tp_orders = d.get("tp_order_ids") or []
         all_tp_filled = (bool(tp_orders) and all(t.get("status") in ("filled", "skipped") for t in tp_orders)
                          and any(t.get("status") == "filled" for t in tp_orders))
-        if pos.remaining_quantity <= 0 or all_tp_filled:
+        if pos.remaining_quantity <= 0:
             await self._finalize_closed(pos, "take_profit")
             return
+        if all_tp_filled:
+            # Every TP order is done but size is left (fills ended early): never cancel its stop.
+            pos.error = _join_error(pos.error, f"{self.name}: tüm kâr al emirleri gerçekleşti ama "
+                                               f"{_fmt(pos.remaining_quantity)} açık kaldı; yalnızca stop ile "
+                                               f"korunuyor, borsayı kontrol edin.")
         if changed:
             await self._resize_sl(pos)
             if self._done(pos):
@@ -1537,6 +1845,7 @@ class CcxtBroker(Broker):
         if size is not None and size < step / 2:
             d["flat_seen"] = int(d.get("flat_seen", 0)) + 1
             if d["flat_seen"] >= 2:   # two consecutive reads: position APIs can lag behind fills
+                pos.remaining_quantity = 0.0      # gone on the venue (closed there by hand)
                 await self._finalize_closed(pos, "flat_on_exchange")
                 pos.error = pos.error or f"{self.name}: pozisyon borsada kapalı bulundu; kalan emirler iptal edildi."
         else:

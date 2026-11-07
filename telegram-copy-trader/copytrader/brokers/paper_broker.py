@@ -315,6 +315,18 @@ class PaperSimulator:
             pos.data["tps"] = [{"price": lv.price, "fraction": lv.close_fraction, "qty": 0.0, "status": "pending"}
                                for lv in levels]
         else:
+            # A level that already filled is done: re-arming it would close another slice of the rest there.
+            filled = [float(tp["price"]) for tp in pos.data.get("tps", []) if tp.get("status") == "filled"]
+            tol = info.price_tick / 2 if info.price_tick > 0 else 1e-9
+            dropped = [lv.price for lv in levels if any(abs(lv.price - p) <= tol for p in filled)]
+            if dropped:
+                levels = [lv for lv in levels if lv.price not in dropped]
+                if not levels:
+                    raise BrokerError(
+                        f"{self.name}: yeni kâr al seviyeleri ({', '.join(_fmt(p) for p in dropped)}) zaten "
+                        f"gerçekleşti; kâr al değiştirilmedi."
+                    )
+                logger.info("%s: filled TP level(s) not re-armed: %s", self.name, dropped)
             self._new_tps(pos, levels, pos.remaining_quantity)
         self._track(pos)
         return pos

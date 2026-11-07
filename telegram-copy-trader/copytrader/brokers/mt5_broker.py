@@ -613,6 +613,7 @@ class MetaTraderLegBroker(Broker, ABC):
             try:
                 await self._modify_leg(symbol, side, leg, sl, tp)
                 leg["sl"] = sl
+                leg.pop("naked", None)
                 return None
             except BrokerError as exc:
                 last = str(exc)
@@ -659,6 +660,8 @@ class MetaTraderLegBroker(Broker, ABC):
         leg["entry"] = p.get("entry") or leg.get("entry")
         leg["sl"] = p.get("sl") or None
         leg["venue_tp"] = p.get("tp") or None
+        if leg["sl"]:
+            leg.pop("naked", None)      # the venue shows a stop on it again
 
     @staticmethod
     def _close_from_summary(leg: dict[str, Any], s: dict[str, Any]) -> None:
@@ -767,6 +770,8 @@ class MetaTraderLegBroker(Broker, ABC):
         live_sls = {leg["sl"] for leg in legs if leg["state"] in LIVE_STATES and leg.get("sl")}
         if len(live_sls) == 1:
             pos.stop_loss = live_sls.pop()
+        # A filled leg without a stop on the venue: the engine alerts on this flag until it is fixed.
+        pos.data["unprotected"] = any(leg["state"] == "open" and not leg.get("sl") for leg in legs)
         states = {leg["state"] for leg in legs}
         if "open" in states:
             pos.status = PositionStatus.OPEN
@@ -837,13 +842,24 @@ class MetaTraderLegBroker(Broker, ABC):
         warning = None
         targets: list[tuple[dict[str, Any], float]] = []
         if p.data.get("netting"):
-            targets = [(live[0], tps[-1].price)]
+            # An emulated TP that already partial-closed stays done: re-arming it would close another
+            # slice of the remaining volume there (the trader's message usually still lists it).
+            done_px = [float(e["price"]) for e in p.data.get("emulated_tps") or [] if e.get("done")]
+            tol = tick / 2 if tick > 0 else 1e-9
+            hit = [any(abs(t.price - px) <= tol for px in done_px) for t in tps]
+            if all(hit):
+                raise BrokerError("Yeni TP seviyelerinin hepsi zaten gerçekleşti; TP'ler değiştirilmedi.")
+            last = max(i for i, h in enumerate(hit) if not h)     # venue TP: the last level not hit yet
+            targets = [(live[0], tps[last].price)]
             s = sum(max(0.0, t.close_fraction) for t in tps)
             p.data["emulated_tps"] = [
                 {"index": i, "price": t.price, "fraction": (max(0.0, t.close_fraction) / s) if s > 0 else 1 / len(tps),
-                 "done": False}
-                for i, t in enumerate(tps[:-1])
+                 "done": hit[i]}
+                for i, t in enumerate(tps) if i != last
             ]
+            if any(hit):
+                logger.info("%s: filled emulated TP level(s) kept done: %s", self.name,
+                            [t.price for t, h in zip(tps, hit) if h])
         elif len(tps) == len(legs):
             targets = [(leg, tps[i].price) for i, leg in enumerate(legs) if leg["state"] in LIVE_STATES]
         elif len(tps) == len(live):
@@ -940,6 +956,9 @@ class MetaTraderLegBroker(Broker, ABC):
         except BrokerError as exc:
             logger.warning("%s: refresh after close failed: %s", self.name, exc)
         self._aggregate(p)
+        if fraction >= 1 - 1e-9 and not errors and p.remaining_quantity > _EPS:
+            # A close deal can execute less than asked: the rest stays open (its stop stays on the venue).
+            errors.append(f"{_num(p.remaining_quantity)} lot hâlâ açık (kapatma emri kısmen gerçekleşti; stop yerinde)")
         p.error = ("Bazı bacaklar kapatılamadı: " + "; ".join(errors)) if errors else None
         return p
 
@@ -1001,8 +1020,12 @@ class MetaTraderLegBroker(Broker, ABC):
         if p.data.get("emulated_tps"):
             await self._run_emulated_tps(p, legs, errors)
         self._aggregate(p)
+        if p.data.get("unprotected") and not any("KRİTİK" in e for e in errors):
+            errors.append(f"KRİTİK: {p.broker_symbol} pozisyonunda stop yok ve eklenemedi; hemen kontrol edin!")
         if errors:
             p.error = "; ".join(errors)
+        elif p.error and "KRİTİK" in p.error:
+            p.error = None              # every filled leg carries its stop again
         return p
 
     async def _run_emulated_tps(self, p: BrokerPosition, legs: list[dict[str, Any]], errors: list[str]) -> None:

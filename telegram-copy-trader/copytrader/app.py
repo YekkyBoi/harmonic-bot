@@ -177,10 +177,20 @@ async def serve(app: App, stop: asyncio.Event | None = None) -> None:
         for task in (stop_task, listen_task):
             if task is not None and not task.done():
                 task.cancel()
-        await _safe(app.listener.stop())          # waits for running signal handlers
+        # 1. No new work anywhere: new batches, edits, approvals and /kapat are refused from now on
+        #    (an owner tap gets "bot kapanıyor"; the confirmation stays pending for after the restart).
+        begin_shutdown = getattr(app.engine, "begin_shutdown", None)
+        if begin_shutdown is not None:
+            with contextlib.suppress(Exception):
+                begin_shutdown()
+        # 2. Stop the Telegram listener (waits for its running handlers).
+        await _safe(app.listener.stop())
         if listen_task is not None:
             await asyncio.gather(listen_task, return_exceptions=True)
-        await _safe(app.engine.stop())            # timers, monitor, brokers
+        # 3. The engine waits for running order flows (entry -> stop -> TPs, also those started by an owner
+        #    tap in a notifier task) and the monitor's current pass, THEN closes the brokers. The notifier
+        #    stays connected until after this, so errors from those flows still reach the owner.
+        await _safe(app.engine.stop())            # drain, timers, monitor, brokers
         await _safe(app.notifier.notify("🛑 Kopya-trade botu durduruldu.", Severity.INFO))
         await _safe(app.notifier.stop())
         aclose = getattr(app.parser, "aclose", None)

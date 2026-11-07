@@ -432,10 +432,10 @@ async def test_used_message_ids_sanitizing() -> None:
             # unknown ids dropped, duplicates removed, reply_to id allowed
             wire_action(action="open", base_asset="ETH", side="long", stop_loss=1.0,
                         used_message_ids=[999, 11, 11, 400]),
-            # empty ids on an actionable type -> all provided ids
+            # empty ids next to an action that claims ids -> only the unclaimed ids, owner asked
             wire_action(action="move_sl", move_sl_to_entry=True, used_message_ids=[],
-                        target_trade_id=7, refers_to_message_id=300),
-            # only unknown ids -> all provided ids
+                        target_trade_id=7, refers_to_message_id=300, confidence=0.95),
+            # only unknown ids -> same
             wire_action(action="incomplete", used_message_ids=[12345]),
             # NONE stays empty
             wire_action(action="none", used_message_ids=[]),
@@ -449,8 +449,9 @@ async def test_used_message_ids_sanitizing() -> None:
     result = await parser.parse([msg(10, "a"), msg(11, "b")], ctx(reply_to=reply, open_trades=trades))
     o, sl, inc, none, close = result.actions
     assert o.used_message_ids == [11, 400]
-    assert sl.used_message_ids == [10, 11] and sl.target_trade_id == 7 and sl.refers_to_message_id == 300
-    assert inc.used_message_ids == [10, 11]
+    assert sl.used_message_ids == [10] and sl.target_trade_id == 7 and sl.refers_to_message_id == 300
+    assert sl.ambiguities and sl.confidence <= 0.6
+    assert inc.used_message_ids == [10] and inc.ambiguities
     assert none.used_message_ids == []
     assert close.target_trade_id is None and close.refers_to_message_id is None
     assert close.ambiguities and close.confidence <= 0.6

@@ -235,19 +235,35 @@ class TradeRecord(BaseModel):
     closed_at: datetime | None = None
     note: str | None = None
 
-    def summary(self) -> dict[str, Any]:
-        """Compact dict for the LLM parser context and status messages."""
-        return {
+    def summary(
+        self, *, tp_hit: list[bool] | None = None, open_fraction: float | None = None
+    ) -> dict[str, Any]:
+        """Compact dict for the LLM parser context and status messages.
+
+        ``take_profits``: one ``{"price", "close_fraction"}`` per current level (fraction of the original
+        size), plus ``"hit": true/false`` when ``tp_hit`` (aligned with ``current_take_profits``) is given.
+        ``open_fraction`` (when known): share of the filled size still open (after TP hits / partial closes).
+        """
+        tps: list[dict[str, Any]] = []
+        for i, tp in enumerate(self.current_take_profits):
+            item: dict[str, Any] = {"price": tp.price, "close_fraction": round(tp.close_fraction, 4)}
+            if tp_hit is not None and i < len(tp_hit):
+                item["hit"] = bool(tp_hit[i])
+            tps.append(item)
+        out: dict[str, Any] = {
             "trade_id": self.id,
             "asset": self.plan.base_asset,
             "side": self.plan.side.value,
             "entry": self.plan.entry_price,
             "stop_loss": self.current_stop_loss,
-            "take_profits": [tp.price for tp in self.current_take_profits],
+            "take_profits": tps,
             "status": self.status.value,
             "source_message_ids": self.plan.source_message_ids,
             "opened_at": self.created_at.isoformat(),
         }
+        if open_fraction is not None:
+            out["open_fraction"] = round(min(1.0, max(0.0, open_fraction)), 4)
+        return out
 
 
 class Quote(BaseModel):

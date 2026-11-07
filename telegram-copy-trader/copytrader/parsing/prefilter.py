@@ -7,11 +7,14 @@ can miss a trade.
 from __future__ import annotations
 
 import re
+import unicodedata
 
 from ..models import StoredMessage
 from .symbols import ASSET_ALIASES, FIAT_CURRENCIES, KNOWN_QUOTES
 
-# Turkish letters -> ASCII, applied before lower(); keywords below are folded.
+# Turkish letters -> ASCII, applied before lower(); keywords below are folded. Letters with a
+# decomposition (İ, ş, ğ, ü, ö, ç, â...) are also handled by NFKD + dropping combining marks, so
+# text typed with combining characters ("i̇ptal") folds the same way; ı/I have no decomposition.
 _FOLD = str.maketrans({
     "ı": "i", "İ": "i", "ş": "s", "Ş": "s", "ğ": "g", "Ğ": "g", "ü": "u", "Ü": "u",
     "ö": "o", "Ö": "o", "ç": "c", "Ç": "c", "â": "a", "Â": "a", "î": "i", "Î": "i",
@@ -29,6 +32,9 @@ _KEYWORDS = frozenset({
     "cek", "cekin", "cektim", "cektik", "cekiyorum", "cekelim",
     "cik", "cikin", "ciktim", "ciktik", "cikiyorum", "cikalim", "cikis",
     "sil", "silin", "sildim", "sildik", "doldu", "dolmadi", "dolmazsa", "dolarsa",
+    # Close / partial close / exit wording ("kes": cut; "poz": short for pozisyon).
+    "aldi", "alindi", "alinir", "alabilirsiniz", "alabilirsin", "alacagim", "alicam", "alacaz",
+    "kes", "kesin", "kesip", "kesiniz", "kesmek", "poz", "half", "out",
 })
 # Keyword stems (prefix match): "stopu", "kapattım", "girişe", "longladım"...
 _STEMS = (
@@ -36,7 +42,18 @@ _STEMS = (
     "cancel", "close", "risk", "pozisyon", "position", "islem", "trade", "sinyal", "signal",
     "profit", "loss", "zarar", "kaldirac", "leverage", "ekle", "trail", "likid", "liquid",
     "emir", "emri",
+    # Turkish close / partial-close / exit verbs with any suffix: "çıktım", "çıkıyoruz", "kapadım",
+    # "sattık", "bozdum", "bozun", "kestim", "yarıya indirdim", "realize ettim", "kâra geçtim"...
+    "cik", "kapa", "sat", "boz", "kest", "kesiyor", "kesel", "kesil", "indir", "realiz",
+    "gir", "cek", "vazgec", "likit", "maliyet", "ortala",
+    "kari", "karda", "karla", "karin",
+    # Amounts typical of management messages: "yarısını", "yarıya", "kalanı", "hepsini", "tamamını".
+    "yari", "kalan", "heps", "tamami",
+    # English exits / partials, TP/SL with suffixes ("tp2ye", "tp'yi" is split at the apostrophe).
+    "exit", "partial", "secure", "booked", "tp",
 )
+# Words that start with a stem but are plain chatter.
+_STEM_EXCEPTIONS = ("yarin",)          # "yarın" (tomorrow), "yarına"...
 
 # Common tickers / instrument names (folded, lower-case), beyond the alias table.
 _TICKERS = frozenset({
@@ -68,12 +85,27 @@ _CAPS_WORD = re.compile(r"(?<!\w)[A-Z][A-Z0-9]{2,11}(?!\w)")
 
 
 def _fold(text: str) -> str:
-    return text.translate(_FOLD).lower()
+    text = unicodedata.normalize("NFKD", text.translate(_FOLD))
+    return "".join(c for c in text if not unicodedata.combining(c)).lower()
+
+
+# Turkish case/possessive suffixes written straight onto a ticker: "ethi", "btcyi", "solden", "ethde".
+_TICKER_SUFFIXES = tuple(sorted({
+    "i", "u", "e", "a", "yi", "yu", "ye", "ya", "de", "da", "te", "ta", "den", "dan", "ten", "tan",
+    "in", "un", "nin", "nun", "le", "la", "yle", "yla", "ler", "lar",
+}, key=len, reverse=True))
+
+
+def _has_stem(word: str) -> bool:
+    return word.startswith(_STEMS) and not word.startswith(_STEM_EXCEPTIONS)
 
 
 def _is_ticker_like(word: str) -> bool:
     if word in _TICKERS:
         return True
+    if any(word.endswith(sfx) and len(word) - len(sfx) >= 3 and word[: -len(sfx)] in _TICKERS
+           for sfx in _TICKER_SUFFIXES):
+        return True  # ethi, btcyi, solden
     if len(word) == 6 and word[:3] in _FIAT_LOWER and word[3:] in _FIAT_LOWER:
         return True  # eurusd
     if any(word.endswith(q) and word[: -len(q)] in _TICKERS for q in _PAIR_QUOTES):
@@ -102,8 +134,10 @@ def looks_relevant(msg: StoredMessage) -> bool:
         return True
     if _TICKER_MARK.search(text) or _PRICE.search(text):
         return True
+    if "kara gec" in text:     # "kâra geçti" (in profit) -> may be followed by a stop move
+        return True
     for word in _WORD.findall(text):
-        if word in _KEYWORDS or word.startswith(_STEMS) or _TP_SL.fullmatch(word):
+        if word in _KEYWORDS or _has_stem(word) or _TP_SL.fullmatch(word):
             return True
         if _is_ticker_like(word):
             return True
