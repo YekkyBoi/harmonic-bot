@@ -231,7 +231,7 @@ def _expand_env(node: Any) -> Any:
             if val is None or val == "":
                 if default is not None:
                     return default
-                raise ValueError(f"environment variable {name} is not set (referenced in config)")
+                raise ValueError(f"ortam değişkeni {name} ayarlanmamış (.env dosyasına ekleyin; config.yaml bu değişkeni kullanıyor)")
             return val
 
         expanded = _ENV_PATTERN.sub(repl, node)

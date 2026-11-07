@@ -459,6 +459,17 @@ class Database:
                 [(chat_id, mid) for mid in ids],
             )
 
+    async def consume_stale_messages(self, before: datetime) -> int:
+        """Mark every unconsumed message older than ``before`` consumed. Returns how many.
+
+        Used at startup: a message that was waiting (e.g. for a parse retry) when the
+        process stopped must never be picked up later as part of a fresh signal."""
+        async with self._write() as conn:
+            cur = await conn.execute(
+                "UPDATE messages SET consumed = 1 WHERE consumed = 0 AND date < ?", (_dt_to_db(before),)
+            )
+            return cur.rowcount or 0
+
     # ---- trades --------------------------------------------------------------
     async def create_trade(self, plan: TradePlan, status: TradeStatus = TradeStatus.OPENING) -> TradeRecord:
         status = TradeStatus(status)

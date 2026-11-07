@@ -76,7 +76,7 @@ miktar = (bakiye × %2 × R) ÷ |giriş − stop|
 - **Bakiye** = hesap değeri (açık K/Z dahil, `use_equity: true`). Her hesap **kendi** bakiyesiyle ayrı hesaplanır.
 - Hızlı piyasada **kayma** (slippage) kaybı 1R'nin biraz üstüne çıkarabilir.
 
-**TP'ler** trader'ın yazdığı gibi kullanılır. Birden fazla TP varsa pozisyon eşit bölünür (`multi_tp_split: equal`); trader oran yazdıysa ("TP1'de yarısı") o oran kullanılır.
+**TP'ler** trader'ın yazdığı gibi kullanılır. Birden fazla TP varsa pozisyon eşit bölünür (`multi_tp_split: equal`); trader oran yazdıysa ("TP1'de yarısı") o oran kullanılır. TP sonradan değiştirilirse ("TP2'yi 2400 yaptım") işlemin oranları korunur; gerçekleşmiş hedefler tekrar konmaz, oranlar kalan hedeflere göre yeniden dağıtılır. Oranlar tutarsızsa size sorulur.
 
 ---
 
@@ -103,7 +103,7 @@ Aşağıdakilerden biri olursa işlem **açılmaz**, bot size sorar.
 - TP verilmemiş, ya da anlık fiyat alınamadı
 - Aynı sinyal tekrar: 15 dk içinde aynı varlık + yön + benzer giriş (`risk.duplicate_window_sec`)
 - Aynı varlıkta ters yönde açık işlem var
-- Sinyal mesajı **sonradan düzenlendi** (düzenlemeler asla otomatik uygulanmaz; yeni stop/TP önerilir)
+- Sinyal mesajı **sonradan düzenlendi** (düzenlemeler asla otomatik uygulanmaz; yeni stop/TP önerilir). Zaten uygulanmış bir yönetim mesajı (ör. "yarısını kapattım") düzenlenirse: aynı talimat ise tekrar uygulanmaz (yalnızca kayda geçer); farklıysa ilk talimatın zaten uygulandığı belirtilerek sorulur.
 - Belirsiz yönetim: stop uzaklaştırılıyor (risk artar), kapatma oranı yok, dolmuş işleme "iptal" dendi, varlık yazılmadı
 
 **Sormadan atlar, sadece bildirir:** `/durdur` ile duraklatıldıysa, açık işlem sınırı (10) doluysa, o hesapta günlük zarar sınırı (%10) aşıldıysa, bakiye/minimum miktar/teminat yetmiyorsa, emir anında o hesapta fiyat stopu veya ilk hedefi geçmişse.

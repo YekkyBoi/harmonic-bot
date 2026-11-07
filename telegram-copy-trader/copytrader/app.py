@@ -16,6 +16,7 @@ from typing import Any
 from .brokers.base import Broker, BrokerError
 from .config import AppConfig, load_config
 from .engine.orchestrator import Engine
+from .errors import ConfigError, ParserError
 from .models import Severity
 
 logger = logging.getLogger(__name__)
@@ -24,6 +25,7 @@ _HANDLER_TAG = "_copytrader_handler"
 _NOISY_LOGGERS = ("telethon", "aiosqlite", "asyncio", "httpx", "httpcore", "anthropic", "ccxt", "urllib3", "metaapi")
 LOG_FILE_MAX_BYTES = 10 * 1024 * 1024
 LOG_FILE_BACKUPS = 5
+MIN_PARSE_DEADLINE_SEC = 60.0      # a slow (image + high effort) reading must still fit
 
 
 def setup_logging(level: str = "INFO", data_dir: str | os.PathLike[str] | None = None) -> Path | None:
@@ -57,6 +59,25 @@ def setup_logging(level: str = "INFO", data_dir: str | os.PathLike[str] | None =
     return log_path
 
 
+def parser_deadline_sec(config: AppConfig) -> float:
+    """Overall limit of one parse() call: ``llm.timeout_sec``, but at most a third of
+    ``telegram.context_window_sec`` (so a stalled API leaves room for the engine's retries and does not
+    hold the sender's later messages for long), never below MIN_PARSE_DEADLINE_SEC (unless timeout_sec is)."""
+    window_share = max(MIN_PARSE_DEADLINE_SEC, float(config.telegram.context_window_sec) / 3.0)
+    return min(float(config.llm.timeout_sec), window_share)
+
+
+def make_parser(config: AppConfig) -> Any:
+    """The Claude parser for ``config``. A setup problem (no API key, broken credentials) raises
+    :class:`ConfigError` (the CLI exits with the config-error code, so systemd does not restart-loop)."""
+    from .parsing.llm_parser import ClaudeSignalParser
+
+    try:
+        return ClaudeSignalParser(config.llm, deadline_sec=parser_deadline_sec(config))
+    except ParserError as exc:
+        raise ConfigError(str(exc)) from exc
+
+
 @dataclass
 class App:
     config: AppConfig
@@ -86,9 +107,7 @@ def build_app(
 
         db = Database(data_dir / "copytrader.db")
     if parser is None:
-        from .parsing.llm_parser import ClaudeSignalParser
-
-        parser = ClaudeSignalParser(config.llm)
+        parser = make_parser(config)
     if broker_factory is None:
         from .brokers.registry import create_broker
 
@@ -226,4 +245,4 @@ async def run(config_path: str | os.PathLike[str] = "config.yaml") -> None:
     await serve(build_app(config))
 
 
-__all__ = ["App", "build_app", "run", "serve", "setup_logging"]
+__all__ = ["App", "build_app", "make_parser", "parser_deadline_sec", "run", "serve", "setup_logging"]

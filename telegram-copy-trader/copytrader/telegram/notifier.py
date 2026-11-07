@@ -22,7 +22,7 @@ from telethon.extensions import html as tl_html
 
 from .. import __version__
 from ..config import NotifierConfig, TelegramConfig
-from ..interfaces import EngineControl
+from ..interfaces import SHUTDOWN_TEXT, EngineControl
 from ..models import ConfirmationStatus, PendingConfirmation, Severity
 from .formatting import CORRECTION_HINT, esc, format_confirmation
 
@@ -343,11 +343,19 @@ class BotNotifier:
             if kind == "fix":
                 await self._answer(event, "✏️ Doğrusunu yazın")
                 reply = await engine.request_correction(conf_id)
+                if reply == SHUTDOWN_TEXT:
+                    await self._send(reply)
+                    return
                 await self._send(f"{reply.strip()}\n\n{CORRECTION_HINT}" if reply and reply.strip() else CORRECTION_HINT)
             else:
                 approved = kind == "ok"
                 await self._answer(event, "⏳ Onaylandı, işleniyor…" if approved else "❌ İptal ediliyor…")
                 result = await engine.handle_confirmation(conf_id, approved)
+                if result == SHUTDOWN_TEXT:
+                    # Nothing was decided: the confirmation stays pending and is restored after the restart,
+                    # so its buttons stay on the message (the owner can approve it again then).
+                    await self._send(result)
+                    return
                 await self._after_decision(conf_id, getattr(event, "message_id", None), result)
         except Exception as exc:
             log.exception("Button %s for confirmation %s failed", kind, conf_id)

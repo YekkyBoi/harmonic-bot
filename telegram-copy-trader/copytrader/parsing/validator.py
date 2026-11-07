@@ -145,71 +145,142 @@ def _uniform(fractions: list[float]) -> bool:
     return not fractions or max(fractions) - min(fractions) <= 1e-6
 
 
+def _split_close(a: float, b: float) -> bool:
+    return abs(a - b) <= _SPLIT_SUM_TOLERANCE + 1e-9
+
+
+def _carried_fractions(prices: list[float], open_current: list[TakeProfit], side: Side) -> dict[float, float]:
+    """The trade's current fraction for each new price: an unchanged price keeps its own, a replaced level
+    takes the fraction of the level it replaces (paired nearest-first, only when the counts match)."""
+    old = {tp.price: tp.close_fraction for tp in open_current
+           if math.isfinite(tp.close_fraction) and tp.close_fraction > 0}
+    carried: dict[float, float] = {}
+    for p in prices:
+        for o, f in old.items():
+            if _same_level(p, o):
+                carried[p] = f
+    unmatched_new = [p for p in prices if p not in carried]
+    unmatched_old = sorted((o for o in old if not any(_same_level(o, p) for p in prices)),
+                           reverse=side is Side.SHORT)
+    if len(unmatched_new) == len(unmatched_old):
+        for p, o in zip(unmatched_new, unmatched_old):
+            carried[p] = old[o]
+    return carried
+
+
 def _move_tp_levels(
     incoming: list[TakeProfit], trade: TradeRecord, filled: list[float], side: Side
 ) -> tuple[list[TakeProfit], list[TakeProfit], ValidationIssue | None]:
-    """New TP list for MOVE_TP that keeps the trade's split. Returns (levels, filled_levels, issue).
+    """New TP list for MOVE_TP that keeps the trader's split. Returns (levels, filled_levels, issue).
+
+    Meaning of ``close_fraction`` in a MOVE_TP (prompt rule, same scale as the OPEN TRADES context): the
+    level's share of the ORIGINAL position size; 1.0 means "not stated". The model is told to copy the
+    fractions of unchanged levels, give a moved level the fraction of the level it replaces and leave out
+    levels that already hit, so the stated fractions of the open levels add up to the share still open
+    (1 minus the hit levels' shares), not to 1. The result is always renormalized over the levels still
+    open, so either scale keeps the trader's split:
 
     * Levels already filled (``filled``: exact prices of the trade's current levels that hit) are never
       re-armed: they stay in the list with their recorded fraction (the engine skips them on every broker
       position where they filled), whether or not the model copied them.
-    * An explicit valid split in ``incoming`` is kept (as weights of the levels still open).
-    * Otherwise (all fractions 1.0 = "not stated") the trade's current fractions are carried over: an
-      unchanged price keeps its fraction, a replaced level takes the fraction of the level it replaces
-      (paired nearest-first). Only when the number of open levels changed and the old split was not
-      equal does it fall back to an equal split, with an issue (ask).
+    * Every open level stated: kept as weights when they add up to 1 (shares of what is open, or of the
+      original with nothing hit yet), to the share still open (original shares, hit levels left out), or
+      to 1 together with the copied hit levels. Any other sum is inconsistent: asked (``tp_split_invalid``),
+      proposed proportionally.
+    * Nothing stated (all 1.0): the trade's current fractions are carried over (unchanged price keeps its
+      own, a replaced level takes the one it replaces, paired nearest-first). When the number of open
+      levels changed and the old split was not equal it falls back to an equal split and asks
+      (``tp_split_changed``).
+    * Some stated, some 1.0: the stated levels keep their share of the original size and the unstated ones
+      share what is left (by their carried fractions when known). Nothing left, or several unstated levels
+      without carried fractions and an unequal old split: asked.
+    * A fraction outside (0, 1] is invalid: treated as not stated, and asked.
     """
     current = list(trade.current_take_profits)
     filled_levels = [tp for tp in current if _is_filled(tp.price, filled)]
     open_current = [tp for tp in current if not _is_filled(tp.price, filled)]
-    merged: dict[float, float] = {}
+    stated: dict[float, float] = {}
+    seen: list[float] = []
+    invalid = False
+    hit_copied = 0.0                       # fractions the model copied for levels that already hit
     for tp in incoming:
-        if not _is_filled(tp.price, filled):
-            merged.setdefault(tp.price, 0.0)
-            merged[tp.price] += tp.close_fraction
-    prices = sorted(merged, reverse=side is Side.SHORT)
+        f = tp.close_fraction
+        ok = math.isfinite(f) and 0 < f <= 1
+        invalid = invalid or not ok
+        if _is_filled(tp.price, filled):
+            hit_copied += f if ok and f < 1.0 else 0.0
+            continue
+        if tp.price not in seen:
+            seen.append(tp.price)
+        if ok and f < 1.0:
+            stated[tp.price] = stated.get(tp.price, 0.0) + f
+    prices = sorted(seen, reverse=side is Side.SHORT)
     if not prices:
         return [], filled_levels, None
 
-    fractions = [tp.close_fraction for tp in incoming]
-    explicit = any(f != 1.0 for f in fractions)
-    valid_explicit = (
-        explicit
-        and all(math.isfinite(f) and 0 < f <= 1 for f in fractions)
-        and abs(sum(fractions) - 1.0) <= _SPLIT_SUM_TOLERANCE + 1e-9
-    )
-    issue: ValidationIssue | None = None
-    weights: dict[float, float] = {}
-    if valid_explicit:
-        weights = {p: merged[p] for p in prices}
-    else:
-        if explicit:
-            issue = ValidationIssue(code="tp_split_invalid", message_tr="TP kapatma oranları geçersiz; eşit bölündü.")
-        else:
-            old = {tp.price: tp.close_fraction for tp in open_current}
-            unmatched_new = [p for p in prices if not any(_same_level(p, o) for o in old)]
-            for p in prices:
-                for o, f in old.items():
-                    if _same_level(p, o):
-                        weights[p] = f
-            unmatched_old = sorted((o for o in old if not any(_same_level(o, p) for p in prices)),
-                                   reverse=side is Side.SHORT)
-            if len(unmatched_new) == len(unmatched_old):
-                for p, o in zip(unmatched_new, unmatched_old):
-                    weights[p] = old[o]
-            else:
-                if len(prices) > 1 and not _uniform([tp.close_fraction for tp in open_current]):
-                    issue = ValidationIssue(
-                        code="tp_split_changed",
-                        message_tr="Hedef sayısı değişti; işlemin TP kapatma oranları korunamadı, açık hedefler "
-                                   "eşit bölündü.",
-                    )
-                weights = {}
-        if not weights or any(not (math.isfinite(w) and w > 0) for w in weights.values()):
-            weights = {p: 1.0 for p in prices}
-    total_w = sum(weights[p] for p in prices)
     done = sum(tp.close_fraction for tp in filled_levels if math.isfinite(tp.close_fraction) and tp.close_fraction > 0)
     share = 1.0 - done if 0 <= done < 1.0 else 1.0
+    unstated = [p for p in prices if p not in stated]
+    carried = _carried_fractions(prices, open_current, side)
+    old_equal = _uniform([tp.close_fraction for tp in open_current])
+    issue: ValidationIssue | None = None
+    weights: dict[float, float] = {}
+
+    def from_current() -> dict[float, float]:
+        nonlocal issue
+        if all(p in carried for p in prices):
+            return {p: carried[p] for p in prices}
+        if len(prices) > 1 and not old_equal:
+            issue = ValidationIssue(
+                code="tp_split_changed",
+                message_tr="Hedef sayısı değişti; işlemin TP kapatma oranları korunamadı, açık hedefler eşit "
+                           "bölündü.",
+            )
+        return {}
+
+    if not stated:
+        weights = from_current()
+    elif not unstated:
+        total = sum(stated.values())
+        weights = dict(stated)
+        consistent = _split_close(total, 1.0) or _split_close(total, share) or _split_close(total + hit_copied, 1.0)
+        if len(prices) > 1 and not consistent:      # a single open level takes everything open anyway
+            issue = ValidationIssue(
+                code="tp_split_invalid",
+                message_tr=(f"TP kapatma oranlarının toplamı tutmuyor (%{_pct(total * 100)}; açık kalan pozisyon "
+                            f"%{_pct(share * 100)}); oranlar açık hedeflere orantılı bölündü."),
+            )
+    else:
+        rest = share - sum(stated.values())
+        if rest > _SPLIT_SUM_TOLERANCE:
+            weights = dict(stated)
+            if len(unstated) == 1:
+                weights[unstated[0]] = rest
+            elif all(p in carried for p in unstated):
+                carried_total = sum(carried[p] for p in unstated)
+                for p in unstated:
+                    weights[p] = rest * carried[p] / carried_total
+            elif old_equal:
+                for p in unstated:
+                    weights[p] = rest / len(unstated)
+            else:
+                weights = {}
+        if not weights:
+            weights = from_current()
+            if issue is None:
+                used = "işlemin mevcut oranları kullanıldı." if weights else "açık hedefler eşit bölündü."
+                issue = ValidationIssue(
+                    code="tp_split_invalid",
+                    message_tr="TP kapatma oranları tutarsız (bazı hedeflerin oranı yok, kalan pay tutmuyor); "
+                               + used,
+                )
+    if invalid and issue is None:
+        issue = ValidationIssue(code="tp_split_invalid",
+                                message_tr="TP kapatma oranlarından biri geçersiz (0 ile 1 arasında değil); "
+                                           "o oran yok sayıldı.")
+    if not weights or any(not (math.isfinite(weights.get(p, 0.0)) and weights.get(p, 0.0) > 0) for p in prices):
+        weights = {p: 1.0 for p in prices}
+    total_w = sum(weights[p] for p in prices)
     levels = [TakeProfit(price=p, close_fraction=share * weights[p] / total_w) for p in prices]
     combined = sorted(filled_levels + levels, key=lambda tp: tp.price, reverse=side is Side.SHORT)
     total = sum(tp.close_fraction for tp in combined)

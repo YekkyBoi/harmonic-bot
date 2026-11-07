@@ -25,6 +25,10 @@ from .models import (
     TradeStatus,
 )
 
+# Returned by the engine for an owner action refused because the bot is shutting down. Nothing was decided:
+# the confirmation stays pending (restored after the restart), so the notifier keeps its buttons.
+SHUTDOWN_TEXT = "⏳ Bot kapanıyor; şu an işlem yapılamıyor. Bot yeniden başlayınca tekrar deneyin."
+
 
 @runtime_checkable
 class Storage(Protocol):

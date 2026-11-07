@@ -11,3 +11,8 @@ class ParserError(Exception):
     def __init__(self, message: str = "", *, transient: bool | None = None) -> None:
         super().__init__(message)
         self.transient = transient
+
+
+class ConfigError(Exception):
+    """A configuration / credentials problem found while building the app (``str(err)`` is Turkish).
+    The CLI exits with the config-error code (2): restarting cannot fix it."""

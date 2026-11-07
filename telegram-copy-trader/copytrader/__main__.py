@@ -23,6 +23,7 @@ from typing import Any
 from .brokers.base import Broker
 from .config import AppConfig, TelegramConfig, load_config
 from .engine.prices import PriceOracle
+from .errors import ConfigError
 from .models import ParseContext, Severity, StoredMessage, TradePlan
 
 EXIT_OK, EXIT_PROBLEM, EXIT_CONFIG, EXIT_INTERRUPTED = 0, 1, 2, 130
@@ -59,9 +60,9 @@ class PrintNotifier:
 # Factories (patched in tests)
 # --------------------------------------------------------------------------- #
 def _make_parser(config: AppConfig) -> Any:
-    from .parsing.llm_parser import ClaudeSignalParser
+    from .app import make_parser
 
-    return ClaudeSignalParser(config.llm)
+    return make_parser(config)      # same deadline as ``run``; no API key -> ConfigError (exit 2)
 
 
 def _make_oracle(config: AppConfig, brokers: Any) -> Any:
@@ -211,10 +212,10 @@ async def cmd_parse(args: argparse.Namespace) -> int:
     if args.text or not msgs:
         msgs.append(StoredMessage(chat_id=0, message_id=len(msgs) + 1, date=now, text=args.text or ""))
 
+    parser = _make_parser(config)       # before anything is opened: no API key -> ConfigError (exit 2)
     db_path = Path(config.data_dir) / "copytrader.db"
     db = Database(db_path if db_path.is_file() else ":memory:")   # real DB only to see open trades
     await db.open()
-    parser = _make_parser(config)
     brokers, errors = _make_brokers(config)
     for err in errors:
         print(f"[HATA] {err}")
@@ -286,6 +287,9 @@ def main(argv: list[str] | None = None) -> int:
     except FileNotFoundError as exc:
         print(f"Dosya bulunamadı: {exc.filename or exc}. (Örnek: config.example.yaml dosyasını config.yaml "
               "olarak kopyalayıp doldurun.)")
+        return EXIT_CONFIG
+    except ConfigError as exc:
+        print(f"Yapılandırma hatası ({args.config}): {exc}")
         return EXIT_CONFIG
     except Exception as exc:
         from pydantic import ValidationError
