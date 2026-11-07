@@ -626,6 +626,22 @@ async def _ask(prompt: str, secret: bool = False) -> str:
     return (await asyncio.to_thread(reader, prompt)).strip()
 
 
+def _code_channel_tr(sent_type: Any) -> str:
+    """Where Telegram says it sent the login code (Turkish, for the owner)."""
+    name = type(sent_type).__name__
+    labels = {
+        "SentCodeTypeApp": "Telegram uygulamasındaki 'Telegram' sohbetine",
+        "SentCodeTypeSms": "SMS ile telefonunuza",
+        "SentCodeTypeFirebaseSms": "SMS ile telefonunuza",
+        "SentCodeTypeFragmentSms": "SMS ile telefonunuza",
+        "SentCodeTypeCall": "telefon araması ile",
+        "SentCodeTypeFlashCall": "telefon araması ile",
+        "SentCodeTypeMissedCall": "kaçan arama ile (son rakamlar)",
+        "SentCodeTypeEmailCode": "e-posta ile",
+    }
+    return labels.get(name, name)
+
+
 async def interactive_login(config: TelegramConfig) -> str:
     """First-time login in a terminal (phone, code, 2FA). Saves the session file and returns a StringSession string."""
 
@@ -644,7 +660,9 @@ async def interactive_login(config: TelegramConfig) -> str:
             # Ask Telegram to send the login code by SMS (the in-app message may never arrive
             # on a new device), then sign in with the code the owner types.
             sent = await client.send_code_request(number, force_sms=True)
-            print("Telegram kodu SMS ile gönderdi. Telefonunuza gelen 5 haneli kodu girin.")
+            print(f"Telegram kodu şuraya gönderdi: {_code_channel_tr(sent.type)}.")
+            if sent.next_type is not None:
+                print(f"Gelmezse sonraki seçenek: {_code_channel_tr(sent.next_type)}.")
             code = (await _ask("Gelen giriş kodu: ")).replace(" ", "")
             try:
                 await client.sign_in(number, code, phone_code_hash=sent.phone_code_hash)
