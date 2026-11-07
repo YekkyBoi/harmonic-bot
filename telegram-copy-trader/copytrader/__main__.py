@@ -113,10 +113,10 @@ def _telegram_config(path: str) -> TelegramConfig:
 # Commands
 # --------------------------------------------------------------------------- #
 async def cmd_login(args: argparse.Namespace) -> int:
-    from .telegram.listener import interactive_login
+    from .telegram.listener import interactive_login, interactive_qr_login
 
     tg = _telegram_config(args.config)
-    session = await interactive_login(tg)
+    session = await (interactive_login(tg) if args.code else interactive_qr_login(tg))
     print()
     print("✅ Giriş başarılı. Oturum dosyası kaydedildi:", f"{tg.session_path}.session")
     print()
@@ -261,7 +261,10 @@ def build_parser() -> argparse.ArgumentParser:
         description="Telegram grubundaki işlemleri kripto borsalarınıza ve MT4/MT5 brokerlarınıza kopyalar.",
     )
     sub = p.add_subparsers(dest="command", required=True, metavar="KOMUT")
-    sub.add_parser("login", parents=[common], help="Telegram kullanıcı hesabınızla ilk girişi yapar")
+    login = sub.add_parser("login", parents=[common],
+                           help="Telegram kullanıcı hesabınızla ilk girişi yapar (varsayılan: QR kod ile)")
+    login.add_argument("--code", action="store_true",
+                       help="QR yerine telefon numarası + Telegram'dan gelen kod ile giriş")
     chats = sub.add_parser("chats", parents=[common], help="sohbetleri listeler (kaynak grubun ID'sini bulmak için)")
     chats.add_argument("--limit", type=int, default=200, help="en fazla kaç sohbet listelensin (varsayılan: 200)")
     sub.add_parser("run", parents=[common], help="botu çalıştırır")

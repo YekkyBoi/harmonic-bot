@@ -703,6 +703,104 @@ async def interactive_login(config: TelegramConfig) -> str:
         await client.disconnect()
 
 
+def render_qr_text(data: str, border: int = 2) -> str:
+    """QR code as text for a dark terminal (PowerShell / Windows Terminal).
+
+    Light modules are drawn with block characters and dark modules are left as the
+    black background, two module rows per text line, so the code keeps the normal
+    dark-on-light polarity and roughly square modules."""
+    import segno  # pure Python dependency, only needed for QR login
+
+    matrix = segno.make(data, error="l").matrix
+    size = len(matrix)
+    total = size + 2 * border
+
+    def light(r: int, c: int) -> bool:
+        r -= border
+        c -= border
+        if 0 <= r < size and 0 <= c < size:
+            return not matrix[r][c]
+        return True  # quiet zone
+
+    lines: list[str] = []
+    for r in range(0, total, 2):
+        row = []
+        for c in range(total):
+            top = light(r, c)
+            bottom = light(r + 1, c) if r + 1 < total else False
+            row.append("█" if top and bottom else "▀" if top else "▄" if bottom else " ")
+        lines.append("".join(row))
+    return "\n".join(lines)
+
+
+def _clear_screen() -> None:
+    import os
+
+    os.system("cls" if os.name == "nt" else "clear")
+
+
+QR_HELP_TR = (
+    "Telefonunuzda: Telegram → Ayarlar → Cihazlar → 'Masaüstü Cihaz Bağla' (Scan QR) → bu QR'ı okutun.\n"
+    "ÖNEMLİ: QR'ı aynı telefonun ekranından okutamazsınız. Bu ekranı BAŞKA bir cihazda açın\n"
+    "(bilgisayar, tablet ya da başka bir telefondan Uzak Masaüstü) ve kendi telefonunuzla okutun."
+)
+
+
+async def interactive_qr_login(config: TelegramConfig, *, max_minutes: float = 10.0) -> str:
+    """Login by scanning a QR code with the already logged-in Telegram app (no login code needed).
+
+    Telegram does not reliably deliver login codes to third-party apps; QR login avoids that.
+    The QR refreshes about every 30 seconds. Saves the session file and returns a StringSession string."""
+    from pathlib import Path
+
+    client = make_user_client(config, prefer_file=True)
+    png_path = Path(config.session_path).parent / "login_qr.png"
+    try:
+        await client.connect()
+        if not await client.is_user_authorized():
+            import segno
+
+            qr = await client.qr_login()
+            deadline = time.monotonic() + max_minutes * 60
+            while True:
+                if time.monotonic() > deadline:
+                    raise TelegramAuthError(
+                        f"QR {max_minutes:.0f} dakika içinde okutulmadı. Komutu tekrar çalıştırın."
+                    )
+                _clear_screen()
+                print(render_qr_text(qr.url))
+                print()
+                print(QR_HELP_TR)
+                try:
+                    png_path.parent.mkdir(parents=True, exist_ok=True)
+                    segno.make(qr.url, error="l").save(str(png_path), scale=10, border=4)
+                    print(f"Daha büyük görmek için resim dosyası: {png_path.resolve()}")
+                except OSError:
+                    pass
+                left = int((qr.expires - datetime.now(timezone.utc)).total_seconds())
+                print(f"Bu QR yaklaşık {max(left, 0)} saniye geçerli; süresi dolunca kendiliğinden yenilenir.")
+                try:
+                    await qr.wait()
+                    break
+                except (asyncio.TimeoutError, TimeoutError):
+                    await qr.recreate()
+                except errors.SessionPasswordNeededError:
+                    password = await _ask("İki adımlı doğrulama şifresi: ", secret=True)
+                    await client.sign_in(password=password)
+                    break
+            try:
+                png_path.unlink()
+            except OSError:
+                pass
+        me = await client.get_me()
+        if getattr(me, "bot", False):
+            raise RuntimeError("Bot hesabıyla giriş yapılamaz; kendi kullanıcı hesabınızı kullanın.")
+        log.info("Logged in via QR as %s (id %s)", _display_name(me), getattr(me, "id", None))
+        return StringSession.save(client.session)
+    finally:
+        await client.disconnect()
+
+
 def _dialog_kind(entity: Any) -> str:
     if isinstance(entity, types.User):
         return "bot" if entity.bot else "user"

@@ -232,7 +232,17 @@ docker compose run --rm copytrader <komut>
 python -m copytrader login
 ```
 
-Telefon numarası (+90…), Telegram'dan gelen kod ve varsa iki adımlı doğrulama şifresi istenir. Oturum `data/telegram_user.session` dosyasına kaydedilir; ekrana bir de **oturum metni** yazılır.
+Giriş **QR kod** ile yapılır (Telegram 2026'dan beri üçüncü parti programlara giriş kodunu çoğu zaman göndermiyor; QR bu sorunu atlar):
+
+1. Ekranda bir QR kod çıkar (yaklaşık 30 saniyede bir kendiliğinden yenilenir).
+2. Telefonunuzda: **Telegram → Ayarlar → Cihazlar → Masaüstü Cihaz Bağla (Scan QR)** ve QR'ı okutun.
+3. İki adımlı doğrulama şifreniz varsa istenir.
+
+⚠️ QR'ı **aynı telefonun ekranından okutamazsınız**. Sunucuyu telefondan yönetiyorsanız bu ekranı başka bir cihazda açın (bilgisayar, tablet ya da başka bir telefondan Uzak Masaüstü ile bağlanın) ve kendi telefonunuzla o ekranı okutun. O cihazda Telegram olması gerekmez. QR ayrıca `data/login_qr.png` resmi olarak da kaydedilir.
+
+Eski yöntem (telefon numarası + Telegram'dan gelen kod): `python -m copytrader login --code`
+
+Oturum `data/telegram_user.session` dosyasına kaydedilir; ekrana bir de **oturum metni** yazılır.
 
 - Docker'da `login` komutu oturumu `data/` klasörüne yazar; bu yeterlidir.
 - Oturum metnini başka bir makinede kullanmak isterseniz `.env`'de `TG_SESSION_STRING` olarak verin.

@@ -4,6 +4,7 @@ ccxt>=4.5
 pydantic>=2.7
 pyyaml>=6
 aiosqlite>=0.20
+segno>=1.6          # QR code for Telegram login
 tzdata
 # optional:
 # metaapi-cloud-sdk>=29   # MT4/MT5 through metaapi.cloud (Linux friendly)
