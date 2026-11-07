@@ -131,7 +131,8 @@ class ParsedAction(BaseModel):
     risk_r: float | None = None           # "1R" -> 1.0, "0.5R" -> 0.5, None = not stated
     new_stop_loss: float | None = None    # MOVE_SL: explicit new stop price
     move_sl_to_entry: bool = False        # MOVE_SL: "SL to BE / girişe çek"
-    close_fraction: float | None = None   # CLOSE: 1.0 = full, 0.5 = half
+    close_fraction: float | None = None   # CLOSE: fraction of what is STILL OPEN (1.0 = all, 0.5 = half of the rest).
+                                          # The engine converts it; Broker.close_position takes a fraction of the original fill.
     refers_to_message_id: int | None = None  # management: the original signal message, if known
     target_trade_id: int | None = None    # management: id of the open trade (from ParseContext.open_trades), if clear
     used_message_ids: list[int] = Field(default_factory=list)  # messages this action was built from

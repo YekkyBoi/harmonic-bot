@@ -116,7 +116,9 @@ class PriceOracle:
                 q = await asyncio.wait_for(broker.get_quote(info), self._timeout)
                 mid = quote_mid(q)
                 if mid is not None:
-                    return mid
+                    # Back to the signal's price scale (1000PEPE contract price / 1000 = PEPE price).
+                    mult = float((info.extra or {}).get("price_multiplier") or 1.0)
+                    return mid / mult if mult > 0 else mid
             except Exception as exc:
                 logger.debug("%s: no price for %s: %s", broker.name, base, exc)
         if market_type in (MarketType.FOREX, MarketType.CFD):
@@ -138,13 +140,17 @@ class PriceOracle:
             ex = self._public = klass(
                 {"enableRateLimit": True, "timeout": int(self._timeout * 1000), "options": {"defaultType": "swap"}}
             )
-        symbol = f"{base}/USDT:USDT"
-        try:
-            ticker = await asyncio.wait_for(ex.fetch_ticker(symbol), self._timeout + 5)
-        except Exception as exc:
-            logger.debug("Public price for %s unavailable: %s", symbol, exc)
-            return None
-        return ticker_price(ticker)
+        for prefix, mult in (("", 1.0), ("1000", 1000.0)):  # PEPE trades as 1000PEPE on most venues
+            symbol = f"{prefix}{base}/USDT:USDT"
+            try:
+                ticker = await asyncio.wait_for(ex.fetch_ticker(symbol), self._timeout + 5)
+            except Exception as exc:
+                logger.debug("Public price for %s unavailable: %s", symbol, exc)
+                continue
+            price = ticker_price(ticker)
+            if price is not None:
+                return price / mult
+        return None
 
     async def close(self) -> None:
         if self._public is not None and self._owns_public:

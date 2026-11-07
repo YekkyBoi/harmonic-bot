@@ -386,17 +386,15 @@ class MetaTraderLegBroker(Broker, ABC):
     def _fee_per_lot(self, loss_per_lot: float, entry: float, stop: float) -> float:
         """MT brokers do not report commission up front: optional buffer.
 
-        ``commission_per_lot`` (if a future config adds it) wins; otherwise
-        risk.fee_rate per side on the notional, scaled into account currency
-        through the loss/price-distance ratio.
+        Only ``commission_per_lot`` from the broker config is used (round trip,
+        account currency). The crypto-style ``risk.fee_rate`` on notional is NOT
+        applied here: on forex/CFD it would massively undersize trades (a 0.06%
+        fee on a 20-pip EURUSD stop is a ~66% buffer).
         """
         commission = getattr(self.config, "commission_per_lot", None)
-        if commission is not None:
-            return float(commission)
-        rc = self.risk_config
-        if not rc.include_fees_in_risk or rc.fee_rate <= 0:
+        if commission is None or not self.risk_config.include_fees_in_risk:
             return 0.0
-        return loss_per_lot * rc.fee_rate * (entry + stop) / abs(entry - stop)
+        return max(0.0, float(commission))
 
     async def size_position(
         self, symbol: SymbolInfo, side: Side, entry_price: float, stop_loss: float, risk_amount: float

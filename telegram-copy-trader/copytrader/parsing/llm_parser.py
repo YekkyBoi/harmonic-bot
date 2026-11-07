@@ -205,13 +205,13 @@ class ClaudeSignalParser:
             response = await self._client.beta.messages.create(**request)
         except anthropic.APITimeoutError as e:
             logger.warning("Claude request timed out: %s", e)
-            raise ParserError(_ERR_TIMEOUT) from e
+            raise ParserError(_ERR_TIMEOUT, transient=True) from e
         except anthropic.APIConnectionError as e:
             logger.warning("Claude connection error: %s", e)
-            raise ParserError(_ERR_CONNECTION) from e
+            raise ParserError(_ERR_CONNECTION, transient=True) from e
         except anthropic.RateLimitError as e:
             logger.warning("Claude rate limited: %s", e)
-            raise ParserError(_ERR_RATE_LIMIT) from e
+            raise ParserError(_ERR_RATE_LIMIT, transient=True) from e
         except (anthropic.AuthenticationError, anthropic.PermissionDeniedError) as e:
             logger.error("Claude auth error: %s", e)
             raise ParserError(_ERR_AUTH) from e
@@ -220,7 +220,7 @@ class ClaudeSignalParser:
             raise ParserError(_ERR_BAD_REQUEST) from e
         except anthropic.APIStatusError as e:
             logger.warning("Claude API error %s: %s", e.status_code, e)
-            raise ParserError(_ERR_STATUS.format(code=e.status_code)) from e
+            raise ParserError(_ERR_STATUS.format(code=e.status_code), transient=e.status_code >= 500 or None) from e
         except anthropic.AnthropicError as e:
             logger.error("Claude client error: %s", e)
             raise ParserError(_ERR_OTHER) from e

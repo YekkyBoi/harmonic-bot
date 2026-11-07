@@ -320,7 +320,9 @@ def format_confirmation(conf: PendingConfirmation, *, with_expiry: bool = True) 
         parts.append(f"💹 Güncel fiyat: <b>{fmt_price(conf.market_price)}</b>")
     parts.append(f"📊 Güven: {fmt_pct(max(0.0, min(1.0, action.confidence)) * 100)}")
 
-    issue_lines = format_issues(conf.issues, action.ambiguities)
+    # The validator already turns parser ambiguities into issues; show each text once.
+    extra = [a for a in action.ambiguities if a and a.strip() and not any(a.strip() in i.message_tr for i in conf.issues)]
+    issue_lines = format_issues(conf.issues, extra)
     if issue_lines:
         parts.append("")
         parts.append("<b>Dikkat:</b>")

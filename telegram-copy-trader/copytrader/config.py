@@ -101,7 +101,7 @@ class CcxtBrokerConfig(_BrokerBase):
     secret: str | None = None
     password: str | None = None                   # OKX / Bitget / KuCoin passphrase
     sandbox: bool = False                         # testnet
-    market_type: Literal["swap", "spot"] = "swap"
+    market_type: Literal["swap"] = "swap"         # USDT-margined perpetuals (spot is not supported: SL/TP would lock the same coins)
     quote_currency: str = "USDT"
     margin_mode: Literal["isolated", "cross"] = "isolated"
     leverage: int = 10                            # preferred leverage (raised automatically only if margin requires it)
@@ -119,6 +119,7 @@ class Mt5BrokerConfig(_BrokerBase):
     magic: int = 770077
     deviation_points: int = 20
     filling: Literal["auto", "fok", "ioc", "return"] = "auto"
+    commission_per_lot: float | None = None       # round-trip commission per 1 lot in account currency (risk buffer)
 
 
 class MetaApiBrokerConfig(_BrokerBase):
@@ -128,6 +129,7 @@ class MetaApiBrokerConfig(_BrokerBase):
     region: str | None = None
     magic: int = 770077
     slippage_points: int = 20
+    commission_per_lot: float | None = None       # round-trip commission per 1 lot in account currency (risk buffer)
 
 
 class PaperBrokerConfig(_BrokerBase):
@@ -217,12 +219,11 @@ def _expand_env(node: Any) -> Any:
             return val
 
         expanded = _ENV_PATTERN.sub(repl, node)
-        # A value that was exactly one placeholder may be meant as a number/bool.
-        if _ENV_PATTERN.fullmatch(node):
-            try:
-                return yaml.safe_load(expanded)
-            except yaml.YAMLError:
-                return expanded
+        # Keep secrets verbatim (no YAML re-parsing: "0123", "#abc", "yes" stay strings);
+        # pydantic converts "123" to int where a field is numeric. An empty
+        # placeholder means "not set".
+        if expanded == "" and _ENV_PATTERN.fullmatch(node):
+            return None
         return expanded
     return node
 

@@ -210,6 +210,19 @@ def _excerpt(msgs: list[StoredMessage]) -> str:
     return joined if len(joined) <= EXCERPT_CHARS else joined[: EXCERPT_CHARS - 1] + "…"
 
 
+def price_multiplier(extra: dict[str, Any] | None) -> float:
+    """Exchange price / signal price (1000 when the signal says PEPE and the venue trades 1000PEPE)."""
+    try:
+        m = float((extra or {}).get("price_multiplier") or 1.0)
+    except (TypeError, ValueError):
+        return 1.0
+    return m if math.isfinite(m) and m > 0 else 1.0
+
+
+def scaled_take_profits(tps: list[TakeProfit], m: float) -> list[TakeProfit]:
+    return [TakeProfit(price=tp.price * m, close_fraction=tp.close_fraction) for tp in tps]
+
+
 def _price_problem(side: Side, quote: Quote, stop: float, tp1: float | None) -> str | None:
     """Live price already beyond the stop (or beyond TP1 when given)? Turkish text or None."""
     long = side is Side.LONG
@@ -839,32 +852,37 @@ class Engine:
             quote = await broker.get_quote(sym)
             if not (quote.bid > 0 and quote.ask > 0):
                 raise BrokerError(f"geçersiz fiyat (alış {quote.bid}, satış {quote.ask})")
-            tp1 = plan.take_profits[0].price if plan.take_profits else None
+            # Signal prices -> this venue's price scale (e.g. PEPE -> 1000PEPE contracts).
+            mult = price_multiplier(sym.extra)
+            stop = plan.stop_loss * mult
+            tps = scaled_take_profits(plan.take_profits, mult)
+            signal_entry = plan.entry_price * mult if plan.entry_price else None
+            tp1 = tps[0].price if tps else None
             if plan.entry_type is EntryType.MARKET:
-                problem = _price_problem(plan.side, quote, plan.stop_loss, tp1)
+                problem = _price_problem(plan.side, quote, stop, tp1)
                 entry = quote.entry_price_for(plan.side)
-                drift = _distance_pct(entry, plan.entry_price) if plan.entry_price else 0.0
+                drift = _distance_pct(entry, signal_entry) if signal_entry else 0.0
                 if problem is None and drift > risk.max_entry_distance_pct:
-                    problem = (f"anlık fiyat ({fmt_price(entry)}) sinyal girişinden ({fmt_price(plan.entry_price)}) "
+                    problem = (f"anlık fiyat ({fmt_price(entry)}) sinyal girişinden ({fmt_price(signal_entry)}) "
                                f"{fmt.fmt_pct(drift)} uzak")
             else:
-                problem = _price_problem(plan.side, quote, plan.stop_loss, None)
-                entry = float(plan.entry_price or 0.0)
+                problem = _price_problem(plan.side, quote, stop, None)
+                entry = float(signal_entry or 0.0)
             if problem:
                 text = f"{esc(name)}: {esc(problem)}; bu hesapta işlem açılmadı"
                 await self._notify(text, Severity.WARNING)
                 return BrokerOutcome(name, "skipped", text)
 
             amount = sizing.risk_amount(equity, plan.risk_pct, float(getattr(broker.config, "risk_multiplier", 1.0)))
-            size = await broker.size_position(sym, plan.side, entry, plan.stop_loss, amount)
+            size = await broker.size_position(sym, plan.side, entry, stop, amount)
             req = OpenRequest(
                 plan=plan,
                 symbol=sym,
                 quantity=size.quantity,
                 entry_type=plan.entry_type,
-                entry_price=plan.entry_price if plan.entry_type is EntryType.LIMIT else None,
-                stop_loss=plan.stop_loss,
-                take_profits=list(plan.take_profits),
+                entry_price=signal_entry if plan.entry_type is EntryType.LIMIT else None,
+                stop_loss=stop,
+                take_profits=tps,
                 leverage=size.leverage,
                 client_tag=f"ct{plan.plan_id}",
             )
@@ -873,6 +891,7 @@ class Engine:
                                            "entry_ref": entry, "leverage": size.leverage})
             pos = await broker.open_position(req)
             pos.risk_amount = size.risk_amount
+            pos.data.setdefault("price_multiplier", mult)
             await self.db.save_broker_position(trade.id, pos)
             if pos.status is PositionStatus.FAILED:
                 text = f"{esc(name)}: <code>{esc(pos.error or 'işlem açılamadı')}</code>"
@@ -971,13 +990,15 @@ class Engine:
             return BrokerOutcome(name, "error", text)
         try:
             new: BrokerPosition
+            mult = price_multiplier(pos.data)
             if plan.action is ActionType.MOVE_SL:
+                signal_sl = plan.new_stop_loss * mult if plan.new_stop_loss is not None else None
                 if plan.move_sl_to_entry:
                     if pos.status is PositionStatus.PENDING:
                         return BrokerOutcome(name, "skipped", f"{esc(name)}: giriş henüz dolmadı; stop değiştirilmedi")
-                    sl = pos.avg_entry_price or plan.new_stop_loss
+                    sl = pos.avg_entry_price or signal_sl
                 else:
-                    sl = plan.new_stop_loss
+                    sl = signal_sl
                 if sl is None:
                     raise BrokerError("yeni stop seviyesi bilinmiyor")
                 if pos.status is PositionStatus.OPEN:
@@ -991,8 +1012,9 @@ class Engine:
                 new = await broker.update_stop_loss(pos, sl)
                 text = f"{esc(name)}: stop {fmt_price(sl)}"
             elif plan.action is ActionType.MOVE_TP:
-                new = await broker.update_take_profits(pos, list(plan.take_profits))
-                text = f"{esc(name)}: TP " + " / ".join(fmt_price(tp.price) for tp in plan.take_profits)
+                tps = scaled_take_profits(plan.take_profits, mult)
+                new = await broker.update_take_profits(pos, tps)
+                text = f"{esc(name)}: TP " + " / ".join(fmt_price(tp.price) for tp in tps)
             elif plan.action is ActionType.CLOSE:
                 frac = plan.close_fraction if plan.close_fraction is not None else 1.0
                 if pos.status is PositionStatus.PENDING:
@@ -1539,9 +1561,11 @@ class Engine:
                 equity = await b.get_equity()
                 ccy = self._currency.get(b.name) or await b.account_currency()
                 quote = await b.get_quote(sym)
-                entry = quote.entry_price_for(plan.side) if plan.entry_type is EntryType.MARKET else plan.entry_price
+                mult = price_multiplier(sym.extra)
+                entry = (quote.entry_price_for(plan.side) if plan.entry_type is EntryType.MARKET
+                         else (plan.entry_price or 0.0) * mult)
                 amount = sizing.risk_amount(equity, plan.risk_pct, float(getattr(b.config, "risk_multiplier", 1.0)))
-                size = await b.size_position(sym, plan.side, float(entry or 0.0), plan.stop_loss, amount)
+                size = await b.size_position(sym, plan.side, float(entry or 0.0), plan.stop_loss * mult, amount)
                 lev = f", kaldıraç {fmt.fmt_number(size.leverage)}x" if size.leverage else ""
                 lines.append(
                     f"{b.name}: {sym.broker_symbol} miktar {_qty(size.quantity)}, risk {_money(amount)} {ccy} "

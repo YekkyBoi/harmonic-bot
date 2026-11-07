@@ -369,6 +369,9 @@ class CcxtBroker(Broker):
             except cx.BaseError as e:
                 raise BrokerError(f"{self.name}: test ağı (sandbox) desteklenmiyor: {_short(e)}") from e
         await self._ccxt("piyasa bilgileri yüklenemedi", self.exchange.load_markets())
+        if self.cfg.api_key and self.cfg.secret:
+            # Catch wrong/expired keys at startup instead of on the first signal.
+            await self._ccxt("API anahtarı doğrulanamadı (yetki/IP kısıtı?)", self.exchange.fetch_balance())
         logger.info("%s: connected to %s (%d markets)", self.name, self.exchange.id, len(self.exchange.markets or {}))
 
     async def close(self) -> None:

@@ -419,12 +419,19 @@ async def test_size_position_uses_order_calc_profit(fake: FakeMT5, broker: Mt5Br
 
 
 async def test_size_position_fee_buffer(fake: FakeMT5) -> None:
+    # The crypto-style percentage fee is NOT applied on MT brokers (it would undersize forex badly).
     b = await connected(fake, include_fees_in_risk=True, fee_rate=0.0006)
     sym = await b.resolve_symbol("ETH")
     assert sym is not None
     res = await b.size_position(sym, Side.LONG, 2232.18, 2205.11, 200.0)
-    per_lot = 27.07 + 0.0006 * (2232.18 + 2205.11)
-    assert res.quantity == 6.72 and res.est_loss_at_sl == pytest.approx(6.72 * per_lot)
+    assert res.quantity == 7.38
+    await b.close()
+
+    # An explicit commission per lot is added to the loss per lot.
+    b = await connected(fake, include_fees_in_risk=True, fee_rate=0.0006)
+    b.config = b.config.model_copy(update={"commission_per_lot": 2.0})
+    res = await b.size_position(sym, Side.LONG, 2232.18, 2205.11, 200.0)
+    assert res.quantity == 6.87 and res.est_loss_at_sl == pytest.approx(6.87 * 29.07)  # 200 / 29.07 = 6.879
     await b.close()
 
 
