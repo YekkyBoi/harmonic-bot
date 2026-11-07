@@ -1,0 +1,213 @@
+# =====================================================================
+# Telegram Kopya-Trade Botu — örnek yapılandırma
+#
+# Kullanım:  cp config.example.yaml config.yaml   (sonra düzenleyin)
+#
+# Gizli bilgiler (şifre, API anahtarı, token) bu dosyaya YAZILMAZ.
+# ${DEGISKEN} yazan yerler .env dosyasından (veya ortam değişkenlerinden)
+# okunur. ${DEGISKEN:-} = değişken boşsa alan boş kalır (hata vermez).
+# ${DEGISKEN} (":-" yok) = değişken boşsa program başlamaz.
+#
+# Bir şey değiştirdikten sonra:  python -m copytrader check
+# =====================================================================
+
+# true: her şey çalışır ama GERÇEK EMİR GÖNDERİLMEZ (emirler simüle edilir).
+# Birkaç gün böyle izleyin; emin olunca false yapın.
+dry_run: true
+
+data_dir: data                  # oturum, veritabanı, görseller, loglar burada (GİZLİ tutun)
+log_level: INFO                 # DEBUG (çok ayrıntılı) | INFO | WARNING
+timezone: Europe/Istanbul       # günlük zarar sınırı bu saat diliminde gece yarısı sıfırlanır
+monitor_interval_sec: 10        # açık pozisyonlar kaç saniyede bir kontrol edilir (dolum, SL/TP)
+price_source_exchange: binanceusdm  # broker fiyat veremezse kontrol için kullanılan herkese açık borsa (ccxt adı)
+
+# ---------------------------------------------------------------------
+# Telegram kullanıcı hesabınız (sinyal grubunu bu hesap OKUR, hiçbir şey yazmaz)
+# ---------------------------------------------------------------------
+telegram:
+  api_id: ${TG_API_ID}          # my.telegram.org -> API development tools
+  api_hash: ${TG_API_HASH}
+  session_path: data/telegram_user          # oturum dosyası ('login' oluşturur; .session uzantısı eklenir)
+  session_string: ${TG_SESSION_STRING:-}    # isteğe bağlı: 'login' çıktısındaki metin (doluysa dosyanın yerine geçer)
+
+  # Dinlenecek grup: 'python -m copytrader chats' ile bulunan ID (-100...).
+  # @kullaniciadi veya t.me/... linki de yazılabilir.
+  source_chats:
+    - -1001234567890
+
+  # Boş = gruptaki herkesin mesajı okunur. Sadece traderı dinlemek için
+  # onun kullanıcı ID'sini yazın, ör: [123456789]
+  allowed_sender_ids: []
+
+  debounce_sec: 4               # traderın son mesajından sonra bu kadar bekle (görsel + metin birlikte okunsun)
+  context_window_sec: 300       # son 5 dk'daki işlenmemiş mesajlar birlikte okunur
+  incomplete_timeout_sec: 180   # eksik sinyal (ör. sadece görsel) bu sürede tamamlanmazsa size sorulur
+  max_context_messages: 12      # birlikte okunacak en fazla mesaj
+  catchup_max_age_sec: 120      # bot kapalıyken gelen mesajlardan yalnızca bu kadar yeni olanlar işlenir
+
+# ---------------------------------------------------------------------
+# Bildirim botu (@BotFather) — size sadece emin olamadığında ve hata olduğunda yazar
+# ---------------------------------------------------------------------
+notifier:
+  bot_token: ${TG_BOT_TOKEN}    # @BotFather -> /newbot ; botu açıp Start'a basmayı unutmayın
+  owner_user_id: ${TG_OWNER_ID} # kendi kullanıcı ID'niz (@userinfobot); bot yalnızca sizi dinler
+  confirm_timeout_sec: 600      # onay sorusuna 10 dk içinde yanıt yoksa işlem AÇILMAZ
+  notify_on_execution: false    # true: her açılan/kapanan işlemi de bildir (hatalar her zaman bildirilir)
+  notify_on_ignored: false      # true: işlem olmadığı anlaşılan mesajları da bildir
+
+# ---------------------------------------------------------------------
+# Claude (sinyal okuyucu)
+# ---------------------------------------------------------------------
+llm:
+  api_key: ${ANTHROPIC_API_KEY} # console.anthropic.com -> API Keys
+  model: claude-opus-5-5        # Claude modeli (varsayılan önerilir)
+  effort: high                  # düşünme düzeyi: low | medium | high | xhigh | max
+  max_tokens: 16000             # yanıt için üst sınır
+  use_fallbacks: true           # istek reddedilirse sunucu tarafında yedek modelle dene (beta)
+  min_confidence: 0.85          # okuma güveni bunun altındaysa size sorulur (0-1)
+  max_images: 4                 # bir okumada gönderilecek en fazla görsel
+  timeout_sec: 120              # Claude yanıt süresi sınırı (sn)
+  prefilter: true               # işlemle ilgisi olmayan sohbet mesajlarını Claude'a göndermeden atla
+
+# ---------------------------------------------------------------------
+# Risk ve emir kuralları
+# ---------------------------------------------------------------------
+risk:
+  risk_per_r_pct: 2.0           # 1R = bakiyenin %2'si (stop olursa kaybedilen). 0.5R = %1, 2R = %4
+  default_r: 1.0                # sinyalde R yazmıyorsa kullanılacak R
+  ask_if_r_missing: false       # true: R yazmıyorsa default_r yerine size sor
+  max_r_per_trade: 2.0          # bundan büyük R içeren sinyaller için size sorulur
+  max_open_trades: 10           # aynı anda en fazla aktif işlem (dolunca yeni sinyaller atlanır)
+  daily_loss_limit_pct: 10.0    # bir brokerda gün içi gerçekleşen zarar %10'a ulaşınca o gün yeni işlem açılmaz (0 = kapalı)
+  entry_mode: auto              # auto | market | limit
+                                #   auto: anlık fiyat girişe yakınsa piyasa emri, değilse girişte limit emir
+  market_entry_tolerance_pct: 0.5  # auto: fiyat girişten en fazla %0.5 uzaksa piyasa emri
+  max_entry_distance_pct: 10.0  # giriş anlık fiyattan %10'dan uzaksa (yanlış okuma olabilir) size sorulur
+  pending_entry_expiry_min: 1440   # dolmayan limit giriş 24 saat sonra iptal edilir (0 = hiç)
+  include_fees_in_risk: true    # komisyon da 1R'nin içine sayılır (stopta toplam kayıp ≈ 1R)
+  fee_rate: 0.0006              # broker komisyonu bildirmezse varsayılan (0.0006 = %0.06, her yön)
+  duplicate_window_sec: 900     # 15 dk içinde aynı varlık+yön+benzer giriş gelirse (tekrar paylaşım) size sorulur
+  multi_tp_split: equal         # birden fazla TP: equal = pozisyon eşit bölünür; last_only = sadece en uzak TP
+                                #   (trader oran yazdıysa, ör. "TP1'de yarısı", onun oranı kullanılır)
+  use_equity: true              # true: bakiye = hesap değeri (açık K/Z dahil); false: serbest bakiye
+  allow_min_qty_round_up: false # 1R borsanın minimum miktarının altında kalırsa: false = işlemi atla,
+                                #   true = minimum miktarla aç (risk en fazla 2R'ye kadar çıkabilir)
+  max_margin_usage_pct: 90.0    # serbest bakiyenin en fazla %90'ı teminat olarak kullanılır
+
+# ---------------------------------------------------------------------
+# Brokerlar / borsalar
+#
+# Her etkin (enabled: true) hesapta işlem AYNI ANDA açılır; her hesap kendi
+# bakiyesine göre boyutlanır. Varsayılan: yalnızca 'paper' (sanal hesap) açık.
+#
+# Ortak alanlar (her broker için):
+#   name             benzersiz ad (bildirimlerde görünür)
+#   enabled          true/false
+#   symbol_map       sembol eşleme, ör: {ETH: ETHUSD, XAU: GOLD}
+#   allowed_assets   boş = tüm varlıklar; ör: [BTC, ETH] = sadece bunlar
+#   risk_multiplier  bu hesapta riski ölçekle (1.0 = 1R başına %2, 0.5 = %1)
+#
+# Bir brokerı açtıktan sonra MUTLAKA 'python -m copytrader check' çalıştırın:
+# API anahtarı yanlış/eksikse burada görünür.
+# ---------------------------------------------------------------------
+brokers:
+
+  # --- Sanal hesap: gerçek fiyatlarla simülasyon, anahtar gerekmez ---
+  - name: paper
+    type: paper
+    enabled: true
+    starting_balance: 10000     # ilk bakiye (sıfırlamak için data/paper_paper.json dosyasını silin)
+    price_source_exchange: binanceusdm  # fiyatların alındığı herkese açık borsa
+    quote_currency: USDT
+    fee_rate: 0.0005            # simüle komisyon (%0.05)
+
+  # --- Binance USDⓈ-M vadeli ---
+  - name: binance
+    type: ccxt
+    enabled: false
+    exchange: binanceusdm       # ccxt borsa adı
+    api_key: ${BINANCE_API_KEY:-}
+    secret: ${BINANCE_API_SECRET:-}
+    sandbox: false              # true: Binance Futures testnet (testnet.binancefuture.com, ayrı anahtar)
+    market_type: swap           # swap = USDT perpetual (spot desteklenmez)
+    quote_currency: USDT
+    margin_mode: isolated       # isolated (önerilir) | cross
+    leverage: 10                # tercih edilen kaldıraç (teminat yetmezse otomatik artar)
+    max_leverage: 50            # asla aşılmaz; ayrıca tasfiye fiyatı her zaman stopun ötesinde tutulur
+    position_mode: oneway       # borsadaki ayarla aynı olmalı: oneway (tek yönlü) | hedge
+    options: {}                 # ek ccxt ayarları (genelde gerekmez)
+    symbol_map: {}
+    allowed_assets: []
+    risk_multiplier: 1.0
+
+  # --- Bybit USDT perpetual (Unified Trading hesabı) ---
+  - name: bybit
+    type: ccxt
+    enabled: false
+    exchange: bybit
+    api_key: ${BYBIT_API_KEY:-}
+    secret: ${BYBIT_API_SECRET:-}
+    sandbox: false              # true: testnet.bybit.com (ayrı hesap ve anahtar)
+    market_type: swap
+    quote_currency: USDT
+    margin_mode: isolated
+    leverage: 10
+    max_leverage: 50
+    position_mode: oneway
+    symbol_map: {}
+    allowed_assets: []
+    risk_multiplier: 1.0
+
+  # --- OKX USDT perpetual ---
+  - name: okx
+    type: ccxt
+    enabled: false
+    exchange: okx
+    api_key: ${OKX_API_KEY:-}
+    secret: ${OKX_API_SECRET:-}
+    password: ${OKX_API_PASSPHRASE:-}   # OKX anahtarını oluştururken belirlediğiniz passphrase
+    sandbox: false              # true: OKX Demo Trading (demo modunda oluşturulmuş anahtar)
+    market_type: swap
+    quote_currency: USDT
+    margin_mode: isolated
+    leverage: 10
+    max_leverage: 50
+    position_mode: oneway
+    symbol_map: {}
+    allowed_assets: []
+    risk_multiplier: 1.0
+
+  # --- MT5, kendi terminaliyle (SADECE WINDOWS) ---
+  # Zorunlu alanları olduğu için kapalı (yorum) duruyor. Kullanmak için
+  # satır başlarındaki "# " işaretlerini kaldırın ve .env'i doldurun.
+  # Ayrıca: pip install MetaTrader5 ; terminalde "Algo Trading" açık olmalı.
+  #
+  # - name: mt5
+  #   type: mt5
+  #   enabled: true
+  #   login: ${MT5_LOGIN}           # hesap numarası
+  #   password: ${MT5_PASSWORD}     # işlem (master) şifresi, yatırımcı şifresi DEĞİL
+  #   server: ${MT5_SERVER}         # ör: BrokerAdi-Server
+  #   terminal_path:                # boş = varsayılan terminal; ör: C:\Program Files\MetaTrader 5\terminal64.exe
+  #   magic: 770077                 # botun emirlerini ayırt eden numara
+  #   deviation_points: 20          # piyasa emrinde izin verilen kayma (point)
+  #   filling: auto                 # emir doldurma tipi: auto | fok | ioc | return
+  #   symbol_map: {XAU: XAUUSD}     # broker sembolleri farklıysa, ör: {XAU: GOLD, ETH: ETHUSD}
+  #   allowed_assets: []
+  #   risk_multiplier: 1.0
+
+  # --- MT4/MT5, MetaApi bulut üzerinden (Linux/Docker için) ---
+  # metaapi.cloud'da hesabınızı ekleyin; token ve hesap ID'sini .env'e yazın.
+  # Gerekli paket: pip install metaapi-cloud-sdk (Docker imajında kurulu).
+  #
+  # - name: metaapi
+  #   type: metaapi
+  #   enabled: true
+  #   token: ${METAAPI_TOKEN}
+  #   account_id: ${METAAPI_ACCOUNT_ID}
+  #   region:                       # boş = otomatik; gerekirse hesabın bölgesi (ör: london)
+  #   magic: 770077
+  #   slippage_points: 20           # piyasa emrinde izin verilen kayma (point)
+  #   symbol_map: {XAU: XAUUSD}
+  #   allowed_assets: []
+  #   risk_multiplier: 1.0

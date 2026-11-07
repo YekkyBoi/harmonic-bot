@@ -1,0 +1,41 @@
+# systemd unit for a venv install in /opt/telegram-copy-trader (see README, "systemd").
+#   sudo cp deploy/copytrader.service /etc/systemd/system/
+#   sudo systemctl daemon-reload && sudo systemctl enable --now copytrader
+#   journalctl -u copytrader -f
+# Installed elsewhere? Change the paths below (and drop ProtectHome= if it is under /home).
+
+[Unit]
+Description=Telegram copy trader
+Wants=network-online.target
+After=network-online.target
+# Give up after 5 failed starts in 10 minutes (e.g. bad API key) instead of looping forever.
+StartLimitIntervalSec=600
+StartLimitBurst=5
+
+[Service]
+Type=simple
+User=copytrader
+Group=copytrader
+WorkingDirectory=/opt/telegram-copy-trader
+# .env next to config.yaml is loaded by the app itself.
+ExecStart=/opt/telegram-copy-trader/.venv/bin/python -m copytrader run --config /opt/telegram-copy-trader/config.yaml
+Environment=PYTHONUNBUFFERED=1
+
+# Crash/network failure -> restart. Exit code 2 = config or Telegram login problem: fix it first.
+Restart=on-failure
+RestartSec=30
+RestartPreventExitStatus=2
+
+# SIGTERM -> graceful shutdown; in-flight orders get time to finish.
+KillSignal=SIGTERM
+TimeoutStopSec=90
+
+# Hardening
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectSystem=full
+ProtectHome=true
+UMask=0077
+
+[Install]
+WantedBy=multi-user.target

@@ -1,0 +1,20 @@
+# Start:     docker compose up -d
+# Logs:      docker compose logs -f
+# Commands:  docker compose run --rm copytrader python -m copytrader check
+services:
+  copytrader:
+    build: .
+    image: telegram-copy-trader:latest
+    container_name: copytrader
+    restart: unless-stopped
+    env_file: .env
+    volumes:
+      - ./config.yaml:/app/config.yaml:ro
+      - ./data:/app/data            # must be writable by uid 1000: sudo chown -R 1000:1000 data
+    # Graceful stop: let in-flight orders finish before the container is killed.
+    stop_grace_period: 90s
+    logging:
+      driver: json-file
+      options:
+        max-size: "10m"
+        max-file: "3"

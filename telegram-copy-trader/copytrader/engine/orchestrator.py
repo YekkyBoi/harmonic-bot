@@ -1,13 +1,231 @@
-"""The engine (STUB - see copytrader.interfaces.EngineControl)."""
+"""The engine: Telegram messages -> parsed actions -> validated plans -> orders.
+
+Flow per (chat, sender): the listener calls :meth:`Engine.on_messages_ready`
+after a debounce; the engine parses the unconsumed recent messages, and for
+each action either executes it on every broker, asks the owner (anything
+uncertain), or ignores it. Owner decisions arrive through the
+:class:`~copytrader.interfaces.EngineControl` methods.
+
+Safety rules kept here:
+* Source messages are marked consumed BEFORE orders are sent, so a crash or
+  restart can never execute the same signal twice.
+* Every position write for a trade happens under that trade's lock (shared
+  with the monitor).
+* Anything doubtful becomes a confirmation; unanswered confirmations expire
+  without trading.
+"""
 
 from __future__ import annotations
 
-from ..brokers.base import Broker
+import asyncio
+import logging
+import math
+import secrets
+import uuid
+from collections.abc import Callable, Coroutine
+from dataclasses import dataclass
+from datetime import datetime, timedelta, timezone
+from typing import Any, Literal
+
+from ..brokers.base import Broker, BrokerError
 from ..config import AppConfig
+from ..errors import ParserError
 from ..interfaces import Notifier, SignalParser, Storage
+from ..models import (
+    ActionType,
+    BrokerPosition,
+    ConfirmationStatus,
+    EntryType,
+    ManagementPlan,
+    MarketType,
+    OpenRequest,
+    ParseContext,
+    ParsedAction,
+    PendingConfirmation,
+    PositionStatus,
+    Quote,
+    Severity,
+    Side,
+    StoredMessage,
+    TakeProfit,
+    TradePlan,
+    TradeRecord,
+    TradeStatus,
+    ValidationIssue,
+)
+from ..parsing import prefilter, validator
+from ..parsing.symbols import canonical_asset, normalize_symbol
+from ..risk import guards, sizing
+from ..telegram import formatting as fmt
+from ..telegram.formatting import esc, fmt_price
+from .monitor import ACTIVE_POSITION, ACTIVE_TRADE, Monitor, rollup_status, utc
+from .prices import PriceOracle
+
+logger = logging.getLogger(__name__)
+
+ConfKind = Literal["open", "manage", "incomplete"]
+_Key = tuple[int, int | None]   # (chat_id, sender_id)
+
+MANAGEMENT_ACTIONS = frozenset({ActionType.MOVE_SL, ActionType.MOVE_TP, ActionType.CLOSE, ActionType.CANCEL})
+TRANSIENT_PARSE_RETRY_DELAYS: tuple[float, ...] = (10.0, 30.0, 60.0)
+# A "none" reading this unsure (or with ambiguities) is shown to the owner instead of being dropped.
+NONE_ASK_BELOW_CONFIDENCE = 0.6
+CONNECT_TIMEOUT_SEC = 180.0
+READ_TIMEOUT_SEC = 20.0
+EXCERPT_CHARS = 300
+
+_CONF_STATUS_TR = {
+    ConfirmationStatus.PENDING: "beklemede",
+    ConfirmationStatus.APPROVED: "onaylandı",
+    ConfirmationStatus.REJECTED: "iptal edildi",
+    ConfirmationStatus.EXPIRED: "süresi doldu",
+    ConfirmationStatus.SUPERSEDED: "yerine düzeltilmiş hali gönderildi",
+}
+_POS_STATUS_TR = {
+    PositionStatus.PENDING: "bekleyen emir",
+    PositionStatus.OPEN: "açık",
+    PositionStatus.CLOSED: "kapalı",
+    PositionStatus.CANCELLED: "iptal",
+    PositionStatus.FAILED: "hata",
+}
 
 
+# --------------------------------------------------------------------------- #
+# Small value types
+# --------------------------------------------------------------------------- #
+@dataclass
+class Evaluation:
+    """What the engine would do with one parsed action."""
+
+    kind: ConfKind
+    action: ParsedAction
+    plan: TradePlan | ManagementPlan | None
+    issues: list[ValidationIssue]
+    market_price: float | None = None
+    trade: TradeRecord | None = None
+
+    @property
+    def automatic(self) -> bool:
+        return self.plan is not None and not self.issues and self.kind != "incomplete"
+
+
+@dataclass
+class BrokerOutcome:
+    broker: str
+    kind: Literal["ok", "unsupported", "skipped", "error"]
+    text: str                                # HTML line for the owner
+    position: BrokerPosition | None = None
+
+
+@dataclass
+class _IncompleteWatch:
+    chat_id: int
+    action: ParsedAction
+    message_ids: list[int]
+    deadline: datetime
+    task: asyncio.Task[None] | None = None
+
+
+# --------------------------------------------------------------------------- #
+# Helpers
+# --------------------------------------------------------------------------- #
+def asset_of(action: ParsedAction) -> tuple[str | None, str | None, MarketType | None]:
+    """Canonical (base, quote, market_type) of an action, like the validator derives them."""
+    base = canonical_asset(action.base_asset) if action.base_asset and action.base_asset.strip() else None
+    quote = action.quote_asset.strip().upper() if action.quote_asset and action.quote_asset.strip() else None
+    market_type = action.market_type
+    if action.symbol:
+        s_base, s_quote, s_type = normalize_symbol(action.symbol)
+        if base is None:
+            base = s_base
+        if s_base is not None and s_base == base:
+            quote = quote or s_quote
+            market_type = market_type or s_type
+    return base, quote, market_type
+
+
+def merge_issues(*groups: list[ValidationIssue]) -> list[ValidationIssue]:
+    """Concatenate, dropping exact duplicates (same code + text)."""
+    seen: set[tuple[str, str]] = set()
+    out: list[ValidationIssue] = []
+    for group in groups:
+        for issue in group:
+            key = (issue.code, issue.message_tr)
+            if key not in seen:
+                seen.add(key)
+                out.append(issue)
+    return out
+
+
+def _issue(code: str, text: str, blocking: bool = False) -> ValidationIssue:
+    return ValidationIssue(code=code, message_tr=text, blocking=blocking)
+
+
+def _same_price(a: float, b: float) -> bool:
+    return math.isclose(a, b, rel_tol=1e-9, abs_tol=1e-12)
+
+
+def _distance_pct(a: float, ref: float) -> float:
+    return abs(a - ref) / ref * 100.0 if ref else math.inf
+
+
+def _qty(x: float | None) -> str:
+    return fmt_price(x) if x is not None else "—"
+
+
+def _money(x: float) -> str:
+    return f"{x:,.2f}".replace(",", " ")
+
+
+def is_transient_parse_error(err: BaseException) -> bool:
+    """Network / timeout / rate-limit / 5xx: worth retrying. Uses ``err.transient`` if present,
+    else the chained cause (llm_parser raises ParserError ``from`` the SDK exception)."""
+    flag = getattr(err, "transient", None)
+    if isinstance(flag, bool):
+        return flag
+    cause = err.__cause__ or err.__context__
+    if cause is None:
+        return False
+    try:
+        import anthropic
+
+        if isinstance(cause, (anthropic.APIConnectionError, anthropic.RateLimitError, anthropic.InternalServerError)):
+            return True       # APITimeoutError is an APIConnectionError
+        if isinstance(cause, anthropic.APIStatusError):
+            return int(getattr(cause, "status_code", 0) or 0) >= 500
+    except ImportError:  # pragma: no cover
+        pass
+    return isinstance(cause, (TimeoutError, asyncio.TimeoutError, ConnectionError))
+
+
+def _excerpt(msgs: list[StoredMessage]) -> str:
+    parts: list[str] = []
+    for m in msgs:
+        text = (m.text or "").strip()
+        if m.media_path or m.media_type:
+            text = ("[görsel] " + text).strip()
+        if text:
+            parts.append(text)
+    joined = " | ".join(parts) or "(boş)"
+    return joined if len(joined) <= EXCERPT_CHARS else joined[: EXCERPT_CHARS - 1] + "…"
+
+
+def _price_problem(side: Side, quote: Quote, stop: float, tp1: float | None) -> str | None:
+    """Live price already beyond the stop (or beyond TP1 when given)? Turkish text or None."""
+    long = side is Side.LONG
+    if (long and quote.bid <= stop) or (not long and quote.ask >= stop):
+        return f"anlık fiyat ({fmt_price(quote.bid if long else quote.ask)}) stop seviyesini ({fmt_price(stop)}) geçmiş"
+    if tp1 is not None and ((long and quote.ask >= tp1) or (not long and quote.bid <= tp1)):
+        return f"anlık fiyat ({fmt_price(quote.ask if long else quote.bid)}) ilk hedefi ({fmt_price(tp1)}) geçmiş"
+    return None
+
+
+# --------------------------------------------------------------------------- #
+# Engine
+# --------------------------------------------------------------------------- #
 class Engine:
+    """Implements :class:`copytrader.interfaces.EngineControl`."""
+
     def __init__(
         self,
         config: AppConfig,
@@ -15,11 +233,1325 @@ class Engine:
         parser: SignalParser,
         brokers: list[Broker],
         notifier: Notifier,
-        price_oracle: "object | None" = None,
+        price_oracle: PriceOracle | Any | None = None,
+        *,
+        clock: Callable[[], datetime] | None = None,
     ) -> None:
-        raise NotImplementedError
+        """``price_oracle``: anything with ``async price(base, quote, market_type, raw_symbol, *, fresh=False)``.
+        ``clock``: returns "now" (tests)."""
+        self.config = config
+        self.db = db
+        self.parser = parser
+        self.notifier = notifier
+        self.configured_brokers: list[Broker] = list(brokers)
+        self.brokers: list[Broker] = list(brokers)       # connected ones after start()
+        self.failed_brokers: dict[str, str] = {}
+        self._clock = clock or (lambda: datetime.now(timezone.utc))
+        self._own_oracle = price_oracle is None
+        self.prices: Any = price_oracle if price_oracle is not None else PriceOracle(
+            lambda: self.brokers, config.price_source_exchange
+        )
+        self.retry_delays: tuple[float, ...] = TRANSIENT_PARSE_RETRY_DELAYS
+        self._sender_locks: dict[_Key, asyncio.Lock] = {}
+        self._conf_locks: dict[str, asyncio.Lock] = {}
+        self._trade_locks: dict[int, asyncio.Lock] = {}
+        self._open_lock = asyncio.Lock()           # guards + execution of new trades are atomic
+        self._expiry_tasks: dict[str, asyncio.Task[None]] = {}
+        self._incomplete: dict[_Key, _IncompleteWatch] = {}
+        self._retry_tasks: dict[_Key, asyncio.Task[None]] = {}
+        self._parse_failures: dict[_Key, int] = {}
+        self._tasks: set[asyncio.Task[Any]] = set()
+        self._currency: dict[str, str] = {}
+        self.monitor = Monitor(config, db, lambda: self.brokers, notifier,
+                               trade_lock=self.trade_lock, clock=self._clock)
+        self._monitor_task: asyncio.Task[None] | None = None
 
-    async def start(self) -> None: ...
-    async def stop(self) -> None: ...
-    async def on_messages_ready(self, chat_id: int, sender_id: int | None) -> None: ...
-    async def on_message_edited(self, msg) -> None: ...
+    # ------------------------------------------------------------------ utils
+    def _now(self) -> datetime:
+        return utc(self._clock())
+
+    def trade_lock(self, trade_id: int) -> asyncio.Lock:
+        return self._trade_locks.setdefault(trade_id, asyncio.Lock())
+
+    def _sender_lock(self, key: _Key) -> asyncio.Lock:
+        return self._sender_locks.setdefault(key, asyncio.Lock())
+
+    def _conf_lock(self, conf_id: str) -> asyncio.Lock:
+        return self._conf_locks.setdefault(conf_id, asyncio.Lock())
+
+    def _spawn(self, coro: Coroutine[Any, Any, Any], name: str) -> asyncio.Task[Any]:
+        task = asyncio.ensure_future(coro)
+        task.set_name(name)
+        self._tasks.add(task)
+        task.add_done_callback(self._task_done)
+        return task
+
+    def _task_done(self, task: asyncio.Task[Any]) -> None:
+        self._tasks.discard(task)
+        if not task.cancelled() and task.exception() is not None:
+            logger.error("Engine task %s failed", task.get_name(), exc_info=task.exception())
+
+    def _broker(self, name: str) -> Broker | None:
+        return next((b for b in self.brokers if b.name == name), None)
+
+    async def _notify(self, text: str, severity: Severity = Severity.INFO) -> None:
+        try:
+            await self.notifier.notify(text, severity)
+        except Exception:
+            logger.exception("notify failed")
+
+    async def _log(self, kind: str, payload: dict[str, Any]) -> None:
+        try:
+            await self.db.log_event(kind, payload)
+        except Exception:
+            logger.exception("log_event %s failed", kind)
+
+    async def _is_paused(self) -> bool:
+        return bool(await self.db.get_state("paused", False))
+
+    async def _open_trade_summaries(self) -> list[dict[str, Any]]:
+        return [t.summary() for t in await self.db.active_trades()]
+
+    async def _price(self, base: str | None, quote: str | None, market_type: MarketType | None,
+                     raw_symbol: str | None = None, *, fresh: bool = False) -> float | None:
+        if not base:
+            return None
+        try:
+            return await self.prices.price(base, quote, market_type, raw_symbol, fresh=fresh)
+        except Exception:
+            logger.exception("Price oracle failed for %s", base)
+            return None
+
+    async def _load_messages(self, chat_id: int, ids: list[int]) -> list[StoredMessage]:
+        out: list[StoredMessage] = []
+        for mid in dict.fromkeys(ids):
+            m = await self.db.get_message(chat_id, mid)
+            if m is not None:
+                out.append(m)
+        out.sort(key=lambda m: (utc(m.date), m.message_id))
+        return out
+
+    async def _reply_context(self, chat_id: int, msgs: list[StoredMessage]) -> StoredMessage | None:
+        """The message replied to by the newest message that is a reply."""
+        for m in reversed(msgs):
+            if m.reply_to_message_id is not None:
+                return await self.db.get_message(chat_id, m.reply_to_message_id)
+        return None
+
+    # ------------------------------------------------------------------ lifecycle
+    async def start(self, *, monitor: bool = True) -> None:
+        """Connect brokers, restore confirmations, start the monitor (``monitor=False``: tests)."""
+        await self.connect_brokers()
+        await self._restore_confirmations()
+        await self._reconcile_trades()
+        if monitor and (self._monitor_task is None or self._monitor_task.done()):
+            self._monitor_task = asyncio.ensure_future(self.monitor.run())
+        await self._notify(await self._startup_text(), Severity.INFO)
+        logger.info("Engine started: %d/%d broker(s) connected, dry_run=%s",
+                    len(self.brokers), len(self.configured_brokers), self.config.dry_run)
+
+    async def connect_brokers(self) -> None:
+        """Connect every configured broker; failures are reported and excluded. No other side effects
+        (the read-only CLI commands use this instead of start())."""
+        results = await asyncio.gather(*(self._connect(b) for b in self.configured_brokers))
+        self.brokers = [b for b, ok in zip(self.configured_brokers, results, strict=True) if ok]
+
+    async def _connect(self, broker: Broker) -> bool:
+        try:
+            broker.set_risk_config(self.config.risk)
+            await asyncio.wait_for(broker.connect(), CONNECT_TIMEOUT_SEC)
+            broker.set_risk_config(self.config.risk)
+            try:
+                self._currency[broker.name] = await asyncio.wait_for(broker.account_currency(), READ_TIMEOUT_SEC)
+            except Exception:
+                self._currency[broker.name] = ""
+            return True
+        except Exception as exc:
+            reason = str(exc) or type(exc).__name__
+            self.failed_brokers[broker.name] = reason
+            logger.exception("Broker %s failed to connect", broker.name)
+            await self._notify(f"{esc(broker.name)} bağlanamadı: <code>{esc(reason)}</code>", Severity.ERROR)
+            try:
+                await broker.close()
+            except Exception:
+                logger.debug("close after failed connect", exc_info=True)
+            return False
+
+    async def _restore_confirmations(self) -> None:
+        now = self._now()
+        for conf in await self.db.pending_confirmations():
+            if utc(conf.expires_at) <= now:
+                await self._expire(conf.id)
+            else:
+                self._arm_expiry(conf)
+
+    async def _reconcile_trades(self) -> None:
+        """After a restart: fix trade statuses and flag trades whose opening was interrupted."""
+        for trade in await self.db.active_trades():
+            positions = await self.db.broker_positions(trade.id)
+            if positions:
+                status = rollup_status(positions)
+                if status is not trade.status:
+                    await self.db.update_trade(trade.id, status=status)
+                if trade.status is TradeStatus.OPENING:   # interrupted while sending: other brokers unknown
+                    saved = ", ".join(esc(p.broker) for p in positions)
+                    await self._notify(
+                        f"#{trade.id} {esc(trade.plan.base_asset)} işlemi gönderilirken sistem durdu. Kayıtlı "
+                        f"pozisyonlar: {saved}. Diğer hesaplarda kayıtsız emir/pozisyon olabilir; elle kontrol edin.",
+                        Severity.WARNING,
+                    )
+                continue
+            await self.db.update_trade(trade.id, status=TradeStatus.FAILED,
+                                       note="açılış yarıda kaldı (yeniden başlatma)")
+            await self._notify(
+                f"#{trade.id} {esc(trade.plan.base_asset)} {trade.plan.side.value.upper()} işlemi açılırken sistem "
+                "durdu; kayıtlı pozisyon yok. Borsada/brokerda açık emir veya pozisyon olup olmadığını "
+                "elle kontrol edin.",
+                Severity.WARNING,
+            )
+
+    async def _startup_text(self) -> str:
+        mode = "🧪 DRY-RUN (gerçek emir gönderilmez)" if self.config.dry_run else "🔴 CANLI (gerçek emirler)"
+        names = ", ".join(esc(b.name) for b in self.brokers) or "yok"
+        lines = [
+            "🚀 <b>Kopya-trade motoru başladı</b>",
+            f"Mod: {mode}",
+            f"Brokerlar: {names}",
+        ]
+        if self.failed_brokers:
+            lines.append("❌ Bağlanamayan: " + ", ".join(esc(n) for n in self.failed_brokers))
+        lines.append(f"Kaynak sohbet: {len(self.config.telegram.source_chats)}")
+        lines.append(f"Risk: 1R = bakiyenin {fmt.fmt_pct(self.config.risk.risk_per_r_pct, possessive=True)}")
+        pending = await self.db.pending_confirmations()
+        if pending:
+            lines.append(f"Bekleyen onay: {len(pending)}")
+        if await self._is_paused():
+            lines.append("⏸ Yeni işlem açma DURAKLATILMIŞ (/devam ile açın).")
+        return "\n".join(lines)
+
+    async def stop(self) -> None:
+        tasks: list[asyncio.Task[Any]] = []
+        if self._monitor_task is not None:
+            tasks.append(self._monitor_task)
+            self._monitor_task = None
+        tasks += list(self._tasks)
+        self._expiry_tasks.clear()
+        self._incomplete.clear()
+        self._retry_tasks.clear()
+        for t in tasks:
+            t.cancel()
+        if tasks:
+            await asyncio.gather(*tasks, return_exceptions=True)
+        for broker in self.brokers:
+            try:
+                await broker.close()
+            except Exception:
+                logger.exception("Error closing broker %s", broker.name)
+        if self._own_oracle and hasattr(self.prices, "close"):
+            try:
+                await self.prices.close()
+            except Exception:
+                logger.debug("oracle close failed", exc_info=True)
+        logger.info("Engine stopped")
+
+    # ------------------------------------------------------------------ incoming messages
+    async def on_messages_ready(self, chat_id: int, sender_id: int | None) -> None:
+        key: _Key = (chat_id, sender_id)
+        async with self._sender_lock(key):
+            await self._process_batch(key)
+
+    async def _process_batch(self, key: _Key) -> None:
+        chat_id, sender_id = key
+        tg = self.config.telegram
+        now = self._now()
+        msgs = await self.db.recent_messages(
+            chat_id,
+            since=now - timedelta(seconds=tg.context_window_sec),
+            sender_id=sender_id,
+            only_unconsumed=True,
+            limit=tg.max_context_messages,
+        )
+        if not msgs:
+            return
+        batch_ids = [m.message_id for m in msgs]
+        if self.config.llm.prefilter and not any(prefilter.looks_relevant(m) for m in msgs):
+            await self.db.mark_consumed(chat_id, batch_ids)
+            logger.debug("Prefilter: %s ignored", batch_ids)
+            return
+
+        reply_to = await self._reply_context(chat_id, msgs)
+        ctx = ParseContext(now=now, open_trades=await self._open_trade_summaries(), reply_to=reply_to)
+        try:
+            result = await self.parser.parse(msgs, ctx)
+        except ParserError as err:
+            await self._on_parse_error(key, msgs, err, transient=is_transient_parse_error(err))
+            return
+        except Exception as err:   # a bug, not an API hiccup: do not loop on it
+            logger.exception("Parser crashed")
+            await self._on_parse_error(key, msgs, err, transient=False)
+            return
+        self._parse_failures.pop(key, None)
+        actions = self._fill_used_ids(result.actions, batch_ids)
+        await self._log("parsed", {
+            "chat_id": chat_id, "message_ids": batch_ids, "model": result.model,
+            "actions": [a.model_dump(mode="json") for a in actions],
+        })
+
+        incompletes = [a for a in actions if a.action is ActionType.INCOMPLETE]
+        kept_for_incomplete = {i for a in incompletes for i in a.used_message_ids}
+        decided = False
+        for action in actions:
+            if action.action is ActionType.INCOMPLETE:
+                continue
+            ids = list(action.used_message_ids)
+            try:
+                if action.action is ActionType.NONE:
+                    await self.db.mark_consumed(chat_id, [i for i in ids if i not in kept_for_incomplete])
+                    await self._handle_none(action, chat_id)
+                    continue
+                # Decided: consume BEFORE sending orders (never execute a signal twice).
+                await self.db.mark_consumed(chat_id, ids)
+                decided = True
+                if action.action is ActionType.OPEN:
+                    await self._handle_open(action, chat_id, reply_to=reply_to)
+                else:
+                    await self._handle_management(action, chat_id, reply_to=reply_to)
+            except Exception as exc:
+                logger.exception("Handling %s failed", action.action.value)
+                await self.db.mark_consumed(chat_id, ids)
+                await self._notify(
+                    f"Sinyal işlenirken hata ({esc(action.summary_tr or action.action.value)}): "
+                    f"<code>{esc(exc)}</code>",
+                    Severity.ERROR,
+                )
+        if incompletes:
+            # One watch per (chat, sender); the newest incomplete reading replaces older ones.
+            ids_all = list(dict.fromkeys(i for a in incompletes for i in a.used_message_ids))
+            self._watch_incomplete(key, incompletes[-1].model_copy(update={"used_message_ids": ids_all}))
+        elif decided:
+            self._cancel_incomplete(key)
+        # Messages the parser saw but did not keep for an incomplete signal are done.
+        leftover = [i for i in batch_ids if i not in kept_for_incomplete]
+        await self.db.mark_consumed(chat_id, leftover)
+
+    @staticmethod
+    def _fill_used_ids(actions: list[ParsedAction], batch_ids: list[int]) -> list[ParsedAction]:
+        """Actions without used_message_ids get the batch messages no other action claimed
+        (a NONE never takes messages another action uses)."""
+        claimed = {i for a in actions for i in a.used_message_ids}
+        free = [i for i in batch_ids if i not in claimed]
+        out: list[ParsedAction] = []
+        for a in actions:
+            if not a.used_message_ids:
+                ids = free if (free or a.action is ActionType.NONE) else batch_ids
+                a = a.model_copy(update={"used_message_ids": list(ids)})
+            out.append(a)
+        return out
+
+    @staticmethod
+    def _none_is_unsure(action: ParsedAction) -> bool:
+        return bool(action.ambiguities) or action.confidence < NONE_ASK_BELOW_CONFIDENCE
+
+    async def _on_parse_error(
+        self, key: _Key, msgs: list[StoredMessage], err: BaseException, *, transient: bool
+    ) -> None:
+        chat_id, sender_id = key
+        attempt = self._parse_failures.get(key, 0)
+        if transient and attempt < len(self.retry_delays):
+            self._parse_failures[key] = attempt + 1
+            delay = self.retry_delays[attempt]
+            logger.warning("Transient parse error (%s); retry %d in %.0fs", err, attempt + 1, delay)
+            if attempt == 0:
+                await self._notify(
+                    f"Sinyal okunamadı (geçici hata: {esc(err)}); tekrar denenecek.\n"
+                    f"Mesaj: <i>{esc(_excerpt(msgs))}</i>",
+                    Severity.WARNING,
+                )
+            old = self._retry_tasks.pop(key, None)
+            if old is not None:
+                old.cancel()
+            self._retry_tasks[key] = self._spawn(self._retry_later(key, delay), f"parse-retry-{chat_id}")
+            return
+        self._parse_failures.pop(key, None)
+        await self._log("parse_failed", {"chat_id": chat_id, "message_ids": [m.message_id for m in msgs],
+                                         "error": str(err), "transient": transient})
+        await self._notify(
+            f"Sinyal okunamadı: {esc(err) or esc(type(err).__name__)}\n"
+            f"Mesaj: <i>{esc(_excerpt(msgs))}</i>\n"
+            "İşlem açılmadı; gerekiyorsa elle kontrol edin.",
+            Severity.WARNING,
+        )
+        if not transient:
+            await self.db.mark_consumed(chat_id, [m.message_id for m in msgs])
+
+    async def _retry_later(self, key: _Key, delay: float) -> None:
+        await asyncio.sleep(delay)
+        if self._retry_tasks.get(key) is asyncio.current_task():
+            del self._retry_tasks[key]
+        await self.on_messages_ready(*key)
+
+    async def _handle_none(self, action: ParsedAction, chat_id: int) -> None:
+        if self._none_is_unsure(action):
+            # "Probably not a trade" but the parser doubts it: let the owner decide.
+            ev = Evaluation(
+                kind="incomplete", action=action, plan=None,
+                issues=merge_issues(
+                    [_issue("unclear_message", "Bu mesajın bir işlem talimatı olup olmadığından emin olamadım.", True)],
+                    validator.low_confidence_issues(action, self.config.llm),
+                ),
+            )
+            await self._ask_eval(ev, chat_id)
+            return
+        if self.config.notifier.notify_on_ignored:
+            await self._notify(f"💬 Yok sayıldı: {esc(action.summary_tr or 'işlem talimatı değil')}", Severity.INFO)
+
+    # ------------------------------------------------------------------ incomplete signals
+    def _watch_incomplete(self, key: _Key, action: ParsedAction) -> None:
+        self._cancel_incomplete(key)
+        deadline = self._now() + timedelta(seconds=self.config.telegram.incomplete_timeout_sec)
+        watch = _IncompleteWatch(chat_id=key[0], action=action, message_ids=list(action.used_message_ids),
+                                 deadline=deadline)
+        watch.task = self._spawn(self._incomplete_timeout(key, watch), f"incomplete-{key[0]}")
+        self._incomplete[key] = watch
+
+    def _cancel_incomplete(self, key: _Key) -> None:
+        watch = self._incomplete.pop(key, None)
+        if watch is not None and watch.task is not None and watch.task is not asyncio.current_task():
+            watch.task.cancel()
+
+    async def _incomplete_timeout(self, key: _Key, watch: _IncompleteWatch) -> None:
+        await asyncio.sleep(max(0.0, (watch.deadline - self._now()).total_seconds()))
+        async with self._sender_lock(key):
+            if self._incomplete.get(key) is not watch:
+                return
+            del self._incomplete[key]
+            msgs = await self._load_messages(watch.chat_id, watch.message_ids)
+            if not any(not m.consumed for m in msgs):
+                return      # a later parse completed (and consumed) them
+            await self.db.mark_consumed(watch.chat_id, watch.message_ids)
+            summary = watch.action.summary_tr or "eksik sinyal"
+            if await self._is_paused():
+                await self._notify(f"Duraklatıldı: eksik sinyal atlandı ({esc(summary)})", Severity.INFO)
+                return
+            secs = self.config.telegram.incomplete_timeout_sec
+            reason = f"Sinyal {fmt.fmt_number(float(secs))} sn içinde tamamlanmadı; eksik bilgi var."
+            ev = await self._evaluate_incomplete(watch.action, watch.chat_id, reason)
+            await self._ask_eval(ev, watch.chat_id)
+
+    # ------------------------------------------------------------------ evaluation
+    async def evaluate(
+        self, action: ParsedAction, chat_id: int, *, reply_to: StoredMessage | None = None
+    ) -> Evaluation | None:
+        """Validate one action without side effects. None for NONE actions."""
+        if action.action is ActionType.OPEN:
+            return await self._evaluate_open(action, chat_id)
+        if action.action is ActionType.INCOMPLETE:
+            return await self._evaluate_incomplete(
+                action, chat_id, "Sinyal eksik: varlık, yön veya stop bilgisi tamamlanmadı."
+            )
+        if action.action in MANAGEMENT_ACTIONS:
+            return await self._evaluate_management(action, chat_id, reply_to)
+        return None
+
+    async def _evaluate_open(self, action: ParsedAction, chat_id: int) -> Evaluation:
+        now = self._now()
+        base, quote, market_type = asset_of(action)
+        market = await self._price(base, quote, market_type, action.symbol)
+        plan, issues = validator.build_open_plan(
+            action, risk=self.config.risk, llm=self.config.llm, market_price=market,
+            source_chat_id=chat_id, now=now,
+        )
+        issues = merge_issues(issues, validator.low_confidence_issues(action, self.config.llm))
+        if plan is not None:
+            issues = merge_issues(issues, await self._portfolio_issues(plan, chat_id))
+        return Evaluation("open", action, plan, issues, market)
+
+    async def _evaluate_incomplete(self, action: ParsedAction, chat_id: int, reason: str) -> Evaluation:
+        base, quote, market_type = asset_of(action)
+        market = await self._price(base, quote, market_type, action.symbol)
+        _plan, issues = validator.build_open_plan(
+            action, risk=self.config.risk, llm=self.config.llm, market_price=market,
+            source_chat_id=chat_id, now=self._now(),
+        )
+        return Evaluation("incomplete", action, None, merge_issues([_issue("incomplete_signal", reason, True)], issues),
+                          market)
+
+    async def _portfolio_issues(self, plan: TradePlan, chat_id: int) -> list[ValidationIssue]:
+        now = self._now()
+        risk = self.config.risk
+        out: list[ValidationIssue] = []
+        recent = await self.db.recent_trades(now - timedelta(seconds=max(0, risk.duplicate_window_sec)))
+        dup = guards.find_duplicate(plan, recent, window_sec=risk.duplicate_window_sec, now=now)
+        if dup is not None:
+            out.append(_issue(
+                "duplicate_signal",
+                f"Benzer bir işlem zaten var (#{dup.id} {dup.plan.base_asset} {dup.plan.side.value.upper()}, "
+                f"giriş {fmt_price(dup.plan.entry_price)}); sinyal tekrar paylaşılmış olabilir.",
+            ))
+        opposite = [t for t in await self.db.active_trades(plan.base_asset) if t.plan.side is plan.side.opposite]
+        if opposite:
+            ids = ", ".join(f"#{t.id}" for t in opposite)
+            out.append(_issue(
+                "opposite_trade_open",
+                f"{plan.base_asset} için ters yönde açık işlem var ({ids}); tek yönlü (one-way) hesaplarda "
+                "iki pozisyon birbirini kapatır.",
+            ))
+        for mid in plan.source_message_ids:
+            t = await self.db.find_trade_by_message(chat_id, mid)
+            if t is not None and t.status not in (TradeStatus.FAILED, TradeStatus.CANCELLED):
+                out.append(_issue("message_already_traded", f"Bu mesajdan zaten işlem açılmış (#{t.id})."))
+                break
+        return out
+
+    async def _resolve_trade(
+        self, action: ParsedAction, chat_id: int, reply_to: StoredMessage | None
+    ) -> tuple[TradeRecord | None, list[TradeRecord], list[ValidationIssue]]:
+        """target_trade_id > refers_to message > replied-to message > the single active trade of the asset."""
+        active = await self.db.active_trades()
+        base, _quote, _type = asset_of(action)
+        extra: list[ValidationIssue] = []
+        trade: TradeRecord | None = None
+        if action.target_trade_id is not None:
+            trade = await self.db.get_trade(action.target_trade_id)
+        if trade is None and action.refers_to_message_id is not None:
+            trade = await self.db.find_trade_by_message(chat_id, action.refers_to_message_id)
+        if trade is None and reply_to is not None:
+            trade = await self.db.find_trade_by_message(chat_id, reply_to.message_id)
+        candidates = [t for t in active if base is None or t.plan.base_asset.upper() == base.upper()]
+        if trade is None:
+            by_side = [t for t in candidates if action.side is None or t.plan.side is action.side]
+            if base is not None and len(by_side) == 1:
+                trade = by_side[0]
+            elif base is None and len(active) == 1:
+                trade = active[0]
+                extra.append(_issue(
+                    "trade_guessed",
+                    f"Varlık belirtilmedi; tek açık işlem seçildi (#{trade.id} {trade.plan.base_asset}).",
+                ))
+            elif len(by_side) > 1:
+                candidates = by_side
+        if trade is not None:
+            if base is not None and trade.plan.base_asset.upper() != base.upper():
+                extra.append(_issue(
+                    "asset_mismatch",
+                    f"Talimattaki varlık ({base}) ile eşleşen işlemin varlığı ({trade.plan.base_asset}) farklı.",
+                ))
+            if action.side is not None and trade.plan.side is not action.side:
+                extra.append(_issue(
+                    "side_mismatch",
+                    f"Talimattaki yön ({action.side.value}) ile işlemin yönü ({trade.plan.side.value}) farklı.",
+                ))
+        return trade, candidates, extra
+
+    async def _evaluate_management(
+        self, action: ParsedAction, chat_id: int, reply_to: StoredMessage | None
+    ) -> Evaluation:
+        trade, candidates, extra = await self._resolve_trade(action, chat_id, reply_to)
+        market = None
+        if trade is not None:
+            market = await self._price(trade.plan.base_asset, trade.plan.quote_asset, trade.plan.market_type)
+        plan, issues = validator.build_management_plan(
+            action, trade=trade, candidates=candidates, market_price=market,
+            source_chat_id=chat_id, now=self._now(),
+        )
+        issues = merge_issues(extra, issues, validator.low_confidence_issues(action, self.config.llm))
+        return Evaluation("manage", action, plan, issues, market, trade)
+
+    # ------------------------------------------------------------------ open
+    async def _handle_open(self, action: ParsedAction, chat_id: int, *, reply_to: StoredMessage | None = None) -> None:
+        async with self._open_lock:
+            ev = await self._evaluate_open(action, chat_id)
+            summary = (ev.plan.summary_tr if isinstance(ev.plan, TradePlan) else "") or action.summary_tr or "?"
+            if await self._is_paused():
+                await self._notify(f"Duraklatıldı: sinyal atlandı ({esc(summary)})", Severity.INFO)
+                await self._log("open_skipped_paused", {"chat_id": chat_id, "action": action.model_dump(mode="json")})
+                return
+            limit = self.config.risk.max_open_trades
+            if guards.max_open_trades_reached(await self.db.active_trades(), limit):
+                await self._notify(
+                    f"Açık işlem sınırına ({limit}) ulaşıldı; sinyal atlandı ({esc(summary)}).", Severity.WARNING
+                )
+                await self._log("open_skipped_max_open", {"chat_id": chat_id, "summary": summary})
+                return
+            if not ev.automatic:
+                await self._ask_eval(ev, chat_id)
+                return
+            assert isinstance(ev.plan, TradePlan)
+            await self.execute_open(ev.plan, raw_symbol=action.symbol)
+
+    async def execute_open(self, plan: TradePlan, *, raw_symbol: str | None = None) -> str:
+        """Open ``plan`` on every broker that can trade it. Returns an HTML result text."""
+        trade = await self.db.create_trade(plan)
+        async with self.trade_lock(trade.id):
+            await self._log("open_start", {"trade_id": trade.id, "plan": plan.model_dump(mode="json")})
+            brokers = [b for b in self.brokers if b.accepts_asset(plan.base_asset)]
+            outcomes: list[BrokerOutcome] = list(
+                await asyncio.gather(*(self._open_on_broker(b, plan, trade, raw_symbol) for b in brokers))
+            ) if brokers else []
+            positions = [o.position for o in outcomes if o.position is not None]
+            status = rollup_status(positions)
+            notes = "; ".join(f"{o.broker}: {o.kind}" for o in outcomes if o.kind != "ok") or None
+            trade = await self.db.update_trade(trade.id, status=status, note=notes)
+
+        label = f"#{trade.id} {esc(plan.base_asset)} {plan.side.value.upper()}"
+        lines = [f"• {o.text}" for o in outcomes]
+        if not outcomes or all(o.kind == "unsupported" for o in outcomes):
+            head = f"⚠️ <b>{label}: hiçbir broker bu varlığı işlemiyor</b>; sinyal kopyalanamadı."
+            await self._notify(f"{head}\n{esc(plan.summary_tr)}", Severity.WARNING)
+        elif status is TradeStatus.FAILED:
+            head = f"🚨 <b>{label} hiçbir brokerda açılamadı</b>"
+            await self._notify(head + "\n" + "\n".join(lines), Severity.ERROR)
+        else:
+            word = "limit emri yerleştirildi" if status is TradeStatus.PENDING else "açıldı"
+            head = f"✅ <b>{label} {word}</b>"
+            if self.config.dry_run:
+                head += " <i>(dry-run: gerçek emir yok)</i>"
+            if self.config.notifier.notify_on_execution:
+                await self._notify(f"{head}\n{fmt.format_plan(plan)}\n\n" + "\n".join(lines), Severity.INFO)
+        await self._log("open_done", {
+            "trade_id": trade.id, "status": status.value,
+            "outcomes": [{"broker": o.broker, "kind": o.kind, "text": o.text} for o in outcomes],
+        })
+        return "\n".join([head, *lines])
+
+    async def _open_on_broker(
+        self, broker: Broker, plan: TradePlan, trade: TradeRecord, raw_symbol: str | None
+    ) -> BrokerOutcome:
+        name = broker.name
+        risk = self.config.risk
+        try:
+            sym = await broker.resolve_symbol(plan.base_asset, plan.quote_asset, plan.market_type, raw_symbol)
+            if sym is None:
+                return BrokerOutcome(name, "unsupported",
+                                     f"{esc(name)}: {esc(plan.base_asset)} bu hesapta işlem görmüyor")
+            equity = await broker.get_equity()
+            ccy = self._currency.get(name, "")
+            if risk.daily_loss_limit_pct > 0:
+                start = guards.start_of_day(self._now(), self.config.timezone)
+                realized = await self.db.realized_pnl_since(name, start)
+                if guards.daily_loss_exceeded(realized, equity, risk.daily_loss_limit_pct):
+                    text = (f"{esc(name)}: günlük zarar sınırı ({fmt.fmt_pct(risk.daily_loss_limit_pct)}) aşıldı "
+                            f"(bugün {_money(realized)} {esc(ccy)}); yeni işlem açılmadı")
+                    await self._notify(text, Severity.WARNING)
+                    return BrokerOutcome(name, "skipped", text)
+            if not (math.isfinite(equity) and equity > 0):
+                raise BrokerError(f"hesap değeri okunamadı veya sıfır ({equity})")
+            quote = await broker.get_quote(sym)
+            if not (quote.bid > 0 and quote.ask > 0):
+                raise BrokerError(f"geçersiz fiyat (alış {quote.bid}, satış {quote.ask})")
+            tp1 = plan.take_profits[0].price if plan.take_profits else None
+            if plan.entry_type is EntryType.MARKET:
+                problem = _price_problem(plan.side, quote, plan.stop_loss, tp1)
+                entry = quote.entry_price_for(plan.side)
+                drift = _distance_pct(entry, plan.entry_price) if plan.entry_price else 0.0
+                if problem is None and drift > risk.max_entry_distance_pct:
+                    problem = (f"anlık fiyat ({fmt_price(entry)}) sinyal girişinden ({fmt_price(plan.entry_price)}) "
+                               f"{fmt.fmt_pct(drift)} uzak")
+            else:
+                problem = _price_problem(plan.side, quote, plan.stop_loss, None)
+                entry = float(plan.entry_price or 0.0)
+            if problem:
+                text = f"{esc(name)}: {esc(problem)}; bu hesapta işlem açılmadı"
+                await self._notify(text, Severity.WARNING)
+                return BrokerOutcome(name, "skipped", text)
+
+            amount = sizing.risk_amount(equity, plan.risk_pct, float(getattr(broker.config, "risk_multiplier", 1.0)))
+            size = await broker.size_position(sym, plan.side, entry, plan.stop_loss, amount)
+            req = OpenRequest(
+                plan=plan,
+                symbol=sym,
+                quantity=size.quantity,
+                entry_type=plan.entry_type,
+                entry_price=plan.entry_price if plan.entry_type is EntryType.LIMIT else None,
+                stop_loss=plan.stop_loss,
+                take_profits=list(plan.take_profits),
+                leverage=size.leverage,
+                client_tag=f"ct{plan.plan_id}",
+            )
+            await self._log("order_send", {"trade_id": trade.id, "broker": name, "symbol": sym.broker_symbol,
+                                           "quantity": size.quantity, "risk_amount": size.risk_amount,
+                                           "entry_ref": entry, "leverage": size.leverage})
+            pos = await broker.open_position(req)
+            pos.risk_amount = size.risk_amount
+            await self.db.save_broker_position(trade.id, pos)
+            if pos.status is PositionStatus.FAILED:
+                text = f"{esc(name)}: <code>{esc(pos.error or 'işlem açılamadı')}</code>"
+                await self._notify(text, Severity.ERROR)
+                return BrokerOutcome(name, "error", text, pos)
+            fill = f", giriş ~{fmt_price(pos.avg_entry_price)}" if pos.avg_entry_price else ""
+            text = (f"{esc(name)}: {_qty(pos.quantity)} {esc(sym.broker_symbol)} "
+                    f"({_POS_STATUS_TR.get(pos.status, pos.status.value)}), risk {_money(size.risk_amount)} {esc(ccy)}"
+                    f"{fill}")
+            if size.warnings:
+                text += " ⚠️ " + esc("; ".join(size.warnings))
+            return BrokerOutcome(name, "ok", text, pos)
+        except BrokerError as exc:
+            text = f"{esc(name)}: <code>{esc(exc)}</code>"
+            await self._notify(text, Severity.ERROR)
+            return BrokerOutcome(name, "error", text)
+        except Exception as exc:
+            logger.exception("%s: unexpected error opening %s", name, plan.base_asset)
+            text = f"{esc(name)}: beklenmeyen hata <code>{esc(exc)}</code>"
+            await self._notify(text, Severity.ERROR)
+            return BrokerOutcome(name, "error", text)
+
+    # ------------------------------------------------------------------ management
+    async def _handle_management(
+        self, action: ParsedAction, chat_id: int, *, reply_to: StoredMessage | None = None
+    ) -> None:
+        ev = await self._evaluate_management(action, chat_id, reply_to)
+        if not ev.automatic:
+            await self._ask_eval(ev, chat_id)
+            return
+        assert isinstance(ev.plan, ManagementPlan)
+        await self.execute_management(ev.plan)
+
+    async def execute_management(self, plan: ManagementPlan, *, notify: bool = True) -> str:
+        """Apply ``plan`` to every active broker position of the trade. Returns an HTML result text."""
+        async with self.trade_lock(plan.trade_id):
+            trade = await self.db.get_trade(plan.trade_id)
+            if trade is None:
+                return f"#{plan.trade_id} işlemi bulunamadı."
+            if trade.status not in ACTIVE_TRADE:
+                return f"#{trade.id} işlemi aktif değil ({trade.status.value})."
+            positions = await self.db.broker_positions(trade.id)
+            active = [p for p in positions if p.status in ACTIVE_POSITION]
+            outcomes: list[BrokerOutcome] = list(
+                await asyncio.gather(*(self._manage_position(plan, trade, p) for p in active))
+            ) if active else []
+            changed = {o.position.broker: o.position for o in outcomes if o.position is not None}
+            merged = [changed.get(p.broker, p) for p in positions]
+            ok = any(o.kind == "ok" for o in outcomes)
+            update: dict[str, Any] = {}
+            if ok and plan.action is ActionType.MOVE_SL:
+                new_sl = plan.new_stop_loss if plan.new_stop_loss is not None else trade.plan.entry_price
+                if new_sl is not None:
+                    update["current_stop_loss"] = new_sl
+            if ok and plan.action is ActionType.MOVE_TP:
+                update["current_take_profits"] = list(plan.take_profits)
+            if merged:
+                status = rollup_status(merged)
+                if status is not trade.status:
+                    update["status"] = status
+            if update:
+                trade = await self.db.update_trade(trade.id, **update)
+
+        label = f"#{trade.id} {esc(trade.plan.base_asset)} {trade.plan.side.value.upper()}"
+        lines = [f"• {o.text}" for o in outcomes] or ["• Aktif broker pozisyonu yok."]
+        if not outcomes:
+            head = f"⚠️ {label}: uygulanacak pozisyon yok"
+        elif ok and all(o.kind != "error" for o in outcomes):
+            head = f"✅ {label}: {esc(plan.summary_tr or plan.action.value)}"
+        elif ok:
+            head = f"⚠️ {label}: kısmen uygulandı"
+        else:
+            head = f"🚨 {label}: uygulanamadı"
+        if notify and ok and self.config.notifier.notify_on_execution:
+            await self._notify(f"{head}\n{fmt.format_management(plan, trade)}\n\n" + "\n".join(lines), Severity.INFO)
+        await self._log("manage_done", {
+            "trade_id": trade.id, "action": plan.action.value, "plan": plan.model_dump(mode="json"),
+            "outcomes": [{"broker": o.broker, "kind": o.kind, "text": o.text} for o in outcomes],
+        })
+        return "\n".join([head, *lines])
+
+    async def _live_quote(self, broker: Broker, trade: TradeRecord) -> Quote | None:
+        try:
+            sym = await broker.resolve_symbol(trade.plan.base_asset, trade.plan.quote_asset, trade.plan.market_type)
+            return await broker.get_quote(sym) if sym is not None else None
+        except Exception as exc:
+            logger.debug("%s: no live quote for %s: %s", broker.name, trade.plan.base_asset, exc)
+            return None
+
+    async def _manage_position(self, plan: ManagementPlan, trade: TradeRecord, pos: BrokerPosition) -> BrokerOutcome:
+        name = pos.broker
+        broker = self._broker(name)
+        if broker is None:
+            text = f"{esc(name)}: broker bağlı değil; değişiklik uygulanamadı"
+            await self._notify(text, Severity.ERROR)
+            return BrokerOutcome(name, "error", text)
+        try:
+            new: BrokerPosition
+            if plan.action is ActionType.MOVE_SL:
+                if plan.move_sl_to_entry:
+                    if pos.status is PositionStatus.PENDING:
+                        return BrokerOutcome(name, "skipped", f"{esc(name)}: giriş henüz dolmadı; stop değiştirilmedi")
+                    sl = pos.avg_entry_price or plan.new_stop_loss
+                else:
+                    sl = plan.new_stop_loss
+                if sl is None:
+                    raise BrokerError("yeni stop seviyesi bilinmiyor")
+                if pos.status is PositionStatus.OPEN:
+                    q = await self._live_quote(broker, trade)
+                    long = pos.side is Side.LONG
+                    if q is not None and ((long and sl >= q.bid) or (not long and sl <= q.ask)):
+                        raise BrokerError(
+                            f"yeni stop ({fmt_price(sl)}) anlık fiyatın ({fmt_price(q.bid if long else q.ask)}) "
+                            "yanlış tarafında; stop taşınmadı"
+                        )
+                new = await broker.update_stop_loss(pos, sl)
+                text = f"{esc(name)}: stop {fmt_price(sl)}"
+            elif plan.action is ActionType.MOVE_TP:
+                new = await broker.update_take_profits(pos, list(plan.take_profits))
+                text = f"{esc(name)}: TP " + " / ".join(fmt_price(tp.price) for tp in plan.take_profits)
+            elif plan.action is ActionType.CLOSE:
+                frac = plan.close_fraction if plan.close_fraction is not None else 1.0
+                if pos.status is PositionStatus.PENDING:
+                    if frac < 0.999:
+                        return BrokerOutcome(name, "skipped", f"{esc(name)}: giriş dolmadı; kısmi kapatma yapılmadı")
+                    new = await broker.cancel_entry(pos)
+                    text = f"{esc(name)}: bekleyen giriş iptal edildi"
+                else:
+                    # Signal fraction is of what is still open; the adapter wants a fraction of the filled size.
+                    broker_frac = 1.0
+                    if frac < 0.999 and pos.filled_quantity > 0 and pos.remaining_quantity > 0:
+                        broker_frac = min(1.0, frac * pos.remaining_quantity / pos.filled_quantity)
+                    elif frac < 0.999:
+                        broker_frac = frac
+                    new = await broker.close_position(pos, broker_frac)
+                    text = f"{esc(name)}: {'tamamı' if frac >= 0.999 else fmt.fmt_pct(frac * 100)} kapatıldı"
+            else:  # CANCEL
+                if pos.status is PositionStatus.PENDING:
+                    new = await broker.cancel_entry(pos)
+                    text = f"{esc(name)}: bekleyen giriş iptal edildi"
+                else:
+                    new = await broker.close_position(pos, 1.0)
+                    text = f"{esc(name)}: pozisyon kapatıldı"
+            await self.db.save_broker_position(trade.id, new)
+            if new.realized_pnl is not None and new.status not in ACTIVE_POSITION:
+                text += f" (K/Z {new.realized_pnl:+.2f})"
+            return BrokerOutcome(name, "ok", text, new)
+        except BrokerError as exc:
+            text = f"{esc(name)}: <code>{esc(exc)}</code>"
+            await self._notify(f"#{trade.id} {text}", Severity.ERROR)
+            return BrokerOutcome(name, "error", text)
+        except Exception as exc:
+            logger.exception("%s: unexpected error managing trade %s", name, trade.id)
+            text = f"{esc(name)}: beklenmeyen hata <code>{esc(exc)}</code>"
+            await self._notify(f"#{trade.id} {text}", Severity.ERROR)
+            return BrokerOutcome(name, "error", text)
+
+    # ------------------------------------------------------------------ confirmations
+    async def _new_conf_id(self) -> str:
+        while True:
+            conf_id = secrets.token_hex(3)
+            if conf_id not in self._conf_locks and await self.db.get_confirmation(conf_id) is None:
+                return conf_id
+
+    async def _ask_eval(self, ev: Evaluation, chat_id: int, *, conf_id: str | None = None) -> PendingConfirmation:
+        return await self._ask(ev.kind, ev.action, ev.plan, ev.issues, ev.market_price, chat_id,
+                               ev.action.used_message_ids, conf_id=conf_id)
+
+    async def _ask(
+        self,
+        kind: ConfKind,
+        action: ParsedAction,
+        plan: TradePlan | ManagementPlan | None,
+        issues: list[ValidationIssue],
+        market_price: float | None,
+        chat_id: int,
+        source_ids: list[int],
+        *,
+        conf_id: str | None = None,
+    ) -> PendingConfirmation:
+        now = self._now()
+        conf_id = conf_id or await self._new_conf_id()
+        conf = PendingConfirmation(
+            id=conf_id, kind=kind, action=action, plan=plan, issues=list(issues), market_price=market_price,
+            source_chat_id=chat_id, source_message_ids=list(source_ids), created_at=now,
+            expires_at=now + timedelta(seconds=self.config.notifier.confirm_timeout_sec),
+        )
+        async with self._conf_lock(conf_id):   # a very fast tap waits until the message id is stored
+            await self.db.save_confirmation(conf)
+            try:
+                msg_id = await self.notifier.ask_confirmation(conf)
+            except Exception:
+                logger.exception("ask_confirmation failed for %s", conf_id)
+                msg_id = None
+            if msg_id is None:
+                logger.error("Confirmation %s could not be delivered to the owner", conf_id)
+            conf.bot_message_id = msg_id
+            await self.db.save_confirmation(conf)
+        self._arm_expiry(conf)
+        await self._log("confirmation_asked", {
+            "id": conf_id, "kind": kind, "chat_id": chat_id, "message_ids": list(source_ids),
+            "issues": [i.code for i in issues], "has_plan": plan is not None,
+        })
+        logger.info("Asked owner (%s %s): %s", kind, conf_id, [i.code for i in issues])
+        return conf
+
+    def _arm_expiry(self, conf: PendingConfirmation) -> None:
+        self._disarm_expiry(conf.id)
+        task = self._spawn(self._expire_later(conf.id, utc(conf.expires_at)), f"expire-{conf.id}")
+        self._expiry_tasks[conf.id] = task
+
+    def _disarm_expiry(self, conf_id: str) -> None:
+        task = self._expiry_tasks.pop(conf_id, None)
+        if task is not None and task is not asyncio.current_task():
+            task.cancel()
+
+    async def _expire_later(self, conf_id: str, at: datetime) -> None:
+        await asyncio.sleep(max(0.0, (at - self._now()).total_seconds()))
+        if self._expiry_tasks.get(conf_id) is asyncio.current_task():
+            del self._expiry_tasks[conf_id]
+        await self._expire(conf_id)
+
+    async def _expire(self, conf_id: str) -> None:
+        async with self._conf_lock(conf_id):
+            conf = await self.db.get_confirmation(conf_id)
+            if conf is None or conf.status is not ConfirmationStatus.PENDING:
+                return
+            if utc(conf.expires_at) > self._now() + timedelta(seconds=0.5):
+                self._arm_expiry(conf)     # extended meanwhile (correction requested)
+                return
+            conf.status = ConfirmationStatus.EXPIRED
+            conf.awaiting_correction = False
+            await self.db.save_confirmation(conf)
+            text = ("⌛ Süre doldu, değişiklik uygulanmadı." if conf.kind == "manage"
+                    else "⌛ Süre doldu, işlem açılmadı.")
+            try:
+                await self.notifier.close_confirmation(conf, text)
+            except Exception:
+                logger.exception("close_confirmation failed for %s", conf_id)
+            await self._log("confirmation_expired", {"id": conf_id})
+
+    async def _finish(self, conf: PendingConfirmation, status: ConfirmationStatus, text: str) -> None:
+        conf.status = status
+        conf.awaiting_correction = False
+        await self.db.save_confirmation(conf)
+        self._disarm_expiry(conf.id)
+        try:
+            await self.notifier.close_confirmation(conf, text)
+        except Exception:
+            logger.exception("close_confirmation failed for %s", conf.id)
+        await self._log("confirmation_" + status.value, {"id": conf.id, "result": text})
+
+    async def handle_confirmation(self, conf_id: str, approved: bool) -> str:
+        async with self._conf_lock(conf_id):
+            conf = await self.db.get_confirmation(conf_id)
+            if conf is None:
+                return "Bu onay bulunamadı."
+            if conf.status is not ConfirmationStatus.PENDING:
+                return f"Bu onay artık geçerli değil ({_CONF_STATUS_TR.get(conf.status, conf.status.value)})."
+            if utc(conf.expires_at) <= self._now():
+                text = "⌛ Bu onayın süresi dolmuş; işlem yapılmadı."
+                await self._finish(conf, ConfirmationStatus.EXPIRED, text)
+                return text
+            if not approved:
+                text = "❌ İptal edildi; işlem yapılmadı."
+                await self._finish(conf, ConfirmationStatus.REJECTED, text)
+                return text
+            if conf.plan is None:
+                return "Önce düzeltme gerekli: ✏️ Düzelt'e basıp doğrusunu yazın."
+            if isinstance(conf.plan, TradePlan):
+                return await self._approve_open(conf, conf.plan)
+            return await self._approve_management(conf, conf.plan)
+
+    async def _approve_open(self, conf: PendingConfirmation, plan: TradePlan) -> str:
+        if await self._is_paused():
+            text = "⏸ Sistem duraklatılmış; işlem açılmadı. (/devam yazıp sinyali tekrar değerlendirin.)"
+            await self._finish(conf, ConfirmationStatus.REJECTED, text)
+            return text
+        async with self._open_lock:
+            limit = self.config.risk.max_open_trades
+            if guards.max_open_trades_reached(await self.db.active_trades(), limit):
+                text = f"⛔ Açık işlem sınırına ({limit}) ulaşıldı; işlem açılmadı."
+                await self._finish(conf, ConfirmationStatus.REJECTED, text)
+                return text
+            problem = await self._approval_price_problem(plan, conf.action.symbol)
+            if problem:
+                text = f"⛔ {esc(problem)} — işlem açılmadı."
+                await self._finish(conf, ConfirmationStatus.REJECTED, text)
+                return text
+            # Mark first: a crash during execution must never leave it approvable again.
+            conf.status = ConfirmationStatus.APPROVED
+            conf.awaiting_correction = False
+            await self.db.save_confirmation(conf)
+            self._disarm_expiry(conf.id)
+            try:
+                result = await self.execute_open(plan, raw_symbol=conf.action.symbol)
+            except Exception as exc:
+                logger.exception("execute_open failed for confirmation %s", conf.id)
+                result = f"🚨 İşlem açılırken hata: <code>{esc(exc)}</code>"
+        await self._finish(conf, ConfirmationStatus.APPROVED, result)
+        return result
+
+    async def _approval_price_problem(self, plan: TradePlan, raw_symbol: str | None) -> str | None:
+        price = await self._price(plan.base_asset, plan.quote_asset, plan.market_type, raw_symbol, fresh=True)
+        if price is None:
+            return None      # each broker re-checks its own live quote before ordering
+        q = Quote(bid=price, ask=price, last=price)
+        tp1 = plan.take_profits[0].price if plan.take_profits else None
+        problem = _price_problem(plan.side, q, plan.stop_loss, tp1)
+        return problem[0].upper() + problem[1:] if problem else None
+
+    async def _approve_management(self, conf: PendingConfirmation, plan: ManagementPlan) -> str:
+        trade = await self.db.get_trade(plan.trade_id)
+        if trade is None or trade.status not in ACTIVE_TRADE:
+            text = f"⛔ #{plan.trade_id} işlemi artık aktif değil; değişiklik uygulanmadı."
+            await self._finish(conf, ConfirmationStatus.REJECTED, text)
+            return text
+        conf.status = ConfirmationStatus.APPROVED
+        await self.db.save_confirmation(conf)
+        self._disarm_expiry(conf.id)
+        try:
+            result = await self.execute_management(plan)
+        except Exception as exc:
+            logger.exception("execute_management failed for confirmation %s", conf.id)
+            result = f"🚨 Uygulanırken hata: <code>{esc(exc)}</code>"
+        await self._finish(conf, ConfirmationStatus.APPROVED, result)
+        return result
+
+    async def request_correction(self, conf_id: str) -> str:
+        # Only one confirmation waits for a correction text at a time.
+        for other in await self.db.pending_confirmations():
+            if other.awaiting_correction and other.id != conf_id:
+                async with self._conf_lock(other.id):
+                    fresh = await self.db.get_confirmation(other.id)
+                    if fresh is not None and fresh.awaiting_correction:
+                        fresh.awaiting_correction = False
+                        await self.db.save_confirmation(fresh)
+        async with self._conf_lock(conf_id):
+            conf = await self.db.get_confirmation(conf_id)
+            if conf is None or conf.status is not ConfirmationStatus.PENDING:
+                return "Bu onay artık geçerli değil."
+            conf.awaiting_correction = True
+            # Give the owner time to type.
+            min_expiry = self._now() + timedelta(seconds=self.config.notifier.confirm_timeout_sec)
+            if utc(conf.expires_at) < min_expiry:
+                conf.expires_at = min_expiry
+                self._arm_expiry(conf)
+            await self.db.save_confirmation(conf)
+        return f"✏️ Onay #{esc(conf_id)} için düzeltmenizi bekliyorum."
+
+    async def awaiting_correction_id(self) -> str | None:
+        found = [c for c in await self.db.pending_confirmations() if c.awaiting_correction]
+        return found[-1].id if found else None
+
+    async def handle_correction(self, conf_id: str, correction_text: str) -> str:
+        text = (correction_text or "").strip()
+        if not text:
+            return "Düzeltme metni boş."
+        async with self._conf_lock(conf_id):
+            conf = await self.db.get_confirmation(conf_id)
+            if conf is None or conf.status is not ConfirmationStatus.PENDING:
+                status = _CONF_STATUS_TR.get(conf.status, conf.status.value) if conf else "bulunamadı"
+                return f"Bu onay artık geçerli değil ({status})."
+            msgs = await self._source_messages(conf)
+            reply_to = await self._reply_context(conf.source_chat_id, msgs)
+            ctx = ParseContext(now=self._now(), open_trades=await self._open_trade_summaries(), reply_to=reply_to,
+                               correction_text=text, previous_action=conf.action)
+            try:
+                result = await self.parser.parse(msgs, ctx)
+            except Exception as exc:
+                logger.warning("Correction parse failed: %s", exc)
+                return f"⚠️ Düzeltme okunamadı ({esc(exc)}). Lütfen tekrar yazın."
+            actions = [a for a in result.actions if a.action is not ActionType.NONE]
+            if not actions:
+                out = "❌ Düzeltmeye göre işlem talimatı yok; işlem yapılmadı."
+                await self._finish(conf, ConfirmationStatus.REJECTED, out)
+                return out
+            action = actions[0]
+            if not action.used_message_ids:
+                action = action.model_copy(update={"used_message_ids": list(conf.source_message_ids)})
+            ev = await self.evaluate(action, conf.source_chat_id, reply_to=reply_to)
+            assert ev is not None
+            if len(actions) > 1:
+                ev.issues.append(_issue("multiple_actions",
+                                        "Düzeltmede birden fazla talimat var; yalnızca ilki gösteriliyor."))
+            new_id = await self._new_conf_id()
+            await self._finish(conf, ConfirmationStatus.SUPERSEDED, f"♻️ Düzeltildi → yeni onay #{new_id}")
+        new = await self._ask_eval(ev, conf.source_chat_id, conf_id=new_id)
+        if new.plan is None:
+            return f"♻️ Düzeltme işlendi ama hâlâ eksik bilgi var (onay #{new.id}). ✏️ Düzelt ile tekrar yazın."
+        return f"♻️ Düzeltme işlendi; yeni onay gönderildi (#{new.id}). Doğruysa ✅ Onayla'ya basın."
+
+    async def _source_messages(self, conf: PendingConfirmation) -> list[StoredMessage]:
+        msgs = await self._load_messages(conf.source_chat_id, conf.source_message_ids)
+        if not msgs:   # deleted / never stored: give the parser what we understood
+            msgs = [StoredMessage(chat_id=conf.source_chat_id, message_id=0, date=utc(conf.created_at),
+                                  text=conf.action.summary_tr or "", consumed=True)]
+        return msgs
+
+    # ------------------------------------------------------------------ edits
+    async def on_message_edited(self, msg: StoredMessage) -> None:
+        try:
+            trade = await self.db.find_trade_by_message(msg.chat_id, msg.message_id)
+            if trade is not None:
+                if trade.status in ACTIVE_TRADE:
+                    await self._edited_trade_signal(trade, msg)
+                return
+            for conf in await self.db.pending_confirmations():
+                if conf.source_chat_id == msg.chat_id and msg.message_id in conf.source_message_ids:
+                    await self._edited_confirmation(conf.id)
+                    return
+            fresh = await self.db.get_message(msg.chat_id, msg.message_id)
+            if fresh is not None and not fresh.consumed:
+                await self.on_messages_ready(msg.chat_id, msg.sender_id)
+        except Exception as exc:
+            logger.exception("on_message_edited failed for %s/%s", msg.chat_id, msg.message_id)
+            await self._notify(f"Düzenlenen mesaj işlenemedi: <code>{esc(exc)}</code>", Severity.ERROR)
+
+    async def _edited_trade_signal(self, trade: TradeRecord, msg: StoredMessage) -> None:
+        """Never auto-apply edits: build MOVE_SL / MOVE_TP proposals and ask."""
+        chat_id = trade.plan.source_chat_id
+        msgs = await self._load_messages(chat_id, trade.plan.source_message_ids)
+        if all(m.message_id != msg.message_id for m in msgs):
+            msgs.append(msg)
+        reply_to = await self._reply_context(chat_id, msgs)
+        ctx = ParseContext(now=self._now(), open_trades=await self._open_trade_summaries(), reply_to=reply_to)
+        try:
+            result = await self.parser.parse(msgs, ctx)
+        except Exception as exc:
+            await self._notify(f"#{trade.id} sinyal mesajı düzenlendi ama okunamadı: {esc(exc)}. Elle kontrol edin.",
+                               Severity.WARNING)
+            return
+        new_sl: float | None = None
+        new_tps: list[TakeProfit] | None = None
+        confidence = 1.0
+        for a in result.actions:
+            if a.action in (ActionType.OPEN, ActionType.INCOMPLETE):
+                base, _q, _t = asset_of(a)
+                if (a.side is not None and a.side is not trade.plan.side) or (base and base != trade.plan.base_asset):
+                    await self._notify(
+                        f"#{trade.id} sinyal mesajı düzenlendi: varlık/yön değişmiş görünüyor "
+                        f"({esc(a.summary_tr)}). Açık işleme otomatik uygulanamaz; elle kontrol edin.",
+                        Severity.WARNING,
+                    )
+                    continue
+                if a.stop_loss is not None:
+                    new_sl = a.stop_loss
+                if a.take_profits:
+                    new_tps = list(a.take_profits)
+                confidence = min(confidence, a.confidence)
+            elif a.action is ActionType.MOVE_SL and a.target_trade_id in (None, trade.id):
+                new_sl = a.new_stop_loss if not a.move_sl_to_entry else trade.plan.entry_price
+                confidence = min(confidence, a.confidence)
+            elif a.action is ActionType.MOVE_TP and a.target_trade_id in (None, trade.id) and a.take_profits:
+                new_tps = list(a.take_profits)
+                confidence = min(confidence, a.confidence)
+
+        edited = _issue("signal_edited", "Sinyal mesajı düzenlendi.")
+        proposals: list[ParsedAction] = []
+        common = dict(base_asset=trade.plan.base_asset, side=trade.plan.side, target_trade_id=trade.id,
+                      refers_to_message_id=msg.message_id, used_message_ids=[msg.message_id], confidence=confidence)
+        if new_sl is not None and not _same_price(new_sl, trade.current_stop_loss):
+            proposals.append(ParsedAction(
+                action=ActionType.MOVE_SL, new_stop_loss=new_sl,
+                summary_tr=f"Sinyal düzenlendi: {trade.plan.base_asset} stop {fmt_price(trade.current_stop_loss)} → "
+                           f"{fmt_price(new_sl)}",
+                **common,
+            ))
+        old_prices = sorted({tp.price for tp in trade.current_take_profits})
+        if new_tps is not None and sorted({tp.price for tp in new_tps}) != old_prices:
+            proposals.append(ParsedAction(
+                action=ActionType.MOVE_TP, take_profits=new_tps,
+                summary_tr=f"Sinyal düzenlendi: {trade.plan.base_asset} hedefler → "
+                           + " / ".join(fmt_price(tp.price) for tp in new_tps),
+                **common,
+            ))
+        if not proposals:
+            logger.info("Edit of %s/%s does not change trade #%s levels", msg.chat_id, msg.message_id, trade.id)
+            return
+        for action in proposals:
+            ev = await self._evaluate_management(action, chat_id, None)
+            ev.issues = merge_issues([edited], ev.issues)
+            await self._ask_eval(ev, chat_id)
+
+    async def _edited_confirmation(self, conf_id: str) -> None:
+        async with self._conf_lock(conf_id):
+            conf = await self.db.get_confirmation(conf_id)
+            if conf is None or conf.status is not ConfirmationStatus.PENDING:
+                return
+            msgs = await self._source_messages(conf)
+            reply_to = await self._reply_context(conf.source_chat_id, msgs)
+            ctx = ParseContext(now=self._now(), open_trades=await self._open_trade_summaries(), reply_to=reply_to)
+            try:
+                result = await self.parser.parse(msgs, ctx)
+            except Exception as exc:
+                await self._notify(f"Onay #{esc(conf_id)}: kaynak mesaj düzenlendi ama okunamadı ({esc(exc)}).",
+                                   Severity.WARNING)
+                return
+            actions = [a for a in result.actions if a.action is not ActionType.NONE]
+            if not actions:
+                await self._finish(conf, ConfirmationStatus.SUPERSEDED,
+                                   "♻️ Mesaj düzenlendi; artık işlem talimatı görünmüyor — işlem yapılmadı.")
+                return
+            action = actions[0]
+            if not action.used_message_ids:
+                action = action.model_copy(update={"used_message_ids": list(conf.source_message_ids)})
+            ev = await self.evaluate(action, conf.source_chat_id, reply_to=reply_to)
+            assert ev is not None
+            ev.issues = merge_issues([_issue("signal_edited", "Sinyal mesajı düzenlendi.")], ev.issues)
+            new_id = await self._new_conf_id()
+            await self._finish(conf, ConfirmationStatus.SUPERSEDED, f"♻️ Mesaj düzenlendi → yeni onay #{new_id}")
+        await self._ask_eval(ev, conf.source_chat_id, conf_id=new_id)
+
+    # ------------------------------------------------------------------ owner commands
+    async def status_text(self) -> str:
+        trades = await self.db.active_trades()
+        pending = await self.db.pending_confirmations()
+        mode = "🧪 DRY-RUN (gerçek emir gönderilmez)" if self.config.dry_run else "🔴 CANLI"
+        paused = await self._is_paused()
+        lines = [
+            "📊 <b>Durum</b>",
+            f"Mod: {mode}",
+            "Yeni işlemler: " + ("⏸ duraklatıldı" if paused else "▶️ kopyalanıyor"),
+        ]
+        broker_bits = [f"✅ {esc(b.name)}" for b in self.brokers]
+        broker_bits += [f"❌ {esc(n)}" for n in self.failed_brokers]
+        lines.append("Brokerlar: " + (", ".join(broker_bits) or "yok"))
+        n_open = sum(1 for t in trades if t.status is TradeStatus.OPEN)
+        n_pending = sum(1 for t in trades if t.status is TradeStatus.PENDING)
+        lines.append(f"Aktif işlem: {len(trades)} (açık {n_open}, bekleyen emir {n_pending})")
+        lines.append(f"Bekleyen onay: {len(pending)}")
+        lines.append(f"Risk: 1R = bakiyenin {fmt.fmt_pct(self.config.risk.risk_per_r_pct, possessive=True)}")
+        return "\n".join(lines)
+
+    async def positions_text(self) -> str:
+        trades = await self.db.active_trades()
+        if not trades:
+            return "📂 Açık işlem yok."
+        lines = [f"📂 <b>Açık işlemler</b> ({len(trades)})"]
+        for t in trades:
+            lines.append("")
+            lines.append(fmt.format_trade_line(t))
+            tps = " / ".join(fmt_price(tp.price) for tp in t.current_take_profits) or "yok"
+            price = await self._price(t.plan.base_asset, t.plan.quote_asset, t.plan.market_type)
+            lines.append(f"🎯 TP: {tps}" + (f" · 💹 anlık {fmt_price(price)}" if price else ""))
+            for p in await self.db.broker_positions(t.id):
+                bits = [f"• {esc(p.broker)}: {_POS_STATUS_TR.get(p.status, p.status.value)}",
+                        f"{_qty(p.remaining_quantity if p.status is PositionStatus.OPEN else p.quantity)}"]
+                if p.avg_entry_price:
+                    bits.append(f"giriş {fmt_price(p.avg_entry_price)}")
+                if p.stop_loss is not None:
+                    bits.append(f"stop {fmt_price(p.stop_loss)}")
+                cs = p.data.get("contract_size")
+                if (price and p.avg_entry_price and p.status is PositionStatus.OPEN
+                        and isinstance(cs, (int, float)) and cs > 0):
+                    direction = 1.0 if p.side is Side.LONG else -1.0
+                    upnl = (price - p.avg_entry_price) * p.remaining_quantity * float(cs) * direction
+                    bits.append(f"~K/Z {upnl:+.2f}")
+                if p.dry_run:
+                    bits.append("dry-run")
+                lines.append(" · ".join(bits))
+        return "\n".join(lines)
+
+    async def balances_text(self) -> str:
+        lines = ["💰 <b>Bakiyeler</b>"]
+
+        async def one(b: Broker) -> str:
+            try:
+                equity = await asyncio.wait_for(b.get_equity(), READ_TIMEOUT_SEC)
+                free = await asyncio.wait_for(b.get_free_margin(), READ_TIMEOUT_SEC)
+                ccy = self._currency.get(b.name) or await asyncio.wait_for(b.account_currency(), READ_TIMEOUT_SEC)
+                tag = " <i>(dry-run)</i>" if b.kind.startswith("dry-run") else ""
+                return f"• {esc(b.name)}: {_money(equity)} {esc(ccy)} (serbest {_money(free)}){tag}"
+            except Exception as exc:
+                return f"• {esc(b.name)}: okunamadı <code>{esc(exc) or type(exc).__name__}</code>"
+
+        lines += await asyncio.gather(*(one(b) for b in self.brokers))
+        lines += [f"• {esc(n)}: ❌ bağlı değil" for n in self.failed_brokers]
+        if len(lines) == 1:
+            lines.append("Bağlı broker yok.")
+        return "\n".join(lines)
+
+    async def set_paused(self, paused: bool) -> str:
+        await self.db.set_state("paused", bool(paused))
+        await self._log("paused" if paused else "resumed", {})
+        if paused:
+            return "⏸ Yeni işlem açma durduruldu. Açık işlemler yönetilmeye devam eder."
+        return "▶️ Yeni sinyaller tekrar kopyalanacak."
+
+    async def close_all(self) -> str:
+        trades = await self.db.active_trades()
+        if not trades:
+            return "Kapatılacak açık işlem yok."
+        lines = ["🔒 <b>Tüm işlemler kapatılıyor</b>"]
+        now = self._now()
+        for t in trades:
+            plan = ManagementPlan(
+                plan_id=uuid.uuid4().hex[:10], action=ActionType.CLOSE, trade_id=t.id, close_fraction=1.0,
+                source_chat_id=t.plan.source_chat_id, summary_tr="tamamı kapatıldı", created_at=now,
+            )
+            try:
+                lines.append(await self.execute_management(plan, notify=False))
+            except Exception as exc:
+                logger.exception("close_all: trade %s", t.id)
+                lines.append(f"🚨 #{t.id}: <code>{esc(exc)}</code>")
+        await self._log("close_all", {"trades": [t.id for t in trades]})
+        return "\n".join(lines)
+
+    async def test_parse(self, text: str) -> str:
+        now = self._now()
+        msg = StoredMessage(chat_id=0, message_id=0, sender_id=None, date=now, text=text)
+        ctx = ParseContext(now=now, open_trades=await self._open_trade_summaries())
+        try:
+            result = await self.parser.parse([msg], ctx)
+        except Exception as exc:
+            return f"⚠️ Okunamadı: {esc(exc)}"
+        return await self.describe_actions(result.actions, chat_id=0)
+
+    async def describe_actions(self, actions: list[ParsedAction], *, chat_id: int) -> str:
+        """Owner-facing explanation of what would happen (no side effects)."""
+        parts = ["🧪 <b>Deneme — işlem açılmaz</b>"]
+        if not actions:
+            parts.append("Hiçbir talimat çıkmadı.")
+        for action in actions:
+            parts.append("")
+            parts.append(fmt.format_action(action))
+            if action.action is ActionType.NONE:
+                unsure = self._none_is_unsure(action)
+                parts.append("🤔 Emin olunamadığı için size sorulurdu." if unsure else "💬 Yok sayılırdı.")
+                continue
+            ev = await self.evaluate(action, chat_id)
+            assert ev is not None
+            if isinstance(ev.plan, TradePlan):
+                parts += ["", fmt.format_plan(ev.plan)]
+            elif isinstance(ev.plan, ManagementPlan):
+                parts += ["", fmt.format_management(ev.plan, ev.trade)]
+            if ev.market_price is not None:
+                parts.append(f"💹 Güncel fiyat: {fmt_price(ev.market_price)}")
+            parts += fmt.format_issues(ev.issues)
+            if ev.kind == "incomplete":
+                parts.append("🧩 Devamı beklenirdi; gelmezse size sorulurdu.")
+            elif ev.plan is None:
+                parts.append("⛔ Bu haliyle uygulanamaz; size düzeltme sorulurdu.")
+            elif ev.issues:
+                parts.append("🤔 Size onay sorulurdu.")
+            else:
+                parts.append("✅ Otomatik uygulanırdı.")
+        if await self._is_paused():
+            parts.append("\n⏸ Not: yeni işlem açma şu an duraklatılmış.")
+        return "\n".join(parts)
+
+    async def preview_open(self, plan: TradePlan, *, raw_symbol: str | None = None) -> list[str]:
+        """Per-broker sizing preview for a plan (read-only: never places orders). Plain text lines."""
+        lines: list[str] = []
+        for b in self.brokers:
+            try:
+                if not b.accepts_asset(plan.base_asset):
+                    lines.append(f"{b.name}: bu varlığa izin verilmiyor (allowed_assets)")
+                    continue
+                sym = await b.resolve_symbol(plan.base_asset, plan.quote_asset, plan.market_type, raw_symbol)
+                if sym is None:
+                    lines.append(f"{b.name}: {plan.base_asset} bu hesapta yok")
+                    continue
+                equity = await b.get_equity()
+                ccy = self._currency.get(b.name) or await b.account_currency()
+                quote = await b.get_quote(sym)
+                entry = quote.entry_price_for(plan.side) if plan.entry_type is EntryType.MARKET else plan.entry_price
+                amount = sizing.risk_amount(equity, plan.risk_pct, float(getattr(b.config, "risk_multiplier", 1.0)))
+                size = await b.size_position(sym, plan.side, float(entry or 0.0), plan.stop_loss, amount)
+                lev = f", kaldıraç {fmt.fmt_number(size.leverage)}x" if size.leverage else ""
+                lines.append(
+                    f"{b.name}: {sym.broker_symbol} miktar {_qty(size.quantity)}, risk {_money(amount)} {ccy} "
+                    f"(stopta ~{_money(size.est_loss_at_sl)}), büyüklük {_money(size.notional)}{lev}, "
+                    f"bakiye {_money(equity)} {ccy}"
+                    + (" ⚠️ " + "; ".join(size.warnings) if size.warnings else "")
+                )
+            except Exception as exc:
+                lines.append(f"{b.name}: {exc}")
+        return lines
+
+
+__all__ = ["Engine", "Evaluation", "BrokerOutcome", "asset_of", "merge_issues", "is_transient_parse_error"]
