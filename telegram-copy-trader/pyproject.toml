@@ -1,0 +1,34 @@
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "telegram-copy-trader"
+version = "0.1.0"
+description = "Copies trades posted in a Telegram group to your crypto exchanges and MT5 brokers, sized at a fixed % risk per R."
+requires-python = ">=3.11"
+dependencies = [
+  "telethon>=1.40",
+  "anthropic>=2.6",
+  "ccxt>=4.5",
+  "pydantic>=2.7",
+  "pyyaml>=6",
+  "aiosqlite>=0.20",
+  "tzdata",
+]
+
+[project.optional-dependencies]
+metaapi = ["metaapi-cloud-sdk>=29"]
+mt5 = ["MetaTrader5>=5.0.45; platform_system == 'Windows'"]
+fast = ["cryptg"]
+dev = ["pytest>=8", "pytest-asyncio>=0.23"]
+
+[project.scripts]
+copytrader = "copytrader.__main__:main"
+
+[tool.setuptools.packages.find]
+include = ["copytrader*"]
+
+[tool.pytest.ini_options]
+asyncio_mode = "auto"
+testpaths = ["tests"]

@@ -1,0 +1,11 @@
+telethon>=1.40
+anthropic>=2.6
+ccxt>=4.5
+pydantic>=2.7
+pyyaml>=6
+aiosqlite>=0.20
+tzdata
+# optional:
+# metaapi-cloud-sdk>=29   # MT4/MT5 through metaapi.cloud (Linux friendly)
+# MetaTrader5>=5.0.45     # native MT5 terminal, Windows only
+# cryptg                  # faster Telegram media downloads
