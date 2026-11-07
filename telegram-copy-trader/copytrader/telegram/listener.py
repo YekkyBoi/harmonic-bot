@@ -626,6 +626,26 @@ async def _ask(prompt: str, secret: bool = False) -> str:
     return (await asyncio.to_thread(reader, prompt)).strip()
 
 
+# Countries whose national numbers start with a trunk "0" that must be dropped after the
+# country code (+44 07765... -> +447765...). Italy (+39) is deliberately absent: its 0 stays.
+_TRUNK_ZERO_CODES = ("44", "90", "49", "33", "31", "32", "41", "43", "61", "64", "81", "82",
+                     "86", "91", "92", "353", "380")
+
+
+def normalize_phone(raw: str) -> str:
+    """'+44 0776 564-3200' / '0044...' -> '+447765643200'. Leaves anything unrecognised as typed."""
+    s = re.sub(r"[\s\-().]", "", raw.strip())
+    if s.startswith("00"):
+        s = "+" + s[2:]
+    if not s.startswith("+"):
+        return s
+    digits = s[1:]
+    for cc in sorted(_TRUNK_ZERO_CODES, key=len, reverse=True):
+        if digits.startswith(cc + "0") and len(digits) > len(cc) + 6:
+            return "+" + cc + digits[len(cc) + 1:]
+    return s
+
+
 def _code_channel_tr(sent_type: Any) -> str:
     """Where Telegram says it sent the login code (Turkish, for the owner)."""
     name = type(sent_type).__name__
@@ -648,9 +668,13 @@ async def interactive_login(config: TelegramConfig) -> str:
     async def phone() -> str:
         while True:
             value = await _ask("Telefon numarası (ülke koduyla, ör. +905551112233): ")
-            if ":" not in value:     # Telethon would treat "id:hash" as a bot token
-                return value
-            print("Bu bir bot token'ı gibi görünüyor; kendi telefon numaranızı girin.")
+            if ":" in value:     # Telethon would treat "id:hash" as a bot token
+                print("Bu bir bot token'ı gibi görünüyor; kendi telefon numaranızı girin.")
+                continue
+            fixed = normalize_phone(value)
+            if fixed != value:
+                print(f"Numara uluslararası biçime çevrildi: {fixed}")
+            return fixed
 
     client = make_user_client(config, prefer_file=True)
     try:
@@ -659,7 +683,8 @@ async def interactive_login(config: TelegramConfig) -> str:
             number = await phone()
             # Ask Telegram to send the login code by SMS (the in-app message may never arrive
             # on a new device), then sign in with the code the owner types.
-            sent = await client.send_code_request(number, force_sms=True)
+            # Telegram no longer lets third-party apps force SMS; the code goes where Telegram decides.
+            sent = await client.send_code_request(number)
             print(f"Telegram kodu şuraya gönderdi: {_code_channel_tr(sent.type)}.")
             if sent.next_type is not None:
                 print(f"Gelmezse sonraki seçenek: {_code_channel_tr(sent.next_type)}.")
