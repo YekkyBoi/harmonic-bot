@@ -638,11 +638,19 @@ async def interactive_login(config: TelegramConfig) -> str:
 
     client = make_user_client(config, prefer_file=True)
     try:
-        await client.start(
-            phone=phone,
-            code_callback=lambda: _ask("Telegram'dan gelen giriş kodu: "),
-            password=lambda: _ask("İki adımlı doğrulama şifresi: ", secret=True),
-        )
+        await client.connect()
+        if not await client.is_user_authorized():
+            number = await phone()
+            # Ask Telegram to send the login code by SMS (the in-app message may never arrive
+            # on a new device), then sign in with the code the owner types.
+            sent = await client.send_code_request(number, force_sms=True)
+            print("Telegram kodu SMS ile gönderdi. Telefonunuza gelen 5 haneli kodu girin.")
+            code = (await _ask("Gelen giriş kodu: ")).replace(" ", "")
+            try:
+                await client.sign_in(number, code, phone_code_hash=sent.phone_code_hash)
+            except errors.SessionPasswordNeededError:
+                password = await _ask("İki adımlı doğrulama şifresi: ", secret=True)
+                await client.sign_in(password=password)
         me = await client.get_me()
         if getattr(me, "bot", False):
             raise RuntimeError("Bot hesabıyla giriş yapılamaz; kendi kullanıcı hesabınızı kullanın.")
