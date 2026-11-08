@@ -148,6 +148,7 @@ brokers:
     api_key: ${BINANCE_API_KEY:-}
     secret: ${BINANCE_API_SECRET:-}
     sandbox: false              # true: Binance Futures testnet (testnet.binancefuture.com, ayrı anahtar)
+    demo: false                 # true: Binance Demo Trading (demo.binance.com'dan alınan anahtar, sahte bakiye)
     market_type: swap           # swap = USDT perpetual (spot desteklenmez)
     quote_currency: USDT
     margin_mode: isolated       # isolated (önerilir) | cross

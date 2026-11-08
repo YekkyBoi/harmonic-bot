@@ -387,6 +387,15 @@ class CcxtBroker(Broker):
                 self.exchange.set_sandbox_mode(True)
             except cx.BaseError as e:
                 raise BrokerError(f"{self.name}: test ağı (sandbox) desteklenmiyor: {_short(e)}") from e
+        if getattr(self.cfg, "demo", False):
+            enable = getattr(self.exchange, "enable_demo_trading", None)
+            if enable is None:
+                raise BrokerError(f"{self.name}: bu borsada demo işlem (demo: true) desteklenmiyor")
+            try:
+                enable(True)
+            except cx.BaseError as e:
+                raise BrokerError(f"{self.name}: demo işlem açılamadı: {_short(e)}") from e
+            logger.info("%s: demo trading enabled (orders go to the exchange's demo environment)", self.name)
         await self._ccxt("piyasa bilgileri yüklenemedi", self.exchange.load_markets())
         if self.cfg.api_key and self.cfg.secret:
             # Catch wrong/expired keys at startup instead of on the first signal.

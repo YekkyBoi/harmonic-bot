@@ -134,6 +134,7 @@ class CcxtBrokerConfig(_BrokerBase):
     secret: str | None = None
     password: str | None = None                   # OKX / Bitget / KuCoin passphrase
     sandbox: bool = False                         # testnet
+    demo: bool = False                            # exchange "demo trading" (Binance: demo.binance.com keys, fake balance)
     market_type: Literal["swap"] = "swap"         # USDT-margined perpetuals (spot is not supported: SL/TP would lock the same coins)
     quote_currency: str = "USDT"
     margin_mode: Literal["isolated", "cross"] = "isolated"
@@ -141,6 +142,13 @@ class CcxtBrokerConfig(_BrokerBase):
     max_leverage: int = 50
     position_mode: Literal["oneway", "hedge"] = "oneway"
     options: dict[str, Any] = Field(default_factory=dict)       # extra ccxt constructor options
+
+
+    @model_validator(mode="after")
+    def _demo_or_sandbox(self) -> "CcxtBrokerConfig":
+        if self.demo and self.sandbox:
+            raise ValueError(f"broker '{self.name}': demo ve sandbox aynı anda açık olamaz; birini seçin")
+        return self
 
 
 class Mt5BrokerConfig(_BrokerBase):
