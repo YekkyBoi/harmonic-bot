@@ -103,6 +103,8 @@ class StoredMessage(BaseModel):
     media_type: str | None = None       # "photo" | "image_document" | None
     reply_to_message_id: int | None = None
     grouped_id: int | None = None       # Telegram album id
+    topic_id: int | None = None         # forum topic id (the topic's root message id); None = no topic / General
+    topic_title: str | None = None      # forum topic title at the time the message was stored
     edited: bool = False
     consumed: bool = False              # already turned into an action / decision
 
@@ -156,6 +158,8 @@ class ParseContext(BaseModel):
     reply_to: StoredMessage | None = None
     correction_text: str | None = None    # user's correction from the confirmation dialog
     previous_action: ParsedAction | None = None  # what we understood before the correction
+    topic_title: str | None = None        # forum topic the messages come from (e.g. "Kasım Ayı Fx İşlemleri")
+    topic_kind: str | None = None         # "crypto" | "fx" | None (from the matching TopicRoute)
 
 
 # --------------------------------------------------------------------------- #
@@ -185,6 +189,8 @@ class TradePlan(BaseModel):
     source_message_ids: list[int] = Field(default_factory=list)
     summary_tr: str = ""
     created_at: datetime
+    route: str | None = None              # TopicRoute.name the signal came from (e.g. "kripto")
+    broker_names: list[str] = Field(default_factory=list)  # brokers to trade on; empty = every enabled broker
 
 
 class ManagementPlan(BaseModel):

@@ -24,6 +24,37 @@ class _Base(BaseModel):
 # --------------------------------------------------------------------------- #
 # Telegram (user account = "userbot") and notification bot
 # --------------------------------------------------------------------------- #
+_TR_FOLD = str.maketrans({"İ": "i", "I": "ı", "Ş": "ş", "Ğ": "ğ", "Ü": "ü", "Ö": "ö", "Ç": "ç"})
+
+
+def fold_tr(text: str) -> str:
+    """Case-insensitive comparison key that respects Turkish letters ('İŞLEMLERİ' == 'işlemleri')."""
+    return " ".join(text.translate(_TR_FOLD).casefold().split())
+
+
+class TopicRoute(_Base):
+    """Which forum topics of the source group to follow, and where their trades go.
+
+    Topic titles change every month ("Kasım Ayı Kripto İşlemleri" -> "Aralık Ayı Kripto İşlemleri"),
+    so a topic is matched by text contained in its title, not by id."""
+
+    name: str                                     # short label, e.g. "kripto" / "fx"
+    title_contains: list[str] = Field(min_length=1)  # topic matches if its title contains ANY of these (Turkish-insensitive)
+    brokers: list[str] = Field(default_factory=list)  # broker names to trade this topic on; empty = all enabled brokers
+    kind: Literal["crypto", "fx", "any"] = "any"  # hint for reading symbols (fx: "EUR" means EURUSD)
+
+
+def match_topic(routes: list[TopicRoute], title: str | None) -> TopicRoute | None:
+    """First route whose title_contains matches ``title`` (None if no title or no match)."""
+    if not title:
+        return None
+    key = fold_tr(title)
+    for route in routes:
+        if any(fold_tr(part) in key for part in route.title_contains if part.strip()):
+            return route
+    return None
+
+
 class TelegramConfig(_Base):
     api_id: int                                   # from https://my.telegram.org
     api_hash: str
@@ -36,6 +67,7 @@ class TelegramConfig(_Base):
     incomplete_timeout_sec: int = 180             # INCOMPLETE signal not completed in time -> ask the owner
     max_context_messages: int = 12
     catchup_max_age_sec: int = 120                # on restart, messages missed while offline and younger than this are processed
+    topics: list[TopicRoute] = Field(default_factory=list)  # forum groups: follow only these topics; empty = every message
 
 
 class NotifierConfig(_Base):
@@ -190,6 +222,13 @@ class AppConfig(_Base):
     def _sanity(self) -> "AppConfig":
         if not 0 < self.risk.risk_per_r_pct <= 10:
             raise ValueError("risk.risk_per_r_pct must be in (0, 10]")
+        names = {b.name for b in self.brokers}
+        for route in self.telegram.topics:
+            unknown = [b for b in route.brokers if b not in names]
+            if unknown:
+                raise ValueError(
+                    f"telegram.topics '{route.name}': bilinmeyen broker adı {unknown} (brokers listesindeki 'name' ile aynı olmalı)"
+                )
         return self
 
     @property
