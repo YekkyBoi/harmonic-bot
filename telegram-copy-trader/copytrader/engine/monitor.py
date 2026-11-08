@@ -401,9 +401,10 @@ class Monitor:
         word = "kapandı" if status is TradeStatus.CLOSED else (
             "iptal edildi" if status is TradeStatus.CANCELLED else "başarısız")
         entry = fmt_price(trade.plan.entry_price) if trade.plan.entry_price is not None else "?"
+        topic = f" · 📁 {esc(trade.plan.route)}" if trade.plan.route else ""     # forum topic route
         await self.notifier.notify(
             f"🏁 #{trade.id} {esc(trade.plan.base_asset)} {trade.plan.side.value.upper()} (giriş {entry}) {word}. "
-            f"Gerçekleşen K/Z: {pnl_text}",
+            f"Gerçekleşen K/Z: {pnl_text}{topic}",
             Severity.INFO,
         )
 

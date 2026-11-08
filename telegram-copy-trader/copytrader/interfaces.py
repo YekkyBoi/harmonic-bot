@@ -50,8 +50,9 @@ class Storage(Protocol):
         sender_id: int | None = None,
         only_unconsumed: bool = True,
         limit: int = 50,
+        topic_id: int | None = None,
     ) -> list[StoredMessage]:
-        """Oldest first."""
+        """Oldest first. ``topic_id`` not None: only messages of that forum topic (None = every topic)."""
 
     async def mark_consumed(self, chat_id: int, message_ids: list[int]) -> None: ...
 

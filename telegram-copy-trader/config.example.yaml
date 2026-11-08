@@ -45,6 +45,25 @@ telegram:
   max_context_messages: 12      # birlikte okunacak en fazla mesaj
   catchup_max_age_sec: 120      # bot kapalıyken gelen mesajlardan yalnızca bu kadar yeni olanlar işlenir
 
+  # Konulu (forum) grup: SADECE bu konular takip edilir ve her konunun işlemleri
+  # yalnızca kendi brokerlarında açılır. Diğer konular (Sohbet, Analiz, Duyuru...)
+  # tamamen yok sayılır. Konu adı her ay değişse de ("Kasım Ayı..." -> "Aralık Ayı...")
+  # adın içindeki metin eşleştiği için ayar değiştirmek gerekmez.
+  # Boş ([]) = gruptaki bütün mesajlar okunur (konusuz gruplar için).
+  # brokers: aşağıdaki "brokers" listesindeki name değerleri; boş = tüm açık brokerlar.
+  # kind: crypto (USDT perpetual) | fx (ör. "EUR" = EURUSD) | any
+  topics: []
+  # Örnek:
+  # topics:
+  #   - name: kripto
+  #     title_contains: ["Kripto İşlemleri"]
+  #     brokers: [binance]
+  #     kind: crypto
+  #   - name: fx
+  #     title_contains: ["Fx İşlemleri"]
+  #     brokers: [mt5]
+  #     kind: fx
+
 # ---------------------------------------------------------------------
 # Bildirim botu (@BotFather) — size sadece emin olamadığında ve hata olduğunda yazar
 # ---------------------------------------------------------------------

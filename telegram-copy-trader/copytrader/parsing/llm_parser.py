@@ -13,6 +13,7 @@ import base64
 import json
 import logging
 import math
+import re
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Literal
@@ -20,7 +21,7 @@ from typing import Any, Literal
 import anthropic
 from pydantic import BaseModel, ConfigDict, ValidationError
 
-from ..config import LLMConfig
+from ..config import LLMConfig, fold_tr
 from ..errors import ParserError
 from ..models import (
     ActionType,
@@ -334,6 +335,9 @@ class ClaudeSignalParser:
         content: list[dict[str, Any]] = [
             {"type": "text", "text": prompts.USER_INTRO.format(now=_iso(context.now))}
         ]
+        topic = _topic_line(context)
+        if topic is not None:
+            content.append({"type": "text", "text": topic})
         for m in messages:
             content.append({"type": "text", "text": _render_message(m, notes.get(m.message_id))})
             if m.message_id in images:
@@ -434,6 +438,7 @@ class ClaudeSignalParser:
             actions = _fill_missing_ids(
                 [_to_action(w, messages, context) for w in wire.actions], [m.message_id for m in messages]
             )
+            actions = [_check_trader_sizing(_apply_topic_kind(a, context), messages, context) for a in actions]
         else:
             # Schema-valid but against the rules ("no instruction" is one "none"): never consume the
             # messages silently; an unsure "none" makes the engine ask the owner.
@@ -482,11 +487,22 @@ def _iso(dt: datetime) -> str:
     return _as_utc(dt).strftime("%Y-%m-%dT%H:%M:%SZ")
 
 
+def _topic_line(context: ParseContext) -> str | None:
+    """'Konu: <title> (tür: fx)' for a forum topic, None when the messages come from no topic."""
+    title = " ".join((context.topic_title or "").split())
+    if not title:
+        return None
+    if context.topic_kind:
+        return prompts.TOPIC_LINE.format(title=title, kind=context.topic_kind)
+    return prompts.TOPIC_LINE_NO_KIND.format(title=title)
+
+
 def _render_message(m: StoredMessage, note: str | None = None) -> str:
     parts = [f"msg_id={m.message_id}", _iso(m.date)]
     sender = m.sender_name or "?"
     parts.append(f"from={sender} (id {m.sender_id})" if m.sender_id is not None else f"from={sender}")
-    if m.reply_to_message_id is not None:
+    # In a forum topic every message "replies" to the topic's root message: that is not a reply.
+    if m.reply_to_message_id is not None and m.reply_to_message_id != m.topic_id:
         parts.append(f"reply_to={m.reply_to_message_id}")
     if m.grouped_id is not None:
         parts.append(f"album={m.grouped_id}")
@@ -690,6 +706,100 @@ def _to_action(w: _WireAction, messages: list[StoredMessage], context: ParseCont
     if not parsed.summary_tr:
         parsed.summary_tr = _fallback_summary(parsed)
     return parsed
+
+
+# --------------------------------------------------------------------------- #
+# Forum topic kind and the trader's own sizing note
+# --------------------------------------------------------------------------- #
+_OPENING = {ActionType.OPEN, ActionType.INCOMPLETE}
+_FX_USD_QUOTED = frozenset({"EUR", "GBP", "AUD", "NZD"})   # "EUR" in an fx topic = EURUSD
+_METALS = frozenset({"XAU", "XAG"})
+_CRYPTO_MARKETS = {MarketType.PERP, MarketType.SPOT}
+_FX_MARKETS = {MarketType.FOREX, MarketType.CFD}
+# "100 risk için 8.7 lot", "100$ risk için 8,7 lot" (text folded with config.fold_tr).
+_LOT_NOTE = re.compile(
+    r"(?<![\d.,])(\d+(?:[.,]\d+)?)\s*(?:\$|usdt|usd|dolar|dolarlık)?\s*risk\s+[iı][çc][iı]n\s+"
+    r"(\d+(?:[.,]\d+)?)\s*lot"
+)
+LOT_CHECK_TOLERANCE = 0.25            # |entry - stop| vs X / Y of "X risk için Y lot"
+_AMB_TOPIC_KIND = "{kind} konusundaki sinyal {market} olarak okundu; enstrüman yanlış okunmuş olabilir."
+_AMB_LOT = (
+    "Trader'ın notu ({note}) stop mesafesinin ≈ {expected} olduğunu gösteriyor, okunan giriş ({entry}) ile stop "
+    "({stop}) arası {actual} (%{dev} fark); seviyeler yanlış okunmuş olabilir."
+)
+
+
+def _apply_topic_kind(a: ParsedAction, context: ParseContext) -> ParsedAction:
+    """Fill what the forum topic's kind makes certain and flag a contradiction (new signals only):
+    fx topic: EUR/GBP/AUD/NZD -> quote USD forex, XAU/XAG -> USD cfd; crypto topic: USDT perpetual."""
+    kind = context.topic_kind
+    if a.action not in _OPENING or kind not in ("crypto", "fx"):
+        return a
+    update: dict[str, Any] = {}
+    base = (a.base_asset or "").upper()
+    if kind == "fx":
+        if a.market_type in _CRYPTO_MARKETS:
+            update["ambiguities"] = [*a.ambiguities, _AMB_TOPIC_KIND.format(kind="Forex", market="kripto")]
+        elif base in _FX_USD_QUOTED | _METALS and a.quote_asset in (None, "USD"):
+            update["quote_asset"] = "USD"
+            if a.market_type is None:
+                update["market_type"] = MarketType.FOREX if base in _FX_USD_QUOTED else MarketType.CFD
+    else:
+        if a.market_type in _FX_MARKETS:
+            update["ambiguities"] = [*a.ambiguities, _AMB_TOPIC_KIND.format(kind="Kripto", market="forex/CFD")]
+        elif base:
+            if a.market_type is None:
+                update["market_type"] = MarketType.PERP
+            if a.quote_asset is None:
+                update["quote_asset"] = "USDT"
+    if "ambiguities" in update:
+        update["confidence"] = min(a.confidence, _LOW_CONFIDENCE_CAP)
+    return a.model_copy(update=update) if update else a
+
+
+def _number(raw: str) -> float | None:
+    """'8.7' / '8,7' -> 8.7; a separator before exactly three digits ('1.000') is ambiguous -> None."""
+    if re.search(r"[.,]\d{3}$", raw):
+        return None
+    try:
+        value = float(raw.replace(",", "."))
+    except ValueError:
+        return None
+    return value if math.isfinite(value) and value > 0 else None
+
+
+def _check_trader_sizing(a: ParsedAction, messages: list[StoredMessage], context: ParseContext) -> ParsedAction:
+    """"X risk için Y lot" is the trader's own size (never used for sizing). On a crypto signal Y lot = Y coins,
+    so |entry - stop| should be about X / Y: far off (> LOT_CHECK_TOLERANCE) means a level was probably
+    misread -> ambiguity + confidence cap (the owner is asked)."""
+    if a.action not in _OPENING or a.entry_price is None or a.stop_loss is None:
+        return a
+    crypto = context.topic_kind == "crypto" or (context.topic_kind is None and a.market_type in _CRYPTO_MARKETS)
+    if not crypto or a.market_type in _FX_MARKETS:
+        return a
+    used = set(a.used_message_ids)
+    sources = [m for m in messages if not used or m.message_id in used]
+    if context.reply_to is not None and context.reply_to.message_id in used:
+        sources.append(context.reply_to)
+    for m in sources:
+        found = _LOT_NOTE.search(fold_tr(m.text or ""))
+        if found is None:
+            continue
+        risk_amount, lots = _number(found.group(1)), _number(found.group(2))
+        if risk_amount is None or lots is None:
+            return a
+        expected = risk_amount / lots
+        actual = abs(a.entry_price - a.stop_loss)
+        deviation = abs(actual - expected) / expected
+        if deviation <= LOT_CHECK_TOLERANCE:
+            return a
+        logger.warning("Sizing note %r implies a stop distance of %.6g, the levels read give %.6g",
+                       found.group(0), expected, actual)
+        text = _AMB_LOT.format(note=found.group(0), expected=f"{expected:.6g}", entry=_fmt(a.entry_price),
+                               stop=_fmt(a.stop_loss), actual=f"{actual:.6g}", dev=f"{deviation * 100:.0f}")
+        return a.model_copy(update={"ambiguities": [*a.ambiguities, text],
+                                    "confidence": min(a.confidence, _LOW_CONFIDENCE_CAP)})
+    return a
 
 
 def _fill_missing_ids(actions: list[ParsedAction], provided: list[int]) -> list[ParsedAction]:

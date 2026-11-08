@@ -62,10 +62,11 @@ Accuracy beats completeness. Never guess. Fill in only what you can read with ce
 # Input
 The user turn contains:
 1. The current time (UTC).
-2. The NEW messages from the group, oldest first. Each starts with a header line:
+2. Only when the group is a forum (a supergroup with topics): the topic the new messages were posted in, as "Konu: <topic title> (tür: crypto)" or "(tür: fx)". See "Forum topics" below.
+3. The NEW messages from the group, oldest first. Each starts with a header line:
    [msg_id=123 | 2026-01-01T12:00:00Z | from=Name (id 42) | reply_to=120 | album=987 | EDITED]
    followed by the message text ("(metin yok)" means the message has no text) and, if the message has a picture, the image right after it. A note in square brackets says when an image could not be attached.
-3. Optional context sections:
+4. Optional context sections:
    - REPLIED-TO MESSAGE: an earlier message that a new message replies to (with its image when available).
    - OPEN TRADES: trades this system copied and still manages, as JSON: trade_id, asset, side, entry, stop_loss, take_profits (one {price, close_fraction, hit} per current level: close_fraction = that level's share of the ORIGINAL position size, hit = true when that level already filled), open_fraction (share of the filled position still open, when known), status ("pending" = limit entry not filled yet, "open" = position is live, "opening" = being sent), source_message_ids (the group messages the trade was built from), opened_at.
    - OWNER CORRECTION: your earlier reading of these messages and the owner's correction of it.
@@ -88,7 +89,7 @@ Return {"actions": [...]}: one object per distinct trading instruction in the NE
 - "close": close a running trade fully or partly, because the trader says he closed or tells followers to close: "kapattım", "kapatın", "closed", "close now", "çıktım", "kârı aldım çıktım", "yarısını aldım" / "yarısını kapattım" (0.5), "%30 kâr aldım" (0.3), "kalanı kapattım" (1.0). `close_fraction` is the fraction of the position that is still open: 1.0 = everything, 0.5 = half. If he closed "some" without an amount, close_fraction is null and add an ambiguity.
 - "cancel": call off a trade that is not filled yet, or a signal that is withdrawn: "limit gelmedi iptal", "girişi iptal ediyorum", "emri sildim", "bu sinyal iptal", "cancel". If the matched trade is already "open" (filled) and the trader only says "iptal", it is unclear whether he wants it closed: keep "cancel", add an ambiguity and keep confidence below 0.7.
 - "incomplete": a trade is clearly being set up but asset, side or stop loss is still missing, or a position-tool screenshot has arrived without any text yet (the trader usually sends "eth 1R long"-style text next). Fill in every field you CAN read (levels from the screenshot, side from the tool) so the system can complete it when the rest arrives. Text "eth long" with no stop and no screenshot is "incomplete" too.
-- "none": everything else: greetings, chat, analysis and opinions ("ETH 2300'ü kırarsa uçar"), news, memes, promotions, questions, results and hits ("TP1 ✅ +2R", "stop oldu", "+%15 kâr", "hedef geldi"), a chart without a position tool and without an instruction. A take profit or stop being hit needs no action because the copied orders already sit on the broker. But "TP1 geldi, stopu girişe çekin" is a "move_sl".
+- "none": everything else: greetings, chat, analysis and opinions ("ETH 2300'ü kırarsa uçar"), news, memes, promotions, questions, results and hits ("TP1 ✅ +2R", "stop oldu", "+%15 kâr", "hedef geldi"), a chart without a position tool and without an instruction. A take profit or stop being hit needs no action because the copied orders already sit on the broker. But "TP1 geldi, stopu girişe çekin" is a "move_sl", and a bare "Stop" sent as a REPLY to a signal is a "close" (see "Wording used in this group").
 
 ## Linking management actions (move_sl, move_tp, close, cancel) to a trade
 - A new message that replies to a message listed in an open trade's source_message_ids refers to that trade.
@@ -105,6 +106,25 @@ If a new message replies to an earlier message:
 
 ## Edited messages
 EDITED means the text shown is the new version of that message. If no trade was built from it yet, just read the current version. If an open trade lists it in source_message_ids and the edit changes the stop or the targets, return "move_sl" / "move_tp" for that trade with confidence at most 0.8 and an ambiguity (edits may be typo fixes). If the edit changes something that cannot be applied to a running trade (asset, side, entry of a filled trade), return "none" with an ambiguity that describes the change.
+
+## Forum topics
+The group can be a Telegram forum: one group with several topics (sub-chats such as crypto trades, forex trades, chat, analysis, results, announcements). Only the trade topics reach you, and the user turn then names the topic: "Konu: Kasım Ayı Kripto İşlemleri (tür: crypto)". The title changes every month ("Aralık Ayı ..."); the kind tells you how to read instruments:
+- tür: crypto -> every ticker is a USDT-margined perpetual future: "Eth short" = ETHUSDT perpetual (base ETH, quote USDT, market_type "perp"). Never read a crypto topic's ticker as forex or a CFD.
+- tür: fx -> a currency or metal name is its usual USD pair: "EUR LONG" = EURUSD long (base EUR, quote USD, market_type "forex"); GBP -> GBPUSD, AUD -> AUDUSD, NZD -> NZDUSD; gold / "altın" / XAU -> XAUUSD (market_type "cfd"). Where USD is the base currency (JPY, CHF, CAD: USDJPY...) the direction is unclear ("JPY long" may mean a USDJPY short): fill what is certain and add an ambiguity. Never read an fx topic's instrument as a crypto coin.
+- No "Konu" line: the group has no topics; use the general rules.
+OPEN TRADES then lists only the trades copied from the same topic, and a management message of a topic always refers to one of them.
+
+## Wording used in this group
+The trade topics are written only by the group's admins (the founder and the moderators). They post a position-tool screenshot with a short text, and manage the trade later by REPLYING to the signal message. What their messages mean:
+- "X risk için Y lot" ("100 risk için 8.7 lot", "100$ risk için 8,7 lot") is the trader's OWN position size for a risk of X dollars. Never use it for the size and never turn it into risk_r (the system sizes every trade from R; "1R risk" -> risk_r 1.0). Use it as a check of your levels: on a crypto trade Y lot = Y coins, so |entry - stop| should be about X / Y (100 / 8.7 = 11.49, and 2250.60 - 2239.20 = 11.40 fits). If the distance you read is more than about 25% away from X / Y, a level is probably misread: re-read the screenshot; if the difference remains, report what you read, add an ambiguity naming both distances, and keep confidence below 0.7. Say in evidence that you did the check. In an fx topic lots are forex lots: skip this check.
+- "Limit Emir" / "limit emir" -> entry_type "limit".
+- "Aktif" (a reply to a limit signal) -> "none": the limit order got filled. Information only; the copied limit order fills by itself.
+- "Stop" (a short reply to a signal) -> "close" with close_fraction 1.0 for the trade of the replied-to signal: the trader's trade hit its stop. Usually the copied stop has closed our position too and the system then ignores the message; if our position is still open (the stop did not trigger on our venue) it is closed like the trader's. This rule is for a reply; "stop oldu" inside a results list stays "none". Never turn such a reply into "none", and do not add an ambiguity only because the trade may already be closed.
+- "0.2R kar ile manuel kapattık." / "manuel kapattık" / "kapattık" -> "close" with close_fraction 1.0 ("0.2R kar" is the result, not a fraction or a size).
+- "Stop olmuş ama bildirimi gelmediği için şimdi Update geçiyoruz -1R. Stop olmayanlar varsa entry stop atsın (okxte stop olmadı Binanceda stop oldu). Grup işlemlerine -1 olarak yazılacak" -> "move_sl" with move_sl_to_entry true for the replied-to trade: whoever is still in the trade moves the stop to the entry ("entry stop atsın" = stop to entry). "-1R" / "-1 olarak yazılacak" is the result for the group's records.
+- A result report on its own -> "none": "2.8 r", "+3R", "-1R olarak yazılacak", "Grup işlemlerine -1 olarak yazılacak". Only an instruction in the same message makes it an action.
+- Comments -> "none": "Euroda tatsız hafta geçirdik", remarks about the week or the market.
+- A management reply ("Stop", "kapattık", "entry stop atsın") whose replied-to message is not in the source_message_ids of any OPEN TRADES entry: never pick another open trade for it (that one is a different trade). Leave target_trade_id null and set refers_to_message_id to the replied-to message id; the system finds the copied trade from the reply, or knows that it is already closed.
 
 # Fields
 - symbol: the instrument as written or shown ("ETHUSDT.P", "eth", "XAUUSD", "GOLD", "BTC/USDT"); null if none.
@@ -196,6 +216,20 @@ The black 2232.85 label with the 07:11 timer is the current price, not the entry
 - "eth long" (no stop, no screenshot) -> incomplete, base ETH, side long, confidence about 0.8.
 - "TP1 ✅ +2R" -> none, confidence about 0.95 (a result report; the copied take-profit order handles it).
 - "günaydın arkadaşlar" -> none, confidence about 0.99, summary "İşlem talimatı yok (selamlaşma)".
+
+## 3. Examples from this group's forum topics (unlisted fields are null / false / [])
+"Konu: Kasım Ayı Kripto İşlemleri (tür: crypto)":
+- msg 610 (photo): TradingView "ETHUSDT.P" with a SHORT position tool: red zone ABOVE the entry, blue zone below. Right-axis labels, top to bottom: "2.250,60" on red at the top edge of the red zone; "2.239,20" on blue at the border of the two zones; "2.239,20" on black with "44:28" under it right next to the blue label (the current price, equal to the entry); "2.205,11" at the bottom edge of the blue zone. msg 611, three lines: "Eth short" / "1R risk" / "100 risk için 8.7 lot" -> open, symbol "ETHUSDT.P", base ETH, quote USDT, market_type perp, side short, entry_type market (the current price label equals the entry), entry 2239.2, stop 2250.6, take_profits [2205.11 (1.0)], risk_r 1.0, used_message_ids [610, 611], confidence about 0.95, evidence mentions "100 risk için 8.7 lot: 100 / 8.7 = 11.49 ≈ 2250.60 - 2239.20 = 11.40; trader'ın kendi lotu, boyut için kullanılmadı".
+- Same signal read as stop 2275.60 (a misread digit): 2275.60 - 2239.20 = 36.40, far from 11.49 -> re-read; if it remains, ambiguity "100 risk için 8.7 lot ≈ 11.49 stop mesafesi demek; okunan giriş-stop farkı 36.40" and confidence below 0.7.
+- Reply to msg 611, OPEN TRADES has trade 21 with source_message_ids [610, 611]: "0.2R kar ile manuel kapattık." -> close, close_fraction 1.0, target_trade_id 21, refers_to_message_id 611, base ETH, side short, confidence about 0.95.
+- Reply to msg 611, trade 21 listed: "Stop olmuş ama bildirimi gelmediği için şimdi Update geçiyoruz -1R. Stop olmayanlar varsa entry stop atsın ..." -> move_sl, move_sl_to_entry true, target_trade_id 21, confidence about 0.9.
+- Reply to msg 611, OPEN TRADES has no trade with 610/611: "Stop" -> close, close_fraction 1.0, target_trade_id null, refers_to_message_id 611, base ETH, side short (from the replied-to signal), confidence about 0.9.
+"Konu: Kasım Ayı Fx İşlemleri (tür: fx)":
+- msg 700 (photo: EURUSD long position tool) + msg 701 "EUR LONG 1R Limit Emir" -> open, symbol "EURUSD", base EUR, quote USD, market_type forex, side long, entry_type limit, entry / stop / take profit from the screenshot, risk_r 1.0, used_message_ids [700, 701].
+- Reply to msg 701: "Aktif" -> none, confidence about 0.95, summary "Limit emir doldu (bilgi)".
+- Reply to msg 701: "Stop" -> close, close_fraction 1.0 for the trade of 701 (target_trade_id when it is listed, else null with refers_to_message_id 701), confidence about 0.9.
+- "Euroda tatsız hafta geçirdik" -> none. "2.8 r" -> none (a result report).
+- "kapattık" as a reply to msg 701 -> close, close_fraction 1.0 of that trade, confidence about 0.95. Without a reply and with exactly one open trade in the topic: close 1.0 of it, confidence at most 0.8 plus an ambiguity (no asset named).
 """
 )
 
@@ -207,6 +241,8 @@ USER_INTRO = (
     "Below are the NEW messages from the signal group, oldest first. "
     "Extract the trading actions as specified."
 )
+TOPIC_LINE = "Konu: {title} (tür: {kind})"        # forum topic of the new messages (see "Forum topics")
+TOPIC_LINE_NO_KIND = "Konu: {title}"
 NO_TEXT = "(metin yok)"
 IMAGE_LIMIT_NOTE = "[This message has an image that was not attached (image limit reached).]"
 IMAGE_UNREADABLE_NOTE = "[This message has an image that could not be attached ({reason}).]"

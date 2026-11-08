@@ -3,6 +3,21 @@
 READ-ONLY by design: it only connects, resolves chats, reads messages and
 downloads their images. It never sends, forwards, reacts to or marks
 anything as read in the source chats.
+
+Forum groups (supergroups with topics)
+--------------------------------------
+Every message gets the id of the forum topic it was posted in (``topic_id_of``):
+
+* top-level message in a topic: ``reply_to.forum_topic`` and ``reply_to_msg_id`` = topic id
+  (NOT a reply to a real message, so ``reply_to_message_id`` is None);
+* reply inside a topic: ``reply_to_top_id`` = topic id, ``reply_to_msg_id`` = the replied message;
+* the topic's root service message (``MessageActionTopicCreate``): its own id;
+* the "General" topic has no forum header: topic id None (its real id 1 is never stored).
+
+Topic titles come from ``messages.getForumTopics`` / ``messages.getForumTopicsByID`` (read-only)
+and are cached per chat; the cache is refreshed on a miss (a new monthly topic) and by topic
+create/edit service messages. When ``telegram.topics`` is set and the chat is a forum, only
+messages whose topic title matches a route (``config.match_topic``) are stored and passed on.
 """
 
 from __future__ import annotations
@@ -17,20 +32,20 @@ from collections import OrderedDict
 from collections.abc import Awaitable, Callable, Coroutine
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
-from typing import Any
+from typing import Any, NamedTuple
 
 from telethon import TelegramClient, errors, events, functions, utils
 from telethon.sessions import StringSession
 from telethon.tl import types
 
 from .. import __version__
-from ..config import TelegramConfig
+from ..config import TelegramConfig, match_topic
 from ..interfaces import Storage
 from ..models import StoredMessage
 
 log = logging.getLogger(__name__)
 
-OnReady = Callable[[int, int | None], Awaitable[None]]       # (chat_id, sender_id)
+OnReady = Callable[[int, int | None, int | None], Awaitable[None]]   # (chat_id, sender_id, topic_id)
 OnEdit = Callable[[StoredMessage], Awaitable[None]]
 
 LOGIN_HINT_TR = (
@@ -60,7 +75,28 @@ RECONNECT_BASE_DELAY_SEC = 1.0
 RECONNECT_MAX_DELAY_SEC = 300.0
 _SEEN_LIMIT = 5000
 
-DebounceKey = tuple[int, int | None]
+GENERAL_TOPIC_ID = 1                 # Telegram's id of a forum's "General" topic (stored as topic_id None)
+GENERAL_TOPIC_TITLE = "General"      # used when Telegram does not return General's title
+TOPIC_LIST_LIMIT = 100               # topics listed per forum at start (the rest are fetched by id on demand)
+TOPIC_REQUEST_TIMEOUT_SEC = 20.0
+TOPIC_RETRY_DELAYS_SEC = (2.0, 5.0, 15.0, 30.0, 60.0)   # after failed title lookups (last one repeats)
+TOPIC_GIVE_UP_SEC = 600.0            # a message waits at most this long for its topic's title
+TOPIC_UNKNOWN_TTL_SEC = 60.0         # topic Telegram did not return: treated as unknown this long, then asked again
+TOPIC_LATE_SEC = 10.0                # title found after this long: the catch-up age rule applies to the message
+
+_TOPIC_ACTIONS = (types.MessageActionTopicCreate, types.MessageActionTopicEdit)
+
+DebounceKey = tuple[int, int | None, int | None]   # (chat_id, topic_id, sender_id)
+
+
+class TopicLookupError(RuntimeError):
+    """The title of a forum topic could not be fetched in time (or the listener is stopping)."""
+
+
+class TopicRef(NamedTuple):
+    follow: bool                     # store / pass on this message
+    topic_id: int | None             # None = General topic / not a forum
+    title: str | None
 
 
 # --------------------------------------------------------------------------- #
@@ -114,6 +150,35 @@ def _reply_to_id(message: Any) -> int | None:
     if getattr(header, "forum_topic", False) and getattr(header, "reply_to_top_id", None) is None:
         return None                      # plain message in a forum topic, not a real reply
     return getattr(header, "reply_to_msg_id", None)
+
+
+def _in_forum_topic(message: Any) -> bool:
+    """The message carries a forum-topic reply header (the chat is a forum)."""
+    return bool(getattr(getattr(message, "reply_to", None), "forum_topic", False))
+
+
+def topic_id_of(message: Any) -> int | None:
+    """Forum topic id of a message (Telethon 1.45 / layer 229 ``MessageReplyHeader``).
+
+    ``forum_topic`` is set on every message of a topic except the General one:
+    a reply has ``reply_to_top_id`` = topic id; a top-level message has ``reply_to_msg_id`` = topic id.
+    The topic's root service message (``MessageActionTopicCreate``) has the topic's id as its own id.
+    None = General topic (id 1 is normalized to None), a non-forum chat, or a reply to another chat
+    without thread id (topic unknown)."""
+    if isinstance(getattr(message, "action", None), types.MessageActionTopicCreate):
+        topic: int | None = getattr(message, "id", None)
+    else:
+        header = getattr(message, "reply_to", None)
+        if header is None or not getattr(header, "forum_topic", False):
+            return None
+        topic = getattr(header, "reply_to_top_id", None)
+        if not topic:
+            if getattr(header, "reply_to_peer_id", None) is not None:
+                return None                  # reply_to_msg_id belongs to another chat
+            topic = getattr(header, "reply_to_msg_id", None)
+    if not topic or topic == GENERAL_TOPIC_ID:
+        return None
+    return int(topic)
 
 
 def _newer(current: Any, candidate: Any) -> Any:
@@ -200,16 +265,32 @@ class TelegramListener:
         self._storing: dict[tuple[int, int], Any] = {}
         self._media_ids: OrderedDict[tuple[int, int], int | None] = OrderedDict()
         self._last_ids: dict[int, int] = {}
+        # Abandoned at shutdown before being stored: last_msg_id stays below them so catch-up refetches them.
+        self._held_back: set[tuple[int, int]] = set()
         self._stopping = False
+        self._stop_event = asyncio.Event()
+        # ---- forum topics ----
+        self._forums: set[int] = set()                                # chats known to be forums
+        self._topic_titles: dict[tuple[int, int], str | None] = {}    # (chat, topic) -> title; None = deleted/unknown
+        self._topic_unknown_until: dict[tuple[int, int], float] = {}  # expiry of a None ("not returned") entry
+        self._topic_retry_at: dict[tuple[int, int], float] = {}       # after a failed lookup: not before (monotonic)
+        self._topic_failures: dict[tuple[int, int], int] = {}
+        self._topic_locks: dict[int, asyncio.Lock] = {}
+        self._warned: set[str] = set()
 
     @property
     def chat_ids(self) -> set[int]:
         return set(self._entities)
 
+    def _filtering(self, chat_id: int) -> bool:
+        """Only configured topics are followed in this chat."""
+        return bool(self._config.topics) and chat_id in self._forums
+
     # ---- lifecycle -------------------------------------------------------
     async def start(self) -> None:
         """Connect with the saved user session (never prompts; raises if not logged in), resolve source chats."""
         self._stopping = False
+        self._stop_event.clear()
         if self._client is None:
             self._client = make_user_client(self._config)
         client = self._client
@@ -224,13 +305,18 @@ class TelegramListener:
         self._self_id = getattr(me, "id", None)
 
         self._entities = await self._resolve_chats()
+        self._forums = {cid for cid, entity in self._entities.items() if getattr(entity, "forum", False)}
         ids = list(self._entities)
         # Handlers first, then catch-up: nothing is missed; duplicates are filtered by _seen.
         client.remove_event_handler(self._on_new_message_event)
         client.remove_event_handler(self._on_edited_event)
+        client.remove_event_handler(self._on_raw_update)
         client.add_event_handler(self._on_new_message_event, events.NewMessage(chats=ids))
         client.add_event_handler(self._on_edited_event, events.MessageEdited(chats=ids))
+        # NewMessage drops service messages; topic create/edit ones keep the title cache fresh.
+        client.add_event_handler(self._on_raw_update, events.Raw(types.UpdateNewChannelMessage))
         log.info("Listening to %d source chat(s): %s", len(ids), ids)
+        await self._load_topics()
         await self._catch_up()
         await self._resume_unprocessed()
 
@@ -273,6 +359,7 @@ class TelegramListener:
 
     async def stop(self) -> None:
         self._stopping = True
+        self._stop_event.set()           # wakes messages waiting for a topic title
         for task in list(self._timers.values()):
             task.cancel()
         self._timers.clear()
@@ -325,6 +412,15 @@ class TelegramListener:
     async def _on_edited_event(self, event: Any) -> None:
         self._spawn(self.handle_edit(event.message))
 
+    async def _on_raw_update(self, update: Any) -> None:
+        message = getattr(update, "message", None)
+        if (
+            isinstance(message, types.MessageService)
+            and isinstance(getattr(message, "action", None), _TOPIC_ACTIONS)
+            and getattr(message, "chat_id", None) in self._entities
+        ):
+            self._spawn(self.handle_message(message))
+
     def _spawn(self, coro: Coroutine[Any, Any, Any]) -> asyncio.Task[Any]:
         # Own tasks so Telethon's disconnect does not cancel work mid-way.
         task = asyncio.ensure_future(coro)
@@ -353,7 +449,10 @@ class TelegramListener:
         return True
 
     async def handle_message(self, message: Any, *, consumed: bool = False) -> None:
-        """New message (live or catch-up): store it, then debounce ``on_ready``."""
+        """New message (live or catch-up): store it, then debounce ``on_ready``.
+
+        Forum + ``telegram.topics``: messages of topics no route matches are neither stored nor
+        downloaded. Topic create/edit service messages only update the title cache."""
         chat_id = getattr(message, "chat_id", None)
         if chat_id is None:
             return
@@ -361,19 +460,53 @@ class TelegramListener:
         if key in self._seen:
             return
         self._remember(self._seen, key, None)
+        self._held_back.discard(key)
         self._note_last_id(chat_id, message.id)
+        if isinstance(message, types.MessageService):
+            if not self._entities or chat_id in self._entities:
+                self._apply_topic_action(message)
+            await self._persist_last_id(chat_id)
+            return
         if not self._accepts(message):
             await self._persist_last_id(chat_id)
             return
+        self._storing[key] = None        # from here on, edits of this message are queued (see handle_edit)
+        started = time.monotonic()
+        try:
+            topic = await self._topic_of(message)
+        except TopicLookupError as exc:
+            self._storing.pop(key, None)
+            self._seen.pop(key, None)    # a later delivery (catch-up, edit) may try again
+            if self._stopping:
+                self._held_back.add(key)
+                log.warning("Stopping: message %s/%s not stored (its forum topic is unknown yet)", chat_id, message.id)
+                return
+            log.error("Message %s/%s NOT stored: title of its forum topic unknown (%s)", chat_id, message.id, exc)
+            await self._persist_last_id(chat_id)
+            return
+        except BaseException:
+            self._storing.pop(key, None)
+            self._seen.pop(key, None)
+            self._held_back.add(key)
+            raise
+        if not topic.follow:
+            self._storing.pop(key, None)
+            await self._persist_last_id(chat_id)
+            return
+        waited = time.monotonic() - started
+        if waited > TOPIC_LATE_SEC and not consumed and not should_process_catchup(
+            message.date, datetime.now(timezone.utc), self._config.catchup_max_age_sec
+        ):
+            log.warning("Message %s/%s waited %.0fs for its forum topic; stored as context only", chat_id, message.id, waited)
+            consumed = True
         has_content = bool(getattr(message, "message", None)) or image_info(message) is not None
         trigger = has_content and not consumed
-        dkey: DebounceKey = (chat_id, getattr(message, "sender_id", None))
+        dkey: DebounceKey = (chat_id, topic.topic_id, getattr(message, "sender_id", None))
         if trigger:
             self._debounce_hold(dkey)
-        self._storing[key] = None
         late_edit: Any = None
         try:
-            stored = await self._build_stored(message, consumed=consumed)
+            stored = await self._build_stored(message, consumed=consumed, topic=topic)
             # Edited while the image was downloading (nothing stored yet, so nothing was built from
             # it): store the newest version instead; the debounce is still held, so the engine only
             # ever sees the edited text.
@@ -388,6 +521,7 @@ class TelegramListener:
                     edited=True,
                     download=media_changed,
                     keep_media=(stored.media_path, stored.media_type),
+                    topic=topic,
                 )
             await self._db.save_message(stored)
         except Exception:
@@ -402,7 +536,7 @@ class TelegramListener:
             await self.handle_edit(late_edit)
 
     async def handle_edit(self, message: Any) -> None:
-        """Edited message: store the new version, then ``on_edit``."""
+        """Edited message: store the new version, then ``on_edit`` (only for followed topics)."""
         if not self._accepts(message):
             return
         chat_id, msg_id = message.chat_id, message.id
@@ -418,11 +552,17 @@ class TelegramListener:
             date = _as_utc(message.date)
             if should_process_catchup(date, datetime.now(timezone.utc), self._config.catchup_max_age_sec):
                 await self.handle_message(message)          # never saw it: treat as new
-            else:
-                stored = await self._build_stored(message, consumed=True, edited=True)
+                return
+            topic = await self._edit_topic(None, message)
+            if topic.follow:
+                stored = await self._build_stored(message, consumed=True, edited=True, topic=topic)
                 await self._db.save_message(stored)         # old message: context only
             return
 
+        topic = await self._edit_topic(existing, message)
+        if not topic.follow:
+            log.debug("Edit of %s/%s ignored: topic %r is not followed", chat_id, msg_id, topic.title)
+            return
         text = getattr(message, "message", None) or ""
         info = image_info(message)
         media_changed = self._media_changed(existing, info)
@@ -435,6 +575,7 @@ class TelegramListener:
             edited=True,
             download=media_changed,
             keep_media=(existing.media_path, existing.media_type),
+            topic=topic,
         )
         await self._db.save_message(stored)
         try:
@@ -458,6 +599,7 @@ class TelegramListener:
         edited: bool = False,
         download: bool = True,
         keep_media: tuple[str | None, str | None] = (None, None),
+        topic: TopicRef | None = None,
     ) -> StoredMessage:
         chat_id, msg_id = message.chat_id, message.id
         media_path, media_type = keep_media
@@ -479,6 +621,8 @@ class TelegramListener:
             media_type=media_type,
             reply_to_message_id=_reply_to_id(message),
             grouped_id=getattr(message, "grouped_id", None),
+            topic_id=topic.topic_id if topic is not None else None,
+            topic_title=topic.title if topic is not None else None,
             edited=edited,
             consumed=consumed,
         )
@@ -508,6 +652,216 @@ class TelegramListener:
             log.error("Image of %s/%s could not be downloaded (empty result)", message.chat_id, message.id)
             return None
         return str(result)
+
+    # ---- forum topics ----------------------------------------------------------
+    async def _topic_of(self, message: Any) -> TopicRef:
+        """Topic of a new message and whether it is followed.
+
+        Raises TopicLookupError when a filtered forum's topic title cannot be fetched in time."""
+        chat_id = message.chat_id
+        topic_id = topic_id_of(message)
+        if _in_forum_topic(message):
+            self._mark_forum(chat_id)
+        if chat_id not in self._forums:
+            if self._config.topics:
+                self._warn_not_forum(chat_id)
+            return TopicRef(True, None, None)
+        filtering = bool(self._config.topics)
+        # Without routes the title is informational only: one attempt, never wait for it.
+        title = await self._topic_title(chat_id, topic_id or GENERAL_TOPIC_ID, patient=filtering)
+        if title is None and topic_id is None:
+            title = GENERAL_TOPIC_TITLE
+        if filtering and match_topic(self._config.topics, title) is None:
+            log.debug("Ignoring %s/%s: topic %s %r is not followed", chat_id, message.id, topic_id, title)
+            return TopicRef(False, topic_id, title)
+        return TopicRef(True, topic_id, title)
+
+    async def _edit_topic(self, existing: StoredMessage | None, message: Any) -> TopicRef:
+        """Topic of an edited message. A stored row keeps its topic (it was followed when stored);
+        rows stored before topic support (no title) in a filtered forum are checked like new ones."""
+        if existing is not None and not (self._filtering(existing.chat_id) and existing.topic_title is None):
+            hit, cached = self._cached_title((existing.chat_id, existing.topic_id or GENERAL_TOPIC_ID))
+            return TopicRef(True, existing.topic_id, cached if hit and cached else existing.topic_title)
+        try:
+            return await self._topic_of(message)
+        except TopicLookupError as exc:
+            log.error("Edit of %s/%s ignored: title of its forum topic unknown (%s)", message.chat_id, message.id, exc)
+            return TopicRef(False, topic_id_of(message), None)
+
+    async def _topic_title(self, chat_id: int, topic_id: int, *, patient: bool) -> str | None:
+        """Cached title of a forum topic, fetched on a cache miss. None = deleted / not returned.
+
+        API errors are remembered per topic (backoff), so concurrent messages do not hammer
+        Telegram. ``patient``: wait and retry until TOPIC_GIVE_UP_SEC, then raise TopicLookupError
+        (also when stopping); otherwise return None at once while the topic is in backoff."""
+        key = (chat_id, topic_id)
+        deadline = time.monotonic() + TOPIC_GIVE_UP_SEC
+        while True:
+            hit, title = self._cached_title(key)
+            if hit:
+                return title
+            now = time.monotonic()
+            wait = self._topic_retry_at.get(key, 0.0) - now
+            if wait > 0:
+                if not patient:
+                    return None
+                if self._stopping:
+                    raise TopicLookupError("listener is stopping")
+                if now >= deadline:
+                    raise TopicLookupError(f"Telegram did not answer for {TOPIC_GIVE_UP_SEC:.0f}s")
+                await self._sleep_unless_stopping(min(wait, deadline - now))
+                continue
+            async with self._topic_lock(chat_id):
+                if self._cached_title(key)[0] or self._topic_retry_at.get(key, 0.0) > time.monotonic():
+                    continue                 # fetched (or failed) by another message meanwhile
+                try:
+                    await self._fetch_topics(chat_id, [topic_id])
+                except Exception as exc:
+                    self._lookup_failed(key, exc)
+                    continue
+                if not self._cached_title(key)[0]:
+                    if topic_id == GENERAL_TOPIC_ID:
+                        self._set_title(chat_id, topic_id, GENERAL_TOPIC_TITLE)
+                    else:
+                        log.warning("Telegram did not return forum topic %s of %s; treated as unknown for %.0fs",
+                                    topic_id, chat_id, TOPIC_UNKNOWN_TTL_SEC)
+                        self._set_title(chat_id, topic_id, None, ttl=TOPIC_UNKNOWN_TTL_SEC)
+
+    async def _fetch_topics(self, chat_id: int, ids: list[int] | None) -> None:
+        """One read-only request filling the title cache: ``ids`` None lists the forum's topics."""
+        entity = self._entities.get(chat_id)
+        if self._client is None or entity is None:
+            raise TopicLookupError(f"chat {chat_id} is not connected")
+        request: Any
+        if ids is None:
+            request = functions.messages.GetForumTopicsRequest(
+                peer=entity, offset_date=None, offset_id=0, offset_topic=0, limit=TOPIC_LIST_LIMIT
+            )
+        else:
+            request = functions.messages.GetForumTopicsByIDRequest(peer=entity, topics=list(ids))
+        result = await asyncio.wait_for(self._client(request), TOPIC_REQUEST_TIMEOUT_SEC)
+        for topic in getattr(result, "topics", None) or []:
+            if isinstance(topic, types.ForumTopic):
+                self._set_title(chat_id, topic.id, topic.title)
+            elif isinstance(topic, types.ForumTopicDeleted):
+                self._set_title(chat_id, topic.id, None)
+
+    def _lookup_failed(self, key: tuple[int, int], exc: BaseException) -> None:
+        failures = self._topic_failures.get(key, 0) + 1
+        self._topic_failures[key] = failures
+        delay = TOPIC_RETRY_DELAYS_SEC[min(failures, len(TOPIC_RETRY_DELAYS_SEC)) - 1]
+        flood = getattr(exc, "seconds", None)            # FloodWaitError
+        if isinstance(flood, (int, float)):
+            delay = max(delay, float(flood))
+        self._topic_retry_at[key] = time.monotonic() + delay
+        log.warning("Could not fetch forum topic %s of %s (attempt %d): %s; retrying in %.0fs",
+                    key[1], key[0], failures, str(exc) or type(exc).__name__, delay)
+
+    def _cached_title(self, key: tuple[int, int]) -> tuple[bool, str | None]:
+        if key not in self._topic_titles:
+            return False, None
+        until = self._topic_unknown_until.get(key)
+        if until is not None and time.monotonic() >= until:
+            del self._topic_titles[key]
+            del self._topic_unknown_until[key]
+            return False, None
+        return True, self._topic_titles[key]
+
+    def _set_title(self, chat_id: int, topic_id: int, title: str | None, *, ttl: float | None = None) -> None:
+        key = (chat_id, topic_id)
+        changed = key not in self._topic_titles or self._topic_titles[key] != title
+        self._topic_titles[key] = title
+        if ttl is None:
+            self._topic_unknown_until.pop(key, None)
+        else:
+            self._topic_unknown_until[key] = time.monotonic() + ttl
+        self._topic_retry_at.pop(key, None)
+        self._topic_failures.pop(key, None)
+        if changed and title is not None:
+            if self._config.topics:
+                route = match_topic(self._config.topics, title)
+                verdict = f"followed (route '{route.name}')" if route else "ignored"
+                log.info("Forum %s topic %s %r: %s", chat_id, topic_id, title, verdict)
+            else:
+                log.info("Forum %s topic %s %r", chat_id, topic_id, title)
+
+    def _forget_topics(self, chat_id: int) -> None:
+        for key in [k for k in self._topic_titles if k[0] == chat_id]:
+            self._topic_titles.pop(key, None)
+            self._topic_unknown_until.pop(key, None)
+
+    def _apply_topic_action(self, message: Any) -> None:
+        """Topic create / edit service message: update the title cache (no API call)."""
+        action = getattr(message, "action", None)
+        if not isinstance(action, _TOPIC_ACTIONS):
+            return
+        chat_id = message.chat_id
+        self._mark_forum(chat_id)
+        if isinstance(action, types.MessageActionTopicCreate):
+            self._set_title(chat_id, message.id, action.title)
+        elif getattr(action, "title", None) is not None:         # renamed (not just closed / hidden)
+            if _in_forum_topic(message):
+                self._set_title(chat_id, topic_id_of(message) or GENERAL_TOPIC_ID, action.title)
+            else:
+                # No topic header (General, or unexpected): titles are fetched again when needed.
+                log.info("Forum %s: a topic was renamed to %r; refreshing topic titles", chat_id, action.title)
+                self._forget_topics(chat_id)
+
+    async def _load_topics(self) -> None:
+        """At start: list every forum's topics (warms the cache, logs which ones are followed)."""
+        for chat_id in self._entities:
+            if chat_id not in self._forums:
+                if self._config.topics:
+                    self._warn_not_forum(chat_id)
+                continue
+            try:
+                async with self._topic_lock(chat_id):
+                    await self._fetch_topics(chat_id, None)
+            except Exception as exc:
+                log.warning("Could not list forum topics of %s: %s (titles are fetched per topic later)", chat_id, exc)
+                continue
+            titles = [t for (cid, _), t in self._topic_titles.items() if cid == chat_id and t]
+            for route in self._config.topics:
+                if not any(match_topic([route], t) for t in titles):
+                    log.warning("No topic of forum %s matches telegram.topics '%s' %s yet; it is followed once "
+                                "such a topic exists", chat_id, route.name, route.title_contains)
+
+    def _mark_forum(self, chat_id: int) -> None:
+        if chat_id in self._forums:
+            return
+        self._forums.add(chat_id)
+        if self._config.topics:
+            log.warning("Chat %s is a forum (seen in message headers): from now on only telegram.topics are followed",
+                        chat_id)
+
+    def _warn_not_forum(self, chat_id: int) -> None:
+        tag = f"not-forum:{chat_id}"
+        if tag not in self._warned:
+            self._warned.add(tag)
+            log.error("telegram.topics is set but chat %s is not a forum (no topics): its messages are stored, "
+                      "but NONE of them will be traded while telegram.topics is set. Remove telegram.topics "
+                      "for this group or check the group id.", chat_id)
+
+    def _topic_lock(self, chat_id: int) -> asyncio.Lock:
+        lock = self._topic_locks.get(chat_id)
+        if lock is None:
+            lock = self._topic_locks[chat_id] = asyncio.Lock()
+        return lock
+
+    def _topic_known(self, message: Any) -> bool:
+        """The message can be filtered without waiting for Telegram."""
+        chat_id = message.chat_id
+        if isinstance(message, types.MessageService) or not self._config.topics:
+            return True
+        if chat_id not in self._forums and not _in_forum_topic(message):
+            return True
+        return self._cached_title((chat_id, topic_id_of(message) or GENERAL_TOPIC_ID))[0]
+
+    async def _sleep_unless_stopping(self, seconds: float) -> None:
+        try:
+            await asyncio.wait_for(self._stop_event.wait(), timeout=max(seconds, 0.0))
+        except (asyncio.TimeoutError, TimeoutError):
+            pass
 
     # ---- debounce -----------------------------------------------------------
     def _debounce_hold(self, key: DebounceKey) -> None:
@@ -540,10 +894,11 @@ class TelegramListener:
         del self._timers[key]
         assert me is not None
         self._tasks.add(me)
+        chat_id, topic_id, sender_id = key
         try:
-            await self._on_ready(key[0], key[1])
+            await self._on_ready(chat_id, sender_id, topic_id)
         except Exception:
-            log.exception("on_ready failed for chat %s sender %s", key[0], key[1])
+            log.exception("on_ready failed for chat %s topic %s sender %s", chat_id, topic_id, sender_id)
         finally:
             self._tasks.discard(me)
 
@@ -556,6 +911,11 @@ class TelegramListener:
         value = self._last_ids.get(chat_id)
         if value is None:
             return
+        # Stay below messages still being stored (download, topic lookup) or abandoned at shutdown:
+        # after a crash / restart, catch-up fetches them again.
+        unfinished = [mid for cid, mid in (*self._storing, *self._held_back) if cid == chat_id]
+        if unfinished:
+            value = min(value, min(unfinished) - 1)
         try:
             await self._db.set_state(f"last_msg_id:{chat_id}", value)
         except Exception:
@@ -586,13 +946,43 @@ class TelegramListener:
         if len(missed) >= CATCHUP_FETCH_LIMIT:
             log.warning("Catch-up for %s hit the %d message limit; older missed messages skipped", chat_id, CATCHUP_FETCH_LIMIT)
         missed.sort(key=lambda m: m.id)
+        await self._prefetch_topics(chat_id, missed)
         now = datetime.now(timezone.utc)
         fresh = 0
         for msg in missed:
             young = should_process_catchup(msg.date, now, self._config.catchup_max_age_sec)
             fresh += young
-            await self.handle_message(msg, consumed=not young)
+            if self._topic_known(msg):
+                await self.handle_message(msg, consumed=not young)
+            else:
+                # Its topic's title is unknown (Telegram error): wait for it in the background,
+                # without holding up the rest of the catch-up.
+                self._spawn(self.handle_message(msg, consumed=not young))
         log.info("Catch-up %s: %d missed message(s), %d recent enough to process", chat_id, len(missed), fresh)
+
+    async def _prefetch_topics(self, chat_id: int, messages: list[Any]) -> None:
+        """One request for the titles of every uncached topic among missed messages (filtered forums)."""
+        if not self._config.topics:
+            return
+        created = {m.id for m in messages if isinstance(getattr(m, "action", None), types.MessageActionTopicCreate)}
+        wanted = {
+            topic_id_of(m) or GENERAL_TOPIC_ID
+            for m in messages
+            if not isinstance(m, types.MessageService) and self._accepts(m)
+            and (chat_id in self._forums or _in_forum_topic(m))
+        }
+        wanted = {t for t in wanted - created if not self._cached_title((chat_id, t))[0]}
+        if not wanted:
+            return
+        try:
+            async with self._topic_lock(chat_id):
+                await self._fetch_topics(chat_id, sorted(wanted))
+        except Exception as exc:
+            log.warning("Could not fetch forum topics %s of %s during catch-up: %s", sorted(wanted), chat_id, exc)
+
+    def _resume_followed(self, msg: StoredMessage) -> bool:
+        """Stored rows of a filtered forum without a matching title (e.g. stored before topic support) stay put."""
+        return not self._filtering(msg.chat_id) or match_topic(self._config.topics, msg.topic_title) is not None
 
     async def _resume_unprocessed(self) -> None:
         """Re-trigger recent stored messages whose debounce never fired (crash / restart)."""
@@ -603,11 +993,15 @@ class TelegramListener:
             except Exception:
                 log.exception("Could not read unprocessed messages of %s", chat_id)
                 continue
-            senders = {m.sender_id for m in msgs if not self._allowed or m.sender_id in self._allowed}
-            for sender_id in senders:
-                self._debounce_hold((chat_id, sender_id))
-                self._debounce_release((chat_id, sender_id))
-            if senders:
+            keys: set[DebounceKey] = {
+                (chat_id, m.topic_id, m.sender_id)
+                for m in msgs
+                if (not self._allowed or m.sender_id in self._allowed) and self._resume_followed(m)
+            }
+            for dkey in keys:
+                self._debounce_hold(dkey)
+                self._debounce_release(dkey)
+            if keys:
                 log.info("Resuming %d unprocessed recent message(s) in %s", len(msgs), chat_id)
 
     @staticmethod

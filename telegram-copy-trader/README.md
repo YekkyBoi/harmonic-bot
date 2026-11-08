@@ -264,6 +264,9 @@ telegram:
 
 İsteğe bağlı: sadece trader'ın mesajlarını dinlemek için `allowed_sender_ids: [trader_id]`. (Trader'ın bir mesajını @userinfobot'a iletirseniz ID'sini gösterebilir.)
 
+
+**Grup konulara (topic) bölünmüşse** (ör. "Kasım Ayı Kripto İşlemleri", "Sohbet", "Kasım Ayı Fx İşlemleri"): `config.yaml` içinde `telegram.topics` ile hangi konuların takip edileceğini ve her konunun hangi brokera gideceğini yazın. Diğer konular tamamen yok sayılır. Konu adı her ay değişse de adın içindeki metin ("Kripto İşlemleri") eşleştiği için ayar değiştirmek gerekmez. Bir konudaki "Stop" / "kapattık" cevapları yalnızca o konunun işlemlerini etkiler; işlem zaten stop olduysa size bir şey sorulmaz. Örnek `config.example.yaml` içinde.
+
 ### 8) config.yaml'ı doldurun
 
 Her ayarın yanında Türkçe açıklama var. En önemlileri:

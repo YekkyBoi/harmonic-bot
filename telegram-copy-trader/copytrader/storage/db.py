@@ -18,6 +18,7 @@ import asyncio
 import json
 import logging
 import os
+import re
 import sqlite3
 from collections.abc import AsyncIterator, Callable, Iterable
 from contextlib import asynccontextmanager
@@ -44,10 +45,19 @@ from ..models import (
 
 log = logging.getLogger(__name__)
 
-SCHEMA_VERSION = 1
+SCHEMA_VERSION = 2
 
 # version -> statements that upgrade from (version - 1). Append, never edit.
-MIGRATIONS: dict[int, list[str]] = {}
+# "ALTER TABLE t ADD COLUMN c ..." is skipped when the column already exists.
+MIGRATIONS: dict[int, list[str]] = {
+    # v2: forum topic of each source message
+    2: [
+        "ALTER TABLE messages ADD COLUMN topic_id INTEGER",
+        "ALTER TABLE messages ADD COLUMN topic_title TEXT",
+    ],
+}
+
+_ADD_COLUMN = re.compile(r"\s*ALTER\s+TABLE\s+(\w+)\s+ADD\s+COLUMN\s+(\w+)", re.IGNORECASE)
 
 _SCHEMA = """
 CREATE TABLE IF NOT EXISTS schema_version (
@@ -67,6 +77,8 @@ CREATE TABLE IF NOT EXISTS messages (
     grouped_id           INTEGER,
     edited               INTEGER NOT NULL DEFAULT 0,
     consumed             INTEGER NOT NULL DEFAULT 0,
+    topic_id             INTEGER,
+    topic_title          TEXT,
     PRIMARY KEY (chat_id, message_id)
 );
 CREATE INDEX IF NOT EXISTS ix_messages_chat_date ON messages (chat_id, date);
@@ -154,6 +166,8 @@ _MESSAGE_COLUMNS = (
     "media_type",
     "reply_to_message_id",
     "grouped_id",
+    "topic_id",
+    "topic_title",
     "edited",
     "consumed",
 )
@@ -316,6 +330,9 @@ class Database:
                 for version in range(current + 1, SCHEMA_VERSION + 1):
                     log.info("Migrating database %s to schema v%d", self.path, version)
                     for stmt in MIGRATIONS.get(version, []):
+                        add = _ADD_COLUMN.match(stmt)
+                        if add is not None and add.group(2) in await _columns(conn, add.group(1)):
+                            continue
                         await conn.execute(stmt)
                 if current < SCHEMA_VERSION or len(rows) > 1:
                     await conn.execute("DELETE FROM schema_version")
@@ -391,6 +408,8 @@ class Database:
             msg.media_type,
             msg.reply_to_message_id,
             msg.grouped_id,
+            msg.topic_id,
+            msg.topic_title,
             int(msg.edited),
             int(msg.consumed),
         )
@@ -409,7 +428,9 @@ class Database:
                 sender_id = COALESCE(excluded.sender_id, messages.sender_id),
                 sender_name = COALESCE(excluded.sender_name, messages.sender_name),
                 reply_to_message_id = COALESCE(excluded.reply_to_message_id, messages.reply_to_message_id),
-                grouped_id = COALESCE(excluded.grouped_id, messages.grouped_id)
+                grouped_id = COALESCE(excluded.grouped_id, messages.grouped_id),
+                topic_id = COALESCE(excluded.topic_id, messages.topic_id),
+                topic_title = COALESCE(excluded.topic_title, messages.topic_title)
         """
         async with self._write() as conn:
             await conn.execute(sql, values)
@@ -428,9 +449,11 @@ class Database:
         sender_id: int | None = None,
         only_unconsumed: bool = True,
         limit: int = 50,
+        topic_id: int | None = None,
     ) -> list[StoredMessage]:
         """Messages with ``date >= since``, oldest first.
 
+        ``topic_id`` not None: only messages of that forum topic (None = every topic).
         When more than ``limit`` match, the NEWEST ``limit`` are returned (still
         oldest first) so the latest signal is never cut off."""
         where = ["chat_id = ?", "date >= ?"]
@@ -438,6 +461,9 @@ class Database:
         if sender_id is not None:
             where.append("sender_id = ?")
             params.append(sender_id)
+        if topic_id is not None:
+            where.append("topic_id = ?")
+            params.append(topic_id)
         if only_unconsumed:
             where.append("consumed = 0")
         params.append(int(limit))
@@ -765,6 +791,8 @@ def _row_to_message(row: sqlite3.Row) -> StoredMessage:
         media_type=row["media_type"],
         reply_to_message_id=row["reply_to_message_id"],
         grouped_id=row["grouped_id"],
+        topic_id=row["topic_id"],
+        topic_title=row["topic_title"],
         edited=bool(row["edited"]),
         consumed=bool(row["consumed"]),
     )
@@ -794,6 +822,11 @@ def _load_position(raw: str) -> BrokerPosition:
 
 def _load_confirmation(raw: str) -> PendingConfirmation:
     return _aware(PendingConfirmation.model_validate_json(raw))
+
+
+async def _columns(conn: aiosqlite.Connection, table: str) -> set[str]:
+    async with conn.execute(f"PRAGMA table_info({table})") as cur:
+        return {str(row[1]) for row in await cur.fetchall()}
 
 
 def _split_sql(script: str) -> list[str]:

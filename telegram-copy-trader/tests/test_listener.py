@@ -67,11 +67,12 @@ class FakeDB:
     async def get_message(self, chat_id: int, message_id: int) -> StoredMessage | None:
         return self.messages.get((chat_id, message_id))
 
-    async def recent_messages(self, chat_id, since, sender_id=None, only_unconsumed=True, limit=50):
+    async def recent_messages(self, chat_id, since, sender_id=None, only_unconsumed=True, limit=50, topic_id=None):
         out = [
             m for m in self.messages.values()
             if m.chat_id == chat_id and m.date >= since and (not only_unconsumed or not m.consumed)
             and (sender_id is None or m.sender_id == sender_id)
+            and (topic_id is None or m.topic_id == topic_id)
         ]
         return sorted(out, key=lambda m: m.message_id)[:limit]
 
@@ -104,14 +105,16 @@ class ReadOnlyFakeClient:
 
 class Recorder:
     def __init__(self, db: FakeDB | None = None, fail: bool = False) -> None:
-        self.ready: list[tuple[int, int | None]] = []
+        self.ready: list[tuple[int, int | None]] = []                 # (chat_id, sender_id)
+        self.calls: list[tuple[int, int | None, int | None]] = []     # (chat_id, sender_id, topic_id)
         self.edits: list[StoredMessage] = []
         self.snapshots: list[list[int]] = []
         self.db = db
         self.fail = fail
 
-    async def on_ready(self, chat_id: int, sender_id: int | None) -> None:
+    async def on_ready(self, chat_id: int, sender_id: int | None, topic_id: int | None) -> None:
         self.ready.append((chat_id, sender_id))
+        self.calls.append((chat_id, sender_id, topic_id))
         if self.db is not None:
             self.snapshots.append(sorted(k[1] for k in self.db.messages))
         if self.fail:
@@ -154,9 +157,10 @@ async def test_message_conversion_with_photo_and_reply(tmp_path):
     assert stored.media_path == str(tmp_path / "media" / f"{abs(CHAT)}_42.jpg")
     assert Path(stored.media_path).read_bytes() == b"img"
     assert not stored.edited and not stored.consumed
+    assert stored.topic_id is None and stored.topic_title is None      # not a forum
     assert db.state[f"last_msg_id:{CHAT}"] == 42
     await settle()
-    assert rec.ready == [(CHAT, TRADER)]
+    assert rec.calls == [(CHAT, TRADER, None)]
 
 
 async def test_image_document_and_sticker():

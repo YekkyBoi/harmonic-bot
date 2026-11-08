@@ -1,10 +1,17 @@
 """The engine: Telegram messages -> parsed actions -> validated plans -> orders.
 
-Flow per (chat, sender): the listener calls :meth:`Engine.on_messages_ready`
-after a debounce; the engine parses the unconsumed recent messages, and for
-each action either executes it on every broker, asks the owner (anything
-uncertain), or ignores it. Owner decisions arrive through the
-:class:`~copytrader.interfaces.EngineControl` methods.
+Flow per (chat, sender, forum topic): the listener calls
+:meth:`Engine.on_messages_ready` after a debounce; the engine parses the
+unconsumed recent messages, and for each action either executes it on every
+broker, asks the owner (anything uncertain), or ignores it. Owner decisions
+arrive through the :class:`~copytrader.interfaces.EngineControl` methods.
+
+Forum topics (``telegram.topics`` non-empty): only messages of a topic whose
+title matches a :class:`~copytrader.config.TopicRoute` are read (others are
+consumed unread). A new trade is opened only on its route's brokers
+(``TradePlan.route`` / ``broker_names``), and management messages of a topic
+only ever see and touch trades of the same route. With no routes configured
+everything behaves as before (one stream per chat and sender).
 
 Safety rules kept here:
 * Source messages are marked consumed BEFORE orders are sent, so a crash or
@@ -35,7 +42,7 @@ from datetime import datetime, timedelta, timezone
 from typing import Any, Literal, TypeVar
 
 from ..brokers.base import Broker, BrokerError
-from ..config import AppConfig
+from ..config import AppConfig, TopicRoute, match_topic
 from ..errors import ParserError
 from ..interfaces import SHUTDOWN_TEXT, Notifier, SignalParser, Storage
 from ..models import (
@@ -80,7 +87,17 @@ logger = logging.getLogger(__name__)
 
 T = TypeVar("T")
 ConfKind = Literal["open", "manage", "incomplete"]
-_Key = tuple[int, int | None]   # (chat_id, sender_id)
+# (chat_id, sender_id) or, in a forum topic, (chat_id, sender_id, topic_id): one message stream each.
+_Key = tuple[int, ...]
+
+
+def stream_key(chat_id: int, sender_id: int | None, topic_id: int | None = None) -> _Key:
+    """Key of a (chat, sender[, forum topic]) message stream; without a topic it is (chat, sender) as before."""
+    return (chat_id, sender_id) if topic_id is None else (chat_id, sender_id, topic_id)  # type: ignore[return-value]
+
+
+def _key_parts(key: _Key) -> tuple[int, int | None, int | None]:
+    return key[0], key[1], (key[2] if len(key) > 2 else None)
 
 MANAGEMENT_ACTIONS = frozenset({ActionType.MOVE_SL, ActionType.MOVE_TP, ActionType.CLOSE, ActionType.CANCEL})
 TRANSIENT_PARSE_RETRY_DELAYS: tuple[float, ...] = (10.0, 30.0, 60.0)
@@ -90,6 +107,13 @@ CONNECT_TIMEOUT_SEC = 180.0
 READ_TIMEOUT_SEC = 20.0
 EXCERPT_CHARS = 300
 _PENDING_CODES = frozenset({"pending_confirmation", "duplicate_pending_signal"})
+# A management message that refers to a trade in one of these states has nothing left to do: ignored, never asked.
+_DONE_TRADE = frozenset({TradeStatus.CLOSED, TradeStatus.CANCELLED, TradeStatus.FAILED})
+_DONE_TRADE_TR = {
+    TradeStatus.CLOSED: "zaten kapanmış",
+    TradeStatus.CANCELLED: "zaten iptal edilmiş",
+    TradeStatus.FAILED: "hiçbir hesapta açılamamıştı",
+}
 SHUTDOWN_GRACE_SEC = 45.0          # shutdown waits this long for running order flows before closing brokers
 EDIT_REPROCESS_MAX_AGE_SEC = 900.0  # an edit turning a non-signal message into a signal is re-read this long
 MSG_OUTCOME_MAX = 2000              # remembered confirmation outcomes per chat
@@ -125,6 +149,7 @@ class Evaluation:
     issues: list[ValidationIssue]
     market_price: float | None = None
     trade: TradeRecord | None = None
+    ignored: str | None = None     # management for a trade that is already over: why it is ignored (Turkish)
 
     @property
     def automatic(self) -> bool:
@@ -146,6 +171,7 @@ class _IncompleteWatch:
     message_ids: list[int]
     deadline: datetime
     task: asyncio.Task[None] | None = None
+    route: TopicRoute | None = None
 
 
 # --------------------------------------------------------------------------- #
@@ -435,10 +461,80 @@ class Engine:
     async def _is_paused(self) -> bool:
         return bool(await self.db.get_state("paused", False))
 
-    async def _open_trade_summaries(self) -> list[dict[str, Any]]:
-        """OPEN TRADES context: levels with their close fractions, which TPs already hit, share still open."""
+    # ------------------------------------------------------------------ forum topic routes
+    def _route_of(self, msgs: list[StoredMessage]) -> tuple[TopicRoute | None, str | None]:
+        """(matching TopicRoute, topic title) of a batch: the newest title that matches a route (a topic may
+        be renamed meanwhile), else (None, the newest title). Always (None, ...) when no routes are set."""
+        titles = [m.topic_title for m in reversed(msgs) if m.topic_title and m.topic_title.strip()]
+        for title in titles:
+            route = match_topic(self.config.telegram.topics, title)
+            if route is not None:
+                return route, title
+        return None, (titles[0] if titles else None)
+
+    def _route_named(self, name: str | None) -> TopicRoute | None:
+        if not name:
+            return None
+        return next((r for r in self.config.telegram.topics if r.name == name), None)
+
+    @staticmethod
+    def _topic_kind(route: TopicRoute | None) -> str | None:
+        return route.kind if route is not None and route.kind != "any" else None
+
+    @staticmethod
+    def _in_scope(trade: TradeRecord, route: TopicRoute | None) -> bool:
+        """Trades a message of ``route`` may see and manage: only that route's own (None = no routing, all)."""
+        return route is None or trade.plan.route == route.name
+
+    def _shares_broker(self, a: TradePlan, b: TradePlan) -> bool:
+        """Could the two trades sit on the same broker account (empty broker_names = every broker)?"""
+        every = {br.name for br in self.configured_brokers}
+        return bool((set(a.broker_names) or every) & (set(b.broker_names) or every))
+
+    def _plan_brokers(self, plan: TradePlan) -> list[Broker]:
+        """Connected brokers the plan may trade on (its route's brokers; all when it names none)."""
+        if not plan.broker_names:
+            return list(self.brokers)
+        return [b for b in self.brokers if b.name in plan.broker_names]
+
+    async def _conf_route(
+        self, conf: PendingConfirmation, msgs: list[StoredMessage]
+    ) -> tuple[TopicRoute | None, str | None]:
+        """Route of a confirmation: from its source messages' topic, else from its plan / managed trade."""
+        route, title = self._route_of(msgs)
+        if route is not None or not self.config.telegram.topics:
+            return route, title
+        if isinstance(conf.plan, TradePlan):
+            route = self._route_named(conf.plan.route)
+        else:
+            trade_id = conf.plan.trade_id if isinstance(conf.plan, ManagementPlan) else conf.action.target_trade_id
+            trade = await self.db.get_trade(trade_id) if trade_id is not None else None
+            route = self._route_named(trade.plan.route) if trade is not None else None
+        return route, title
+
+    def _topic_unknown_issues(self, ev: Evaluation | None, route: TopicRoute | None) -> list[ValidationIssue]:
+        """Topics are configured but a new trade's topic is unknown (its messages are gone): never automatic."""
+        if ev is None or route is not None or not self.config.telegram.topics or not isinstance(ev.plan, TradePlan):
+            return []
+        return [_issue("topic_unknown",
+                       "Sinyalin geldiği konu (topic) belirlenemedi; hangi brokerda açılacağı bilinmediği için "
+                       "bu işlem açılamaz. Gerekirse işlemi brokerda elle açın.", blocking=True)]
+
+    async def _parse_context(
+        self, route: TopicRoute | None, title: str | None, reply_to: StoredMessage | None = None, *,
+        now: datetime | None = None, **extra: Any,
+    ) -> ParseContext:
+        """Parser context; open trades and topic of ``route`` (None: every trade, no topic kind)."""
+        return ParseContext(now=now or self._now(), open_trades=await self._open_trade_summaries(route),
+                            reply_to=reply_to, topic_title=title, topic_kind=self._topic_kind(route), **extra)
+
+    async def _open_trade_summaries(self, route: TopicRoute | None = None) -> list[dict[str, Any]]:
+        """OPEN TRADES context: levels with their close fractions, which TPs already hit, share still open.
+        ``route``: only the trades of that forum topic route (None: every active trade)."""
         out: list[dict[str, Any]] = []
         for t in await self.db.active_trades():
+            if not self._in_scope(t, route):
+                continue
             try:
                 hit, open_fraction = tp_progress(t, await self.db.broker_positions(t.id))
             except Exception:
@@ -472,9 +568,10 @@ class Engine:
         return out
 
     async def _reply_context(self, chat_id: int, msgs: list[StoredMessage]) -> StoredMessage | None:
-        """The message replied to by the newest message that is a reply."""
+        """The message replied to by the newest message that is a reply. In a forum topic every message
+        "replies" to the topic's root (reply_to == topic_id): that is not a reply."""
         for m in reversed(msgs):
-            if m.reply_to_message_id is not None:
+            if m.reply_to_message_id is not None and m.reply_to_message_id != m.topic_id:
                 return await self.db.get_message(chat_id, m.reply_to_message_id)
         return None
 
@@ -605,6 +702,8 @@ class Engine:
         if self.failed_brokers:
             lines.append("❌ Bağlanamayan: " + ", ".join(esc(n) for n in self.failed_brokers))
         lines.append(f"Kaynak sohbet: {len(self.config.telegram.source_chats)}")
+        if self.config.telegram.topics:
+            lines.append(self._routes_text())
         lines.append(f"Risk: 1R = bakiyenin {fmt.fmt_pct(self.config.risk.risk_per_r_pct, possessive=True)}")
         pending = await self.db.pending_confirmations()
         if pending:
@@ -612,6 +711,19 @@ class Engine:
         if await self._is_paused():
             lines.append("⏸ Yeni işlem açma DURAKLATILMIŞ (/devam ile açın).")
         return "\n".join(lines)
+
+    def _routes_text(self) -> str:
+        """HTML: followed forum topics and their brokers."""
+        connected = {b.name for b in self.brokers}
+
+        def brokers_of(route: TopicRoute) -> str:
+            if not route.brokers:
+                return "tüm brokerlar"
+            return ", ".join(esc(n) + ("" if n in connected else " ❌") for n in route.brokers)
+
+        items = [f"{esc(r.name)} ('{esc(' / '.join(r.title_contains))}') → {brokers_of(r)}"
+                 for r in self.config.telegram.topics]
+        return "Takip edilen konular: " + "; ".join(items) + " (diğer konular yok sayılır)"
 
     def begin_shutdown(self) -> None:
         """Stop accepting new work (message batches, edits, approvals, corrections, /kapat); running
@@ -678,31 +790,46 @@ class Engine:
         logger.info("Engine stopped")
 
     # ------------------------------------------------------------------ incoming messages
-    async def on_messages_ready(self, chat_id: int, sender_id: int | None) -> None:
+    async def on_messages_ready(self, chat_id: int, sender_id: int | None, topic_id: int | None = None) -> None:
+        """A sender's messages in a chat (``topic_id``: forum topic, None = no topic / General) are ready."""
         if not self._accepting:
             # Left unconsumed: the listener re-triggers recent unprocessed messages after the restart.
-            logger.info("Shutting down: batch of %s/%s not processed", chat_id, sender_id)
+            logger.info("Shutting down: batch of %s/%s (topic %s) not processed", chat_id, sender_id, topic_id)
             return
-        key: _Key = (chat_id, sender_id)
+        key = stream_key(chat_id, sender_id, topic_id)
         async with self._sender_lock(key):
             await self._process_batch(key)
 
     async def _process_batch(self, key: _Key) -> None:
-        chat_id, sender_id = key
+        chat_id, sender_id, topic_id = _key_parts(key)
         tg = self.config.telegram
         now = self._now()
-        msgs = await self.db.recent_messages(
-            chat_id,
+        query: dict[str, Any] = dict(
             since=now - timedelta(seconds=tg.context_window_sec),
             sender_id=sender_id,
             only_unconsumed=True,
             limit=tg.max_context_messages,
         )
+        if topic_id is not None:
+            query["topic_id"] = topic_id        # only that forum topic's messages
+        msgs = await self.db.recent_messages(chat_id, **query)
         msgs = await self._with_failed_messages(key, msgs)
+        # Never mix topics in one batch (a General batch is not filtered by storage); the other topics'
+        # messages stay unconsumed for their own batch. In a non-forum group every topic_id is None.
+        msgs = [m for m in msgs if m.topic_id == topic_id]
         if not msgs:
             self._clear_parse_failures(key)
             return
         batch_ids = [m.message_id for m in msgs]
+        route, title = self._route_of(msgs)
+        if tg.topics and route is None:
+            # Not one of the followed topics (chat, analysis, results...): consumed without reading.
+            await self.db.mark_consumed(chat_id, batch_ids)
+            self._clear_parse_failures(key, batch_ids)
+            logger.info("Topic %r (id %s) is not followed: messages %s ignored", title, topic_id, batch_ids)
+            await self._log("topic_ignored", {"chat_id": chat_id, "topic_id": topic_id, "topic_title": title,
+                                              "message_ids": batch_ids})
+            return
         if self.config.llm.prefilter and not any(prefilter.looks_relevant(m) for m in msgs):
             await self.db.mark_consumed(chat_id, batch_ids)
             self._clear_parse_failures(key, batch_ids)
@@ -710,7 +837,7 @@ class Engine:
             return
 
         reply_to = await self._reply_context(chat_id, msgs)
-        ctx = ParseContext(now=now, open_trades=await self._open_trade_summaries(), reply_to=reply_to)
+        ctx = await self._parse_context(route, title, reply_to, now=now)
         try:
             result = await self.parser.parse(msgs, ctx)
         except ParserError as err:
@@ -725,6 +852,7 @@ class Engine:
         await self._log("parsed", {
             "chat_id": chat_id, "message_ids": batch_ids, "model": result.model,
             "actions": [a.model_dump(mode="json") for a in actions],
+            **({"topic_id": topic_id, "route": route.name} if route is not None else {}),
         })
 
         incompletes = [a for a in actions if a.action is ActionType.INCOMPLETE]
@@ -747,9 +875,9 @@ class Engine:
                 await self.db.mark_consumed(chat_id, ids)
                 decided = True
                 if action.action is ActionType.OPEN:
-                    await self._handle_open(action, chat_id, reply_to=reply_to)
+                    await self._handle_open(action, chat_id, reply_to=reply_to, route=route)
                 else:
-                    await self._handle_management(action, chat_id, reply_to=reply_to)
+                    await self._handle_management(action, chat_id, reply_to=reply_to, route=route)
             except Exception as exc:
                 logger.exception("Handling %s failed", action.action.value)
                 await self.db.mark_consumed(chat_id, ids)
@@ -761,7 +889,8 @@ class Engine:
         if incompletes:
             # One watch per (chat, sender); the newest incomplete reading replaces older ones.
             ids_all = list(dict.fromkeys(i for a in incompletes for i in a.used_message_ids))
-            self._watch_incomplete(key, incompletes[-1].model_copy(update={"used_message_ids": ids_all}))
+            self._watch_incomplete(key, incompletes[-1].model_copy(update={"used_message_ids": ids_all}),
+                                   route=route)
         elif decided:
             self._cancel_incomplete(key)
         # Messages the parser saw but did not keep for an incomplete signal are done.
@@ -842,7 +971,7 @@ class Engine:
     async def _on_parse_error(
         self, key: _Key, msgs: list[StoredMessage], err: BaseException, *, transient: bool
     ) -> None:
-        chat_id, sender_id = key
+        chat_id = key[0]
         if not transient:
             self._clear_parse_failures(key)
             await self._give_up_parse(chat_id, msgs, err, transient=False, attempts=1)
@@ -924,11 +1053,11 @@ class Engine:
             await self._notify(f"💬 Yok sayıldı: {esc(action.summary_tr or 'işlem talimatı değil')}", Severity.INFO)
 
     # ------------------------------------------------------------------ incomplete signals
-    def _watch_incomplete(self, key: _Key, action: ParsedAction) -> None:
+    def _watch_incomplete(self, key: _Key, action: ParsedAction, *, route: TopicRoute | None = None) -> None:
         self._cancel_incomplete(key)
         deadline = self._now() + timedelta(seconds=self.config.telegram.incomplete_timeout_sec)
         watch = _IncompleteWatch(chat_id=key[0], action=action, message_ids=list(action.used_message_ids),
-                                 deadline=deadline)
+                                 deadline=deadline, route=route)
         watch.task = self._spawn(self._incomplete_timeout(key, watch), f"incomplete-{key[0]}")
         self._incomplete[key] = watch
 
@@ -953,45 +1082,56 @@ class Engine:
                 return
             secs = self.config.telegram.incomplete_timeout_sec
             reason = f"Sinyal {fmt.fmt_number(float(secs))} sn içinde tamamlanmadı; eksik bilgi var."
-            ev = await self._evaluate_incomplete(watch.action, watch.chat_id, reason)
+            ev = await self._evaluate_incomplete(watch.action, watch.chat_id, reason, route=watch.route)
             await self._ask_eval(ev, watch.chat_id)
 
     # ------------------------------------------------------------------ evaluation
     async def evaluate(
         self, action: ParsedAction, chat_id: int, *, reply_to: StoredMessage | None = None,
-        exclude_conf: str | None = None,
+        exclude_conf: str | None = None, route: TopicRoute | None = None,
     ) -> Evaluation | None:
         """Validate one action without side effects. None for NONE actions.
-        ``exclude_conf``: the confirmation being corrected / re-read (not a conflict with itself)."""
+        ``exclude_conf``: the confirmation being corrected / re-read (not a conflict with itself).
+        ``route``: forum topic route of the messages (a new trade goes to its brokers; management only sees
+        its trades); None = no routing."""
         if action.action is ActionType.OPEN:
-            return await self._evaluate_open(action, chat_id, exclude_conf=exclude_conf)
+            return await self._evaluate_open(action, chat_id, exclude_conf=exclude_conf, route=route)
         if action.action is ActionType.INCOMPLETE:
             return await self._evaluate_incomplete(
-                action, chat_id, "Sinyal eksik: varlık, yön veya stop bilgisi tamamlanmadı."
+                action, chat_id, "Sinyal eksik: varlık, yön veya stop bilgisi tamamlanmadı.", route=route
             )
         if action.action in MANAGEMENT_ACTIONS:
-            return await self._evaluate_management(action, chat_id, reply_to, exclude_conf=exclude_conf)
+            return await self._evaluate_management(action, chat_id, reply_to, exclude_conf=exclude_conf, route=route)
         return None
 
-    async def _evaluate_open(self, action: ParsedAction, chat_id: int, *, exclude_conf: str | None = None) -> Evaluation:
+    async def _evaluate_open(
+        self, action: ParsedAction, chat_id: int, *, exclude_conf: str | None = None,
+        route: TopicRoute | None = None,
+    ) -> Evaluation:
         now = self._now()
         base, quote, market_type = asset_of(action)
         market = await self._price(base, quote, market_type, action.symbol)
         plan, issues = validator.build_open_plan(
             action, risk=self.config.risk, llm=self.config.llm, market_price=market,
             source_chat_id=chat_id, now=now,
+            route=route.name if route is not None else None,
+            broker_names=list(route.brokers) if route is not None else [],
         )
         issues = merge_issues(issues, validator.low_confidence_issues(action, self.config.llm))
         if plan is not None:
             issues = merge_issues(issues, await self._portfolio_issues(plan, chat_id, exclude_conf=exclude_conf))
         return Evaluation("open", action, plan, issues, market)
 
-    async def _evaluate_incomplete(self, action: ParsedAction, chat_id: int, reason: str) -> Evaluation:
+    async def _evaluate_incomplete(
+        self, action: ParsedAction, chat_id: int, reason: str, *, route: TopicRoute | None = None
+    ) -> Evaluation:
         base, quote, market_type = asset_of(action)
         market = await self._price(base, quote, market_type, action.symbol)
         _plan, issues = validator.build_open_plan(
             action, risk=self.config.risk, llm=self.config.llm, market_price=market,
             source_chat_id=chat_id, now=self._now(),
+            route=route.name if route is not None else None,
+            broker_names=list(route.brokers) if route is not None else [],
         )
         return Evaluation("incomplete", action, None, merge_issues([_issue("incomplete_signal", reason, True)], issues),
                           market)
@@ -1009,11 +1149,15 @@ class Engine:
         )
 
     async def _trade_issues(self, plan: TradePlan, chat_id: int) -> list[ValidationIssue]:
-        """Conflicts with trades that exist (re-checked at approval time)."""
+        """Conflicts with trades that exist (re-checked at approval time). With forum routes a repost is
+        looked for among the same route's trades only; an opposite trade counts when it is of the same route
+        or may sit on one of the same broker accounts (one-way netting)."""
         now = self._now()
         risk = self.config.risk
+        route = self._route_named(plan.route)
         out: list[ValidationIssue] = []
-        recent = await self.db.recent_trades(now - timedelta(seconds=max(0, risk.duplicate_window_sec)))
+        recent = [t for t in await self.db.recent_trades(now - timedelta(seconds=max(0, risk.duplicate_window_sec)))
+                  if self._in_scope(t, route)]
         dup = guards.find_duplicate(plan, recent, window_sec=risk.duplicate_window_sec, now=now)
         if dup is not None:
             out.append(_issue(
@@ -1021,7 +1165,9 @@ class Engine:
                 f"Benzer bir işlem zaten var (#{dup.id} {dup.plan.base_asset} {dup.plan.side.value.upper()}, "
                 f"giriş {fmt_price(dup.plan.entry_price)}); sinyal tekrar paylaşılmış olabilir.",
             ))
-        opposite = [t for t in await self.db.active_trades(plan.base_asset) if t.plan.side is plan.side.opposite]
+        opposite = [t for t in await self.db.active_trades(plan.base_asset)
+                    if t.plan.side is plan.side.opposite
+                    and (self._in_scope(t, route) or self._shares_broker(t.plan, plan))]
         if opposite:
             ids = ", ".join(f"#{t.id}" for t in opposite)
             out.append(_issue(
@@ -1059,6 +1205,8 @@ class Engine:
                 ))
                 continue
             if plan is not None and isinstance(conf.plan, TradePlan):
+                if plan.route is not None and conf.plan.route != plan.route:
+                    continue    # another forum topic's signal is not a repost of this one
                 by_plan[conf.plan.plan_id] = conf
                 similar.append(TradeRecord(
                     id=0, plan=conf.plan, status=TradeStatus.OPENING, current_stop_loss=conf.plan.stop_loss,
@@ -1306,19 +1454,49 @@ class Engine:
         return out
 
     async def _resolve_trade(
-        self, action: ParsedAction, chat_id: int, reply_to: StoredMessage | None
+        self, action: ParsedAction, chat_id: int, reply_to: StoredMessage | None,
+        *, route: TopicRoute | None = None,
     ) -> tuple[TradeRecord | None, list[TradeRecord], list[ValidationIssue]]:
-        """target_trade_id > refers_to message > replied-to message > the single active trade of the asset."""
-        active = await self.db.active_trades()
+        """target_trade_id > refers_to message > replied-to message > the single active trade of the asset.
+        ``route``: only that forum topic route's trades are considered (None: every trade).
+
+        A message the instruction explicitly refers to (Telegram reply, else refers_to_message_id) that
+        belongs to a trade which is already over (closed / cancelled / failed) wins over a different
+        target_trade_id: the instruction is about that finished trade (and is then ignored), never about
+        another open one. A different ACTIVE trade behind the reply is a conflict: asked."""
+        active = [t for t in await self.db.active_trades() if self._in_scope(t, route)]
         base, _quote, _type = asset_of(action)
         extra: list[ValidationIssue] = []
+
+        async def by_message(mid: int) -> TradeRecord | None:
+            found = await self.db.find_trade_by_message(chat_id, mid)
+            return found if found is not None and self._in_scope(found, route) else None
+
+        referenced: TradeRecord | None = None
+        if reply_to is not None:
+            referenced = await by_message(reply_to.message_id)
+        if referenced is None and action.refers_to_message_id is not None:
+            referenced = await by_message(action.refers_to_message_id)
         trade: TradeRecord | None = None
         if action.target_trade_id is not None:
             trade = await self.db.get_trade(action.target_trade_id)
+            if trade is not None and not self._in_scope(trade, route):
+                logger.warning("Trade #%s is not of route %s; not managed from this topic",
+                               trade.id, route.name if route else None)
+                trade = None
         if trade is None and action.refers_to_message_id is not None:
-            trade = await self.db.find_trade_by_message(chat_id, action.refers_to_message_id)
+            trade = await by_message(action.refers_to_message_id)
         if trade is None and reply_to is not None:
-            trade = await self.db.find_trade_by_message(chat_id, reply_to.message_id)
+            trade = await by_message(reply_to.message_id)
+        if referenced is not None and trade is not None and referenced.id != trade.id:
+            if referenced.status in _DONE_TRADE:
+                trade = referenced
+            elif reply_to is not None:
+                extra.append(_issue(
+                    "reply_trade_mismatch",
+                    f"Mesaj #{referenced.id} {referenced.plan.base_asset} işleminin sinyaline yanıt, ama talimat "
+                    f"#{trade.id} {trade.plan.base_asset} işlemi için okundu.",
+                ))
         candidates = [t for t in active if base is None or t.plan.base_asset.upper() == base.upper()]
         if trade is None:
             by_side = [t for t in candidates if action.side is None or t.plan.side is action.side]
@@ -1347,9 +1525,9 @@ class Engine:
 
     async def _evaluate_management(
         self, action: ParsedAction, chat_id: int, reply_to: StoredMessage | None, *,
-        exclude_conf: str | None = None,
+        exclude_conf: str | None = None, route: TopicRoute | None = None,
     ) -> Evaluation:
-        trade, candidates, extra = await self._resolve_trade(action, chat_id, reply_to)
+        trade, candidates, extra = await self._resolve_trade(action, chat_id, reply_to, route=route)
         market = None
         filled: list[float] = []
         if trade is not None:
@@ -1372,12 +1550,20 @@ class Engine:
             await self._outcome_issues(chat_id, ids, exclude_conf),
             await self._applied_issues(chat_id, ids, action, plan),
         )
-        return Evaluation("manage", action, plan, issues, market, trade)
+        ignored: str | None = None
+        if trade is not None and trade.status in _DONE_TRADE:
+            # e.g. our stop already hit, then the trader replies "Stop" / "kapattık": nothing left to do.
+            ignored = (f"#{trade.id} {trade.plan.base_asset} {trade.plan.side.value.upper()} işlemi "
+                       f"{_DONE_TRADE_TR[trade.status]}")
+        return Evaluation("manage", action, plan, issues, market, trade, ignored=ignored)
 
     # ------------------------------------------------------------------ open
-    async def _handle_open(self, action: ParsedAction, chat_id: int, *, reply_to: StoredMessage | None = None) -> None:
+    async def _handle_open(
+        self, action: ParsedAction, chat_id: int, *, reply_to: StoredMessage | None = None,
+        route: TopicRoute | None = None,
+    ) -> None:
         async with self._open_lock:
-            ev = await self._evaluate_open(action, chat_id)
+            ev = await self._evaluate_open(action, chat_id, route=route)
             summary = (ev.plan.summary_tr if isinstance(ev.plan, TradePlan) else "") or action.summary_tr or "?"
             if await self._is_paused():
                 await self._notify(f"Duraklatıldı: sinyal atlandı ({esc(summary)})", Severity.INFO)
@@ -1397,15 +1583,26 @@ class Engine:
             await self.execute_open(ev.plan, raw_symbol=action.symbol)
 
     async def execute_open(self, plan: TradePlan, *, raw_symbol: str | None = None) -> str:
-        """Open ``plan`` on every broker that can trade it. Returns an HTML result text.
+        """Open ``plan`` on every broker that can trade it (only ``plan.broker_names`` when it names any:
+        a forum topic's brokers). Returns an HTML result text.
         Runs as a critical section: never interrupted half-way by a cancelled caller or shutdown."""
         return await self._critical_section(self._execute_open(plan, raw_symbol), f"open-{plan.plan_id}")
 
     async def _execute_open(self, plan: TradePlan, raw_symbol: str | None) -> str:
+        if self.config.telegram.topics and not plan.route:
+            # Topics route every trade to specific brokers; without a route we would open everywhere.
+            text = (f"🚨 <b>{esc(plan.base_asset)} {plan.side.value.upper()}</b>: sinyalin konusu (topic) "
+                    "belirlenemediği için işlem AÇILMADI (yanlış brokerda açılmasın diye).")
+            await self._notify(text, Severity.ERROR)
+            await self._log("open_refused_no_route", {"plan": plan.model_dump(mode="json")})
+            return text
         trade = await self.db.create_trade(plan)
+        if plan.broker_names and not self._plan_brokers(plan):
+            async with self.trade_lock(trade.id):
+                return await self._no_route_broker(trade)
         async with self.trade_lock(trade.id):
             await self._log("open_start", {"trade_id": trade.id, "plan": plan.model_dump(mode="json")})
-            brokers = [b for b in self.brokers if b.accepts_asset(plan.base_asset)]
+            brokers = [b for b in self._plan_brokers(plan) if b.accepts_asset(plan.base_asset)]
             outcomes: list[BrokerOutcome] = list(
                 await asyncio.gather(*(self._open_on_broker(b, plan, trade, raw_symbol) for b in brokers))
             ) if brokers else []
@@ -1435,6 +1632,24 @@ class Engine:
             "outcomes": [{"broker": o.broker, "kind": o.kind, "text": o.text} for o in outcomes],
         })
         return "\n".join([head, *lines])
+
+    async def _no_route_broker(self, trade: TradeRecord) -> str:
+        """None of the route's brokers is connected: never trade the signal elsewhere. The trade is kept as
+        FAILED (later "Stop" / "kapattık" replies to it are then ignored, not asked)."""
+        plan = trade.plan
+        names = ", ".join(esc(n) for n in plan.broker_names)
+        why = "; ".join(f"{esc(n)}: {esc(self.failed_brokers[n])}" for n in plan.broker_names if n in self.failed_brokers)
+        await self.db.update_trade(trade.id, status=TradeStatus.FAILED, note="konunun brokerı bağlı değil")
+        text = (
+            f"🚨 <b>#{trade.id} {esc(plan.base_asset)} {plan.side.value.upper()} açılamadı</b>: "
+            f"'{esc(plan.route or '?')}' konusunun brokerı ({names}) bağlı değil. Sinyal başka bir hesapta "
+            "AÇILMADI." + (f"\nBağlantı hatası: <code>{why}</code>" if why else "")
+            + f"\n{esc(plan.summary_tr)}"
+        )
+        await self._notify(text, Severity.ERROR)
+        await self._log("open_no_route_broker", {"trade_id": trade.id, "route": plan.route,
+                                                 "brokers": list(plan.broker_names)})
+        return text
 
     async def _open_on_broker(
         self, broker: Broker, plan: TradePlan, trade: TradeRecord, raw_symbol: str | None
@@ -1550,14 +1765,50 @@ class Engine:
 
     # ------------------------------------------------------------------ management
     async def _handle_management(
-        self, action: ParsedAction, chat_id: int, *, reply_to: StoredMessage | None = None
+        self, action: ParsedAction, chat_id: int, *, reply_to: StoredMessage | None = None,
+        route: TopicRoute | None = None,
     ) -> None:
-        ev = await self._evaluate_management(action, chat_id, reply_to)
+        ev = await self._evaluate_management(action, chat_id, reply_to, route=route)
+        if ev.ignored is None and ev.trade is not None and ev.trade.status in ACTIVE_TRADE:
+            # The trader's "Stop" / "kapattık" often comes right after the stop hit: sync the trade with its
+            # venues first, so a position that just closed is not "closed" again (or asked about).
+            fresh = await self._refresh_trade(ev.trade)
+            if fresh.status is not ev.trade.status:
+                ev = await self._evaluate_management(action, chat_id, reply_to, route=route)
+        if ev.ignored is not None:
+            await self._ignore_management(ev, chat_id)
+            return
         if not ev.automatic:
             await self._ask_eval(ev, chat_id)
             return
         assert isinstance(ev.plan, ManagementPlan)
         await self.execute_management(ev.plan)
+
+    async def _refresh_trade(self, trade: TradeRecord) -> TradeRecord:
+        """Sync one trade's positions now (like a monitor pass). Never raises; the stored trade after it."""
+        try:
+            async with self.trade_lock(trade.id):
+                await self.monitor.sync_trade(trade.id)
+            return await self.db.get_trade(trade.id) or trade
+        except Exception:
+            logger.exception("Sync of trade #%s before managing it failed", trade.id)
+            return trade
+
+    async def _ignore_management(self, ev: Evaluation, chat_id: int) -> None:
+        """A management instruction for a trade that is already over: nothing to do, the owner is not asked."""
+        action = ev.action
+        logger.info("Management %s for a finished trade ignored: %s (messages %s)",
+                    action.action.value, ev.ignored, action.used_message_ids)
+        await self._log("manage_ignored", {
+            "chat_id": chat_id, "trade_id": ev.trade.id if ev.trade else None, "reason": ev.ignored,
+            "action": action.model_dump(mode="json"),
+        })
+        if self.config.notifier.notify_on_ignored:
+            await self._notify(
+                f"💬 Yok sayıldı: {esc(action.summary_tr or action.action.value)} — {esc(ev.ignored or '')}; "
+                "yapılacak bir şey yok.",
+                Severity.INFO,
+            )
 
     async def execute_management(self, plan: ManagementPlan, *, notify: bool = True) -> str:
         """Apply ``plan`` to every active broker position of the trade. Returns an HTML result text.
@@ -1953,8 +2204,9 @@ class Engine:
                 return f"Bu onay artık geçerli değil ({status})."
             msgs = await self._source_messages(conf)
             reply_to = await self._reply_context(conf.source_chat_id, msgs)
-            ctx = ParseContext(now=self._now(), open_trades=await self._open_trade_summaries(), reply_to=reply_to,
-                               correction_text=text, previous_action=conf.action)
+            route, title = await self._conf_route(conf, msgs)
+            ctx = await self._parse_context(route, title, reply_to, correction_text=text,
+                                            previous_action=conf.action)
             try:
                 result = await self.parser.parse(msgs, ctx)
             except Exception as exc:
@@ -1968,8 +2220,10 @@ class Engine:
             action = actions[0]
             if not action.used_message_ids:
                 action = action.model_copy(update={"used_message_ids": list(conf.source_message_ids)})
-            ev = await self.evaluate(action, conf.source_chat_id, reply_to=reply_to, exclude_conf=conf.id)
+            ev = await self.evaluate(action, conf.source_chat_id, reply_to=reply_to, exclude_conf=conf.id,
+                                     route=route)
             assert ev is not None
+            ev.issues = merge_issues(ev.issues, self._topic_unknown_issues(ev, route))
             if len(actions) > 1:
                 ev.issues.append(_issue("multiple_actions",
                                         "Düzeltmede birden fazla talimat var; yalnızca ilki gösteriliyor."))
@@ -1995,7 +2249,7 @@ class Engine:
         try:
             # A batch of this sender may be parsing / executing this very message right now. Wait for it,
             # so the lookups below see the trade or confirmation it created and the edit is never lost.
-            async with self._sender_lock((msg.chat_id, msg.sender_id)):
+            async with self._sender_lock(stream_key(msg.chat_id, msg.sender_id, msg.topic_id)):
                 fresh = await self.db.get_message(msg.chat_id, msg.message_id)
             current = fresh or msg
             trade = await self.db.find_trade_by_message(msg.chat_id, msg.message_id)
@@ -2008,7 +2262,7 @@ class Engine:
                     await self._edited_confirmation(conf.id)
                     return
             if fresh is not None and not fresh.consumed:
-                await self.on_messages_ready(msg.chat_id, msg.sender_id)
+                await self.on_messages_ready(msg.chat_id, msg.sender_id, current.topic_id)
                 return
             await self._edited_consumed_message(current)
         except Exception as exc:
@@ -2023,11 +2277,16 @@ class Engine:
         if age > EDIT_REPROCESS_MAX_AGE_SEC:
             logger.info("Edit of old message %s/%s (%.0fs) ignored", msg.chat_id, msg.message_id, age)
             return
+        route, title = self._route_of([msg])
+        if self.config.telegram.topics and route is None:
+            logger.info("Edit of %s/%s in a topic that is not followed (%r) ignored", msg.chat_id, msg.message_id,
+                        title)
+            return
         if self.config.llm.prefilter and not prefilter.looks_relevant(msg):
             logger.debug("Edit of %s/%s: prefilter says not relevant", msg.chat_id, msg.message_id)
             return
         reply_to = await self._reply_context(msg.chat_id, [msg])
-        ctx = ParseContext(now=self._now(), open_trades=await self._open_trade_summaries(), reply_to=reply_to)
+        ctx = await self._parse_context(route, title, reply_to)
         try:
             result = await self.parser.parse([msg], ctx)
         except Exception as exc:
@@ -2065,8 +2324,11 @@ class Engine:
                 await self._notify(f"Duraklatıldı: düzenlenen sinyal atlandı ({esc(action.summary_tr or '?')})",
                                    Severity.INFO)
                 continue
-            ev = await self.evaluate(action, msg.chat_id, reply_to=reply_to)
+            ev = await self.evaluate(action, msg.chat_id, reply_to=reply_to, route=route)
             if ev is None:
+                continue
+            if ev.ignored is not None:
+                logger.info("Edit of %s/%s: %s; ignored", msg.chat_id, msg.message_id, ev.ignored)
                 continue
             if applied:
                 same = [r for r in applied if self._same_as_applied(r, action, ev.plan)]
@@ -2097,7 +2359,9 @@ class Engine:
         if all(m.message_id != msg.message_id for m in msgs):
             msgs.append(msg)
         reply_to = await self._reply_context(chat_id, msgs)
-        ctx = ParseContext(now=self._now(), open_trades=await self._open_trade_summaries(), reply_to=reply_to)
+        route = self._route_named(trade.plan.route)
+        title = self._route_of(msgs)[1]
+        ctx = await self._parse_context(route, title, reply_to)
         try:
             result = await self.parser.parse(msgs, ctx)
         except Exception as exc:
@@ -2152,7 +2416,7 @@ class Engine:
             logger.info("Edit of %s/%s does not change trade #%s levels", msg.chat_id, msg.message_id, trade.id)
             return
         for action in proposals:
-            ev = await self._evaluate_management(action, chat_id, None)
+            ev = await self._evaluate_management(action, chat_id, None, route=route)
             ev.issues = merge_issues([edited], ev.issues)
             await self._ask_eval(ev, chat_id)
 
@@ -2163,7 +2427,8 @@ class Engine:
                 return
             msgs = await self._source_messages(conf)
             reply_to = await self._reply_context(conf.source_chat_id, msgs)
-            ctx = ParseContext(now=self._now(), open_trades=await self._open_trade_summaries(), reply_to=reply_to)
+            route, title = await self._conf_route(conf, msgs)
+            ctx = await self._parse_context(route, title, reply_to)
             try:
                 result = await self.parser.parse(msgs, ctx)
             except Exception as exc:
@@ -2178,9 +2443,11 @@ class Engine:
             action = actions[0]
             if not action.used_message_ids:
                 action = action.model_copy(update={"used_message_ids": list(conf.source_message_ids)})
-            ev = await self.evaluate(action, conf.source_chat_id, reply_to=reply_to, exclude_conf=conf.id)
+            ev = await self.evaluate(action, conf.source_chat_id, reply_to=reply_to, exclude_conf=conf.id,
+                                     route=route)
             assert ev is not None
-            ev.issues = merge_issues([_issue("signal_edited", "Sinyal mesajı düzenlendi.")], ev.issues)
+            ev.issues = merge_issues([_issue("signal_edited", "Sinyal mesajı düzenlendi.")], ev.issues,
+                                     self._topic_unknown_issues(ev, route))
             new_id = await self._new_conf_id()
             await self._finish(conf, ConfirmationStatus.SUPERSEDED, f"♻️ Mesaj düzenlendi → yeni onay #{new_id}")
         await self._ask_eval(ev, conf.source_chat_id, conf_id=new_id)
@@ -2199,6 +2466,8 @@ class Engine:
         broker_bits = [f"✅ {esc(b.name)}" for b in self.brokers]
         broker_bits += [f"❌ {esc(n)}" for n in self.failed_brokers]
         lines.append("Brokerlar: " + (", ".join(broker_bits) or "yok"))
+        if self.config.telegram.topics:
+            lines.append(self._routes_text())
         n_open = sum(1 for t in trades if t.status is TradeStatus.OPEN)
         n_pending = sum(1 for t in trades if t.status is TradeStatus.PENDING)
         lines.append(f"Aktif işlem: {len(trades)} (açık {n_open}, bekleyen emir {n_pending})")
@@ -2213,7 +2482,7 @@ class Engine:
         lines = [f"📂 <b>Açık işlemler</b> ({len(trades)})"]
         for t in trades:
             lines.append("")
-            lines.append(fmt.format_trade_line(t))
+            lines.append(fmt.format_trade_line(t) + (f" · 📁 {esc(t.plan.route)}" if t.plan.route else ""))
             hit, _share = tp_progress(t, await self.db.broker_positions(t.id))
             tps = " / ".join(fmt_price(tp.price) + (" ✔" if h else "")
                              for tp, h in zip(t.current_take_profits, hit)) or "yok"
@@ -2294,9 +2563,17 @@ class Engine:
             return f"⚠️ Okunamadı: {esc(exc)}"
         return await self.describe_actions(result.actions, chat_id=0)
 
-    async def describe_actions(self, actions: list[ParsedAction], *, chat_id: int) -> str:
-        """Owner-facing explanation of what would happen (no side effects)."""
+    async def describe_actions(
+        self, actions: list[ParsedAction], *, chat_id: int, route: TopicRoute | None = None
+    ) -> str:
+        """Owner-facing explanation of what would happen (no side effects). ``route``: as if the messages
+        came from that forum topic (None: no topic)."""
         parts = ["🧪 <b>Deneme — işlem açılmaz</b>"]
+        if route is not None:
+            parts.append(f"📁 Konu: {esc(route.name)} → {esc(', '.join(route.brokers) or 'tüm brokerlar')}")
+        elif self.config.telegram.topics:
+            parts.append("📁 Konu bilgisi yok: tüm brokerlar ve tüm açık işlemler varsayıldı (gerçek mesajlarda "
+                         "yalnızca takip edilen konular okunur).")
         if not actions:
             parts.append("Hiçbir talimat çıkmadı.")
         for action in actions:
@@ -2306,8 +2583,11 @@ class Engine:
                 unsure = self._none_is_unsure(action)
                 parts.append("🤔 Emin olunamadığı için size sorulurdu." if unsure else "💬 Yok sayılırdı.")
                 continue
-            ev = await self.evaluate(action, chat_id)
+            ev = await self.evaluate(action, chat_id, route=route)
             assert ev is not None
+            if ev.ignored is not None:
+                parts.append(f"💬 Yok sayılırdı: {esc(ev.ignored)}.")
+                continue
             if isinstance(ev.plan, TradePlan):
                 parts += ["", fmt.format_plan(ev.plan)]
             elif isinstance(ev.plan, ManagementPlan):
@@ -2328,9 +2608,14 @@ class Engine:
         return "\n".join(parts)
 
     async def preview_open(self, plan: TradePlan, *, raw_symbol: str | None = None) -> list[str]:
-        """Per-broker sizing preview for a plan (read-only: never places orders). Plain text lines."""
+        """Per-broker sizing preview for a plan (read-only: never places orders). Plain text lines.
+        Only the plan's route brokers (``plan.broker_names``) when it names any, like execute_open."""
         lines: list[str] = []
-        for b in self.brokers:
+        brokers = self._plan_brokers(plan)
+        if plan.broker_names and not brokers:
+            lines.append(f"'{plan.route or '?'}' konusunun brokerı ({', '.join(plan.broker_names)}) bağlı değil; "
+                         "işlem başka hesapta açılmaz")
+        for b in brokers:
             try:
                 if not b.accepts_asset(plan.base_asset):
                     lines.append(f"{b.name}: bu varlığa izin verilmiyor (allowed_assets)")
@@ -2360,4 +2645,4 @@ class Engine:
 
 
 __all__ = ["Engine", "Evaluation", "BrokerOutcome", "asset_of", "merge_issues", "is_transient_parse_error",
-           "filled_tp_prices", "tp_progress"]
+           "filled_tp_prices", "tp_progress", "stream_key"]

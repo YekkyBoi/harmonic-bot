@@ -632,3 +632,111 @@ async def test_end_to_end_through_real_sdk() -> None:
     assert any(b["type"] == "image" for b in body["messages"][0]["content"])
     (a,) = result.actions
     assert a.action is ActionType.OPEN and a.stop_loss == 2205.11 and a.risk_r == 1.0
+
+
+# --------------------------------------------------------------------------- #
+# Forum topics (KLAN-style group: crypto / fx topics)
+# --------------------------------------------------------------------------- #
+def eth_short_wire(**overrides: Any) -> dict[str, Any]:
+    data: dict[str, Any] = dict(
+        action="open", symbol="ETHUSDT.P", base_asset="ETH", quote_asset="USDT", market_type="perp",
+        side="short", entry_type="market", entry_price=2239.2, stop_loss=2250.6,
+        take_profits=[{"price": 2205.11, "close_fraction": 1.0}], risk_r=1.0, used_message_ids=[610, 611],
+        confidence=0.95, summary_tr="ETH SHORT",
+    )
+    data.update(overrides)
+    return wire_action(**data)
+
+
+SIZING_TEXT = "Eth short\n1R risk\n100 risk için 8.7 lot"
+
+
+async def test_topic_line_follows_the_intro() -> None:
+    parser, client = parser_with(make_response({"actions": [wire_action()]}))
+    await parser.parse([msg(1, "Aktif", reply_to_message_id=20, topic_id=20)],
+                       ctx(topic_title="💱 Kasım Ayı Fx İşlemleri", topic_kind="fx"))
+    content = user_content(client)
+    assert content[0]["text"].startswith("Current time (UTC)")
+    assert content[1]["text"] == "Konu: 💱 Kasım Ayı Fx İşlemleri (tür: fx)"
+    # A forum message "replies" to its topic's root: not shown as a reply.
+    assert "[msg_id=1 | 2026-11-07T17:07:00Z | from=Ahmet (id 42)]\nAktif" in texts(content)
+
+
+async def test_topic_line_without_kind_and_none_without_topic() -> None:
+    parser, client = parser_with(make_response({"actions": [wire_action()]}))
+    await parser.parse([msg(1, "x")], ctx(topic_title="Analiz"))
+    assert user_content(client)[1]["text"] == "Konu: Analiz"
+    await parser.parse([msg(2, "x", reply_to_message_id=1)], ctx())
+    content = user_content(client)
+    assert not any(b["type"] == "text" and b["text"].startswith("Konu:") for b in content)
+    assert "| reply_to=1]" in texts(content)
+
+
+def test_system_prompt_teaches_the_forum_wording_and_stays_stable() -> None:
+    sp = prompts.SYSTEM_PROMPT
+    for phrase in ('"Aktif"', '"Stop" (a short reply to a signal) -> "close" with close_fraction 1.0',
+                   "manuel kapattık", "entry stop atsın", '"2.8 r"', "Limit Emir", "100 risk için 8.7 lot",
+                   "X / Y", '"EUR LONG" = EURUSD', "tür: crypto", "tür: fx", "never pick another open trade"):
+        assert phrase in sp, phrase
+    assert "{" not in prompts.TOPIC_LINE.replace("{title}", "").replace("{kind}", "")
+    assert "Kasım Ayı Kripto" in sp and "2026-" not in sp.split("# Examples")[1].split("## 3.")[1]
+
+
+async def test_lot_note_consistent_with_levels_is_accepted() -> None:
+    parser, _ = parser_with(make_response({"actions": [eth_short_wire()]}))
+    result = await parser.parse([msg(610, "", media_path=str(EXAMPLE_JPG)), msg(611, SIZING_TEXT)],
+                                ctx(topic_title="Kripto İşlemleri", topic_kind="crypto"))
+    (a,) = result.actions
+    assert a.ambiguities == [] and a.confidence == 0.95 and a.risk_r == 1.0
+
+
+async def test_lot_note_far_from_levels_flags_a_misread() -> None:
+    parser, _ = parser_with(make_response({"actions": [eth_short_wire(stop_loss=2275.6)]}))
+    result = await parser.parse([msg(610, "", media_path=str(EXAMPLE_JPG)), msg(611, SIZING_TEXT)],
+                                ctx(topic_title="Kripto İşlemleri", topic_kind="crypto"))
+    (a,) = result.actions
+    assert a.confidence <= 0.6 and len(a.ambiguities) == 1
+    assert "100 risk için 8.7 lot" in a.ambiguities[0] and "11.4943" in a.ambiguities[0] and "36.4" in a.ambiguities[0]
+
+
+async def test_lot_note_check_skipped_in_fx_topics_and_for_other_texts() -> None:
+    eur = wire_action(action="open", symbol="EURUSD", base_asset="EUR", quote_asset="USD", market_type="forex",
+                      side="long", entry_type="limit", entry_price=1.084, stop_loss=1.08, risk_r=1.0,
+                      take_profits=[{"price": 1.095, "close_fraction": 1.0}], used_message_ids=[701], confidence=0.95)
+    parser, _ = parser_with(make_response({"actions": [eur]}))
+    result = await parser.parse([msg(701, "EUR LONG 1R\n100 risk için 0.5 lot")],
+                                ctx(topic_title="Fx İşlemleri", topic_kind="fx"))
+    assert result.actions[0].ambiguities == []
+    # Not part of the action's messages: not checked.
+    parser, _ = parser_with(make_response({"actions": [eth_short_wire(used_message_ids=[611])]}))
+    result = await parser.parse([msg(600, "100 risk için 1 lot"), msg(611, "Eth short 1R")],
+                                ctx(topic_kind="crypto", topic_title="Kripto"))
+    assert result.actions[0].ambiguities == []
+
+
+async def test_fx_topic_fills_the_usd_pair_and_crypto_topic_the_usdt_perp() -> None:
+    eur = wire_action(action="open", symbol="EUR", base_asset="EUR", side="long", entry_type="limit",
+                      entry_price=1.084, stop_loss=1.08, used_message_ids=[701], confidence=0.95)
+    parser, _ = parser_with(make_response({"actions": [eur]}))
+    (a,) = (await parser.parse([msg(701, "EUR LONG 1R Limit Emir")], ctx(topic_title="Fx", topic_kind="fx"))).actions
+    assert (a.base_asset, a.quote_asset, a.market_type) == ("EUR", "USD", MarketType.FOREX)
+    assert a.ambiguities == [] and a.confidence == 0.95
+
+    eth = wire_action(action="open", symbol="Eth", base_asset="ETH", side="short", entry_price=2239.2,
+                      stop_loss=2250.6, used_message_ids=[611], confidence=0.95)
+    parser, _ = parser_with(make_response({"actions": [eth]}))
+    (a,) = (await parser.parse([msg(611, "Eth short")], ctx(topic_title="Kripto", topic_kind="crypto"))).actions
+    assert (a.quote_asset, a.market_type) == ("USDT", MarketType.PERP)
+
+    # Without a topic nothing is assumed.
+    parser, _ = parser_with(make_response({"actions": [eur]}))
+    (a,) = (await parser.parse([msg(701, "EUR LONG")], ctx())).actions
+    assert a.quote_asset is None and a.market_type is None
+
+
+async def test_instrument_contradicting_the_topic_kind_is_asked() -> None:
+    eth = wire_action(action="open", symbol="ETHUSDT.P", base_asset="ETH", quote_asset="USDT", market_type="perp",
+                      side="short", entry_price=2239.2, stop_loss=2250.6, used_message_ids=[701], confidence=0.95)
+    parser, _ = parser_with(make_response({"actions": [eth]}))
+    (a,) = (await parser.parse([msg(701, "Eth short")], ctx(topic_title="Fx", topic_kind="fx"))).actions
+    assert a.confidence <= 0.6 and any("Forex konusundaki" in x for x in a.ambiguities)

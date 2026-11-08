@@ -745,3 +745,115 @@ async def test_operation_waiting_on_lock_during_close_fails_cleanly(clock: Clock
     await closer
     with pytest.raises(RuntimeError):
         await late
+
+
+# --------------------------------------------------------------------------- #
+# Forum topics (schema v2)
+# --------------------------------------------------------------------------- #
+CRYPTO_TOPIC = 3
+FX_TOPIC = 7
+
+_V1_MESSAGES = """
+CREATE TABLE schema_version (version INTEGER NOT NULL);
+INSERT INTO schema_version (version) VALUES (1);
+CREATE TABLE messages (
+    chat_id              INTEGER NOT NULL,
+    message_id           INTEGER NOT NULL,
+    sender_id            INTEGER,
+    sender_name          TEXT,
+    date                 TEXT    NOT NULL,
+    text                 TEXT    NOT NULL DEFAULT '',
+    media_path           TEXT,
+    media_type           TEXT,
+    reply_to_message_id  INTEGER,
+    grouped_id           INTEGER,
+    edited               INTEGER NOT NULL DEFAULT 0,
+    consumed             INTEGER NOT NULL DEFAULT 0,
+    PRIMARY KEY (chat_id, message_id)
+);
+CREATE INDEX ix_messages_chat_date ON messages (chat_id, date);
+CREATE TABLE state (key TEXT PRIMARY KEY, value TEXT NOT NULL);
+INSERT INTO messages (chat_id, message_id, sender_id, date, text, consumed)
+    VALUES (-1001234567890, 10, 111, '2026-11-07T12:00:00.000000+00:00', 'eth 1R long', 1);
+INSERT INTO state (key, value) VALUES ('last_msg_id:-1001234567890', '10');
+"""
+
+
+def _make_v1_db(path: Path) -> None:
+    with closing(sqlite3.connect(path)) as raw:
+        raw.executescript(_V1_MESSAGES)
+        raw.commit()
+
+
+async def test_topic_fields_roundtrip(db: Database):
+    m = msg(5, text="Eth short\n1R risk", topic_id=CRYPTO_TOPIC, topic_title="💰 Kasım Ayı Kripto İşlemleri")
+    await db.save_message(m)
+    assert await db.get_message(CHAT, 5) == m
+    await db.save_message(msg(6, text="General chatter"))
+    got = await db.get_message(CHAT, 6)
+    assert got is not None and got.topic_id is None and got.topic_title is None
+
+
+async def test_topic_kept_on_upsert_without_topic_and_title_updated_on_rename(db: Database):
+    await db.save_message(msg(5, text="EUR LONG", topic_id=FX_TOPIC, topic_title="Kasım Ayı Fx İşlemleri"))
+    await db.save_message(msg(5, text="EUR LONG 1R Limit Emir", edited=True))        # no topic info
+    got = await db.get_message(CHAT, 5)
+    assert got is not None and got.topic_id == FX_TOPIC and got.topic_title == "Kasım Ayı Fx İşlemleri"
+    await db.save_message(msg(5, text="EUR LONG 1R Limit Emir", topic_id=FX_TOPIC,
+                              topic_title="Aralık Ayı Fx İşlemleri"))
+    got = await db.get_message(CHAT, 5)
+    assert got is not None and got.topic_title == "Aralık Ayı Fx İşlemleri" and got.text == "EUR LONG 1R Limit Emir"
+
+
+async def test_recent_messages_topic_filter(db: Database):
+    await db.save_message(msg(1, date=T0, text="Eth short", topic_id=CRYPTO_TOPIC))
+    await db.save_message(msg(2, date=T0 + timedelta(seconds=1), text="EUR LONG", topic_id=FX_TOPIC))
+    await db.save_message(msg(3, date=T0 + timedelta(seconds=2), text="general"))
+    await db.save_message(msg(4, date=T0 + timedelta(seconds=3), text="Aktif", topic_id=FX_TOPIC, sender_id=OTHER))
+    since = T0 - timedelta(minutes=1)
+    assert [m.message_id for m in await db.recent_messages(CHAT, since)] == [1, 2, 3, 4]       # None = every topic
+    assert [m.message_id for m in await db.recent_messages(CHAT, since, topic_id=CRYPTO_TOPIC)] == [1]
+    assert [m.message_id for m in await db.recent_messages(CHAT, since, topic_id=FX_TOPIC)] == [2, 4]
+    assert [m.message_id for m in await db.recent_messages(CHAT, since, TRADER, True, 50, FX_TOPIC)] == [2]
+    assert await db.recent_messages(CHAT, since, topic_id=999) == []
+
+
+async def test_migrates_v1_database_in_place(tmp_path: Path):
+    path = tmp_path / "copytrader.db"
+    _make_v1_db(path)
+    async with Database(str(path)) as database:
+        old = await database.get_message(CHAT, 10)
+        assert old is not None and old.text == "eth 1R long" and old.consumed
+        assert old.topic_id is None and old.topic_title is None
+        assert await database.get_state(f"last_msg_id:{CHAT}") == 10
+        await database.save_message(msg(11, text="Eth short", topic_id=CRYPTO_TOPIC, topic_title="Kripto"))
+        await database.create_trade(plan())                                # other tables created as well
+    with closing(sqlite3.connect(path)) as raw:
+        assert raw.execute("SELECT version FROM schema_version").fetchall() == [(SCHEMA_VERSION,)]
+        cols = {r[1] for r in raw.execute("PRAGMA table_info(messages)")}
+        assert {"topic_id", "topic_title"} <= cols
+    async with Database(str(path)) as database:                           # reopening is a no-op
+        got = await database.get_message(CHAT, 11)
+        assert got is not None and got.topic_id == CRYPTO_TOPIC and got.topic_title == "Kripto"
+        assert [m.message_id for m in await database.recent_messages(CHAT, T0 - timedelta(days=30),
+                                                                      only_unconsumed=False,
+                                                                      topic_id=CRYPTO_TOPIC)] == [11]
+
+
+async def test_migration_tolerates_columns_that_already_exist(tmp_path: Path):
+    path = tmp_path / "copytrader.db"
+    _make_v1_db(path)
+    with closing(sqlite3.connect(path)) as raw:                          # e.g. a half-upgraded dev build
+        raw.execute("ALTER TABLE messages ADD COLUMN topic_id INTEGER")
+        raw.commit()
+    async with Database(str(path)) as database:
+        await database.save_message(msg(12, topic_id=FX_TOPIC, topic_title="Fx"))
+        got = await database.get_message(CHAT, 12)
+        assert got is not None and got.topic_id == FX_TOPIC
+    with closing(sqlite3.connect(path)) as raw:
+        assert raw.execute("SELECT version FROM schema_version").fetchall() == [(SCHEMA_VERSION,)]
+
+
+def test_schema_version_has_migration_for_every_step():
+    assert SCHEMA_VERSION == 2
+    assert all(v in dbmod.MIGRATIONS for v in range(2, SCHEMA_VERSION + 1))

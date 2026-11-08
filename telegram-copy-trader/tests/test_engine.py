@@ -809,3 +809,38 @@ async def test_incomplete_watch_survives_unrelated_open_in_same_batch(env: Env) 
     await wait_for(lambda: len(env.notifier.confirmations) == 1)
     assert env.notifier.confirmations[0].kind == "incomplete"
     assert env.notifier.confirmations[0].action.base_asset == "BTC"
+
+
+# --------------------------------------------------------------------------- #
+# Replies to a trade's signal (also without forum topics)
+# --------------------------------------------------------------------------- #
+async def test_close_reply_to_an_already_closed_trade_is_ignored(env: Env) -> None:
+    env.parser.push(result(eth_open()))
+    await env.signal()
+    trade = (await env.db.active_trades())[0]
+    for pos in await env.db.broker_positions(trade.id):
+        await env.db.save_broker_position(trade.id, pos.model_copy(update={"status": PositionStatus.CLOSED,
+                                                                           "remaining_quantity": 0.0}))
+    await env.db.update_trade(trade.id, status=TradeStatus.CLOSED)
+    env.parser.push(result(action(ActionType.CLOSE, close_fraction=1.0, refers_to_message_id=502,
+                                  used_message_ids=[600], ambiguities=["Açık işlem bulunamadı."])))
+    await add_msg(env.db, 600, "Stop", reply_to=502)
+    await env.engine.on_messages_ready(CHAT, SENDER, None)          # topic_id=None: same stream as before
+    assert env.notifier.confirmations == [] and env.notifier.notifications == []
+    assert all(b.calls_of("close_position") == [] for b in env.brokers)
+    assert (await env.db.get_message(CHAT, 600)).consumed  # type: ignore[union-attr]
+
+
+async def test_reply_to_one_trade_read_as_another_open_trade_is_asked(env: Env) -> None:
+    env.parser.push(result(eth_open()))
+    await env.signal()
+    first = (await env.db.active_trades())[0]
+    second = await env.db.create_trade(first.plan.model_copy(update={"plan_id": "second", "source_message_ids": [400]}),
+                                       status=TradeStatus.OPEN)
+    env.parser.push(result(action(ActionType.CLOSE, close_fraction=1.0, target_trade_id=second.id,
+                                  base_asset="ETH", used_message_ids=[600])))
+    await add_msg(env.db, 600, "kapattım", reply_to=502)            # 502 is the FIRST trade's signal
+    await env.engine.on_messages_ready(CHAT, SENDER)
+    (conf,) = env.notifier.confirmations
+    assert "reply_trade_mismatch" in [i.code for i in conf.issues]
+    assert all(b.calls_of("close_position") == [] for b in env.brokers)

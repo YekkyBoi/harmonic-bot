@@ -51,6 +51,8 @@ _STEMS = (
     "yari", "kalan", "heps", "tamami",
     # English exits / partials, TP/SL with suffixes ("tp2ye", "tp'yi" is split at the apostrophe).
     "exit", "partial", "secure", "booked", "tp",
+    # Signal-group status words: "Aktif" (limit filled), "Update geçiyoruz", "güncelleme", "manuel kapattık".
+    "aktif", "update", "guncelle", "manuel",
 )
 # Words that start with a stem but are plain chatter.
 _STEM_EXCEPTIONS = ("yarin",)          # "yarın" (tomorrow), "yarına"...

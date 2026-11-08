@@ -78,3 +78,27 @@ def test_image_with_chatter_is_relevant():
 
 def test_media_path_without_type_is_relevant():
     assert looks_relevant(msg("", media_path="/x.jpg")) is True
+
+
+# Forum signal topics: the admins' short status / management replies must reach the parser.
+@pytest.mark.parametrize(
+    "text",
+    [
+        "Aktif",
+        "AKTİF",
+        "Stop",
+        "kapattık",
+        "0.2R kar ile manuel kapattık.",
+        "Update",
+        "Stop olmuş ama bildirimi gelmediği için şimdi Update geçiyoruz -1R",
+        "Stop olmayanlar varsa entry stop atsın",
+        "2.8 r",
+        "2 r kar",
+        "100 risk için 8.7 lot",
+        "Eth short\n1R risk\n100 risk için 8.7 lot",
+        "EUR LONG 1R Limit Emir",
+        "Grup işlemlerine -1 olarak yazılacak",
+    ],
+)
+def test_forum_signal_wording_is_relevant(text):
+    assert looks_relevant(msg(text)), text

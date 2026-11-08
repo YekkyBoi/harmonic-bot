@@ -305,8 +305,13 @@ def build_open_plan(
     source_chat_id: int,
     now: datetime,
     plan_id: str | None = None,
+    route: str | None = None,
+    broker_names: list[str] | None = None,
 ) -> tuple[TradePlan | None, list[ValidationIssue]]:
     """Validate an OPEN action and turn it into a TradePlan.
+
+    ``route`` / ``broker_names``: the forum topic route the signal came from (TopicRoute.name) and the
+    brokers it may be traded on (empty = every enabled broker); copied onto the plan unchanged.
 
     Blocking issues (plan is None): missing asset / side / stop loss; stop on the
     wrong side of entry (long: SL >= entry; short: SL <= entry); market price
@@ -516,6 +521,8 @@ def build_open_plan(
         source_chat_id=source_chat_id,
         source_message_ids=list(action.used_message_ids),
         created_at=now,
+        route=route,
+        broker_names=list(broker_names or []),
     )
     plan.summary_tr = _open_summary(plan, entry_is_market_price=entry is None)
     return plan, issues.items
@@ -530,10 +537,13 @@ def _open_summary(plan: TradePlan, *, entry_is_market_price: bool) -> str:
     else:
         entry = f"giriş {_fmt(plan.entry_price)}"
     tps = " / ".join(_fmt(tp.price) for tp in plan.take_profits) or "yok"
-    return (
+    out = (
         f"{plan.base_asset} {plan.side.value.upper()} ({kind}), {entry}, SL {_fmt(plan.stop_loss)}, "
         f"TP {tps}, risk {_fmt(plan.risk_r)}R (%{_pct(plan.risk_pct)})"
     )
+    if plan.route:
+        out += f" · konu {plan.route} → {', '.join(plan.broker_names) or 'tüm brokerlar'}"
+    return out
 
 
 # --------------------------------------------------------------------------- #
