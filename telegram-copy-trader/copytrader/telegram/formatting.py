@@ -159,11 +159,18 @@ def _tp_lines(tps: Iterable[TakeProfit], entry: float | None, stop: float | None
     return lines
 
 
+#: Set by the engine when some brokers risk a fixed USD amount per R ("binance 10 USD, breakout 50 USD"):
+#: then "1R = x% of equity" would be misleading, so the per-broker amounts are shown instead.
+RISK_PER_R_NOTE: str | None = None
+
+
 def _risk_line(risk_r: float | None, risk_pct: float | None) -> str:
     if risk_r is None:
         return "⚖️ Risk: <i>belirtilmedi (varsayılan R kullanılır)</i>"
     text = f"⚖️ Risk: <b>{fmt_number(risk_r)}R</b>"
-    if risk_pct is not None:
+    if RISK_PER_R_NOTE:
+        text += f" (1R: {esc(RISK_PER_R_NOTE)})"
+    elif risk_pct is not None:
         text += f" = bakiyenin {fmt_pct(risk_pct, possessive=True)}"
     return text
 

@@ -641,9 +641,23 @@ class Engine:
             Severity.WARNING,
         )
 
+    def _risk_per_r_text(self) -> str:
+        """'binance 10 USD, breakout 50 USD' when brokers use fixed amounts, else 'bakiyenin %2'si'."""
+        pct = f"bakiyenin {fmt.fmt_pct(self.config.risk.risk_per_r_pct, possessive=True)}"
+        cfgs = [b for b in self.config.brokers if b.enabled]
+        if not any(getattr(b, "risk_usd", None) for b in cfgs):
+            return pct
+        parts = []
+        for b in cfgs:
+            fixed = getattr(b, "risk_usd", None)
+            parts.append(f"{b.name} {fixed:g} USD" if fixed else f"{b.name} {pct}")
+        return ", ".join(parts)
+
     async def connect_brokers(self) -> None:
         """Connect every configured broker; failures are reported and excluded. No other side effects
         (the read-only CLI commands use this instead of start())."""
+        if any(getattr(b, "risk_usd", None) for b in self.config.brokers if b.enabled):
+            fmt.RISK_PER_R_NOTE = self._risk_per_r_text()
         results = await asyncio.gather(*(self._connect(b) for b in self.configured_brokers))
         self.brokers = [b for b, ok in zip(self.configured_brokers, results, strict=True) if ok]
 
@@ -717,7 +731,7 @@ class Engine:
         lines.append(f"Kaynak sohbet: {len(self.config.telegram.source_chats)}")
         if self.config.telegram.topics:
             lines.append(self._routes_text())
-        lines.append(f"Risk: 1R = bakiyenin {fmt.fmt_pct(self.config.risk.risk_per_r_pct, possessive=True)}")
+        lines.append(f"Risk: 1R = {esc(self._risk_per_r_text())}")
         pending = await self.db.pending_confirmations()
         if pending:
             lines.append(f"Bekleyen onay: {len(pending)}")
@@ -2485,7 +2499,7 @@ class Engine:
         n_pending = sum(1 for t in trades if t.status is TradeStatus.PENDING)
         lines.append(f"Aktif işlem: {len(trades)} (açık {n_open}, bekleyen emir {n_pending})")
         lines.append(f"Bekleyen onay: {len(pending)}")
-        lines.append(f"Risk: 1R = bakiyenin {fmt.fmt_pct(self.config.risk.risk_per_r_pct, possessive=True)}")
+        lines.append(f"Risk: 1R = {esc(self._risk_per_r_text())}")
         return "\n".join(lines)
 
     async def positions_text(self) -> str:
