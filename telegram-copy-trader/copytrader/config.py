@@ -181,8 +181,23 @@ class PaperBrokerConfig(_BrokerBase):
     fee_rate: float = 0.0005
 
 
+class ManualBrokerConfig(_BrokerBase):
+    """No orders: the owner gets a Telegram message (entry / stop / TP / quantity) and trades by hand.
+
+    Risk is a fixed amount per R (``risk_usd``), not a % of equity. Positions are tracked virtually
+    with real prices so later "close" / "stop to entry" messages are forwarded too."""
+
+    type: Literal["manual"]
+    risk_usd: float = Field(50.0, gt=0)          # money at risk for 1R
+    qty_decimals: int | None = None              # round the quantity down to this many decimals (None = exchange step)
+    price_source_exchange: str = "binanceusdm"   # public prices for checks and virtual tracking
+    quote_currency: str = "USDT"
+    starting_balance: float = 1_000_000.0        # virtual, only for tracking
+    fee_rate: float = 0.0
+
+
 BrokerConfig = Annotated[
-    Union[CcxtBrokerConfig, Mt5BrokerConfig, MetaApiBrokerConfig, PaperBrokerConfig],
+    Union[CcxtBrokerConfig, Mt5BrokerConfig, MetaApiBrokerConfig, PaperBrokerConfig, ManualBrokerConfig],
     Field(discriminator="type"),
 ]
 

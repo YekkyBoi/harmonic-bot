@@ -27,6 +27,11 @@ def create_broker(cfg: Any, *, dry_run: bool, app_config: Any) -> Broker:
 
         return PaperBroker(cfg, data_dir)   # already simulated, never wrapped
 
+    if kind == "manual":
+        from .manual_broker import ManualBroker
+
+        return ManualBroker(cfg, data_dir)  # sends messages only, never places orders
+
     broker: Broker
     try:
         if kind == "ccxt":

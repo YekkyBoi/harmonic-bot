@@ -639,6 +639,9 @@ class Engine:
 
     async def _connect(self, broker: Broker) -> bool:
         try:
+            set_notifier = getattr(broker, "set_notifier", None)
+            if set_notifier is not None:     # manual (message-only) brokers talk to the owner
+                set_notifier(self.notifier)
             broker.set_risk_config(self.config.risk)
             await asyncio.wait_for(broker.connect(), CONNECT_TIMEOUT_SEC)
             broker.set_risk_config(self.config.risk)

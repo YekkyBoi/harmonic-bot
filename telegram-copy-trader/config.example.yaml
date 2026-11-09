@@ -197,6 +197,17 @@ brokers:
     allowed_assets: []
     risk_multiplier: 1.0
 
+  # --- Elle işlem bildirimi: emir göndermez, size Telegram'dan mesaj atar ---
+  # Mesajda giriş / stop / TP ve kalın yazıyla miktar olur. 1R = risk_usd (sabit USD).
+  # Sonraki "kapat" / "stopu girişe çek" talimatları da mesajla gelir.
+  # Kullanmak için enabled: true yapın ve telegram.topics içinde brokers listesine ekleyin.
+  - name: elle
+    type: manual
+    enabled: false
+    risk_usd: 50                # 1R'de riske edilecek tutar (USD)
+    qty_decimals:               # miktarı bu kadar ondalığa aşağı yuvarla (boş = borsa adımı)
+    allowed_assets: []          # sadece bu coinler için mesaj at (boş = hepsi), ör: [BTC, ETH, SOL]
+
   # --- MT5, kendi terminaliyle (SADECE WINDOWS) ---
   # Zorunlu alanları olduğu için kapalı (yorum) duruyor. Kullanmak için
   # satır başlarındaki "# " işaretlerini kaldırın ve .env'i doldurun.
