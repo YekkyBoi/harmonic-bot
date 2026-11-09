@@ -240,6 +240,7 @@ def choose_leverage(
     venue_max_leverage: float | None = None,
     max_margin_usage_pct: float = 90.0,
     maintenance_margin_rate: float = 0.005,
+    liquidation_cap: bool = True,
 ) -> tuple[int, float]:
     """Pick leverage for an isolated/cross futures position. Returns (leverage, margin_required).
 
@@ -260,7 +261,9 @@ def choose_leverage(
 
     liq_cap = int((Decimal(1) / (_d(stop_distance_frac) * Decimal("1.5") + _d(maintenance_margin_rate)))
                   .to_integral_value(rounding=ROUND_FLOOR))
-    caps = [max(1, liq_cap), max(1, int(max_leverage))]
+    # liquidation_cap=False (cross margin): liquidation depends on the whole account, not this
+    # position's margin, so the stop-distance cap does not apply.
+    caps = ([max(1, liq_cap)] if liquidation_cap else []) + [max(1, int(max_leverage))]
     if venue_max_leverage is not None and math.isfinite(venue_max_leverage) and venue_max_leverage >= 1:
         caps.append(int(math.floor(venue_max_leverage)))
     cap = min(caps)

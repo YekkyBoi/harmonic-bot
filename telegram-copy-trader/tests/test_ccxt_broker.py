@@ -834,3 +834,34 @@ async def test_bybit_limit_cancelled_on_exchange_becomes_cancelled() -> None:
     fake.orders[pos.data["entry_order_id"]]["status"] = "canceled"
     pos = await broker.sync_position(pos)
     assert pos.status is PositionStatus.CANCELLED
+
+
+async def test_cross_margin_uses_max_leverage_without_liquidation_cap() -> None:
+    from copytrader.risk.sizing import choose_leverage
+
+    # 1% stop: isolated would cap at floor(1 / (0.015 + 0.005)) = 50x; cross may use 125x
+    iso, _ = choose_leverage(notional=1000, free_margin=50, stop_distance_frac=0.01, preferred=125,
+                             max_leverage=125)
+    cross, margin = choose_leverage(notional=1000, free_margin=50, stop_distance_frac=0.01, preferred=125,
+                                    max_leverage=125, liquidation_cap=False)
+    assert iso == 50 and cross == 125 and margin == 8.0
+
+
+async def test_refused_leverage_steps_down_to_symbol_max() -> None:
+    broker, fake = make_broker(margin_mode="cross", leverage=125, max_leverage=125)
+    await broker.connect()
+    for lev in (125, 100, 75):
+        fake.fail_when(lambda m, a, lev=lev: m == "set_leverage" and a[0] == lev,
+                       cx.BadRequest('binanceusdm {"code":-4028,"msg":"Leverage %d is not valid"}' % lev))
+    warnings = await broker._prepare_symbol(SYM, 125, Side.LONG)
+    levs = [c[1][0] for c in fake.calls if c[0] == "set_leverage"]
+    assert levs == [125, 100, 75, 50]
+    assert any("50x" in w for w in warnings)
+
+
+async def test_other_leverage_errors_still_refuse() -> None:
+    broker, fake = make_broker()
+    await broker.connect()
+    fake.fail_when(lambda m, a: m == "set_leverage", cx.AuthenticationError("invalid api key"))
+    with pytest.raises(BrokerError):
+        await broker._prepare_symbol(SYM, 10, Side.LONG)

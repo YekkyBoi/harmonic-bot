@@ -70,6 +70,9 @@ _ALREADY_SET_RE = re.compile(
     r"not modified|no need to change|already|is the same|unchanged|110043|110026|-4046", re.IGNORECASE
 )
 _CANCELED = ("canceled", "cancelled", "expired", "rejected")
+# set_leverage refused because the value is above the symbol's maximum (binance -4028, bybit 10001...).
+_LEVERAGE_INVALID_RE = re.compile(r"-4028|leverage .*not valid|leverage.*(exceed|too (high|large)|invalid|out of range)|110013|10001", re.IGNORECASE)
+_LEVERAGE_STEPS = (125, 100, 75, 50, 40, 25, 20, 15, 10, 8, 5, 4, 3, 2, 1)
 _TP_PLACE_ATTEMPTS = 3
 # pos.error is a " | "-joined list of notes; these markers find the notes that clear themselves.
 _ERR_SEP = " | "
@@ -654,13 +657,15 @@ class CcxtBroker(Broker):
             max_leverage=self.cfg.max_leverage,
             venue_max_leverage=symbol.max_leverage,
             max_margin_usage_pct=risk.max_margin_usage_pct,
+            liquidation_cap=self.cfg.margin_mode == "isolated",
         )
         return result.model_copy(update={"leverage": float(leverage), "margin_required": margin})
 
     async def _resolve_leverage(self, req: OpenRequest, qty: float, ref_price: float) -> int:
         frac = abs(ref_price - req.stop_loss) / ref_price
-        liq_cap = max(1, math.floor(1 / (frac * 1.5 + 0.005)))
-        caps = [liq_cap, max(1, self.cfg.max_leverage)]
+        caps = [max(1, self.cfg.max_leverage)]
+        if self.cfg.margin_mode == "isolated":   # cross: liquidation depends on the whole account
+            caps.append(max(1, math.floor(1 / (frac * 1.5 + 0.005))))
         if req.symbol.max_leverage:
             caps.append(max(1, int(req.symbol.max_leverage)))
         if req.leverage:
@@ -675,6 +680,7 @@ class CcxtBroker(Broker):
                 max_leverage=self.cfg.max_leverage,
                 venue_max_leverage=req.symbol.max_leverage,
                 max_margin_usage_pct=self._risk().max_margin_usage_pct,
+                liquidation_cap=self.cfg.margin_mode == "isolated",
             )
         return max(1, min([lev, *caps]))
 
@@ -705,14 +711,25 @@ class CcxtBroker(Broker):
                 lev_params["posSide"] = side.value
         elif fam == "bitget" and self._hedged and mode == "isolated":
             lev_params["holdSide"] = side.value
-        try:
-            await self.exchange.set_leverage(leverage, symbol, lev_params)
-        except cx.NoChange:
-            pass
-        except cx.BaseError as e:
-            if not _ALREADY_SET_RE.search(str(e)):
-                raise BrokerError(f"{self.name}: kaldıraç {leverage}x ayarlanamadı: {_short(e)}") from e
-        return warnings
+        # The exchange's per-symbol maximum is often unknown up front (e.g. 125x BTC, 50x for many
+        # alts): when the wanted leverage is refused, step down to the next common level.
+        candidates = [leverage] + [x for x in _LEVERAGE_STEPS if x < leverage]
+        last_error: Exception | None = None
+        for lev in candidates:
+            try:
+                await self.exchange.set_leverage(lev, symbol, lev_params)
+            except cx.NoChange:
+                pass
+            except cx.BaseError as e:
+                if not _ALREADY_SET_RE.search(str(e)):
+                    last_error = e
+                    if _LEVERAGE_INVALID_RE.search(str(e)):
+                        continue
+                    raise BrokerError(f"{self.name}: kaldıraç {lev}x ayarlanamadı: {_short(e)}") from e
+            if lev != leverage:
+                warnings.append(f"Kaldıraç {leverage}x yerine {lev}x (bu coinde borsanın izin verdiği en yüksek).")
+            return warnings
+        raise BrokerError(f"{self.name}: kaldıraç ayarlanamadı: {_short(last_error)}")
 
     # ------------------------------------------------------------------ order lookups
     async def _fetch_order(self, order_id: str, symbol: str, kind: str, since: int | None = None) -> dict[str, Any]:
