@@ -46,7 +46,7 @@ class ManualBroker(PaperBroker):
     # risk = equity * risk_pct / 100, so report the equity that makes 1R == risk_usd.
     async def get_equity(self) -> float:
         rc = getattr(self, "risk_config", None) or RiskConfig()
-        return self.cfg.risk_usd * 100.0 / rc.risk_per_r_pct
+        return (self.cfg.risk_usd or 50.0) * 100.0 / rc.risk_per_r_pct
 
     async def get_free_margin(self) -> float:
         return await self.get_equity() * 1000.0     # never a margin limit for hand trades
@@ -90,7 +90,7 @@ class ManualBroker(PaperBroker):
             f"Giriş: {entry}\n"
             f"Stop: {fmt_price(plan.stop_loss)}\n"
             f"TP: {tps}\n"
-            f"Risk: ~{risk:.2f} USD ({plan.risk_r:g}R, 1R = {self.cfg.risk_usd:g} USD)"
+            f"Risk: ~{risk:.2f} USD ({plan.risk_r:g}R, 1R = {(self.cfg.risk_usd or 50.0):g} USD)"
         )
         await self._send(text)
         return pos

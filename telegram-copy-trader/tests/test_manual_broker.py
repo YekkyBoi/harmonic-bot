@@ -93,3 +93,15 @@ def test_registry_builds_manual_and_never_wraps_in_dry_run(tmp_path: Path) -> No
                     brokers=[cfg])
     broker = create_broker(cfg, dry_run=True, app_config=app)
     assert isinstance(broker, ManualBroker)
+
+
+def test_fixed_risk_usd_per_broker() -> None:
+    from types import SimpleNamespace
+
+    from copytrader.engine.orchestrator import broker_risk_amount
+
+    plan = eth_short(risk_r=0.5, risk_pct=1.0)
+    fixed = SimpleNamespace(config=SimpleNamespace(risk_usd=10.0, risk_multiplier=1.0))
+    pct = SimpleNamespace(config=SimpleNamespace(risk_usd=None, risk_multiplier=1.0))
+    assert broker_risk_amount(fixed, 123_456.0, plan) == 5.0         # 0.5R x 10 USD, equity ignored
+    assert broker_risk_amount(pct, 1_000.0, plan) == 10.0            # 1% of 1000

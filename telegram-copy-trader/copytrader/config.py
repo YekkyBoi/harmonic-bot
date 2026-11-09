@@ -125,6 +125,7 @@ class _BrokerBase(_Base):
     symbol_map: dict[str, str] = Field(default_factory=dict)   # "ETH" -> "ETHUSD" (base asset or raw symbol -> broker symbol)
     allowed_assets: list[str] = Field(default_factory=list)     # empty = all assets
     risk_multiplier: float = 1.0                  # scale risk on this broker only (1.0 = 2% per R)
+    risk_usd: float | None = Field(None, gt=0)    # fixed money at risk for 1R on this broker (instead of a % of equity)
 
 
 class CcxtBrokerConfig(_BrokerBase):
@@ -188,7 +189,7 @@ class ManualBrokerConfig(_BrokerBase):
     with real prices so later "close" / "stop to entry" messages are forwarded too."""
 
     type: Literal["manual"]
-    risk_usd: float = Field(50.0, gt=0)          # money at risk for 1R
+    risk_usd: float | None = Field(50.0, gt=0)   # money at risk for 1R
     qty_decimals: int | None = None              # round the quantity down to this many decimals (None = exchange step)
     price_source_exchange: str = "binanceusdm"   # public prices for checks and virtual tracking
     quote_currency: str = "USDT"

@@ -258,6 +258,16 @@ def _excerpt(msgs: list[StoredMessage]) -> str:
     return joined if len(joined) <= EXCERPT_CHARS else joined[: EXCERPT_CHARS - 1] + "…"
 
 
+def broker_risk_amount(broker: Broker, equity: float, plan: TradePlan) -> float:
+    """Money to risk at the stop on ``broker``: a fixed ``risk_usd`` per R when the broker sets one,
+    otherwise risk_pct of equity; both scaled by the broker's risk_multiplier."""
+    multiplier = float(getattr(broker.config, "risk_multiplier", 1.0) or 1.0)
+    fixed = getattr(broker.config, "risk_usd", None)
+    if fixed:
+        return float(fixed) * plan.risk_r * multiplier
+    return sizing.risk_amount(equity, plan.risk_pct, multiplier)
+
+
 def price_multiplier(extra: dict[str, Any] | None) -> float:
     """Exchange price / signal price (1000 when the signal says PEPE and the venue trades 1000PEPE)."""
     try:
@@ -1700,7 +1710,7 @@ class Engine:
                 await self._notify(text, Severity.WARNING)
                 return BrokerOutcome(name, "skipped", text)
 
-            amount = sizing.risk_amount(equity, plan.risk_pct, float(getattr(broker.config, "risk_multiplier", 1.0)))
+            amount = broker_risk_amount(broker, equity, plan)
             size = await broker.size_position(sym, plan.side, entry, stop, amount)
             req = OpenRequest(
                 plan=plan,
@@ -2633,7 +2643,7 @@ class Engine:
                 mult = price_multiplier(sym.extra)
                 entry = (quote.entry_price_for(plan.side) if plan.entry_type is EntryType.MARKET
                          else (plan.entry_price or 0.0) * mult)
-                amount = sizing.risk_amount(equity, plan.risk_pct, float(getattr(b.config, "risk_multiplier", 1.0)))
+                amount = broker_risk_amount(b, equity, plan)
                 size = await b.size_position(sym, plan.side, float(entry or 0.0), plan.stop_loss * mult, amount)
                 lev = f", kaldıraç {fmt.fmt_number(size.leverage)}x" if size.leverage else ""
                 lines.append(
