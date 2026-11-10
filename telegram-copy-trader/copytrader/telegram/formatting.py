@@ -8,6 +8,7 @@ from __future__ import annotations
 
 import html
 import math
+import re
 from collections.abc import Iterable
 from decimal import Decimal, InvalidOperation
 
@@ -28,6 +29,9 @@ from ..models import (
 
 HEADER_UNSURE = "🤔 <b>Emin olamadım — şunu anladım, doğru mu?</b>"
 HEADER_INCOMPLETE = "🧩 <b>Eksik sinyal — tamamlayabilir misin?</b>"
+# Under the one-line question of a confirmation that can be approved: what the two buttons do.
+BUTTON_HINT_MANAGE = "✅ Onayla = uygula · ❌ İptal = dokunma"
+BUTTON_HINT_OPEN = "✅ Onayla = aç · ❌ İptal = açma"
 CORRECTION_HINT = (
     "✏️ Doğrusunu yazın, ör: <code>SL 2200, TP 2320</code> veya <code>short olacak</code>"
 )
@@ -312,10 +316,80 @@ def expiry_minutes(conf: PendingConfirmation) -> int:
     return max(1, round(seconds / 60))
 
 
+_SIDE_WORD = {Side.LONG: "LONG", Side.SHORT: "SHORT"}
+# The validator starts a management plan's summary with the trade's own label: "#1 BTC SHORT: ...".
+_TRADE_LABEL = re.compile(r"#(\d+) \S+ (?:LONG|SHORT)(?![^\s:])")
+
+
+def _pct_accusative(value_pct: float) -> str:
+    """"%50'sini", "%30'unu", "%25'ini" (possessive + accusative: "... kapatayım mı?")."""
+    num = fmt_number(value_pct)
+    poss = tr_possessive(num)
+    return f"%{num}{poss}n{poss[-1]}" if poss else f"%{num} kadarını"
+
+
+def _managed_label(plan: ManagementPlan) -> str:
+    """'#1 BTC SHORT' (escaped) from the plan's summary, else just '#1'. Never taken from the parser's
+    reading: the asset it read can differ from the trade the plan really targets."""
+    found = _TRADE_LABEL.match(plan.summary_tr or "")
+    if found and int(found.group(1)) == plan.trade_id:
+        return esc(found.group(0))
+    return f"#{plan.trade_id}"
+
+
+def _manage_question(plan: ManagementPlan, issues: Iterable[ValidationIssue]) -> str:
+    label = _managed_label(plan)
+    if plan.action is ActionType.CLOSE:
+        if plan.close_fraction is None or plan.close_fraction >= 0.999:
+            return f"{label} pozisyonunu KAPATAYIM MI?"
+        return f"{label} pozisyonunun {_pct_accusative(plan.close_fraction * 100)} KAPATAYIM MI?"
+    if plan.action is ActionType.MOVE_SL:
+        price = fmt_price(plan.new_stop_loss) if plan.new_stop_loss is not None else None
+        if plan.move_sl_to_entry:
+            return f"{label} stopunu girişe{f' ({price})' if price else ''} çekeyim mi?"
+        return f"{label} stopunu {price} yapayım mı?" if price else f"{label} stopunu değiştireyim mi?"
+    if plan.action is ActionType.MOVE_TP:
+        if not plan.take_profits:
+            return f"{label} TP'sini değiştireyim mi?"
+        noun = "TP'sini" if len(plan.take_profits) == 1 else "TP'lerini"
+        prices = " / ".join(fmt_price(tp.price) for tp in plan.take_profits)
+        return f"{label} {noun} {prices} yapayım mı?"
+    if plan.action is ActionType.CANCEL:
+        if any(i.code == "cancel_filled_trade" for i in issues):   # the entry already filled: "cancel" closes it
+            return f"{label} işlemini iptal edip AÇIK POZİSYONU KAPATAYIM MI?"
+        return f"{label} bekleyen emrini iptal edeyim mi?"
+    return f"{label} işleminde bu değişikliği yapayım mı?"
+
+
+def confirmation_question(conf: PendingConfirmation) -> str | None:
+    """The plain one-line question a confirmation asks ("#1 BTC SHORT pozisyonunu KAPATAYIM MI?"), as
+    HTML-safe text. None when there is nothing to approve (no plan: the owner has to correct it first)."""
+    if conf.kind == "incomplete":
+        return None
+    if isinstance(conf.plan, ManagementPlan):
+        return _manage_question(conf.plan, conf.issues)
+    if isinstance(conf.plan, TradePlan):
+        return f"{esc(conf.plan.base_asset.upper())} {_SIDE_WORD[conf.plan.side]} işlemini AÇAYIM MI?"
+    if conf.kind == "manage":
+        # No plan: the trade the message is about could not be told (several candidates / none found).
+        return "Hangi işlemden bahsediliyor? Düzelt'e basıp işlem numarasını yazın (ör. #2)."
+    return None
+
+
 def format_confirmation(conf: PendingConfirmation, *, with_expiry: bool = True) -> str:
-    """The 'I understood X, is that right?' message (``with_expiry=False`` once it is closed)."""
+    """The 'I understood X, is that right?' message (``with_expiry=False`` once it is closed).
+
+    A confirmation that can be approved starts with the question itself in one bold line and, while its
+    buttons are live, a line that says what the buttons do; the details follow."""
     action = conf.action
-    parts = [HEADER_INCOMPLETE if conf.kind == "incomplete" else HEADER_UNSURE, ""]
+    parts: list[str] = []
+    question = confirmation_question(conf)
+    if question:
+        parts.append(f"❓ <b>{question}</b>")
+        if with_expiry and conf.plan is not None:
+            parts.append(BUTTON_HINT_OPEN if isinstance(conf.plan, TradePlan) else BUTTON_HINT_MANAGE)
+        parts.append("")
+    parts += [HEADER_INCOMPLETE if conf.kind == "incomplete" else HEADER_UNSURE, ""]
     if isinstance(conf.plan, TradePlan):
         parts.append(format_plan(conf.plan))
     elif isinstance(conf.plan, ManagementPlan):

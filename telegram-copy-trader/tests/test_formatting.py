@@ -209,3 +209,155 @@ def test_number_helpers():
     assert f.fmt_pct(100, possessive=True) == "%100'ü"
     assert f.fmt_pct(50, possessive=True) == "%50'si"
     assert f.esc("<a & b>") == "&lt;a &amp; b&gt;"
+
+
+# --------------------------------------------------------------------------- #
+# The question on top of a confirmation (what the owner is asked, in one line)
+# --------------------------------------------------------------------------- #
+def manage_plan(action: ActionType, summary: str = "#1 BTC SHORT: değişiklik", **kw) -> ManagementPlan:
+    return ManagementPlan(plan_id="m", action=action, trade_id=1, source_chat_id=1, created_at=NOW,
+                          summary_tr=summary, **kw)
+
+
+def manage_conf(plan: ManagementPlan, **kw) -> PendingConfirmation:
+    data = dict(kind="manage", plan=plan, market_price=73638.75,
+                action=make_action(action=plan.action, symbol=None, base_asset="BTC", side=Side.SHORT,
+                                   entry_price=None, stop_loss=None, take_profits=[], risk_r=None, confidence=0.6))
+    data.update(kw)
+    return make_conf(**data)
+
+
+@pytest.mark.parametrize(
+    ("plan", "question"),
+    [
+        (manage_plan(ActionType.CLOSE, close_fraction=1.0), "#1 BTC SHORT pozisyonunu KAPATAYIM MI?"),
+        (manage_plan(ActionType.CLOSE), "#1 BTC SHORT pozisyonunu KAPATAYIM MI?"),
+        (manage_plan(ActionType.CLOSE, close_fraction=0.5), "#1 BTC SHORT pozisyonunun %50'sini KAPATAYIM MI?"),
+        (manage_plan(ActionType.CLOSE, close_fraction=0.3), "#1 BTC SHORT pozisyonunun %30'unu KAPATAYIM MI?"),
+        (manage_plan(ActionType.CLOSE, close_fraction=0.25), "#1 BTC SHORT pozisyonunun %25'ini KAPATAYIM MI?"),
+        (manage_plan(ActionType.MOVE_SL, new_stop_loss=74868.8), "#1 BTC SHORT stopunu 74868.8 yapayım mı?"),
+        (manage_plan(ActionType.MOVE_SL, new_stop_loss=74868.8, move_sl_to_entry=True),
+         "#1 BTC SHORT stopunu girişe (74868.8) çekeyim mi?"),
+        (manage_plan(ActionType.MOVE_SL, move_sl_to_entry=True), "#1 BTC SHORT stopunu girişe çekeyim mi?"),
+        (manage_plan(ActionType.MOVE_TP, take_profits=[TakeProfit(price=73095)]),
+         "#1 BTC SHORT TP'sini 73095 yapayım mı?"),
+        (manage_plan(ActionType.MOVE_TP, take_profits=[TakeProfit(price=73448.2, close_fraction=0.5),
+                                                       TakeProfit(price=73095, close_fraction=0.5)]),
+         "#1 BTC SHORT TP'lerini 73448.2 / 73095 yapayım mı?"),
+        (manage_plan(ActionType.CANCEL), "#1 BTC SHORT bekleyen emrini iptal edeyim mi?"),
+    ],
+)
+def test_manage_confirmation_starts_with_the_question_and_the_button_hint(plan, question):
+    text = f.format_confirmation(manage_conf(plan))
+    lines = text.split("\n")
+    assert lines[0] == f"❓ <b>{question}</b>"
+    assert lines[1] == "✅ Onayla = uygula · ❌ İptal = dokunma" == f.BUTTON_HINT_MANAGE
+    assert lines[2] == "" and lines[3] == f.HEADER_UNSURE            # then the details, as before
+    assert f"🔗 İşlem: #{plan.trade_id}" in text and "uygulanmaz" in text
+    assert assert_valid_html(text).startswith(f"❓ {question}\n")
+    assert f.confirmation_question(manage_conf(plan)) == question
+
+
+def test_incident_close_confirmation_reads_as_a_question():
+    plan = manage_plan(ActionType.CLOSE, "#1 BTC SHORT: pozisyonun tamamı kapatılacak", close_fraction=1.0,
+                       source_message_ids=[20129])
+    conf = manage_conf(plan, source_message_ids=[20129], issues=[
+        ValidationIssue(code="low_confidence", message_tr="Güven düşük (%60)."),
+        ValidationIssue(code="ambiguity", message_tr="Mesaj bir yanıt değil; işlem #1'e asset eşleşmesiyle bağlandı."),
+    ])
+    plain = assert_valid_html(f.format_confirmation(conf))
+    assert plain.split("\n")[:3] == ["❓ #1 BTC SHORT pozisyonunu KAPATAYIM MI?",
+                                     "✅ Onayla = uygula · ❌ İptal = dokunma", ""]
+    for kept in ("Emin olamadım — şunu anladım, doğru mu?", "🔒 Kapat: tamamı", "🔗 İşlem: #1",
+                 "📝 #1 BTC SHORT: pozisyonun tamamı kapatılacak", "Güncel fiyat: 73638.75", "Güven: %60",
+                 "⚠️ Güven düşük (%60).", "Kaynak mesaj: #20129", "⏳ 10 dk içinde yanıt gelmezse bu değişiklik"):
+        assert kept in plain, kept
+
+
+def test_cancel_of_a_filled_trade_asks_about_closing_the_open_position():
+    conf = manage_conf(manage_plan(ActionType.CANCEL), issues=[
+        ValidationIssue(code="cancel_filled_trade", message_tr="#1 BTC SHORT girişi zaten dolmuş")])
+    assert f.format_confirmation(conf).split("\n")[0] == (
+        "❓ <b>#1 BTC SHORT işlemini iptal edip AÇIK POZİSYONU KAPATAYIM MI?</b>")
+
+
+def test_open_confirmation_starts_with_the_question_and_the_button_hint():
+    conf = make_conf(plan=make_plan(base_asset="btc", side=Side.SHORT, entry_type=EntryType.LIMIT,
+                                    entry_price=74868.8, stop_loss=75575.0,
+                                    take_profits=[TakeProfit(price=73095.0)]))
+    text = f.format_confirmation(conf)
+    lines = text.split("\n")
+    assert lines[0] == "❓ <b>BTC SHORT işlemini AÇAYIM MI?</b>"
+    assert lines[1] == "✅ Onayla = aç · ❌ İptal = açma" == f.BUTTON_HINT_OPEN
+    assert lines[2] == "" and lines[3] == f.HEADER_UNSURE
+    assert "işlem açılmaz" in text
+    assert f.format_confirmation(make_conf()).split("\n")[0] == "❓ <b>ETH LONG işlemini AÇAYIM MI?</b>"
+
+
+def test_closed_confirmation_keeps_the_question_but_not_the_button_hint():
+    conf = manage_conf(manage_plan(ActionType.CLOSE, close_fraction=1.0))
+    closed = f.format_confirmation(conf, with_expiry=False)
+    assert closed.split("\n")[:3] == ["❓ <b>#1 BTC SHORT pozisyonunu KAPATAYIM MI?</b>", "", f.HEADER_UNSURE]
+    assert "Onayla" not in closed and "⏳" not in closed
+    closed_open = f.format_confirmation(make_conf(), with_expiry=False)
+    assert closed_open.startswith("❓ <b>ETH LONG işlemini AÇAYIM MI?</b>\n\n") and "Onayla" not in closed_open
+
+
+def test_no_question_when_there_is_nothing_to_approve():
+    # No plan (blocking issue): only Düzelt / İptal buttons exist, so no "Onayla = ..." line either.
+    blocked = make_conf(plan=None, action=make_action(stop_loss=None))
+    text = f.format_confirmation(blocked)
+    assert text.startswith(f.HEADER_UNSURE) and "❓ <b>" not in text and "Onayla =" not in text
+    assert f.confirmation_question(blocked) is None
+    # A manage question without a plan asks which trade is meant (answered with Düzelt, no Onayla).
+    blocked_manage = make_conf(kind="manage", plan=None, action=make_action(action=ActionType.CLOSE))
+    text = f.format_confirmation(blocked_manage)
+    assert text.startswith("❓ <b>Hangi işlemden bahsediliyor?") and "Onayla =" not in text
+    assert f.HEADER_UNSURE in text
+    incomplete = make_conf(kind="incomplete", plan=None, action=make_action(action=ActionType.INCOMPLETE))
+    assert f.format_confirmation(incomplete).startswith(f.HEADER_INCOMPLETE)
+    assert f.confirmation_question(incomplete) is None
+
+
+def test_question_label_comes_from_the_plan_not_from_the_parsers_reading():
+    # The parser read ETH, the plan targets trade #1 BTC SHORT: the question names the real trade.
+    plan = manage_plan(ActionType.CLOSE, "#1 BTC SHORT: pozisyonun tamamı kapatılacak", close_fraction=1.0)
+    conf = manage_conf(plan, action=make_action(action=ActionType.CLOSE, base_asset="ETH", side=Side.LONG))
+    assert f.confirmation_question(conf) == "#1 BTC SHORT pozisyonunu KAPATAYIM MI?"
+    # A summary without the trade's label (or with another trade's): only the id is certain.
+    for summary in ("", "pozisyon kapatılacak", "#2 ETH LONG: pozisyonun tamamı kapatılacak", "#1 BTC SHORTY: x"):
+        plain_plan = manage_plan(ActionType.CLOSE, summary, close_fraction=1.0)
+        assert f.confirmation_question(manage_conf(plain_plan)) == "#1 pozisyonunu KAPATAYIM MI?", summary
+
+
+def test_question_escapes_untrusted_asset_names():
+    conf = manage_conf(manage_plan(ActionType.CLOSE, "#1 A&B<i> SHORT: x", close_fraction=1.0))
+    text = f.format_confirmation(conf)
+    assert text.split("\n")[0] == "❓ <b>#1 A&amp;B&lt;i&gt; SHORT pozisyonunu KAPATAYIM MI?</b>"
+    assert assert_valid_html(text).startswith("❓ #1 A&B<i> SHORT pozisyonunu KAPATAYIM MI?")
+    opened = f.format_confirmation(make_conf(plan=make_plan(base_asset="<eth>")))
+    assert opened.split("\n")[0] == "❓ <b>&lt;ETH&gt; LONG işlemini AÇAYIM MI?</b>"
+    assert_valid_html(opened)
+
+
+def test_question_uses_the_label_the_validator_writes_into_the_plan():
+    from copytrader.parsing import validator
+
+    trade = TradeRecord(
+        id=7, plan=make_plan(), status=TradeStatus.OPEN, current_stop_loss=2205.11,
+        current_take_profits=[TakeProfit(price=2310.6)], created_at=NOW, updated_at=NOW,
+    )
+
+    def question(action: ParsedAction, market: float = 2250.0) -> str:
+        plan, issues = validator.build_management_plan(
+            action, trade=trade, candidates=[trade], market_price=market, source_chat_id=-1001, now=NOW)
+        assert plan is not None, issues
+        conf = make_conf(kind="manage", plan=plan, action=action, issues=issues)
+        return f.format_confirmation(conf).split("\n")[0]
+
+    close = ParsedAction(action=ActionType.CLOSE, close_fraction=1.0, target_trade_id=7, confidence=0.6)
+    assert question(close) == "❓ <b>#7 ETH LONG pozisyonunu KAPATAYIM MI?</b>"
+    to_entry = ParsedAction(action=ActionType.MOVE_SL, move_sl_to_entry=True, target_trade_id=7, confidence=0.6)
+    assert question(to_entry) == "❓ <b>#7 ETH LONG stopunu girişe (2232.18) çekeyim mi?</b>"
+    cancel = ParsedAction(action=ActionType.CANCEL, target_trade_id=7, confidence=0.6)
+    assert question(cancel) == "❓ <b>#7 ETH LONG işlemini iptal edip AÇIK POZİSYONU KAPATAYIM MI?</b>"

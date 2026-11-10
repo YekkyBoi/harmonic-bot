@@ -1495,8 +1495,15 @@ class Engine:
         base, _quote, _type = asset_of(action)
         extra: list[ValidationIssue] = []
 
-        async def by_message(mid: int) -> TradeRecord | None:
+        async def by_message(mid: int, hops: int = 3) -> TradeRecord | None:
             found = await self.db.find_trade_by_message(chat_id, mid)
+            if found is None and hops > 0:
+                # A reply to a reply ("2R kapandı" -> "entry stop attık" / "Aktif" -> the signal): follow
+                # the thread up to the signal message.
+                parent = await self.db.get_message(chat_id, mid)
+                up = parent.reply_to_message_id if parent is not None else None
+                if parent is not None and up is not None and up != parent.topic_id:
+                    return await by_message(up, hops - 1)
             return found if found is not None and self._in_scope(found, route) else None
 
         referenced: TradeRecord | None = None
@@ -1529,6 +1536,14 @@ class Engine:
             by_side = [t for t in candidates if action.side is None or t.plan.side is action.side]
             if base is not None and len(by_side) == 1:
                 trade = by_side[0]
+                if reply_to is not None:
+                    # The message replies to something no trade was copied from (a signal we never took?):
+                    # the only trade of that asset may be a DIFFERENT trade. Asked, never applied silently.
+                    extra.append(_issue(
+                        "reply_unlinked",
+                        f"Mesaj #{reply_to.message_id} mesajına yanıt, ama o mesajdan kopyalanmış bir işlem yok; "
+                        f"aynı varlıktaki #{trade.id} {trade.plan.base_asset} işlemi seçildi.",
+                    ))
             elif base is None and len(active) == 1:
                 trade = active[0]
                 extra.append(_issue(
@@ -1537,6 +1552,16 @@ class Engine:
                 ))
             elif len(by_side) > 1:
                 candidates = by_side
+        if (trade is None and base is not None and not candidates
+                and action.action in (ActionType.CLOSE, ActionType.CANCEL)):
+            # "BTC kapandı" while no BTC copy is active: if this topic's latest copy of that asset is
+            # already over, the message is about that one -> ignored like a reply to it, never asked.
+            done = [t for t in await self.db.recent_trades(self._now() - timedelta(days=7))
+                    if self._in_scope(t, route) and t.status in _DONE_TRADE
+                    and t.plan.base_asset.upper() == base.upper()
+                    and (action.side is None or t.plan.side is action.side)]
+            if done:
+                trade = done[0]
         if trade is not None:
             if base is not None and trade.plan.base_asset.upper() != base.upper():
                 extra.append(_issue(
@@ -1879,7 +1904,9 @@ class Engine:
         if not outcomes:
             head = f"⚠️ {label}: uygulanacak pozisyon yok"
         elif ok and all(o.kind not in ("error", "partial") for o in outcomes):
-            head = f"✅ {label}: {esc(plan.summary_tr or plan.action.value)}"
+            # The plan summary already starts with the trade label and is written before the fact
+            # ("#1 BTC SHORT: pozisyonun tamamı kapatılacak"): the outcome lines below say what was done.
+            head = f"✅ {label}: uygulandı"
         elif ok:
             head = f"⚠️ {label}: kısmen uygulandı"
         else:

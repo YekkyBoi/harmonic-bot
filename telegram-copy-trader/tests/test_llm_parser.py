@@ -676,8 +676,12 @@ def test_system_prompt_teaches_the_forum_wording_and_stays_stable() -> None:
     sp = prompts.SYSTEM_PROMPT
     for phrase in ('"Aktif"', '"Stop" (a short reply to a signal) -> "close" with close_fraction 1.0',
                    "manuel kapattık", "entry stop atsın", '"2.8 r"', "Limit Emir", "100 risk için 8.7 lot",
-                   "X / Y", '"EUR LONG" = EURUSD', "tür: crypto", "tür: fx", "never pick another open trade"):
+                   "X / Y", '"EUR LONG" = EURUSD', "tür: crypto", "tür: fx", "never pick another open trade",
+                   # closure reports of one trade close its copy (details: tests/test_closure_reports.py)
+                   "- Closure reports.", '"2R kapandı"', "A copy must never outlive the trader's trade",
+                   '- NOT a closure report -> "none"'):
         assert phrase in sp, phrase
+    assert 'A result report on its own -> "none"' not in sp        # the old rule: every result report ignored
     assert "{" not in prompts.TOPIC_LINE.replace("{title}", "").replace("{kind}", "")
     assert "Kasım Ayı Kripto" in sp and "2026-" not in sp.split("# Examples")[1].split("## 3.")[1]
 
