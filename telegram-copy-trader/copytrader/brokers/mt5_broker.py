@@ -32,6 +32,7 @@ import importlib
 import logging
 import math
 import sys
+import time
 from abc import ABC, abstractmethod
 from collections.abc import Callable, Sequence
 from concurrent.futures import ThreadPoolExecutor
@@ -129,6 +130,8 @@ class MT5:
     RES_E_NOT_FOUND = -4
 
 
+_STALE_TICK_SEC = 600           # a tick older than this = market closed (no expiration is set)
+_METAL_BASES = frozenset({"XAU", "XAG", "XPT", "XPD"})
 _IPC_ERRORS = range(-10005, -9999)          # -10005..-10000: terminal IPC lost
 _REQUOTE_CODES = (MT5.TRADE_RETCODE_REQUOTE, MT5.TRADE_RETCODE_PRICE_CHANGED, MT5.TRADE_RETCODE_PRICE_OFF)
 _DEAL_OK = (MT5.TRADE_RETCODE_DONE, MT5.TRADE_RETCODE_DONE_PARTIAL)
@@ -153,7 +156,8 @@ RETCODE_TR: dict[int, str] = {
     10022: "geçersiz emir süresi",
     10024: "çok sık istek",
     10026: "sunucu otomatik işlemi kapattı",
-    10027: "terminalde 'Algo Trading' kapalı",
+    10027: ("MT5'te üst araç çubuğundaki 'Algo Trading' düğmesi kapalı; yeşil yapın "
+            "(Araçlar > Seçenekler > Uzman Danışmanlar > algoritmik ticarete izin ver)"),
     10028: "talep kilitli",
     10029: "emir/pozisyon donmuş (freeze level)",
     10030: "desteklenmeyen dolum tipi (filling)",
@@ -235,9 +239,11 @@ def split_tp_legs(
     return legs
 
 
-def symbol_candidates(base: str, quote: str | None) -> list[str]:
+def symbol_candidates(base: str, quote: str | None, market_type: MarketType | None = None) -> list[str]:
     out: list[str] = []
-    for q in (quote, "USD", "USDT"):
+    # FX / CFD never trade against USDT: probing "EURUSDT" could hit an unrelated listing and beat "EURUSD.a".
+    quotes = (quote, "USD") if market_type in (MarketType.FOREX, MarketType.CFD) else (quote, "USD", "USDT")
+    for q in quotes:
         if q:
             name = base.upper() + q.upper()
             if name not in out:
@@ -513,10 +519,23 @@ class MetaTraderLegBroker(Broker, ABC):
         tps = [TakeProfit(price=round_to_tick(t.price, tick), close_fraction=t.close_fraction) for t in req.take_profits]
         pending = req.entry_type is EntryType.LIMIT
         quote = await self._quote(sym.broker_symbol)
+        notes: list[str] = []
         if pending:
             if req.entry_price is None:
                 raise BrokerError("Limit emir için giriş fiyatı yok.")
             ref = round_to_tick(req.entry_price, tick)
+            # A limit that is already marketable (long: ask <= price; short: bid >= price) would be sent as a
+            # BUY_STOP / SELL_STOP, a different trade. The signal means "get in at this price or better":
+            # open it at the market instead (the engine still bounds the distance by max_entry_distance_pct).
+            if (quote.ask <= ref) if side is Side.LONG else (quote.bid >= ref):
+                fill = quote.entry_price_for(side)
+                notes.append(
+                    f"Limit giriş ({_num(ref)}) anlık fiyatta ({_num(fill)}) zaten gerçekleşebilir durumda "
+                    f"olduğundan bekleyen emir yerine piyasa emriyle açıldı."
+                )
+                total = await self._resize_for_fill(sym, side, total, ref, fill, sl, notes)
+                pending = False
+                ref = fill
         else:
             ref = quote.entry_price_for(side)
         self._check_levels(side, ref, sl, tps, quote, sym, pending)
@@ -537,6 +556,7 @@ class MetaTraderLegBroker(Broker, ABC):
                 "volume_min": vmin,
                 "price_tick": tick,
                 "emulated_tps": [],
+                "warnings": notes,
             },
         )
 
@@ -568,6 +588,13 @@ class MetaTraderLegBroker(Broker, ABC):
                     leg = await self._open_pending_leg(sym, side, pl.volume, ref, sl, pl.tp, tag, quote)
                 else:
                     leg = await self._open_market_leg(sym, side, pl.volume, sl, pl.tp, tag)
+            except OrderReplyLostError as exc:
+                # The reply was lost; the order may exist. Look it up by its tag instead of sending again.
+                leg = await self._adopt_lost_leg(sym.broker_symbol, tag, pl.volume, sl, pl.tp)
+                if leg is None:
+                    errors.append(f"{label} açılamadı: {exc}")
+                    break
+                notes.append(f"{label}: emir yanıtı kaybolmuştu, etiketle bulundu (#{leg['ticket']}); tekrar gönderilmedi.")
             except BrokerError as exc:
                 errors.append(f"{label} açılamadı: {exc}")
                 break
@@ -604,6 +631,35 @@ class MetaTraderLegBroker(Broker, ABC):
         )
         return pos
 
+    async def _resize_for_fill(
+        self, sym: SymbolInfo, side: Side, total: float, planned_entry: float, fill: float, sl: float,
+        notes: list[str],
+    ) -> float:
+        """Lots re-sized from the price the order will really fill at, so that the loss at the stop stays the
+        1R the engine sized for the planned entry. Never raises: on any problem the original lots stand
+        (always the smaller, safer size here, because a marketable limit fills at a better price)."""
+        try:
+            old = await self._loss_per_lot(sym, side, planned_entry, sl)
+            new = await self._loss_per_lot(sym, side, fill, sl)
+            fee = self._fee_per_lot(old, planned_entry, sl)
+            if not (math.isfinite(old) and math.isfinite(new) and new > 0 and old > 0):
+                return total
+            lots = floor_to_step((total * (old + fee)) / (new + fee), sym.qty_step)
+            if sym.max_qty:
+                lots = min(lots, floor_to_step(sym.max_qty, sym.qty_step))
+            if lots <= total + _EPS:
+                return total
+            margin = await self._margin_for(sym, side, lots, fill)
+            allowed = await self.get_free_margin() * self.risk_config.max_margin_usage_pct / 100.0
+            if margin is not None and margin > allowed:
+                notes.append("Lot, piyasadan dolum fiyatına göre artırılamadı (teminat yetersiz); ilk hesaplanan lot kullanıldı.")
+                return total
+            notes.append(f"Lot dolum fiyatına göre {_num(total)} -> {_num(lots)} olarak yeniden hesaplandı (risk 1R'de kalsın).")
+            return lots
+        except BrokerError as exc:
+            logger.warning("%s: could not re-size for the market fill: %s", self.name, exc)
+            return total
+
     async def _protect_or_close(
         self, symbol: str, side: Side, leg: dict[str, Any], sl: float, tp: float | None
     ) -> str | None:
@@ -632,6 +688,24 @@ class MetaTraderLegBroker(Broker, ABC):
         leg["state"] = "failed"
         leg["reason"] = "no_stop"
         return f"Stop konulamadı ({last}); pozisyon #{leg['ticket']} piyasa fiyatından kapatıldı."
+
+    async def _adopt_lost_leg(
+        self, symbol: str, tag: str, volume: float, sl: float, tp: float | None
+    ) -> dict[str, Any] | None:
+        """After a lost order_send reply: the leg with exactly this tag, if the order reached the venue."""
+        try:
+            positions, orders = await self._snapshot(symbol)
+        except BrokerError as exc:
+            logger.error("%s: cannot verify lost order_send reply for %s: %s", self.name, tag, exc)
+            return None
+        found = [leg for leg in self._legs_from_snapshot(positions, orders, tag) if leg["tag"] == tag]
+        if not found:
+            return None
+        leg = found[0]
+        leg["volume"] = float(volume) if not leg.get("volume") else leg["volume"]
+        if leg["state"] == "pending":
+            leg["order_ticket"] = leg["ticket"]
+        return leg
 
     # ---- refresh / aggregate ---------------------------------------------------
     def _legs_from_snapshot(
@@ -1072,6 +1146,10 @@ def _last_error(mt5: Any) -> tuple[int, str]:
         return -1, "unknown"
 
 
+class OrderReplyLostError(BrokerError):
+    """order_send returned nothing (IPC loss): the order may or may not exist on the venue."""
+
+
 def _err_text(err: tuple[int, str] | None) -> str:
     return f"{err[1]} (kod {err[0]})" if err else "bilinmeyen hata"
 
@@ -1091,9 +1169,11 @@ class Mt5Broker(MetaTraderLegBroker):
     """
 
     kind = "mt5"
+    tick_wait_sec: float = 0.3
 
     def __init__(self, config: Mt5BrokerConfig, *, mt5_module: Any | None = None) -> None:
         super().__init__(config)
+        self.startup_warnings: list[str] = []
         self.cfg = config
         self._mt5: Any | None = mt5_module
         self._executor: ThreadPoolExecutor | None = None
@@ -1124,6 +1204,10 @@ class Mt5Broker(MetaTraderLegBroker):
             err = _last_error(mt5)
             if err[0] in _IPC_ERRORS and self._initialize(mt5):   # terminal link dropped: re-login once
                 logger.warning("%s: MT5 IPC error %s, re-initialized", self.name, err)
+                if name == "order_send":
+                    # Never re-send: the first request may have reached the server and only the reply was lost,
+                    # a second send would duplicate the order. The caller looks the order up by its tag.
+                    return None, err
                 res = func(*args, **kwargs)
                 if res is not None:
                     return res, None
@@ -1148,7 +1232,11 @@ class Mt5Broker(MetaTraderLegBroker):
     async def _send(self, request: dict[str, Any]) -> Any:
         res, err = await self._call("order_send", dict(request))
         if res is None:
-            raise BrokerError(f"MT5 emir gönderilemedi: {_err_text(err)}")
+            raise OrderReplyLostError(
+                f"MT5 emir yanıtı alınamadı ({_err_text(err)}). Emir sunucuya ulaşmış olabilir; aynı emir "
+                f"ikinci kez GÖNDERİLMEDİ. Önce etiketle (komut yorumu) kontrol edilecek; gerekirse MT5'te "
+                f"{request.get('symbol') or 'sembol'} emir/pozisyonlarına elle bakın."
+            )
         logger.info(
             "%s: order_send action=%s type=%s vol=%s price=%s sl=%s tp=%s -> retcode=%s order=%s %s",
             self.name, request.get("action"), request.get("type"), request.get("volume"), request.get("price"),
@@ -1199,7 +1287,15 @@ class Mt5Broker(MetaTraderLegBroker):
             if hasattr(self._mt5, "terminal_info"):
                 ti, _ = await self._call("terminal_info")
                 if ti is not None and not getattr(ti, "trade_allowed", True):
-                    raise BrokerError("MT5 terminalinde 'Algo Trading' düğmesi kapalı; açıp programı yeniden başlatın.")
+                    # Not fatal: the button can be switched on later without restarting the bot. The first
+                    # order fails with the actionable 10027 text while it is still off.
+                    warning = (
+                        "MT5'te üst araç çubuğundaki 'Algo Trading' düğmesi KAPALI. Emir gönderilebilmesi için "
+                        "yeşil yapın (Araçlar > Seçenekler > Uzman Danışmanlar > algoritmik ticarete izin ver); "
+                        "programı yeniden başlatmanız gerekmez."
+                    )
+                    self.startup_warnings.append(warning)
+                    logger.warning("%s: %s", self.name, warning)
             self._netting = int(getattr(acc, "margin_mode", MT5.ACCOUNT_MARGIN_MODE_RETAIL_HEDGING)) != (
                 MT5.ACCOUNT_MARGIN_MODE_RETAIL_HEDGING
             )
@@ -1266,7 +1362,7 @@ class Mt5Broker(MetaTraderLegBroker):
                 raise BrokerError(f"symbol_map'teki '{mapped}' sembolü {self.name} brokerında bulunamadı.")
             return await self._symbol_info_model(info, base_asset, quote_asset)
 
-        candidates = symbol_candidates(base_asset, quote_asset)
+        candidates = symbol_candidates(base_asset, quote_asset, market_type)
         for name in candidates:
             info, _ = await self._call("symbol_info", name)
             if info is not None and self._tradable(info):
@@ -1281,6 +1377,13 @@ class Mt5Broker(MetaTraderLegBroker):
                 scored.append(((rank, not full, not getattr(info, "visible", True)), info))
         if not scored:
             logger.info("%s: no MT5 symbol for %s/%s", self.name, base_asset, quote_asset)
+            if market_type in (MarketType.FOREX, MarketType.CFD) or base_asset.upper() in _METAL_BASES:
+                raise BrokerError(
+                    f"{self.name}: '{base_asset.upper()}' için MT5'te sembol bulunamadı (denenen: "
+                    f"{', '.join(candidates)}). Broker farklı bir ad kullanıyor olabilir (ör. altın için GOLD): "
+                    f"brokerın ayarına symbol_map ekleyin, örn. symbol_map: {{{base_asset.upper()}: GOLD}} "
+                    f"(MT5'te Piyasa Gözetimi'ndeki tam sembol adını yazın)."
+                )
             return None
         scored.sort(key=lambda x: x[0])
         return await self._symbol_info_model(scored[0][1], base_asset, quote_asset)
@@ -1292,6 +1395,11 @@ class Mt5Broker(MetaTraderLegBroker):
             if not ok:
                 logger.warning("%s: symbol_select(%s) failed", self.name, name)
             info = await self._get("symbol_info", name, what=f"{name} sembol bilgisi")
+            # A freshly selected symbol has no quote for a moment: wait for the first tick (best effort).
+            try:
+                await self._tick(name, attempts=5)
+            except BrokerError as exc:
+                logger.warning("%s: no tick for %s right after symbol_select: %s", self.name, name, exc)
         point = _f(info.point)
         tick = _f(getattr(info, "trade_tick_size", 0.0)) or point
         logger.info("%s: %s resolved to %s", self.name, base, name)
@@ -1316,8 +1424,32 @@ class Mt5Broker(MetaTraderLegBroker):
             },
         )
 
-    async def _tick(self, broker_symbol: str) -> Any:
-        return await self._get("symbol_info_tick", broker_symbol, what=f"{broker_symbol} fiyatı")
+    @staticmethod
+    def _now_epoch() -> float:
+        return time.time()
+
+    def _tick_is_stale(self, tick_time: int) -> bool:
+        """True when the tick is clearly old (market closed, e.g. the weekend).
+
+        MT5 gives no trade-server clock and tick.time is in server time (a whole-hour offset from UTC,
+        typically UTC+2/+3). So the difference to our UTC clock must be a whole-hour offset +/- 10 minutes
+        inside [-4h, +1h]; anything else is an old tick. (A stale tick that looks fresh by chance only costs a
+        10022 retry without expiration, which is handled.)"""
+        d = self._now_epoch() - tick_time
+        if not -4 * 3600 - _STALE_TICK_SEC <= d <= 3600 + _STALE_TICK_SEC:
+            return True
+        off = (d + 1800) % 3600 - 1800        # distance to the nearest whole hour
+        return abs(off) > _STALE_TICK_SEC
+
+    async def _tick(self, broker_symbol: str, attempts: int = 3) -> Any:
+        """Latest tick; a symbol that was just added to Market Watch answers None for a moment, so retry."""
+        for i in range(max(1, attempts)):
+            res, err = await self._call("symbol_info_tick", broker_symbol)
+            if res is not None:
+                return res
+            if i + 1 < attempts:
+                await asyncio.sleep(self.tick_wait_sec)
+        raise BrokerError(f"MT5 {broker_symbol} fiyatı alınamadı: {_err_text(err)}")
 
     async def _quote(self, broker_symbol: str) -> Quote:
         self._require()
@@ -1345,10 +1477,15 @@ class Mt5Broker(MetaTraderLegBroker):
         return float(margin)
 
     # ---- order primitives -------------------------------------------------------------
-    def _fillings(self, broker_symbol: str, filling_flags: int) -> list[int]:
-        """Filling modes to try, best first: cached > configured > symbol flags > the rest."""
+    def _fillings(self, broker_symbol: str, filling_flags: int, pending: bool = False) -> list[int]:
+        """Filling modes to try, best first: cached > configured > symbol flags > the rest.
+
+        Pending orders (``pending``) start with RETURN (the mode a resting order normally uses; FOK/IOC on a
+        pending order is rejected or meaningless on many servers) unless the owner pinned a mode in the config."""
         order: list[int] = []
-        cached = self._filling_cache.get(broker_symbol)
+        if pending and self.cfg.filling == "auto":
+            order.append(MT5.ORDER_FILLING_RETURN)
+        cached = self._filling_cache.get(broker_symbol + (":pending" if pending else ""))
         if cached is not None:
             order.append(cached)
         configured = {"fok": MT5.ORDER_FILLING_FOK, "ioc": MT5.ORDER_FILLING_IOC, "return": MT5.ORDER_FILLING_RETURN}
@@ -1363,12 +1500,14 @@ class Mt5Broker(MetaTraderLegBroker):
 
     async def _send_filling(self, request: dict[str, Any], broker_symbol: str, flags: int) -> Any:
         res = None
-        for filling in self._fillings(broker_symbol, flags):
+        pending = request.get("action") == MT5.TRADE_ACTION_PENDING
+        cache_key = broker_symbol + (":pending" if pending else "")
+        for filling in self._fillings(broker_symbol, flags, pending):
             request["type_filling"] = filling
             res = await self._send(request)
             if res.retcode != MT5.TRADE_RETCODE_INVALID_FILL:
                 if res.retcode in _DEAL_OK or res.retcode == MT5.TRADE_RETCODE_PLACED:
-                    self._filling_cache[broker_symbol] = filling
+                    self._filling_cache[cache_key] = filling
                 return res
             logger.info("%s: filling %s rejected for %s, trying next", self.name, filling, broker_symbol)
         return res
@@ -1476,7 +1615,9 @@ class Mt5Broker(MetaTraderLegBroker):
         if minutes > 0 and exp_flags & MT5.SYMBOL_EXPIRATION_SPECIFIED:
             tick = await self._tick(name)
             server_now = int(getattr(tick, "time", 0) or 0)   # expiration is in trade-server time, like tick.time
-            if server_now > 0:
+            # Weekend / closed market: tick.time is the last (Friday) tick, so "now + N min" would already be
+            # in the past. Stale tick -> GTC; the engine cancels stale pending entries itself.
+            if server_now > 0 and not self._tick_is_stale(server_now):
                 request.update(type_time=MT5.ORDER_TIME_SPECIFIED, expiration=server_now + minutes * 60)
         flags = int(getattr(info, "filling_mode", 0) or 0)
         res = await self._send_filling(request, name, flags)
@@ -1486,6 +1627,11 @@ class Mt5Broker(MetaTraderLegBroker):
             res = await self._send_filling(request, name, flags)
         if res.retcode not in (MT5.TRADE_RETCODE_PLACED, MT5.TRADE_RETCODE_DONE):
             raise BrokerError(f"{name} bekleyen emri reddedildi: {retcode_text(res.retcode, getattr(res, 'comment', ''))}")
+        if int(getattr(res, "order", 0) or 0) <= 0:
+            raise BrokerError(
+                f"{name} bekleyen emri kabul edildi görünüyor ama emir numarası alınamadı; MT5'te "
+                f"'{tag}' etiketli emri kontrol edin."
+            )
         leg = new_leg(ticket=int(res.order), order_ticket=int(res.order), state="pending", volume=float(volume),
                       entry=float(price), sl=float(sl), tp=tp, tag=tag)
         leg["order_type"] = otype

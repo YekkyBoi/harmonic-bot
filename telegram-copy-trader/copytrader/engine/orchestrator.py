@@ -42,7 +42,7 @@ from datetime import datetime, timedelta, timezone
 from typing import Any, Literal, TypeVar
 
 from ..brokers.base import Broker, BrokerError
-from ..config import AppConfig, TopicRoute, match_topic
+from ..config import AppConfig, TopicRoute, effective_risk, match_topic, route_thresholds
 from ..errors import ParserError
 from ..interfaces import SHUTDOWN_TEXT, Notifier, SignalParser, Storage
 from ..models import (
@@ -162,6 +162,7 @@ class BrokerOutcome:
     kind: Literal["ok", "partial", "unsupported", "skipped", "error"]   # partial: applied, adapter reported a problem
     text: str                                # HTML line for the owner
     position: BrokerPosition | None = None
+    benign: bool = False                     # an intended skip (e.g. no-hedge rule): not an alarming failure
 
 
 @dataclass
@@ -501,6 +502,27 @@ class Engine:
         every = {br.name for br in self.configured_brokers}
         return bool((set(a.broker_names) or every) & (set(b.broker_names) or every))
 
+    def _all_no_hedge(self, plan: TradePlan) -> bool:
+        names = set(plan.broker_names) or {b.name for b in self.configured_brokers}
+        cfgs = [b.config for b in self.configured_brokers if b.name in names]
+        return bool(cfgs) and all(getattr(c, "no_hedge", False) for c in cfgs)
+
+    async def _hedge_conflict(self, broker: Broker, plan: TradePlan, trade: TradeRecord) -> str | None:
+        """Turkish skip text when ``broker`` (no_hedge) already holds an active (pending or open) position on
+        the same asset in the opposite direction, else None."""
+        if not getattr(broker.config, "no_hedge", False):
+            return None
+        for trade_id, pos in await self.db.active_broker_positions():
+            if pos.broker != broker.name or trade_id == trade.id or pos.side is not plan.side.opposite:
+                continue
+            other = await self.db.get_trade(trade_id)
+            if other is None or other.plan.base_asset.upper() != plan.base_asset.upper():
+                continue
+            state = "bekleyen limit emri" if pos.status is PositionStatus.PENDING else "açık"
+            return (f"{esc(plan.base_asset)}: {state} {pos.side.value.upper()} var; ters yönlü "
+                    f"{plan.side.value.upper()} sinyali hedging yasağı nedeniyle açılmadı")
+        return None
+
     def _plan_brokers(self, plan: TradePlan) -> list[Broker]:
         """Connected brokers the plan may trade on (its route's brokers; all when it names none)."""
         if not plan.broker_names:
@@ -669,6 +691,8 @@ class Engine:
             broker.set_risk_config(self.config.risk)
             await asyncio.wait_for(broker.connect(), CONNECT_TIMEOUT_SEC)
             broker.set_risk_config(self.config.risk)
+            for warning in getattr(broker, "startup_warnings", None) or []:
+                await self._notify(f"⚠️ {esc(broker.name)}: {esc(warning)}", Severity.WARNING)
             try:
                 self._currency[broker.name] = await asyncio.wait_for(broker.account_currency(), READ_TIMEOUT_SEC)
             except Exception:
@@ -1139,7 +1163,7 @@ class Engine:
         base, quote, market_type = asset_of(action)
         market = await self._price(base, quote, market_type, action.symbol)
         plan, issues = validator.build_open_plan(
-            action, risk=self.config.risk, llm=self.config.llm, market_price=market,
+            action, risk=effective_risk(self.config.risk, route), llm=self.config.llm, market_price=market,
             source_chat_id=chat_id, now=now,
             route=route.name if route is not None else None,
             broker_names=list(route.brokers) if route is not None else [],
@@ -1155,7 +1179,7 @@ class Engine:
         base, quote, market_type = asset_of(action)
         market = await self._price(base, quote, market_type, action.symbol)
         _plan, issues = validator.build_open_plan(
-            action, risk=self.config.risk, llm=self.config.llm, market_price=market,
+            action, risk=effective_risk(self.config.risk, route), llm=self.config.llm, market_price=market,
             source_chat_id=chat_id, now=self._now(),
             route=route.name if route is not None else None,
             broker_names=list(route.brokers) if route is not None else [],
@@ -1185,7 +1209,8 @@ class Engine:
         out: list[ValidationIssue] = []
         recent = [t for t in await self.db.recent_trades(now - timedelta(seconds=max(0, risk.duplicate_window_sec)))
                   if self._in_scope(t, route)]
-        dup = guards.find_duplicate(plan, recent, window_sec=risk.duplicate_window_sec, now=now)
+        dup = guards.find_duplicate(plan, recent, window_sec=risk.duplicate_window_sec, now=now,
+                                    entry_tolerance_pct=route_thresholds(risk, route)[2])
         if dup is not None:
             out.append(_issue(
                 "duplicate_signal",
@@ -1195,6 +1220,8 @@ class Engine:
         opposite = [t for t in await self.db.active_trades(plan.base_asset)
                     if t.plan.side is plan.side.opposite
                     and (self._in_scope(t, route) or self._shares_broker(t.plan, plan))]
+        if opposite and self._all_no_hedge(plan):
+            opposite = []       # every target broker refuses hedging itself (skipped per broker, no question)
         if opposite:
             ids = ", ".join(f"#{t.id}" for t in opposite)
             out.append(_issue(
@@ -1241,7 +1268,10 @@ class Engine:
                     updated_at=conf.created_at,
                 ))
         if plan is not None and similar:
-            dup = guards.find_duplicate(plan, similar, window_sec=risk.duplicate_window_sec, now=self._now())
+            dup = guards.find_duplicate(
+                plan, similar, window_sec=risk.duplicate_window_sec, now=self._now(),
+                entry_tolerance_pct=route_thresholds(risk, self._route_named(plan.route))[2],
+            )
             if dup is not None:
                 conf = by_plan[dup.plan.plan_id]
                 out.append(_issue(
@@ -1668,6 +1698,9 @@ class Engine:
         if not outcomes or all(o.kind == "unsupported" for o in outcomes):
             head = f"⚠️ <b>{label}: hiçbir broker bu varlığı işlemiyor</b>; sinyal kopyalanamadı."
             await self._notify(f"{head}\n{esc(plan.summary_tr)}", Severity.WARNING)
+        elif status is TradeStatus.FAILED and all(o.benign for o in outcomes):
+            head = f"ℹ️ <b>{label} açılmadı</b> (hedging yasağı)"
+            await self._notify(head + "\n" + "\n".join(lines), Severity.WARNING)
         elif status is TradeStatus.FAILED:
             head = f"🚨 <b>{label} hiçbir brokerda açılamadı</b>"
             await self._notify(head + "\n" + "\n".join(lines), Severity.ERROR)
@@ -1707,19 +1740,25 @@ class Engine:
         self, broker: Broker, plan: TradePlan, trade: TradeRecord, raw_symbol: str | None
     ) -> BrokerOutcome:
         name = broker.name
-        risk = self.config.risk
+        risk = effective_risk(self.config.risk, self._route_named(plan.route))
         try:
             sym = await broker.resolve_symbol(plan.base_asset, plan.quote_asset, plan.market_type, raw_symbol)
             if sym is None:
                 return BrokerOutcome(name, "unsupported",
                                      f"{esc(name)}: {esc(plan.base_asset)} bu hesapta işlem görmüyor")
+            conflict = await self._hedge_conflict(broker, plan, trade)
+            if conflict:
+                return BrokerOutcome(name, "skipped", f"{esc(name)}: {conflict}", benign=True)
             equity = await broker.get_equity()
             ccy = self._currency.get(name, "")
-            if risk.daily_loss_limit_pct > 0:
+            loss_limit = getattr(broker.config, "daily_loss_limit_pct", None)
+            if loss_limit is None:
+                loss_limit = risk.daily_loss_limit_pct
+            if loss_limit > 0:
                 start = guards.start_of_day(self._now(), self.config.timezone)
                 realized = await self.db.realized_pnl_since(name, start)
-                if guards.daily_loss_exceeded(realized, equity, risk.daily_loss_limit_pct):
-                    text = (f"{esc(name)}: günlük zarar sınırı ({fmt.fmt_pct(risk.daily_loss_limit_pct)}) aşıldı "
+                if guards.daily_loss_exceeded(realized, equity, loss_limit):
+                    text = (f"{esc(name)}: günlük zarar sınırı ({fmt.fmt_pct(loss_limit)}) aşıldı "
                             f"(bugün {_money(realized)} {esc(ccy)}); yeni işlem açılmadı")
                     await self._notify(text, Severity.WARNING)
                     return BrokerOutcome(name, "skipped", text)
@@ -1744,6 +1783,15 @@ class Engine:
             else:
                 problem = _price_problem(plan.side, quote, stop, None)
                 entry = float(signal_entry or 0.0)
+                if problem is None and entry > 0:
+                    # A limit that is already marketable is opened at the market by MT5 brokers: only within
+                    # max_entry_distance_pct (beyond it the price was probably misread).
+                    live = quote.entry_price_for(plan.side)
+                    marketable = live <= entry if plan.side is Side.LONG else live >= entry
+                    drift = _distance_pct(live, entry)
+                    if marketable and drift > risk.max_entry_distance_pct:
+                        problem = (f"anlık fiyat ({fmt_price(live)}) limit girişten ({fmt_price(entry)}) "
+                                   f"{fmt.fmt_pct(drift)} uzak")
             if problem:
                 text = f"{esc(name)}: {esc(problem)}; bu hesapta işlem açılmadı"
                 await self._notify(text, Severity.WARNING)
@@ -1778,8 +1826,9 @@ class Engine:
             text = (f"{esc(name)}: {_qty(pos.quantity)} {esc(sym.broker_symbol)} "
                     f"({_POS_STATUS_TR.get(pos.status, pos.status.value)}), risk {_money(size.risk_amount)} {esc(ccy)}"
                     f"{fill}")
-            if size.warnings:
-                text += " ⚠️ " + esc("; ".join(size.warnings))
+            warnings = [*size.warnings, *(str(w) for w in pos.data.get("warnings") or [])]
+            if warnings:
+                text += " ⚠️ " + esc("; ".join(warnings))
             if await self._report_position_problem(trade, pos, None):
                 text += f" 🚨 <code>{esc(pos.error or protection_problem(pos) or '')}</code>"
                 return BrokerOutcome(name, "partial", text, pos)

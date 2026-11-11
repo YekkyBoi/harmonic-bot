@@ -286,6 +286,13 @@ def make_req(sym: Any, quantity: float, plan: TradePlan, tag: str = "ct12ab34cd"
 THREE_TPS = ((2260.0, 1 / 3), (2290.0, 1 / 3), (2310.6, 1 / 3))
 
 
+@pytest.fixture(autouse=True)
+def _server_clock(monkeypatch: pytest.MonkeyPatch) -> None:
+    """The fake ticks carry SERVER_TIME; make the broker's "now" match (server = UTC+2) and skip real sleeps."""
+    monkeypatch.setattr(Mt5Broker, "_now_epoch", staticmethod(lambda: SERVER_TIME - 7200.0))
+    monkeypatch.setattr(Mt5Broker, "tick_wait_sec", 0.0)
+
+
 @pytest.fixture
 def fake() -> FakeMT5:
     return FakeMT5()
@@ -524,12 +531,10 @@ async def test_retry_with_same_tag_does_not_double(fake: FakeMT5, broker: Mt5Bro
     "side, entry, sl, tp_price, expected",
     [
         (Side.LONG, 2200.0, 2180.0, 2300.0, MT5.ORDER_TYPE_BUY_LIMIT),
-        (Side.LONG, 2250.0, 2230.0, 2300.0, MT5.ORDER_TYPE_BUY_STOP),
         (Side.SHORT, 2250.0, 2270.0, 2200.0, MT5.ORDER_TYPE_SELL_LIMIT),
-        (Side.SHORT, 2200.0, 2220.0, 2150.0, MT5.ORDER_TYPE_SELL_STOP),
     ],
 )
-async def test_pending_limit_vs_stop(
+async def test_pending_limit_stays_limit(
     fake: FakeMT5, broker: Mt5Broker, side: Side, entry: float, sl: float, tp_price: float, expected: int
 ) -> None:
     sym = await broker.resolve_symbol("ETH")
@@ -699,3 +704,191 @@ async def test_netting_single_leg_with_emulated_tp() -> None:
     with pytest.raises(BrokerError, match="Netting"):
         await b.open_position(make_req(sym, 0.10, make_plan(), tag="ctother000"))
     await b.close()
+
+
+# --------------------------------------------------------------------------- #
+# FX pre-flight fixes
+# --------------------------------------------------------------------------- #
+async def test_marketable_long_limit_opens_at_market_not_buy_stop(fake: FakeMT5, broker: Mt5Broker) -> None:
+    # ask 2232.95 <= limit 2240: used to become a BUY_STOP (type 4); now a market buy with the same SL/TP
+    sym = await broker.resolve_symbol("ETH")
+    plan = make_plan(entry_type=EntryType.LIMIT, entry=2240.0, sl=2205.0, tps=((2300.0, 1.0),))
+    pos = await broker.open_position(make_req(sym, 0.05, plan))
+    assert fake.sent_actions(MT5.TRADE_ACTION_PENDING) == []
+    (deal,) = fake.sent_actions(MT5.TRADE_ACTION_DEAL)
+    assert deal["type"] == MT5.ORDER_TYPE_BUY and deal["sl"] == 2205.0 and deal["tp"] == 2300.0
+    assert pos.status is PositionStatus.OPEN
+    assert any("piyasa emriyle" in w for w in pos.data["warnings"])
+
+
+async def test_marketable_short_limit_opens_at_market_not_sell_stop(fake: FakeMT5, broker: Mt5Broker) -> None:
+    sym = await broker.resolve_symbol("ETH")
+    plan = make_plan(side=Side.SHORT, entry_type=EntryType.LIMIT, entry=2220.0, sl=2260.0, tps=((2150.0, 1.0),))
+    pos = await broker.open_position(make_req(sym, 0.05, plan))
+    assert fake.sent_actions(MT5.TRADE_ACTION_PENDING) == []
+    (deal,) = fake.sent_actions(MT5.TRADE_ACTION_DEAL)
+    assert deal["type"] == MT5.ORDER_TYPE_SELL and deal["sl"] == 2260.0
+    assert pos.status is PositionStatus.OPEN and pos.data["warnings"]
+
+
+async def test_marketable_limit_is_resized_from_the_real_fill(fake: FakeMT5, broker: Mt5Broker) -> None:
+    # sized for entry 2240 / stop 2200 (40 pts) but fills at ask 2232.95 (32.95 pts): lots grow so 1R stays 1R
+    sym = await broker.resolve_symbol("ETH")
+    plan = make_plan(entry_type=EntryType.LIMIT, entry=2240.0, sl=2200.0, tps=((2300.0, 1.0),))
+    pos = await broker.open_position(make_req(sym, 1.00, plan))
+    (deal,) = fake.sent_actions(MT5.TRADE_ACTION_DEAL)
+    assert deal["volume"] == 1.21           # floor(1.0 * 40 / 32.95, 0.01)
+    assert pos.quantity == 1.21
+
+
+async def test_non_marketable_limit_stays_pending_limit(fake: FakeMT5, broker: Mt5Broker) -> None:
+    sym = await broker.resolve_symbol("ETH")
+    plan = make_plan(entry_type=EntryType.LIMIT, entry=2200.0, sl=2180.0, tps=((2300.0, 1.0),))
+    pos = await broker.open_position(make_req(sym, 0.05, plan))
+    (req,) = fake.sent_actions(MT5.TRADE_ACTION_PENDING)
+    assert req["type"] == MT5.ORDER_TYPE_BUY_LIMIT and fake.sent_actions(MT5.TRADE_ACTION_DEAL) == []
+    assert pos.data["warnings"] == [] and pos.status is PositionStatus.PENDING
+
+
+def test_10027_hint_is_actionable() -> None:
+    text = mt5_broker.retcode_text(10027)
+    assert "Algo Trading" in text and "yeşil" in text and "Uzman Danışmanlar" in text
+
+
+async def test_algo_trading_off_at_connect_is_a_warning_not_a_failure(fake: FakeMT5) -> None:
+    fake.terminal_info = lambda: SimpleNamespace(trade_allowed=False)   # type: ignore[method-assign]
+    b = await connected(fake)
+    assert b._connected and any("Algo Trading" in w and "yeşil" in w for w in b.startup_warnings)
+    # the first order then fails with the actionable text while the button is still off
+    fake.hooks.append(lambda r: 10027)
+    sym = await b.resolve_symbol("ETH")
+    with pytest.raises(BrokerError, match="yeşil"):
+        await b.open_position(make_req(sym, 0.05, make_plan()))
+    await b.close()
+
+
+async def test_order_send_is_never_auto_retried_and_lost_reply_adopts_by_tag(fake: FakeMT5, broker: Mt5Broker) -> None:
+    sym = await broker.resolve_symbol("ETH")
+    real_send = fake.order_send
+    state = {"n": 0}
+
+    def flaky(request: dict[str, Any]) -> Any:
+        state["n"] += 1
+        res = real_send(request)          # the order IS recorded by the "server" ...
+        if state["n"] == 1:
+            fake.last = (-10001, "IPC send failed")
+            return None                   # ... but the reply is lost
+        return res
+
+    fake.order_send = flaky   # type: ignore[method-assign]
+    pos = await broker.open_position(make_req(sym, 0.05, make_plan()))
+    assert state["n"] == 1                                   # not sent a second time
+    assert len(fake.positions) == 1                          # no duplicate on the venue
+    (leg,) = pos.data["legs"]
+    assert leg["state"] == "open" and leg["sl"] == 2205.11   # adopted by its tag, stop verified
+    assert any("tekrar gönderilmedi" in w for w in pos.data["warnings"])
+    assert fake.init_count >= 2                              # terminal link re-initialized
+
+
+async def test_lost_reply_without_order_on_venue_raises_clear_error(fake: FakeMT5, broker: Mt5Broker) -> None:
+    sym = await broker.resolve_symbol("ETH")
+    state = {"n": 0}
+
+    def lost(request: dict[str, Any]) -> Any:
+        state["n"] += 1
+        fake.last = (-10001, "IPC send failed")
+        return None
+
+    fake.order_send = lost   # type: ignore[method-assign]
+    with pytest.raises(BrokerError, match="yanıtı alınamadı"):
+        await broker.open_position(make_req(sym, 0.05, make_plan()))
+    assert state["n"] == 1 and fake.positions == {}
+
+
+async def test_pending_order_tries_return_filling_first(fake: FakeMT5, broker: Mt5Broker) -> None:
+    sym = await broker.resolve_symbol("ETH")
+    plan = make_plan(entry_type=EntryType.LIMIT, entry=2200.0, sl=2180.0, tps=((2300.0, 1.0),))
+    await broker.open_position(make_req(sym, 0.05, plan))
+    (req,) = fake.sent_actions(MT5.TRADE_ACTION_PENDING)
+    assert req["type_filling"] == MT5.ORDER_FILLING_RETURN
+
+
+async def test_pending_filling_falls_back_after_10030(fake: FakeMT5, broker: Mt5Broker) -> None:
+    fake.accepted_fillings = {MT5.ORDER_FILLING_IOC}
+    sym = await broker.resolve_symbol("ETH")
+    plan = make_plan(entry_type=EntryType.LIMIT, entry=2200.0, sl=2180.0, tps=((2300.0, 1.0),))
+    await broker.open_position(make_req(sym, 0.05, plan))
+    fillings = [r["type_filling"] for r in fake.sent_actions(MT5.TRADE_ACTION_PENDING)]
+    assert fillings[0] == MT5.ORDER_FILLING_RETURN and fillings[-1] == MT5.ORDER_FILLING_IOC
+
+
+async def test_market_order_keeps_fok_ioc_order(fake: FakeMT5, broker: Mt5Broker) -> None:
+    sym = await broker.resolve_symbol("ETH")
+    await broker.open_position(make_req(sym, 0.05, make_plan()))
+    (deal,) = fake.sent_actions(MT5.TRADE_ACTION_DEAL)
+    assert deal["type_filling"] == MT5.ORDER_FILLING_FOK
+
+
+async def test_pending_order_ticket_zero_is_an_error(fake: FakeMT5, broker: Mt5Broker) -> None:
+    sym = await broker.resolve_symbol("ETH")
+    real_send = fake.order_send
+
+    def zero_ticket(request: dict[str, Any]) -> Any:
+        real_send(request)
+        return fake._result(PLACED, order=0)
+
+    fake.order_send = zero_ticket   # type: ignore[method-assign]
+    plan = make_plan(entry_type=EntryType.LIMIT, entry=2200.0, sl=2180.0, tps=((2300.0, 1.0),))
+    with pytest.raises(BrokerError, match="emir numarası"):
+        await broker.open_position(make_req(sym, 0.05, plan))
+
+
+async def test_forex_does_not_probe_usdt_candidate(fake: FakeMT5) -> None:
+    fake.symbols["EURUSDT"] = make_symbol("EURUSDT")
+    fake.symbols["EURUSD.a"] = make_symbol("EURUSD.a")
+    b = await connected(fake)
+    sym = await b.resolve_symbol("EUR", "USD", MarketType.FOREX)
+    assert sym is not None and sym.broker_symbol == "EURUSD.a"
+    assert not any(c[0] == "symbol_info" and c[1] == ("EURUSDT",) for c in fake.calls)
+    await b.close()
+
+
+async def test_missing_gold_symbol_gives_symbol_map_hint(fake: FakeMT5, broker: Mt5Broker) -> None:
+    with pytest.raises(BrokerError, match=r"symbol_map: \{XAU: GOLD\}"):
+        await broker.resolve_symbol("XAU", "USD", MarketType.CFD)
+
+
+async def test_tick_retried_after_symbol_select(fake: FakeMT5) -> None:
+    fake.symbols["ETHUSD"].visible = False
+    b = await connected(fake)
+    real = fake.symbol_info_tick
+    seen = {"n": 0}
+
+    def late(name: str) -> Any:
+        seen["n"] += 1
+        return None if seen["n"] < 3 else real(name)
+
+    fake.symbol_info_tick = late   # type: ignore[method-assign]
+    sym = await b.resolve_symbol("ETH")
+    assert sym is not None and seen["n"] == 3
+    await b.close()
+
+
+async def test_weekend_stale_tick_pending_has_no_expiration(
+    fake: FakeMT5, broker: Mt5Broker, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    # Saturday: the last tick is from Friday evening (hours old) -> GTC instead of a past expiration
+    monkeypatch.setattr(Mt5Broker, "_now_epoch", staticmethod(lambda: SERVER_TIME - 7200.0 + 13 * 3600))
+    sym = await broker.resolve_symbol("ETH")
+    plan = make_plan(entry_type=EntryType.LIMIT, entry=2200.0, sl=2180.0, tps=((2300.0, 1.0),))
+    await broker.open_position(make_req(sym, 0.05, plan))
+    (req,) = fake.sent_actions(MT5.TRADE_ACTION_PENDING)
+    assert req["type_time"] == MT5.ORDER_TIME_GTC and "expiration" not in req
+
+
+async def test_fresh_tick_pending_keeps_expiration(fake: FakeMT5, broker: Mt5Broker) -> None:
+    sym = await broker.resolve_symbol("ETH")
+    plan = make_plan(entry_type=EntryType.LIMIT, entry=2200.0, sl=2180.0, tps=((2300.0, 1.0),))
+    await broker.open_position(make_req(sym, 0.05, plan))
+    (req,) = fake.sent_actions(MT5.TRADE_ACTION_PENDING)
+    assert req["type_time"] == MT5.ORDER_TIME_SPECIFIED

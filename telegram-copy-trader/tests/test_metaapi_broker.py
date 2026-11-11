@@ -471,12 +471,10 @@ async def test_invalid_stops_then_attach_succeeds(conn: FakeConn, broker: MetaAp
     "side, entry, sl, tp_price, method",
     [
         (Side.LONG, 2200.0, 2180.0, 2300.0, "create_limit_buy_order"),
-        (Side.LONG, 2250.0, 2230.0, 2300.0, "create_stop_buy_order"),
         (Side.SHORT, 2250.0, 2270.0, 2200.0, "create_limit_sell_order"),
-        (Side.SHORT, 2200.0, 2220.0, 2150.0, "create_stop_sell_order"),
     ],
 )
-async def test_pending_limit_vs_stop(conn: FakeConn, broker: MetaApiBroker, side: Side, entry: float, sl: float,
+async def test_pending_limit_stays_limit(conn: FakeConn, broker: MetaApiBroker, side: Side, entry: float, sl: float,
                                      tp_price: float, method: str) -> None:
     sym = await broker.resolve_symbol("ETH")
     plan = make_plan(side=side, entry_type=EntryType.LIMIT, entry=entry, sl=sl, tps=((tp_price, 1.0),))

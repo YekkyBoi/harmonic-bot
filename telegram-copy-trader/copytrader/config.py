@@ -42,6 +42,46 @@ class TopicRoute(_Base):
     title_contains: list[str] = Field(min_length=1)  # topic matches if its title contains ANY of these (Turkish-insensitive)
     brokers: list[str] = Field(default_factory=list)  # broker names to trade this topic on; empty = all enabled brokers
     kind: Literal["crypto", "fx", "any"] = "any"  # hint for reading symbols (fx: "EUR" means EURUSD)
+    # Per-route overrides of the global risk.* values (percent of price). Unset: kind "fx" uses the FX defaults
+    # below (a crypto-sized 0.5% is ~54 pips on EURUSD), other kinds use the global values.
+    market_entry_tolerance_pct: float | None = Field(None, gt=0)  # auto: market only if price is this close to entry
+    max_entry_distance_pct: float | None = Field(None, gt=0)      # entry farther than this from market -> ask / skip
+    duplicate_tolerance_pct: float | None = Field(None, gt=0)     # repost check: entries this close are "the same"
+
+
+FX_MARKET_ENTRY_TOLERANCE_PCT = 0.03     # ~3 pips on EURUSD
+FX_MAX_ENTRY_DISTANCE_PCT = 1.0
+FX_DUPLICATE_TOLERANCE_PCT = 0.05
+DEFAULT_DUPLICATE_TOLERANCE_PCT = 0.5
+
+
+def route_thresholds(risk: "RiskConfig", route: "TopicRoute | None") -> tuple[float, float, float]:
+    """(market_entry_tolerance_pct, max_entry_distance_pct, duplicate_tolerance_pct) effective for ``route``."""
+    fx = route is not None and route.kind == "fx"
+    def pick(own: float | None, fx_default: float, global_value: float) -> float:
+        if route is not None and own is not None:
+            return own
+        return fx_default if fx else global_value
+    return (
+        pick(route.market_entry_tolerance_pct if route else None, FX_MARKET_ENTRY_TOLERANCE_PCT,
+             risk.market_entry_tolerance_pct),
+        pick(route.max_entry_distance_pct if route else None, FX_MAX_ENTRY_DISTANCE_PCT,
+             risk.max_entry_distance_pct),
+        pick(route.duplicate_tolerance_pct if route else None, FX_DUPLICATE_TOLERANCE_PCT,
+             DEFAULT_DUPLICATE_TOLERANCE_PCT),
+    )
+
+
+def effective_risk(risk: "RiskConfig", route: "TopicRoute | None") -> "RiskConfig":
+    """``risk`` with the route's entry thresholds applied (the global object when nothing differs)."""
+    tol, dist, _dup = route_thresholds(risk, route)
+    ask = risk.ask_if_limit_marketable and not (route is not None and route.kind == "fx")
+    if (tol == risk.market_entry_tolerance_pct and dist == risk.max_entry_distance_pct
+            and ask == risk.ask_if_limit_marketable):
+        return risk
+    return risk.model_copy(update={
+        "market_entry_tolerance_pct": tol, "max_entry_distance_pct": dist, "ask_if_limit_marketable": ask,
+    })
 
 
 def match_topic(routes: list[TopicRoute], title: str | None) -> TopicRoute | None:
@@ -106,6 +146,7 @@ class RiskConfig(_Base):
     entry_mode: Literal["auto", "market", "limit"] = "auto"
     market_entry_tolerance_pct: float = 0.5       # auto: |price-entry|/entry <= this -> market, else limit at entry
     max_entry_distance_pct: float = 10.0          # entry this far from market -> probably misread -> ask
+    ask_if_limit_marketable: bool = True          # a limit entry already at/through the market: ask (False for fx routes: the broker opens it at market)
     pending_entry_expiry_min: int = 1440          # unfilled limit entries are cancelled after this
     include_fees_in_risk: bool = True             # size so that loss incl. estimated fees ~= 1R
     fee_rate: float = 0.0006                      # assumed taker fee per side when the broker cannot tell
@@ -126,6 +167,8 @@ class _BrokerBase(_Base):
     allowed_assets: list[str] = Field(default_factory=list)     # empty = all assets
     risk_multiplier: float = 1.0                  # scale risk on this broker only (1.0 = 2% per R)
     risk_usd: float | None = Field(None, gt=0)    # fixed money at risk for 1R on this broker (instead of a % of equity)
+    no_hedge: bool = False                        # never open the opposite direction of an active position on the same asset (prop firms / netting)
+    daily_loss_limit_pct: float | None = Field(None, ge=0)  # replaces risk.daily_loss_limit_pct for this broker (0 = off)
 
 
 class CcxtBrokerConfig(_BrokerBase):

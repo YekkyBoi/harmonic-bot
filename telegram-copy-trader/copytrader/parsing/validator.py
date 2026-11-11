@@ -457,12 +457,16 @@ def build_open_plan(
                 f"Sinyal piyasa emri diyor ama anlık fiyat ({_fmt(market)}) girişten ({_fmt(entry)}) "
                 f"%{_pct(dist)} uzak.",
             )
-        if entry_type is EntryType.LIMIT and _profit_side(side, entry, market):
+        if (entry_type is EntryType.LIMIT and _profit_side(side, entry, market)
+                and (risk.ask_if_limit_marketable or dist > risk.max_entry_distance_pct)):
+            # ask_if_limit_marketable=False (fx routes): the broker opens a marketable limit at the market
+            # price, so within max_entry_distance_pct nothing is asked; only a far-away entry (probably a
+            # misread price) is.
             where = "üstünde" if side is Side.LONG else "altında"
             issues.warn(
                 "limit_entry_marketable",
                 f"{_side_word(side)} limit giriş ({_fmt(entry)}) piyasa fiyatının ({_fmt(market)}) {where} — "
-                f"limit emir hemen anlık fiyattan dolar (kırılım/stop emri desteklenmiyor).",
+                f"emir hemen anlık piyasa fiyatından dolar (kırılım/stop emri desteklenmiyor).",
             )
     if entry is not None and market is not None and side is not None and raw_tps:
         tp1 = min(raw_tps, key=lambda t: t.price) if side is Side.LONG else max(raw_tps, key=lambda t: t.price)

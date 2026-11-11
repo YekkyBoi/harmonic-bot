@@ -449,6 +449,11 @@ Bilinmesi gerekenler:
 - **Lot:** Brokerın kendi kâr/zarar hesabıyla, 1R hesap para biriminde olacak şekilde hesaplanır. Komisyon önceden bilinmez.
 - **Birden fazla TP:** MT pozisyonunda tek TP olabildiği için her TP ayrı pozisyon olarak açılır, hepsinde aynı stop. Lot bölünemeyecek kadar küçükse seviyeler birleştirilir. **Netting** hesaplarda tek pozisyon açılır; ara TP'leri bot kısmi kapatma ile uygular (bot açık olmalı).
 - **Fiyat farkı:** Brokerınızın ETHUSD fiyatı Binance ETHUSDT.P'den farklı olabilir; sinyaldeki seviyeler olduğu gibi kullanılır.
+- **Algo Trading yeşil olmalı:** MT5'in üst araç çubuğundaki "Algo Trading" düğmesi kapalıysa bot bağlanır ama uyarı verir ve ilk emir reddedilir. Yeşil yapın (Araçlar > Seçenekler > Uzman Danışmanlar > algoritmik ticarete izin ver); botu yeniden başlatmanız gerekmez.
+- **Vantage Raw/ECN hesap:** Raw/ECN hesapta lot başına komisyon alınır; riski doğru hesaplamak için broker ayarına `commission_per_lot` yazın (gidiş-dönüş, ör. `6`). Standard STP hesapta komisyon yoktur, bu alanı boş bırakın.
+- **Altın sembolü:** Vantage'da altın genelde `XAUUSD`'dir; listede `GOLD` görüyorsanız `symbol_map: {XAU: GOLD}` ekleyin. Sembol bulunamazsa bot bunu açık bir hata olarak size yazar.
+- **FX girişleri:** `kind: fx` konularında piyasa/limit ayrımı çok dardır (varsayılan ~3 pip); limit giriş anlık fiyatta zaten gerçekleşebilir durumdaysa (long: satış fiyatı <= giriş) emir piyasa emriyle açılır ve bu bildirimde belirtilir. Eşikler konu bazında `market_entry_tolerance_pct`, `max_entry_distance_pct`, `duplicate_tolerance_pct` ile değiştirilebilir.
+- **Netting hesap:** Her sembolde tek pozisyon olur. Aynı sembolde zaten açık pozisyon varken yeni sinyal açılmaz, nedeni size yazılır. Birden fazla TP'li sinyal tek pozisyon olarak açılır (TP = son hedef), ara hedeflerde bot kısmi kapatır (bot açık olmalı). Hedging yasağı için `no_hedge: true`, prop firma günlük zarar limiti için broker başına `daily_loss_limit_pct` kullanın.
 - **Piyasa saatleri:** CFD'ler hafta sonu kapalıdır; brokerın minimum stop mesafesi (stops level) çok yakın stopları reddeder.
 
 ---

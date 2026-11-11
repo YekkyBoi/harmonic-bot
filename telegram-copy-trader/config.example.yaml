@@ -63,6 +63,11 @@ telegram:
   #     title_contains: ["Fx İşlemleri"]
   #     brokers: [mt5]
   #     kind: fx
+  #     # İsteğe bağlı eşikler (fiyatın %'si). fx konusunda boş bırakırsanız FX değerleri kullanılır,
+  #     # diğerlerinde risk bölümündeki genel değerler:
+  #     # market_entry_tolerance_pct: 0.03   # fx varsayılanı; fiyat girişe bu kadar yakınsa piyasa emri, değilse limit (~3 pip EURUSD)
+  #     # max_entry_distance_pct: 1.0        # fx varsayılanı; giriş piyasadan bu kadar uzaksa yanlış okunmuş sayılır
+  #     # duplicate_tolerance_pct: 0.05      # fx varsayılanı; tekrar paylaşılan sinyal kontrolünde "aynı giriş" payı
 
 # ---------------------------------------------------------------------
 # Bildirim botu (@BotFather) — size sadece emin olamadığında ve hata olduğunda yazar
@@ -224,8 +229,15 @@ brokers:
   #   deviation_points: 20          # piyasa emrinde izin verilen kayma (point)
   #   filling: auto                 # emir doldurma tipi: auto | fok | ioc | return
   #   symbol_map: {XAU: XAUUSD}     # broker sembolleri farklıysa, ör: {XAU: GOLD, ETH: ETHUSD}
+  #                                 # (altın broker listesinde GOLD ise mutlaka: symbol_map: {XAU: GOLD})
+  #   # Vantage Raw/ECN hesapta komisyon vardır: lot başına gidiş-dönüş tutarı yazın (ör: 6 USD);
+  #   # Standard STP hesapta komisyon yoktur, boş bırakın.
+  #   commission_per_lot: 6
+  #   no_hedge: true                # aynı varlıkta ters yönlü işlem açma (hedging yasağı / netting hesap)
+  #   daily_loss_limit_pct: 3       # prop firma günlük zarar limitinin altında tutun, ör. 3 (boş = genel risk.daily_loss_limit_pct)
   #   allowed_assets: []
   #   risk_multiplier: 1.0
+  #   # DİKKAT: MT5'te üstteki "Algo Trading" düğmesi YEŞİL olmalı; kapalıysa ilk emir reddedilir.
 
   # --- MT4/MT5, MetaApi bulut üzerinden (Linux/Docker için) ---
   # metaapi.cloud'da hesabınızı ekleyin; token ve hesap ID'sini .env'e yazın.
