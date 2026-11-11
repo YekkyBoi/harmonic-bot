@@ -684,8 +684,14 @@ class CcxtBroker(Broker):
             )
         return max(1, min([lev, *caps]))
 
-    async def _prepare_symbol(self, symbol: str, leverage: int, side: Side) -> list[str]:
-        """Margin mode (best effort) + leverage (must succeed). Returns warnings."""
+    async def _prepare_symbol(self, symbol: str, leverage: int, side: Side,
+                              isolated_safe_leverage: int | None = None) -> list[str]:
+        """Margin mode (best effort) + leverage (must succeed). Returns warnings.
+
+        ``isolated_safe_leverage``: the highest leverage whose liquidation stays beyond the stop if the
+        position ends up ISOLATED. Used when cross margin was asked for but the exchange refused to switch
+        the symbol (open orders / positions, multi-asset mode...): the position then trades in the symbol's
+        existing mode, so the leverage chosen for cross could liquidate it before the stop."""
         warnings: list[str] = []
         fam, mode = self._family, self.cfg.margin_mode
         key = symbol   # once per symbol and session (bybit UTA: the call is account-wide)
@@ -704,6 +710,12 @@ class CcxtBroker(Broker):
                     # Not a stop-safety issue: liquidation stays beyond the stop in both modes.
                     logger.warning("%s: set_margin_mode(%s, %s) failed: %s", self.name, mode, symbol, e)
                     warnings.append(f"Marjin modu '{mode}' ayarlanamadı: {_short(e, 120)}")
+                    if mode == "cross" and isolated_safe_leverage is not None and leverage > isolated_safe_leverage:
+                        warnings.append(
+                            f"Coin izole kalmış olabilir: kaldıraç {leverage}x yerine {isolated_safe_leverage}x "
+                            "kullanıldı (tasfiye fiyatı stoptan önce gelmesin diye)."
+                        )
+                        leverage = isolated_safe_leverage
         lev_params: dict[str, Any] = {}
         if fam == "okx":
             lev_params["marginMode"] = mode
@@ -913,7 +925,9 @@ class CcxtBroker(Broker):
                             attached_tp_price=tps[0].price if tps else None)
 
         async with self._lock(symbol):
-            data["warnings"] += await self._prepare_symbol(symbol, leverage, side)
+            frac = abs(ref_price - req.stop_loss) / ref_price
+            safe = max(1, math.floor(1 / (frac * 1.5 + 0.005)))
+            data["warnings"] += await self._prepare_symbol(symbol, leverage, side, isolated_safe_leverage=safe)
             entry = await self._create_entry(symbol, req.entry_type, self._order_side(side), qty, limit_price, params, client_id, now)
         data["entry_order_id"] = str(entry.get("id"))
         self._known_order_ids.add(data["entry_order_id"])

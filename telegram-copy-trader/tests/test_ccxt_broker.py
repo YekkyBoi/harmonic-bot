@@ -865,3 +865,33 @@ async def test_other_leverage_errors_still_refuse() -> None:
     fake.fail_when(lambda m, a: m == "set_leverage", cx.AuthenticationError("invalid api key"))
     with pytest.raises(BrokerError):
         await broker._prepare_symbol(SYM, 10, Side.LONG)
+
+
+async def test_cross_refused_by_exchange_caps_leverage_to_isolated_safe_value() -> None:
+    """Cross margin was asked for but the symbol could not be switched (it stays isolated): the leverage
+    must not put the liquidation price before the stop."""
+    broker, fake = make_broker(margin_mode="cross", leverage=125, max_leverage=125)
+    await broker.connect()
+    fake.fail_when(lambda m, a: m == "set_margin_mode",
+                   cx.ExchangeError('binanceusdm {"code":-4048,"msg":"Margin type cannot be changed if there exists position."}'))
+    info = await broker.resolve_symbol("ETH", "USDT", MarketType.PERP, "ETHUSDT.P")
+    plan = make_plan(Side.LONG, sl=2205.11)
+    req = OpenRequest(plan=plan, symbol=info, quantity=1.0, entry_type=EntryType.MARKET,
+                      stop_loss=plan.stop_loss, take_profits=[], leverage=125, client_tag="ctxx")
+    pos = await broker.open_position(req)
+    levs = [c[1][0] for c in fake.calls if c[0] == "set_leverage"]
+    # stop is ~1.2% away: liquidation-safe leverage is floor(1 / (0.012 * 1.5 + 0.005)) = 43
+    assert levs and levs[0] < 125 and levs[0] <= 43
+    assert any("izole kalmış olabilir" in w for w in pos.data["warnings"])
+
+
+async def test_cross_switched_fine_keeps_the_max_leverage() -> None:
+    broker, fake = make_broker(margin_mode="cross", leverage=125, max_leverage=125)
+    await broker.connect()
+    info = await broker.resolve_symbol("ETH", "USDT", MarketType.PERP, "ETHUSDT.P")
+    plan = make_plan(Side.LONG, sl=2205.11)
+    req = OpenRequest(plan=plan, symbol=info, quantity=1.0, entry_type=EntryType.MARKET,
+                      stop_loss=plan.stop_loss, take_profits=[], leverage=125, client_tag="ctxx")
+    await broker.open_position(req)
+    levs = [c[1][0] for c in fake.calls if c[0] == "set_leverage"]
+    assert levs[0] > 43
