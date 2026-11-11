@@ -32,6 +32,7 @@ Safety rules kept here:
 from __future__ import annotations
 
 import asyncio
+import contextlib
 import logging
 import math
 import secrets
@@ -107,6 +108,7 @@ TRANSIENT_PARSE_RETRY_DELAYS: tuple[float, ...] = (10.0, 30.0, 60.0)
 NONE_ASK_BELOW_CONFIDENCE = 0.6
 CONNECT_TIMEOUT_SEC = 180.0
 READ_TIMEOUT_SEC = 20.0
+OPTIONAL_RETRY_SEC = 300.0     # an optional broker that could not connect is retried this often
 EXCERPT_CHARS = 300
 _PENDING_CODES = frozenset({"pending_confirmation", "duplicate_pending_signal"})
 # A management message that refers to a trade in one of these states has nothing left to do: ignored, never asked.
@@ -462,6 +464,10 @@ class Engine:
         self.configured_brokers: list[Broker] = list(brokers)
         self.brokers: list[Broker] = list(brokers)       # connected ones after start()
         self.failed_brokers: dict[str, str] = {}
+        # Optional brokers (config ``optional: true``) that are not connected right now: name -> reason.
+        # Their trades are skipped (with a short notice), never queued; they are retried in the background.
+        self.optional_down: dict[str, str] = {}
+        self.optional_retry_sec = OPTIONAL_RETRY_SEC
         self._clock = clock or (lambda: datetime.now(timezone.utc))
         self._own_oracle = price_oracle is None
         self.prices: Any = price_oracle if price_oracle is not None else PriceOracle(
@@ -710,6 +716,9 @@ class Engine:
     async def start(self, *, monitor: bool = True) -> None:
         """Connect brokers, restore confirmations, start the monitor (``monitor=False``: tests)."""
         await self.connect_brokers()
+        for broker in self.configured_brokers:
+            if broker.name in self.optional_down:
+                self._spawn(self._retry_optional(broker), f"retry-{broker.name}")
         await self._restore_confirmations()
         await self._reconcile_trades()
         await self._drop_stale_messages()
@@ -782,31 +791,84 @@ class Engine:
         results = await asyncio.gather(*(self._connect(b) for b in self.configured_brokers))
         self.brokers = [b for b, ok in zip(self.configured_brokers, results, strict=True) if ok]
 
+    async def _try_connect(self, broker: Broker) -> None:
+        """Connect one broker and read its currency. Raises on failure (the caller decides what that means)."""
+        set_notifier = getattr(broker, "set_notifier", None)
+        if set_notifier is not None:     # manual (message-only) brokers talk to the owner
+            set_notifier(self.notifier)
+        broker.set_risk_config(self.config.risk)
+        await asyncio.wait_for(broker.connect(), CONNECT_TIMEOUT_SEC)
+        broker.set_risk_config(self.config.risk)
+        for warning in getattr(broker, "startup_warnings", None) or []:
+            await self._notify(f"⚠️ {esc(broker.name)}: {esc(warning)}", Severity.WARNING)
+        try:
+            self._currency[broker.name] = await asyncio.wait_for(broker.account_currency(), READ_TIMEOUT_SEC)
+        except Exception:
+            self._currency[broker.name] = ""
+
+    @staticmethod
+    def _is_optional(broker: Broker) -> bool:
+        return bool(getattr(broker.config, "optional", False))
+
     async def _connect(self, broker: Broker) -> bool:
         try:
-            set_notifier = getattr(broker, "set_notifier", None)
-            if set_notifier is not None:     # manual (message-only) brokers talk to the owner
-                set_notifier(self.notifier)
-            broker.set_risk_config(self.config.risk)
-            await asyncio.wait_for(broker.connect(), CONNECT_TIMEOUT_SEC)
-            broker.set_risk_config(self.config.risk)
-            for warning in getattr(broker, "startup_warnings", None) or []:
-                await self._notify(f"⚠️ {esc(broker.name)}: {esc(warning)}", Severity.WARNING)
-            try:
-                self._currency[broker.name] = await asyncio.wait_for(broker.account_currency(), READ_TIMEOUT_SEC)
-            except Exception:
-                self._currency[broker.name] = ""
+            await self._try_connect(broker)
             return True
         except Exception as exc:
             reason = str(exc) or type(exc).__name__
             self.failed_brokers[broker.name] = reason
             logger.exception("Broker %s failed to connect", broker.name)
-            await self._notify(f"{esc(broker.name)} bağlanamadı: <code>{esc(reason)}</code>", Severity.ERROR)
+            if self._is_optional(broker):
+                self.optional_down[broker.name] = reason
+                await self._notify(
+                    f"⚠️ <b>{esc(broker.name)}</b> bağlanamadı (isteğe bağlı hesap). Bot ve diğer hesaplar "
+                    f"normal çalışıyor; {esc(broker.name)} için gelen sinyaller atlanacak. Arka planda "
+                    f"{fmt.fmt_number(self.optional_retry_sec / 60.0)} dakikada bir tekrar denenecek.\n"
+                    f"Sebep: <code>{esc(reason)}</code>",
+                    Severity.WARNING,
+                )
+            else:
+                await self._notify(f"{esc(broker.name)} bağlanamadı: <code>{esc(reason)}</code>", Severity.ERROR)
             try:
                 await broker.close()
             except Exception:
                 logger.debug("close after failed connect", exc_info=True)
             return False
+
+    async def _retry_optional(self, broker: Broker) -> None:
+        """Keep trying to connect an optional broker that was down at startup. Silent while it keeps failing
+        (the owner was warned once); one message when it comes up."""
+        name = broker.name
+        while self._accepting and not self._brokers_closed:
+            await asyncio.sleep(self.optional_retry_sec)
+            if not self._accepting or self._brokers_closed:
+                return
+            try:
+                await self._try_connect(broker)
+            except asyncio.CancelledError:
+                with contextlib.suppress(Exception):
+                    await broker.close()
+                raise
+            except Exception as exc:
+                reason = str(exc) or type(exc).__name__
+                self.failed_brokers[name] = reason
+                self.optional_down[name] = reason
+                logger.warning("Optional broker %s still not connected: %s", name, reason)
+                with contextlib.suppress(Exception):
+                    await broker.close()
+                continue
+            if not self._accepting or self._brokers_closed:
+                with contextlib.suppress(Exception):
+                    await broker.close()
+                return
+            self.failed_brokers.pop(name, None)
+            self.optional_down.pop(name, None)
+            up = {b.name for b in self.brokers} | {name}
+            self.brokers = [b for b in self.configured_brokers if b.name in up]
+            logger.info("Optional broker %s connected after retry", name)
+            await self._notify(f"✅ <b>{esc(name)}</b> bağlandı. Bundan sonraki sinyaller bu hesapta da açılacak "
+                               "(atlanan eski sinyaller açılmaz).", Severity.INFO)
+            return
 
     async def _restore_confirmations(self) -> None:
         now = self._now()
@@ -1786,6 +1848,7 @@ class Engine:
         if plan.broker_names and not self._plan_brokers(plan):
             async with self.trade_lock(trade.id):
                 return await self._no_route_broker(trade)
+        await self._optional_skip_notice(plan)
         async with self.trade_lock(trade.id):
             await self._log("open_start", {"trade_id": trade.id, "plan": plan.model_dump(mode="json")})
             brokers = [b for b in self._plan_brokers(plan) if b.accepts_asset(plan.base_asset)]
@@ -1826,10 +1889,29 @@ class Engine:
         })
         return "\n".join([head, *lines])
 
+    async def _optional_skip_notice(self, plan: TradePlan) -> None:
+        """Once per signal: tell the owner which optional (not connected) brokers skip this trade. The trade is
+        never queued for them; the other brokers are not affected."""
+        names = [n for n in (plan.broker_names or list(self.optional_down)) if n in self.optional_down]
+        for name in names:
+            await self._notify(
+                f"ℹ️ {esc(name)} bağlı değil, bu işlem atlandı ({esc(plan.base_asset)} {plan.side.value.upper()}).",
+                Severity.WARNING,
+            )
+
     async def _no_route_broker(self, trade: TradeRecord) -> str:
         """None of the route's brokers is connected: never trade the signal elsewhere. The trade is kept as
         FAILED (later "Stop" / "kapattık" replies to it are then ignored, not asked)."""
         plan = trade.plan
+        if all(n in self.optional_down for n in plan.broker_names):
+            # Only optional brokers are on this route and they are down: a short notice, not an alarm.
+            await self.db.update_trade(trade.id, status=TradeStatus.FAILED, note="isteğe bağlı broker bağlı değil")
+            text = (f"ℹ️ {esc(', '.join(plan.broker_names))} bağlı değil, bu işlem atlandı "
+                    f"(#{trade.id} {esc(plan.base_asset)} {plan.side.value.upper()}).")
+            await self._notify(text, Severity.WARNING)
+            await self._log("open_skipped_optional_down", {"trade_id": trade.id, "route": plan.route,
+                                                           "brokers": list(plan.broker_names)})
+            return text
         names = ", ".join(esc(n) for n in plan.broker_names)
         why = "; ".join(f"{esc(n)}: {esc(self.failed_brokers[n])}" for n in plan.broker_names if n in self.failed_brokers)
         await self.db.update_trade(trade.id, status=TradeStatus.FAILED, note="konunun brokerı bağlı değil")

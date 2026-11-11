@@ -116,11 +116,14 @@ def build_app(
 
     brokers: list[Broker] = []
     errors: list[str] = []
+    optional_errors: dict[str, str] = {}
     for cfg in config.enabled_brokers:
         try:
             brokers.append(broker_factory(cfg))
         except BrokerError as exc:
             errors.append(f"{cfg.name}: {exc}")
+            if getattr(cfg, "optional", False):
+                optional_errors[cfg.name] = str(exc)
             logger.error("Broker %s could not be created: %s", cfg.name, exc)
     if notifier is None:
         from .telegram.notifier import BotNotifier
@@ -129,6 +132,7 @@ def build_app(
     engine = Engine(config, db, parser, brokers, notifier)
     for err in errors:
         engine.failed_brokers[err.split(":", 1)[0]] = err.split(":", 1)[-1].strip()
+    engine.optional_down.update(optional_errors)     # optional + could not even be created: skipped, no retry
     if listener_factory is None:
         from .telegram.listener import TelegramListener
 
@@ -171,7 +175,12 @@ async def serve(app: App, stop: asyncio.Event | None = None) -> None:
         await app.db.open()
         await app.notifier.start(app.engine)
         for err in app.broker_errors:
-            await app.notifier.notify(f"Broker oluşturulamadı: {_esc(err)}", Severity.ERROR)
+            if err.split(":", 1)[0] in app.engine.optional_down:
+                await _safe(app.notifier.notify(
+                    f"⚠️ İsteğe bağlı broker oluşturulamadı: {_esc(err)}\nBot ve diğer hesaplar normal çalışıyor; "
+                    "bu hesap için sinyaller atlanacak.", Severity.WARNING))
+            else:
+                await app.notifier.notify(f"Broker oluşturulamadı: {_esc(err)}", Severity.ERROR)
         await app.engine.start()
         await app.listener.start()
         logger.info("Copy trader running (%s)", "DRY-RUN" if app.config.dry_run else "LIVE")

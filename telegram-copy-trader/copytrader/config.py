@@ -163,6 +163,9 @@ class RiskConfig(_Base):
 class _BrokerBase(_Base):
     name: str
     enabled: bool = True
+    # optional: a broker that is not essential (e.g. a friend's account). If it cannot connect (bad token, service
+    # down...) the bot still starts, warns the owner once, skips its trades and retries in the background.
+    optional: bool = False
     symbol_map: dict[str, str] = Field(default_factory=dict)   # "ETH" -> "ETHUSD" (base asset or raw symbol -> broker symbol)
     allowed_assets: list[str] = Field(default_factory=list)     # empty = all assets
     risk_multiplier: float = 1.0                  # scale risk on this broker only (1.0 = 2% per R)
@@ -224,12 +227,18 @@ class Mt5BrokerConfig(_BrokerBase):
 
 class MetaApiBrokerConfig(_BrokerBase):
     type: Literal["metaapi"]                      # MT4/MT5 via metaapi.cloud (works on Linux/Docker)
-    token: str
-    account_id: str
+    token: str | None = None                      # required unless optional (an optional broker may start without it)
+    account_id: str | None = None
     region: str | None = None
     magic: int = 770077
     slippage_points: int = 20
     commission_per_lot: float | None = None       # round-trip commission per 1 lot in account currency (risk buffer)
+
+    @model_validator(mode="after")
+    def _credentials(self) -> "MetaApiBrokerConfig":
+        if not self.optional and not (self.token and self.account_id):
+            raise ValueError(f"broker '{self.name}': token ve account_id gerekli")
+        return self
 
 
 class PaperBrokerConfig(_BrokerBase):

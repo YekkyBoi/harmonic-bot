@@ -330,9 +330,15 @@ python -m copytrader run
 
 ---
 
-## Arkadaşınız için kurulum (Tickmill MT5, fiyat farkı)
+## Arkadaşınız için Tickmill hesabı (MetaApi)
 
-Aynı sinyalleri kendi Windows bilgisayarında ve kendi hesaplarıyla almak isteyen biri için adım adım rehber: [docs/ARKADAS_KURULUM.md](docs/ARKADAS_KURULUM.md). Örnek ayar: `config.tickmill.example.yaml`. Brokerda `reference_exchange: binanceusdm` açıkken kripto sinyallerindeki giriş/stop/TP seviyeleri, broker ile Binance fiyatı arasındaki farkla kaydırılır (varsayılan: kapalı).
+Arkadaşınız Telegram grubunda olmak zorunda değildir ve kendi botunu kurmaz. Siz tek botla sinyalleri okursunuz; arkadaşınızın Tickmill MT5 hesabı metaapi.cloud üzerinden ikinci bir hesap olarak eklenir.
+
+- Arkadaşınızın yapacakları: [docs/ARKADAS_METAAPI.md](docs/ARKADAS_METAAPI.md)
+- Sizin yapacaklarınız (sunucuda): [docs/OWNER_TICKMILL_EKLE.md](docs/OWNER_TICKMILL_EKLE.md)
+- Eklenecek ayar parçası: `config.tickmill.example.yaml`
+
+Bu broker `optional: true` ile eklenir: bağlanamazsa veya hata verirse bot durmaz, Binance / Breakout / FundingPips kopyaları etkilenmez; size sadece uyarı gelir. `reference_exchange: binanceusdm` açıkken kripto sinyallerindeki giriş/stop/TP seviyeleri, broker ile Binance fiyatı arasındaki farkla kaydırılır (varsayılan: kapalı).
 
 ---
 

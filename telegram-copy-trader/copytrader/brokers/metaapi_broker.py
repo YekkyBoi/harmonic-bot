@@ -7,6 +7,7 @@ this module only implements the venue primitives.
 
 from __future__ import annotations
 
+import asyncio
 import logging
 from collections.abc import Awaitable, Callable
 from datetime import UTC, datetime, timedelta
@@ -44,6 +45,7 @@ _TRADE_MODES = {
 }
 _DEAL_REASONS = {"DEAL_REASON_SL": "sl", "DEAL_REASON_TP": "tp", "DEAL_REASON_SO": "stop_out"}
 _MAX_TAG_PLUS_COMMENT = 26      # SDK: len(comment) + len(clientId) <= 26
+RPC_TIMEOUT_SEC = 120.0          # SDK calls have their own timeouts; this is only the last resort
 _EPOCH = datetime(1970, 1, 1, tzinfo=UTC)
 
 
@@ -97,6 +99,7 @@ class MetaApiBroker(MetaTraderLegBroker):
         super().__init__(config)
         self.cfg = config
         self._conn: Any | None = connection
+        self._owns_conn = connection is None     # created by connect(): dropped on close so a retry starts clean
         self._api_factory = api_factory
         self._api: Any | None = None
         self._connected = False
@@ -107,9 +110,13 @@ class MetaApiBroker(MetaTraderLegBroker):
     # ---- plumbing ------------------------------------------------------------
     async def _rpc(self, what: str, fn: Callable[..., Awaitable[Any]], *args: Any, **kwargs: Any) -> Any:
         try:
-            return await fn(*args, **kwargs)
+            return await asyncio.wait_for(fn(*args, **kwargs), RPC_TIMEOUT_SEC)
         except BrokerError:
             raise
+        except asyncio.TimeoutError as exc:      # backstop: a hung cloud call must not block the shared loops
+            err = MetaApiError(f"MetaApi {what}: {int(RPC_TIMEOUT_SEC)} sn içinde yanıt gelmedi.")
+            logger.warning("%s: %s", self.name, err)
+            raise err from exc
         except Exception as exc:
             err = map_error(what, exc)
             logger.warning("%s: %s", self.name, err)
@@ -125,12 +132,18 @@ class MetaApiBroker(MetaTraderLegBroker):
         if self._connected:
             return
         if self._conn is None:
+            if not (self.cfg.token and self.cfg.account_id):
+                raise BrokerError("MetaApi token veya hesap kimliği (account_id) boş. .env dosyasında "
+                                  "METAAPI_TOKEN ve METAAPI_ACCOUNT_ID satırlarını doldurun.")
             factory = self._api_factory
             if factory is None:
                 try:
                     from metaapi_cloud_sdk import MetaApi
                 except ImportError as exc:
-                    raise BrokerError("metaapi-cloud-sdk paketi kurulu değil: pip install metaapi-cloud-sdk") from exc
+                    raise BrokerError(
+                        "metaapi-cloud-sdk paketi kurulu değil. Sunucuda şunu çalıştırın: "
+                        "pip install metaapi-cloud-sdk"
+                    ) from exc
                 factory = MetaApi
             opts: dict[str, Any] = {"region": self.cfg.region} if self.cfg.region else {}
             try:
@@ -167,6 +180,8 @@ class MetaApiBroker(MetaTraderLegBroker):
                 await self._conn.close()
             except Exception as exc:  # noqa: BLE001 - best effort on shutdown
                 logger.warning("%s: MetaApi connection close failed: %s", self.name, exc)
+            if self._owns_conn:
+                self._conn = None
         if self._api is not None:
             try:
                 self._api.close()

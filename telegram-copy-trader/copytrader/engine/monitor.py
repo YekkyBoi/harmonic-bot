@@ -33,6 +33,7 @@ UNPROTECTED_REALERT_PASSES = 30   # repeat the "no stop" alert every this many p
 ERROR_REALERT_PASSES = 30         # the same adapter error text is not re-sent within this many passes
 ERROR_ALERTS_PER_WINDOW = 3       # and at most this many different ones per position in that window
 _DEAD_LEG_STATES = frozenset({"closed", "cancelled", "failed"})
+SYNC_TIMEOUT_SEC = 120.0          # one venue sync that hangs must not stall the shared monitor loop
 VIRTUAL_POLL_SEC = 2.0            # virtual (reference-touch) entries are checked this often
 
 
@@ -283,7 +284,7 @@ class Monitor:
         key = (trade.id, pos.broker)
         before = pos.status
         try:
-            new = await broker.sync_position(pos)
+            new = await asyncio.wait_for(broker.sync_position(pos), SYNC_TIMEOUT_SEC)
         except asyncio.CancelledError:
             raise
         except Exception as exc:

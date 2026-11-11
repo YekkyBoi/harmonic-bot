@@ -78,9 +78,10 @@ class FakeBroker(Broker):
         unsupported: set[str] | None = None,
         fail: dict[str, Exception] | None = None,
         sync_fn: Callable[[BrokerPosition], BrokerPosition] | None = None,
+        optional: bool = False,
     ) -> None:
         cfg = PaperBrokerConfig(type="paper", name=name, allowed_assets=allowed_assets or [],
-                                risk_multiplier=risk_multiplier)
+                                risk_multiplier=risk_multiplier, optional=optional)
         super().__init__(cfg)
         self.equity = equity
         self.quote = quote or Quote(bid=2232.80, ask=2232.90, last=2232.85)

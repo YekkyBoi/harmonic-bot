@@ -127,6 +127,12 @@ risk:
 # Ortak alanlar (her broker için):
 #   name             benzersiz ad (bildirimlerde görünür)
 #   enabled          true/false
+#   optional         true = zorunlu olmayan hesap (ör. arkadaşın hesabı). Bağlanamazsa (yanlış token, servis
+#                    kapalı, paket eksik...) bot DURMAZ ve diğer hesaplar etkilenmez: size bir kez Türkçe uyarı
+#                    gelir, o hesap için gelen sinyaller atlanır (sonraya bırakılmaz) ve bot arka planda 5 dakikada
+#                    bir yeniden bağlanmayı dener; bağlanınca haber verir. Çalışırken çıkan hatalar da diğer
+#                    hesapların kopyalarını engellemez. Varsayılan false: bağlanamayan broker bugünkü gibi
+#                    ERROR ile bildirilir. Örnek: config.tickmill.example.yaml
 #   symbol_map       sembol eşleme, ör: {ETH: ETHUSD, XAU: GOLD}
 #   allowed_assets   boş = tüm varlıklar; ör: [BTC, ETH] = sadece bunlar
 #   risk_multiplier  bu hesapta riski ölçekle (1.0 = 1R başına %2, 0.5 = %1)

@@ -1,59 +1,58 @@
 # =====================================================================
-# Tickmill MT5 hesabı için örnek yapılandırma (kripto + fx sinyalleri)
+# Tickmill (arkadaşın MT5 hesabı) için config.yaml'a EKLENECEK PARÇA
 #
-# Kullanım:  Copy-Item config.tickmill.example.yaml config.yaml
-# Gizli bilgiler .env dosyasından okunur; bu dosyaya şifre YAZILMAZ.
-# Değiştirdikten sonra:  python -m copytrader check
+# Bu dosya tek başına çalışan bir ayar dosyası DEĞİLDİR.
+# Kendi config.yaml'ınıza iki yer eklenir (adımlar: docs/OWNER_TICKMILL_EKLE.md):
+#   1) "brokers:" listesinin SONUNA aşağıdaki "tickmill" bloğu.
+#   2) "telegram: topics:" içindeki iki konunun "brokers" satırına "tickmill".
+#
+# Önce .env dosyasına şu iki satırı yazın (arkadaşınızdan gelen değerler):
+#   METAAPI_TOKEN=...
+#   METAAPI_ACCOUNT_ID=...
+#
+# Güvenlik: "optional: true" sayesinde Tickmill bağlanamazsa bot DURMAZ.
+# Binance, Breakout ve FundingPips aynen çalışır. Size sadece uyarı gelir.
 # =====================================================================
 
-dry_run: true                   # önce true: emir gönderilmez. Emin olunca false yapın.
-data_dir: data
-log_level: INFO
-timezone: Europe/Istanbul
+# ---------------------------------------------------------------------
+# 1) brokers: listesinin sonuna eklenecek blok
+# ---------------------------------------------------------------------
+brokers:
+  - name: tickmill
+    type: metaapi                       # metaapi.cloud üzerinden MT5 (arkadaşınız hesabını orada bağlar)
+    enabled: true
+    optional: true                      # bağlanamazsa bot durmaz; uyarı gelir, sinyaller bu hesapta atlanır
+    token: ${METAAPI_TOKEN:-}           # .env; boşsa bağlantı kurulamaz ve sadece uyarı gelir
+    account_id: ${METAAPI_ACCOUNT_ID:-} # .env
+    risk_usd: 5                         # 1R'de kaybedilecek tutar (USD). Küçük başlayın.
+    # Sinyal grafikleri Binance vadeli (ör. BTCUSDT.P). Tickmill CFD fiyatı biraz farklıdır:
+    # giriş / stop / hedefler iki fiyat arasındaki farkla kaydırılır.
+    reference_exchange: binanceusdm
+    offset_mode: additive
+    max_offset_pct: 1.0                 # fark %1'i aşarsa işlem açılmaz
+    # LIMIT girişte brokerda emir bekletme. Binance fiyatı seviyeye değince farkı o an ölç ve MARKET aç:
+    entry_trigger: reference_touch
+    virtual_trigger_max_hours: 48       # tetiklenmezse 48 saat sonra iptal
+    # YER TUTUCU: arkadaşınızın MT5 "Market Watch" listesindeki TAM sembol adlarını yazın.
+    # Tickmill'de kripto CFD adları ve sonekleri farklı olabilir (ör. BTCUSD, ETHUSD).
+    symbol_map: {BTC: BTCUSD, ETH: ETHUSD}
+    # YER TUTUCU: sadece Tickmill'de gerçekten işlem gören varlıklar (boş = hepsi denenir).
+    allowed_assets: [BTC, ETH, EUR, GBP, XAU]
+    no_hedge: true                      # aynı varlıkta ters yönlü işlem açma
+    daily_loss_limit_pct: 3             # günlük zarar %3'ü geçerse bu hesapta yeni işlem açılmaz
 
+# ---------------------------------------------------------------------
+# 2) telegram.topics: sizin MEVCUT konularınız, sadece "tickmill" eklenmiş hali.
+#    Kendi başlık metinlerinizi (title_contains) ve diğer ayarlarınızı koruyun;
+#    yalnızca "brokers" satırına tickmill'i ekleyin.
+# ---------------------------------------------------------------------
 telegram:
-  api_id: ${TG_API_ID}
-  api_hash: ${TG_API_HASH}
-  session_path: data/telegram_user
-  # 'python -m copytrader chats' ile bulduğunuz grup ID'sini yazın (-100...):
-  source_chats:
-    - -1001234567890
   topics:
     - name: kripto
       title_contains: ["Kripto İşlemleri"]
-      brokers: [tickmill]
+      brokers: [binance, breakout, tickmill]    # <- tickmill eklendi
       kind: crypto
     - name: fx
       title_contains: ["Fx İşlemleri"]
-      brokers: [tickmill]
+      brokers: [fx, tickmill]                   # <- tickmill eklendi
       kind: fx
-
-notifier:
-  bot_token: ${TG_BOT_TOKEN}
-  owner_user_id: ${TG_OWNER_ID}
-
-llm:
-  api_key: ${ANTHROPIC_API_KEY}
-
-brokers:
-  - name: tickmill
-    type: mt5
-    enabled: true
-    login: ${MT5_LOGIN}
-    password: ${MT5_PASSWORD}     # işlem (master) şifresi, yatırımcı şifresi DEĞİL
-    server: ${MT5_SERVER}         # ör: Tickmill-Live
-    risk_usd: 10                  # 1R'de kaybedilecek tutar (USD). Küçük başlayın.
-    # Sinyal grafikleri Binance vadeli (BTCUSDT.P). Tickmill CFD fiyatı farklıdır:
-    # seviyeler iki fiyat arasındaki farkla kaydırılır.
-    reference_exchange: binanceusdm
-    offset_mode: additive
-    max_offset_pct: 1.0           # fark %1'i aşarsa işlem açılmaz
-    # LIMIT girişlerde brokerda emir bekletme; Binance fiyatı seviyeye değince farkı o an ölç ve MARKET aç:
-    entry_trigger: reference_touch
-    virtual_trigger_max_hours: 48 # tetiklenmezse 48 saat sonra iptal
-    # Market Watch'taki TAM adları yazın (Tickmill'de farklı olabilir):
-    symbol_map: {BTC: BTCUSD, ETH: ETHUSD}
-    # Sadece Tickmill'in listelediği coinler işlem görebilir:
-    allowed_assets: [BTC, ETH, EUR, GBP, XAU]
-    no_hedge: true
-    daily_loss_limit_pct: 3

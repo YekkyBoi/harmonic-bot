@@ -324,16 +324,56 @@ def test_config_defaults_and_validation() -> None:
 
 
 def test_tickmill_example_loads(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
+    """The snippet merged into an owner-like config (binance / breakout / fx brokers already there)."""
+    import yaml
+
     for k, v in {"TG_API_ID": "123", "TG_API_HASH": "h", "TG_BOT_TOKEN": "1:abc", "TG_OWNER_ID": "42",
-                 "ANTHROPIC_API_KEY": "sk-test", "MT5_LOGIN": "5000", "MT5_PASSWORD": "pw",
-                 "MT5_SERVER": "Tickmill-Demo"}.items():
+                 "ANTHROPIC_API_KEY": "sk-test", "METAAPI_TOKEN": "tok", "METAAPI_ACCOUNT_ID": "acc"}.items():
         monkeypatch.setenv(k, v)
     monkeypatch.chdir(tmp_path)          # no stray .env
-    cfg = load_config(ROOT / "config.tickmill.example.yaml")
-    (b,) = cfg.brokers
-    assert b.name == "tickmill" and b.type == "mt5" and b.risk_usd == 10
+    snippet = yaml.safe_load((ROOT / "config.tickmill.example.yaml").read_text(encoding="utf-8"))
+    base = {
+        "dry_run": True,
+        "telegram": {"api_id": "${TG_API_ID}", "api_hash": "${TG_API_HASH}", "source_chats": [-1001]},
+        "notifier": {"bot_token": "${TG_BOT_TOKEN}", "owner_user_id": "${TG_OWNER_ID}"},
+        "llm": {"api_key": "${ANTHROPIC_API_KEY}"},
+        "brokers": [{"name": n, "type": "paper"} for n in ("binance", "breakout", "fx")],
+    }
+    base["brokers"] += snippet["brokers"]
+    base["telegram"]["topics"] = snippet["telegram"]["topics"]
+    path = tmp_path / "merged.yaml"
+    path.write_text(yaml.safe_dump(base, allow_unicode=True), encoding="utf-8")
+    cfg = load_config(path)
+    b = next(x for x in cfg.brokers if x.name == "tickmill")
+    assert b.type == "metaapi" and b.optional is True and b.risk_usd == 5
+    assert b.token == "tok" and b.account_id == "acc"
     assert b.reference_exchange == "binanceusdm" and b.offset_mode == "additive" and b.max_offset_pct == 1.0
-    assert b.symbol_map == {"BTC": "BTCUSD", "ETH": "ETHUSD"} and b.no_hedge and b.daily_loss_limit_pct == 3
-    assert [t.name for t in cfg.telegram.topics] == ["kripto", "fx"]
-    assert all(t.brokers == ["tickmill"] for t in cfg.telegram.topics)
-    assert cfg.dry_run is True
+    assert b.entry_trigger == "reference_touch" and b.no_hedge and b.daily_loss_limit_pct == 3
+    assert b.symbol_map == {"BTC": "BTCUSD", "ETH": "ETHUSD"}
+    routes = {t.name: t.brokers for t in cfg.telegram.topics}
+    assert routes == {"kripto": ["binance", "breakout", "tickmill"], "fx": ["fx", "tickmill"]}
+    assert all(not x.optional for x in cfg.brokers if x.name != "tickmill")
+
+
+def test_tickmill_example_without_env_still_loads(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
+    """Missing METAAPI_* must not break config loading (the optional broker just fails to connect)."""
+    import yaml
+
+    for k in ("METAAPI_TOKEN", "METAAPI_ACCOUNT_ID"):
+        monkeypatch.delenv(k, raising=False)
+    monkeypatch.setenv("TG_API_ID", "1")
+    monkeypatch.setenv("TG_API_HASH", "h")
+    monkeypatch.setenv("TG_BOT_TOKEN", "1:a")
+    monkeypatch.setenv("TG_OWNER_ID", "4")
+    monkeypatch.setenv("ANTHROPIC_API_KEY", "k")
+    monkeypatch.chdir(tmp_path)
+    snippet = yaml.safe_load((ROOT / "config.tickmill.example.yaml").read_text(encoding="utf-8"))
+    base = {
+        "telegram": {"api_id": "${TG_API_ID}", "api_hash": "${TG_API_HASH}", "source_chats": [-1001]},
+        "notifier": {"bot_token": "${TG_BOT_TOKEN}", "owner_user_id": "${TG_OWNER_ID}"},
+        "llm": {"api_key": "${ANTHROPIC_API_KEY}"},
+        "brokers": [{"name": n, "type": "paper"} for n in ("binance", "breakout", "fx")] + snippet["brokers"],
+    }
+    path = tmp_path / "m.yaml"
+    path.write_text(yaml.safe_dump(base), encoding="utf-8")
+    assert load_config(path).brokers[-1].token is None
