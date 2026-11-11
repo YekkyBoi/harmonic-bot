@@ -81,7 +81,7 @@ from .monitor import (
     unprotected_alert_text,
     utc,
 )
-from .prices import PriceOracle
+from .prices import PriceOracle, ReferencePriceOracle
 
 logger = logging.getLogger(__name__)
 
@@ -278,6 +278,47 @@ def price_multiplier(extra: dict[str, Any] | None) -> float:
     return m if math.isfinite(m) and m > 0 else 1.0
 
 
+def shift_price(price: float, offset: dict[str, Any] | None) -> float:
+    """Signal-scale-adjusted ``price`` moved onto an offset broker: additive ``+ value`` / ratio ``* value``."""
+    if not offset:
+        return price
+    value = float(offset["value"])
+    return price * value if offset.get("mode") == "ratio" else price + value
+
+
+def unshift_price(price: float, offset: dict[str, Any] | None) -> float:
+    """Inverse of :func:`shift_price` (broker price -> the signal's chart price)."""
+    if not offset:
+        return price
+    value = float(offset["value"])
+    if offset.get("mode") == "ratio":
+        return price / value if value else price
+    return price - value
+
+
+def stored_offset(data: dict[str, Any] | None) -> dict[str, Any] | None:
+    """The price offset kept on a broker position (``data["price_offset"]``) or None; never raises."""
+    off = (data or {}).get("price_offset")
+    if not isinstance(off, dict) or off.get("mode") not in ("additive", "ratio"):
+        return None
+    try:
+        v = float(off["value"])
+    except (KeyError, TypeError, ValueError):
+        return None
+    return {"mode": off["mode"], "value": v} if math.isfinite(v) else None
+
+
+def offset_text(offset: dict[str, Any]) -> str:
+    v = round(float(offset["value"]), 6)
+    return f"fark {v:+} uygulandı" if offset["mode"] == "additive" else f"oran x{v} uygulandı"
+
+
+def shifted_take_profits(tps: list[TakeProfit], offset: dict[str, Any] | None) -> list[TakeProfit]:
+    if not offset:
+        return tps
+    return [TakeProfit(price=shift_price(tp.price, offset), close_fraction=tp.close_fraction) for tp in tps]
+
+
 def scaled_take_profits(tps: list[TakeProfit], m: float) -> list[TakeProfit]:
     return [TakeProfit(price=tp.price * m, close_fraction=tp.close_fraction) for tp in tps]
 
@@ -299,6 +340,7 @@ def filled_tp_prices(pos: BrokerPosition) -> list[float]:
         if isinstance(e, dict) and e.get("done"):
             raw.append(e.get("price"))
     mult = price_multiplier(d)
+    offset = stored_offset(d)
     out: list[float] = []
     for p in raw:
         try:
@@ -306,7 +348,7 @@ def filled_tp_prices(pos: BrokerPosition) -> list[float]:
         except (TypeError, ValueError):
             continue
         if math.isfinite(v) and v > 0:
-            out.append(v / mult)
+            out.append(unshift_price(v, offset) / mult)
     return out
 
 
@@ -357,9 +399,11 @@ class Engine:
         notifier: Notifier,
         price_oracle: PriceOracle | Any | None = None,
         *,
+        reference_prices: ReferencePriceOracle | Any | None = None,
         clock: Callable[[], datetime] | None = None,
     ) -> None:
         """``price_oracle``: anything with ``async price(base, quote, market_type, raw_symbol, *, fresh=False)``.
+        ``reference_prices``: anything with ``async mid(exchange_id, base, *, fresh=False)`` (price-offset brokers).
         ``clock``: returns "now" (tests)."""
         self.config = config
         self.db = db
@@ -373,6 +417,8 @@ class Engine:
         self.prices: Any = price_oracle if price_oracle is not None else PriceOracle(
             lambda: self.brokers, config.price_source_exchange
         )
+        self._own_reference = reference_prices is None
+        self.reference_prices: Any = reference_prices if reference_prices is not None else ReferencePriceOracle()
         self.retry_delays: tuple[float, ...] = TRANSIENT_PARSE_RETRY_DELAYS
         self._sender_locks: dict[_Key, asyncio.Lock] = {}
         self._conf_locks: dict[str, asyncio.Lock] = {}
@@ -838,6 +884,11 @@ class Engine:
                 await self.prices.close()
             except Exception:
                 logger.debug("oracle close failed", exc_info=True)
+        if self._own_reference and hasattr(self.reference_prices, "close"):
+            try:
+                await self.reference_prices.close()
+            except Exception:
+                logger.debug("reference oracle close failed", exc_info=True)
         logger.info("Engine stopped")
 
     # ------------------------------------------------------------------ incoming messages
@@ -1736,6 +1787,36 @@ class Engine:
                                                  "brokers": list(plan.broker_names)})
         return text
 
+    async def _compute_price_offset(
+        self, broker: Broker, plan: TradePlan, quote: Quote, mult: float
+    ) -> tuple[dict[str, Any] | None, str | None]:
+        """(offset, problem). Offset brokers only (``reference_exchange`` set, crypto plan): compares the
+        broker's mid with the reference exchange's mid (scaled like the signal) and returns the shift to apply.
+        Fails closed: unavailable reference or a too big difference -> a problem text and no offset."""
+        cfg = broker.config
+        ref_id = getattr(cfg, "reference_exchange", None)
+        if not ref_id or plan.market_type not in (None, MarketType.PERP):
+            return None, None
+        ref = None
+        try:
+            ref = await self.reference_prices.mid(ref_id, plan.base_asset, fresh=True)
+        except Exception:
+            logger.exception("Reference price failed for %s on %s", plan.base_asset, ref_id)
+        broker_mid = (quote.bid + quote.ask) / 2.0
+        if ref is None or not (math.isfinite(ref) and ref > 0) or not (math.isfinite(broker_mid) and broker_mid > 0):
+            return None, (f"referans fiyat ({esc(ref_id)}) alınamadı; fiyat farkı hesaplanamadığı için "
+                          "işlem güvenlik gereği açılmadı")
+        ref_mid = float(ref) * mult
+        diff_pct = abs(broker_mid - ref_mid) / ref_mid * 100.0
+        max_pct = float(getattr(cfg, "max_offset_pct", 1.0))
+        if diff_pct > max_pct:
+            return None, (f"broker fiyatı ({fmt_price(broker_mid)}) ile {esc(ref_id)} fiyatı ({fmt_price(ref_mid)}) "
+                          f"arasındaki fark {fmt.fmt_pct(diff_pct)} (sınır {fmt.fmt_pct(max_pct)}); "
+                          "yanlış sembol veya eski fiyat olabilir, işlem açılmadı")
+        if getattr(cfg, "offset_mode", "additive") == "ratio":
+            return {"mode": "ratio", "value": broker_mid / ref_mid}, None
+        return {"mode": "additive", "value": broker_mid - ref_mid}, None
+
     async def _open_on_broker(
         self, broker: Broker, plan: TradePlan, trade: TradeRecord, raw_symbol: str | None
     ) -> BrokerOutcome:
@@ -1772,6 +1853,19 @@ class Engine:
             stop = plan.stop_loss * mult
             tps = scaled_take_profits(plan.take_profits, mult)
             signal_entry = plan.entry_price * mult if plan.entry_price else None
+            offset, offset_problem = await self._compute_price_offset(broker, plan, quote, mult)
+            if offset_problem:
+                text = f"{esc(name)}: {offset_problem}"
+                await self._notify(text, Severity.WARNING)
+                return BrokerOutcome(name, "skipped", text)
+            if offset:
+                stop = shift_price(stop, offset)
+                tps = shifted_take_profits(tps, offset)
+                signal_entry = shift_price(signal_entry, offset) if signal_entry else None
+                if stop <= 0 or any(tp.price <= 0 for tp in tps) or (signal_entry is not None and signal_entry <= 0):
+                    text = f"{esc(name)}: kaydırılmış seviyeler geçersiz; bu hesapta işlem açılmadı"
+                    await self._notify(text, Severity.WARNING)
+                    return BrokerOutcome(name, "skipped", text)
             tp1 = tps[0].price if tps else None
             if plan.entry_type is EntryType.MARKET:
                 problem = _price_problem(plan.side, quote, stop, tp1)
@@ -1816,6 +1910,8 @@ class Engine:
             pos = await broker.open_position(req)
             pos.risk_amount = size.risk_amount
             pos.data.setdefault("price_multiplier", mult)
+            if offset:
+                pos.data["price_offset"] = offset
             await self.db.save_broker_position(trade.id, pos)
             if pos.status is PositionStatus.FAILED:
                 text = f"{esc(name)}: <code>{esc(pos.error or 'işlem açılamadı')}</code>"
@@ -1826,6 +1922,8 @@ class Engine:
             text = (f"{esc(name)}: {_qty(pos.quantity)} {esc(sym.broker_symbol)} "
                     f"({_POS_STATUS_TR.get(pos.status, pos.status.value)}), risk {_money(size.risk_amount)} {esc(ccy)}"
                     f"{fill}")
+            if offset:
+                text += f" ({offset_text(offset)})"
             warnings = [*size.warnings, *(str(w) for w in pos.data.get("warnings") or [])]
             if warnings:
                 text += " ⚠️ " + esc("; ".join(warnings))
@@ -1986,8 +2084,10 @@ class Engine:
         try:
             new: BrokerPosition
             mult = price_multiplier(pos.data)
+            offset = stored_offset(pos.data)   # fixed when the position was opened, never recomputed
             if plan.action is ActionType.MOVE_SL:
-                signal_sl = plan.new_stop_loss * mult if plan.new_stop_loss is not None else None
+                signal_sl = (shift_price(plan.new_stop_loss * mult, offset)
+                             if plan.new_stop_loss is not None else None)
                 if plan.move_sl_to_entry:
                     if pos.status is PositionStatus.PENDING:
                         return BrokerOutcome(name, "skipped", f"{esc(name)}: giriş henüz dolmadı; stop değiştirilmedi")
@@ -2013,7 +2113,7 @@ class Engine:
                 if not levels:
                     return BrokerOutcome(name, "skipped",
                                          f"{esc(name)}: hedeflerin hepsi bu hesapta zaten gerçekleşmiş; TP değişmedi")
-                tps = scaled_take_profits(levels, mult)
+                tps = shifted_take_profits(scaled_take_profits(levels, mult), offset)
                 new = await broker.update_take_profits(pos, tps)
                 text = f"{esc(name)}: TP " + " / ".join(fmt_price(tp.price) for tp in tps)
                 if len(levels) < len(plan.take_profits):
@@ -2731,15 +2831,21 @@ class Engine:
                 ccy = self._currency.get(b.name) or await b.account_currency()
                 quote = await b.get_quote(sym)
                 mult = price_multiplier(sym.extra)
+                offset, offset_problem = await self._compute_price_offset(b, plan, quote, mult)
+                if offset_problem:
+                    lines.append(f"{b.name}: {offset_problem} (işlem açılmazdı)")
+                    continue
                 entry = (quote.entry_price_for(plan.side) if plan.entry_type is EntryType.MARKET
-                         else (plan.entry_price or 0.0) * mult)
+                         else (shift_price(plan.entry_price * mult, offset) if plan.entry_price else 0.0))
                 amount = broker_risk_amount(b, equity, plan)
-                size = await b.size_position(sym, plan.side, float(entry or 0.0), plan.stop_loss * mult, amount)
+                size = await b.size_position(sym, plan.side, float(entry or 0.0),
+                                             shift_price(plan.stop_loss * mult, offset), amount)
                 lev = f", kaldıraç {fmt.fmt_number(size.leverage)}x" if size.leverage else ""
                 lines.append(
                     f"{b.name}: {sym.broker_symbol} miktar {_qty(size.quantity)}, risk {_money(amount)} {ccy} "
                     f"(stopta ~{_money(size.est_loss_at_sl)}), büyüklük {_money(size.notional)}{lev}, "
                     f"bakiye {_money(equity)} {ccy}"
+                    + (f" ({offset_text(offset)})" if offset else "")
                     + (" ⚠️ " + "; ".join(size.warnings) if size.warnings else "")
                 )
             except Exception as exc:

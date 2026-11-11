@@ -330,6 +330,12 @@ python -m copytrader run
 
 ---
 
+## Arkadaşınız için kurulum (Tickmill MT5, fiyat farkı)
+
+Aynı sinyalleri kendi Windows bilgisayarında ve kendi hesaplarıyla almak isteyen biri için adım adım rehber: [docs/ARKADAS_KURULUM.md](docs/ARKADAS_KURULUM.md). Örnek ayar: `config.tickmill.example.yaml`. Brokerda `reference_exchange: binanceusdm` açıkken kripto sinyallerindeki giriş/stop/TP seviyeleri, broker ile Binance fiyatı arasındaki farkla kaydırılır (varsayılan: kapalı).
+
+---
+
 ## 7/24 çalıştırma
 
 ### Docker

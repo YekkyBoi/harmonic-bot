@@ -169,6 +169,10 @@ class _BrokerBase(_Base):
     risk_usd: float | None = Field(None, gt=0)    # fixed money at risk for 1R on this broker (instead of a % of equity)
     no_hedge: bool = False                        # never open the opposite direction of an active position on the same asset (prop firms / netting)
     daily_loss_limit_pct: float | None = Field(None, ge=0)  # replaces risk.daily_loss_limit_pct for this broker (0 = off)
+    # Price-offset brokers (CFD price differs from the exchange the signal charts come from): None = off.
+    reference_exchange: str | None = None         # ccxt id of the chart's exchange, e.g. "binanceusdm"
+    offset_mode: Literal["additive", "ratio"] = "additive"  # shift levels by (broker - ref) or scale by broker / ref
+    max_offset_pct: float = Field(1.0, gt=0)      # broker vs reference price differing more than this % -> skip the trade
 
 
 class CcxtBrokerConfig(_BrokerBase):

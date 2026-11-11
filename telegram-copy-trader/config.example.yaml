@@ -130,6 +130,16 @@ risk:
 #   symbol_map       sembol eşleme, ör: {ETH: ETHUSD, XAU: GOLD}
 #   allowed_assets   boş = tüm varlıklar; ör: [BTC, ETH] = sadece bunlar
 #   risk_multiplier  bu hesapta riski ölçekle (1.0 = 1R başına %2, 0.5 = %1)
+#   reference_exchange  (isteğe bağlı, her broker tipinde) sinyal grafiklerinin geldiği borsanın ccxt adı,
+#                    ör: binanceusdm. Doluysa KRİPTO sinyallerinde broker fiyatı ile bu borsanın fiyatı
+#                    karşılaştırılır ve sinyaldeki giriş/stop/TP seviyeleri aradaki farkla KAYDIRILIR
+#                    (ör. Binance 73200, CFD brokerı 73400 -> giriş 73200 ise 73400 kullanılır).
+#                    Boş = kapalı (seviyeler olduğu gibi kullanılır). FX/CFD sinyallerine hiç uygulanmaz.
+#   offset_mode      additive = fark kadar topla/çıkar (varsayılan) | ratio = broker/referans oranıyla çarp
+#   max_offset_pct   broker ve referans fiyatı arasındaki fark bu yüzdeyi aşarsa (yanlış sembol, eski fiyat)
+#                    işlem AÇILMAZ ve uyarı gelir (varsayılan 1.0). Referans fiyat alınamazsa da işlem
+#                    güvenlik gereği açılmaz; seviyeler asla kaydırılmadan kullanılmaz.
+#                    Örnek:  reference_exchange: binanceusdm / offset_mode: additive / max_offset_pct: 1.0
 #
 # Bir brokerı açtıktan sonra MUTLAKA 'python -m copytrader check' çalıştırın:
 # API anahtarı yanlış/eksikse burada görünür.

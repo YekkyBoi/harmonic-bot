@@ -46,6 +46,72 @@ def ticker_price(ticker: dict[str, Any] | None) -> float | None:
     return None
 
 
+async def fetch_public_price(ex: Any, base: str, timeout_sec: float) -> float | None:
+    """Mid of ``<BASE>/USDT:USDT`` on a ccxt-like exchange in the SIGNAL's price scale (1000-prefix aware)."""
+    for prefix, mult in (("", 1.0), ("1000", 1000.0)):  # PEPE trades as 1000PEPE on most venues
+        symbol = f"{prefix}{base}/USDT:USDT"
+        try:
+            ticker = await asyncio.wait_for(ex.fetch_ticker(symbol), timeout_sec + 5)
+        except Exception as exc:
+            logger.debug("Public price for %s unavailable: %s", symbol, exc)
+            continue
+        price = ticker_price(ticker)
+        if price is not None:
+            return price / mult
+    return None
+
+
+class ReferencePriceOracle:
+    """Mid price of a coin's USDT perpetual on a named public exchange (the venue the signal charts come
+    from), used to shift signal levels onto a broker whose price is offset. One public ccxt client per
+    exchange id, results cached a few seconds. ``mid()`` never raises: unknown -> None."""
+
+    def __init__(self, *, cache_ttl_sec: float = 3.0, timeout_sec: float = 10.0,
+                 exchanges: dict[str, Any] | None = None) -> None:
+        """``exchanges``: prebuilt ccxt-like objects by id (tests)."""
+        self._ttl = cache_ttl_sec
+        self._timeout = timeout_sec
+        self._clients: dict[str, Any] = dict(exchanges or {})
+        self._cache: dict[tuple[str, str], tuple[float, float | None]] = {}
+
+    async def mid(self, exchange_id: str, base_asset: str, *, fresh: bool = False) -> float | None:
+        if not exchange_id or not base_asset:
+            return None
+        key = (exchange_id, base_asset.upper())
+        hit = self._cache.get(key)
+        if not fresh and hit is not None and time.monotonic() - hit[0] <= self._ttl:
+            return hit[1]
+        try:
+            value = await self._lookup(exchange_id, base_asset.upper())
+        except Exception:  # never raise
+            logger.exception("Reference price lookup failed for %s on %s", base_asset, exchange_id)
+            value = None
+        self._cache[key] = (time.monotonic(), value)
+        return value
+
+    async def _lookup(self, exchange_id: str, base: str) -> float | None:
+        ex = self._clients.get(exchange_id)
+        if ex is None:
+            import ccxt.async_support as ccxt_async
+
+            klass = getattr(ccxt_async, exchange_id, None)
+            if klass is None:
+                logger.warning("Unknown reference_exchange %r", exchange_id)
+                return None
+            ex = self._clients[exchange_id] = klass(
+                {"enableRateLimit": True, "timeout": int(self._timeout * 1000), "options": {"defaultType": "swap"}}
+            )
+        return await fetch_public_price(ex, base, self._timeout)
+
+    async def close(self) -> None:
+        clients, self._clients = self._clients, {}
+        for ex in clients.values():
+            try:
+                await ex.close()
+            except Exception:
+                logger.debug("Error closing reference exchange", exc_info=True)
+
+
 class PriceOracle:
     def __init__(
         self,
@@ -140,17 +206,7 @@ class PriceOracle:
             ex = self._public = klass(
                 {"enableRateLimit": True, "timeout": int(self._timeout * 1000), "options": {"defaultType": "swap"}}
             )
-        for prefix, mult in (("", 1.0), ("1000", 1000.0)):  # PEPE trades as 1000PEPE on most venues
-            symbol = f"{prefix}{base}/USDT:USDT"
-            try:
-                ticker = await asyncio.wait_for(ex.fetch_ticker(symbol), self._timeout + 5)
-            except Exception as exc:
-                logger.debug("Public price for %s unavailable: %s", symbol, exc)
-                continue
-            price = ticker_price(ticker)
-            if price is not None:
-                return price / mult
-        return None
+        return await fetch_public_price(ex, base, self._timeout)
 
     async def close(self) -> None:
         if self._public is not None and self._owns_public:

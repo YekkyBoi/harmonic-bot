@@ -1,0 +1,56 @@
+# =====================================================================
+# Tickmill MT5 hesabı için örnek yapılandırma (kripto + fx sinyalleri)
+#
+# Kullanım:  Copy-Item config.tickmill.example.yaml config.yaml
+# Gizli bilgiler .env dosyasından okunur; bu dosyaya şifre YAZILMAZ.
+# Değiştirdikten sonra:  python -m copytrader check
+# =====================================================================
+
+dry_run: true                   # önce true: emir gönderilmez. Emin olunca false yapın.
+data_dir: data
+log_level: INFO
+timezone: Europe/Istanbul
+
+telegram:
+  api_id: ${TG_API_ID}
+  api_hash: ${TG_API_HASH}
+  session_path: data/telegram_user
+  # 'python -m copytrader chats' ile bulduğunuz grup ID'sini yazın (-100...):
+  source_chats:
+    - -1001234567890
+  topics:
+    - name: kripto
+      title_contains: ["Kripto İşlemleri"]
+      brokers: [tickmill]
+      kind: crypto
+    - name: fx
+      title_contains: ["Fx İşlemleri"]
+      brokers: [tickmill]
+      kind: fx
+
+notifier:
+  bot_token: ${TG_BOT_TOKEN}
+  owner_user_id: ${TG_OWNER_ID}
+
+llm:
+  api_key: ${ANTHROPIC_API_KEY}
+
+brokers:
+  - name: tickmill
+    type: mt5
+    enabled: true
+    login: ${MT5_LOGIN}
+    password: ${MT5_PASSWORD}     # işlem (master) şifresi, yatırımcı şifresi DEĞİL
+    server: ${MT5_SERVER}         # ör: Tickmill-Live
+    risk_usd: 10                  # 1R'de kaybedilecek tutar (USD). Küçük başlayın.
+    # Sinyal grafikleri Binance vadeli (BTCUSDT.P). Tickmill CFD fiyatı farklıdır:
+    # seviyeler iki fiyat arasındaki farkla kaydırılır.
+    reference_exchange: binanceusdm
+    offset_mode: additive
+    max_offset_pct: 1.0           # fark %1'i aşarsa işlem açılmaz
+    # Market Watch'taki TAM adları yazın (Tickmill'de farklı olabilir):
+    symbol_map: {BTC: BTCUSD, ETH: ETHUSD}
+    # Sadece Tickmill'in listelediği coinler işlem görebilir:
+    allowed_assets: [BTC, ETH, EUR, GBP, XAU]
+    no_hedge: true
+    daily_loss_limit_pct: 3
