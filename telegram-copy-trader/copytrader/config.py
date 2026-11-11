@@ -173,6 +173,17 @@ class _BrokerBase(_Base):
     reference_exchange: str | None = None         # ccxt id of the chart's exchange, e.g. "binanceusdm"
     offset_mode: Literal["additive", "ratio"] = "additive"  # shift levels by (broker - ref) or scale by broker / ref
     max_offset_pct: float = Field(1.0, gt=0)      # broker vs reference price differing more than this % -> skip the trade
+    # LIMIT entries on an offset broker: "broker_limit" = resting limit order on the broker (default);
+    # "reference_touch" = no broker order: the bot waits for the reference exchange to touch the chart level,
+    # then measures the offset right then and opens a MARKET order with the shifted SL/TPs.
+    entry_trigger: Literal["broker_limit", "reference_touch"] = "broker_limit"
+    virtual_trigger_max_hours: float = Field(48.0, gt=0)   # a virtual entry not triggered within this is cancelled
+
+    @model_validator(mode="after")
+    def _touch_needs_reference(self) -> "_BrokerBase":
+        if self.entry_trigger == "reference_touch" and not self.reference_exchange:
+            raise ValueError(f"broker '{self.name}': entry_trigger: reference_touch için reference_exchange gerekli")
+        return self
 
 
 class CcxtBrokerConfig(_BrokerBase):

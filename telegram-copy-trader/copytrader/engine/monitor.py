@@ -12,7 +12,8 @@ from __future__ import annotations
 
 import asyncio
 import logging
-from collections.abc import Callable, Sequence
+import time
+from collections.abc import Awaitable, Callable, Sequence
 from datetime import datetime, timedelta, timezone
 
 
@@ -32,6 +33,12 @@ UNPROTECTED_REALERT_PASSES = 30   # repeat the "no stop" alert every this many p
 ERROR_REALERT_PASSES = 30         # the same adapter error text is not re-sent within this many passes
 ERROR_ALERTS_PER_WINDOW = 3       # and at most this many different ones per position in that window
 _DEAD_LEG_STATES = frozenset({"closed", "cancelled", "failed"})
+VIRTUAL_POLL_SEC = 2.0            # virtual (reference-touch) entries are checked this often
+
+
+def is_virtual_pending(pos: BrokerPosition) -> bool:
+    """A virtual entry waiting for its reference-exchange trigger: no order exists on the broker yet."""
+    return pos.status is PositionStatus.PENDING and bool((pos.data or {}).get("virtual_trigger"))
 
 
 def utc(dt: datetime) -> datetime:
@@ -139,6 +146,8 @@ class Monitor:
         self._remainder_warned: set[tuple[int, str]] = set()
         self._passes = 0
         self._stop = asyncio.Event()
+        # Engine hook for virtual entries: (trade, position, now) -> new position. Called under the trade lock.
+        self.virtual_hook: Callable[[TradeRecord, BrokerPosition, datetime], Awaitable[BrokerPosition]] | None = None
 
     def request_stop(self) -> None:
         """Finish the current position sync, then leave :meth:`run` (graceful shutdown)."""
@@ -165,15 +174,22 @@ class Monitor:
     async def run(self) -> None:
         interval = max(0.05, float(self.config.monitor_interval_sec))
         logger.info("Monitor started (every %.1fs)", interval)
+        fast = min(interval, VIRTUAL_POLL_SEC)
+        last_full: float | None = None
         while not self._stop.is_set():
             try:
-                await self.run_once()
+                now = time.monotonic()
+                if last_full is None or now - last_full >= interval - 0.01:
+                    last_full = now
+                    await self.run_once()
+                else:
+                    await self.run_virtual_once()
             except asyncio.CancelledError:
                 raise
             except Exception:
                 logger.exception("Monitor pass failed")
             try:
-                await asyncio.wait_for(self._stop.wait(), interval)
+                await asyncio.wait_for(self._stop.wait(), fast)
             except asyncio.TimeoutError:
                 pass
         logger.info("Monitor stopped")
@@ -201,9 +217,30 @@ class Monitor:
                 except Exception:
                     logger.exception("Monitor: trade %s sync failed", trade_id)
 
+    async def run_virtual_once(self) -> None:
+        """Fast pass: only trades with a waiting virtual entry (cheap; the venue-syncing pass runs less often)."""
+        trade_ids: list[int] = []
+        for trade_id, pos in await self.db.active_broker_positions():
+            if is_virtual_pending(pos) and trade_id not in trade_ids:
+                trade_ids.append(trade_id)
+        for trade_id in trade_ids:
+            if self._stop.is_set():
+                return
+            lock = self._trade_lock(trade_id)
+            if lock.locked():
+                continue
+            async with lock:
+                try:
+                    await self.sync_trade(trade_id, virtual_only=True)
+                except asyncio.CancelledError:
+                    raise
+                except Exception:
+                    logger.exception("Monitor: virtual entry of trade %s failed", trade_id)
+
     # ---- one trade -----------------------------------------------------------
-    async def sync_trade(self, trade_id: int) -> None:
-        """Sync all active positions of one trade. Caller holds the trade lock."""
+    async def sync_trade(self, trade_id: int, *, virtual_only: bool = False) -> None:
+        """Sync all active positions of one trade (``virtual_only``: just its waiting virtual entries).
+        Caller holds the trade lock."""
         trade = await self.db.get_trade(trade_id)
         positions = await self.db.broker_positions(trade_id)   # fresh copies (the engine may have changed them)
         if trade is None:
@@ -221,12 +258,22 @@ class Monitor:
 
         updated: list[BrokerPosition] = []
         for pos in positions:
-            if pos.status in ACTIVE_POSITION:
+            if pos.status in ACTIVE_POSITION and (not virtual_only or is_virtual_pending(pos)):
                 pos = await self._sync_position(trade, pos, now)
             updated.append(pos)
         await self._rollup(trade, updated)
 
     async def _sync_position(self, trade: TradeRecord, pos: BrokerPosition, now: datetime) -> BrokerPosition:
+        if is_virtual_pending(pos):     # no venue order exists: the engine watches the reference price
+            if self.virtual_hook is None:
+                return pos
+            try:
+                return await self.virtual_hook(trade, pos, now)
+            except asyncio.CancelledError:
+                raise
+            except Exception:
+                logger.exception("Monitor: virtual entry %s #%s failed", pos.broker, trade.id)
+                return pos
         broker = self._broker(pos.broker)
         if broker is None:
             if pos.broker not in self._warned_missing:
@@ -431,5 +478,5 @@ def unprotected_alert_text(trade: TradeRecord, pos: BrokerPosition, problem: str
 
 __all__ = [
     "Monitor", "rollup_status", "position_opened_at", "entry_placed_at", "entry_remainder_resting",
-    "protection_problem", "unprotected_alert_text", "utc", "ACTIVE_POSITION", "ACTIVE_TRADE",
+    "protection_problem", "unprotected_alert_text", "is_virtual_pending", "VIRTUAL_POLL_SEC", "utc", "ACTIVE_POSITION", "ACTIVE_TRADE",
 ]

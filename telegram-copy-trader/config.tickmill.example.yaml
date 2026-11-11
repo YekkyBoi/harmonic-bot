@@ -48,6 +48,9 @@ brokers:
     reference_exchange: binanceusdm
     offset_mode: additive
     max_offset_pct: 1.0           # fark %1'i aşarsa işlem açılmaz
+    # LIMIT girişlerde brokerda emir bekletme; Binance fiyatı seviyeye değince farkı o an ölç ve MARKET aç:
+    entry_trigger: reference_touch
+    virtual_trigger_max_hours: 48 # tetiklenmezse 48 saat sonra iptal
     # Market Watch'taki TAM adları yazın (Tickmill'de farklı olabilir):
     symbol_map: {BTC: BTCUSD, ETH: ETHUSD}
     # Sadece Tickmill'in listelediği coinler işlem görebilir:

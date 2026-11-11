@@ -172,6 +172,7 @@ Sonra tekrar çalıştırmak için klasöre gir, sanal ortamı aç (adım 5) ve 
 ## Bilmen gerekenler
 
 - **Fiyat farkı:** Bot her işlemde Binance ile Tickmill fiyatını karşılaştırır. Fark %1'den büyükse veya Binance fiyatı alınamazsa işlem **açılmaz** ve sana uyarı gelir. Bu bilerek böyledir.
+- **Limit girişler (sanal tetik):** Config'te `entry_trigger: reference_touch` varsa limit girişli sinyalde Tickmill'e bekleyen emir konmaz. Bot Binance fiyatını izler. Fiyat giriş seviyesine değince farkı o an ölçer ve işlemi piyasa emriyle açar. Tetiklenmeden önce stop veya ilk hedef geçilirse ya da 48 saat dolarsa giriş iptal olur. Bot kapanıp açılsa da bekleyen tetik kaybolmaz.
 - **Fark değişir:** Fark işlem açıldığı andaki değerle sabitlenir. İşlem boyunca fark değişebilir. Stop ve hedef biraz farklı bölgeye denk gelebilir.
 - **Spread:** CFD'de alış ve satış fiyatı arasında fark vardır. Stop spread yüzünden biraz erken çalışabilir.
 - **Hafta sonu ve boşluk:** Stop bazen beklenenden kötü fiyattan kapanır. Kayıp 1R'yi aşabilir.

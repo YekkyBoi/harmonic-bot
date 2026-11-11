@@ -35,6 +35,7 @@ import asyncio
 import logging
 import math
 import secrets
+import time
 import uuid
 from collections.abc import Callable, Coroutine
 from dataclasses import dataclass
@@ -76,6 +77,7 @@ from .monitor import (
     ACTIVE_POSITION,
     ACTIVE_TRADE,
     Monitor,
+    is_virtual_pending,
     protection_problem,
     rollup_status,
     unprotected_alert_text,
@@ -374,6 +376,54 @@ def tp_progress(trade: TradeRecord, positions: list[BrokerPosition]) -> tuple[li
     return hit, (max(shares) if shares else None)
 
 
+_REF_LABELS = {"binanceusdm": "Binance", "binance": "Binance", "bybit": "Bybit", "okx": "OKX", "bitget": "Bitget"}
+VIRTUAL_NOTE_THROTTLE_SEC = 1800.0     # same reference-outage warning is not repeated within this
+
+
+def ref_label(ref_id: str) -> str:
+    return _REF_LABELS.get(ref_id.lower(), ref_id)
+
+
+def pos_status_text(pos: BrokerPosition) -> str:
+    """Turkish position status; a waiting virtual entry is "bekleyen (sanal tetik)"."""
+    if is_virtual_pending(pos):
+        return "bekleyen (sanal tetik)"
+    return _POS_STATUS_TR.get(pos.status, pos.status.value)
+
+
+def virtual_entry_wanted(broker: Broker, plan: TradePlan) -> bool:
+    """True when ``plan`` is a crypto LIMIT entry on a broker set to ``entry_trigger: reference_touch``."""
+    cfg = broker.config
+    return (
+        getattr(cfg, "entry_trigger", "broker_limit") == "reference_touch"
+        and bool(getattr(cfg, "reference_exchange", None))
+        and plan.entry_type is EntryType.LIMIT
+        and bool(plan.entry_price)
+        and plan.market_type in (None, MarketType.PERP)
+    )
+
+
+class _VirtualEntryOps:
+    """Stands in for a broker while managing a waiting virtual entry: no venue order exists, so stop /
+    take-profit changes and cancellation only edit the stored position."""
+
+    async def update_stop_loss(self, pos: BrokerPosition, sl: float) -> BrokerPosition:
+        new = pos.model_copy(deep=True)
+        new.stop_loss = sl
+        return new
+
+    async def update_take_profits(self, pos: BrokerPosition, tps: list[TakeProfit]) -> BrokerPosition:
+        new = pos.model_copy(deep=True)
+        new.take_profits = list(tps)
+        return new
+
+    async def cancel_entry(self, pos: BrokerPosition) -> BrokerPosition:
+        new = pos.model_copy(deep=True)
+        new.status = PositionStatus.CANCELLED
+        new.data["virtual_state"] = "cancelled"
+        return new
+
+
 def _price_problem(side: Side, quote: Quote, stop: float, tp1: float | None) -> str | None:
     """Live price already beyond the stop (or beyond TP1 when given)? Turkish text or None."""
     long = side is Side.LONG
@@ -435,6 +485,8 @@ class Engine:
         self._currency: dict[str, str] = {}
         self.monitor = Monitor(config, db, lambda: self.brokers, notifier,
                                trade_lock=self.trade_lock, clock=self._clock)
+        self.monitor.virtual_hook = self._virtual_tick
+        self._virtual_warned: dict[tuple[int, str], float] = {}   # (trade, broker) -> monotonic time of last outage warning
         self._monitor_task: asyncio.Task[None] | None = None
         self._accepting = True                     # False once shutdown began: no new work is started
         self._brokers_closed = False
@@ -564,7 +616,8 @@ class Engine:
             other = await self.db.get_trade(trade_id)
             if other is None or other.plan.base_asset.upper() != plan.base_asset.upper():
                 continue
-            state = "bekleyen limit emri" if pos.status is PositionStatus.PENDING else "açık"
+            state = ("bekleyen sanal tetikli giriş" if is_virtual_pending(pos)
+                     else "bekleyen limit emri" if pos.status is PositionStatus.PENDING else "açık")
             return (f"{esc(plan.base_asset)}: {state} {pos.side.value.upper()} var; ters yönlü "
                     f"{plan.side.value.upper()} sinyali hedging yasağı nedeniyle açılmadı")
         return None
@@ -1756,7 +1809,11 @@ class Engine:
             head = f"🚨 <b>{label} hiçbir brokerda açılamadı</b>"
             await self._notify(head + "\n" + "\n".join(lines), Severity.ERROR)
         else:
-            word = "limit emri yerleştirildi" if status is TradeStatus.PENDING else "açıldı"
+            if status is TradeStatus.PENDING:
+                word = ("sanal tetik kuruldu" if any(is_virtual_pending(p) for p in positions)
+                        else "limit emri yerleştirildi")
+            else:
+                word = "açıldı"
             icon = "⚠️" if any(o.kind in ("partial", "error") for o in outcomes) else "✅"
             head = f"{icon} <b>{label} {word}</b>"
             if self.config.dry_run:
@@ -1788,7 +1845,7 @@ class Engine:
         return text
 
     async def _compute_price_offset(
-        self, broker: Broker, plan: TradePlan, quote: Quote, mult: float
+        self, broker: Broker, plan: TradePlan, quote: Quote, mult: float, *, ref_price: float | None = None
     ) -> tuple[dict[str, Any] | None, str | None]:
         """(offset, problem). Offset brokers only (``reference_exchange`` set, crypto plan): compares the
         broker's mid with the reference exchange's mid (scaled like the signal) and returns the shift to apply.
@@ -1797,11 +1854,12 @@ class Engine:
         ref_id = getattr(cfg, "reference_exchange", None)
         if not ref_id or plan.market_type not in (None, MarketType.PERP):
             return None, None
-        ref = None
-        try:
-            ref = await self.reference_prices.mid(ref_id, plan.base_asset, fresh=True)
-        except Exception:
-            logger.exception("Reference price failed for %s on %s", plan.base_asset, ref_id)
+        ref = ref_price     # a virtual trigger passes the fresh reading it just triggered on
+        if ref is None:
+            try:
+                ref = await self.reference_prices.mid(ref_id, plan.base_asset, fresh=True)
+            except Exception:
+                logger.exception("Reference price failed for %s on %s", plan.base_asset, ref_id)
         broker_mid = (quote.bid + quote.ask) / 2.0
         if ref is None or not (math.isfinite(ref) and ref > 0) or not (math.isfinite(broker_mid) and broker_mid > 0):
             return None, (f"referans fiyat ({esc(ref_id)}) alınamadı; fiyat farkı hesaplanamadığı için "
@@ -1818,8 +1876,11 @@ class Engine:
         return {"mode": "additive", "value": broker_mid - ref_mid}, None
 
     async def _open_on_broker(
-        self, broker: Broker, plan: TradePlan, trade: TradeRecord, raw_symbol: str | None
+        self, broker: Broker, plan: TradePlan, trade: TradeRecord, raw_symbol: str | None,
+        *, virtual: BrokerPosition | None = None, ref_price: float | None = None,
     ) -> BrokerOutcome:
+        """``virtual``: the waiting virtual entry that just triggered (open it as a MARKET order with its stored
+        stop / take-profits, the offset measured now from ``ref_price``)."""
         name = broker.name
         risk = effective_risk(self.config.risk, self._route_named(plan.route))
         try:
@@ -1830,6 +1891,9 @@ class Engine:
             conflict = await self._hedge_conflict(broker, plan, trade)
             if conflict:
                 return BrokerOutcome(name, "skipped", f"{esc(name)}: {conflict}", benign=True)
+            if virtual is None and virtual_entry_wanted(broker, plan):
+                return await self._register_virtual(broker, plan, trade, sym, raw_symbol)
+            entry_type = EntryType.MARKET if virtual is not None else plan.entry_type
             equity = await broker.get_equity()
             ccy = self._currency.get(name, "")
             loss_limit = getattr(broker.config, "daily_loss_limit_pct", None)
@@ -1852,8 +1916,11 @@ class Engine:
             mult = price_multiplier(sym.extra)
             stop = plan.stop_loss * mult
             tps = scaled_take_profits(plan.take_profits, mult)
+            if virtual is not None:     # levels as moved by the trader while the entry was waiting
+                stop = virtual.stop_loss if virtual.stop_loss is not None else stop
+                tps = [TakeProfit(price=tp.price, close_fraction=tp.close_fraction) for tp in virtual.take_profits]
             signal_entry = plan.entry_price * mult if plan.entry_price else None
-            offset, offset_problem = await self._compute_price_offset(broker, plan, quote, mult)
+            offset, offset_problem = await self._compute_price_offset(broker, plan, quote, mult, ref_price=ref_price)
             if offset_problem:
                 text = f"{esc(name)}: {offset_problem}"
                 await self._notify(text, Severity.WARNING)
@@ -1867,7 +1934,7 @@ class Engine:
                     await self._notify(text, Severity.WARNING)
                     return BrokerOutcome(name, "skipped", text)
             tp1 = tps[0].price if tps else None
-            if plan.entry_type is EntryType.MARKET:
+            if entry_type is EntryType.MARKET:
                 problem = _price_problem(plan.side, quote, stop, tp1)
                 entry = quote.entry_price_for(plan.side)
                 drift = _distance_pct(entry, signal_entry) if signal_entry else 0.0
@@ -1897,8 +1964,8 @@ class Engine:
                 plan=plan,
                 symbol=sym,
                 quantity=size.quantity,
-                entry_type=plan.entry_type,
-                entry_price=signal_entry if plan.entry_type is EntryType.LIMIT else None,
+                entry_type=entry_type,
+                entry_price=signal_entry if entry_type is EntryType.LIMIT else None,
                 stop_loss=stop,
                 take_profits=tps,
                 leverage=size.leverage,
@@ -1912,6 +1979,11 @@ class Engine:
             pos.data.setdefault("price_multiplier", mult)
             if offset:
                 pos.data["price_offset"] = offset
+            if virtual is not None:
+                pos.data["virtual_fired"] = {
+                    "trigger_price": virtual.data.get("trigger_price"), "ref_price": ref_price,
+                    "at": self._now().isoformat(),
+                }
             await self.db.save_broker_position(trade.id, pos)
             if pos.status is PositionStatus.FAILED:
                 text = f"{esc(name)}: <code>{esc(pos.error or 'işlem açılamadı')}</code>"
@@ -1920,7 +1992,7 @@ class Engine:
                 return BrokerOutcome(name, "error", text, pos)
             fill = f", giriş ~{fmt_price(pos.avg_entry_price)}" if pos.avg_entry_price else ""
             text = (f"{esc(name)}: {_qty(pos.quantity)} {esc(sym.broker_symbol)} "
-                    f"({_POS_STATUS_TR.get(pos.status, pos.status.value)}), risk {_money(size.risk_amount)} {esc(ccy)}"
+                    f"({pos_status_text(pos)}), risk {_money(size.risk_amount)} {esc(ccy)}"
                     f"{fill}")
             if offset:
                 text += f" ({offset_text(offset)})"
@@ -1940,6 +2012,136 @@ class Engine:
             text = f"{esc(name)}: beklenmeyen hata <code>{esc(exc)}</code>"
             await self._notify(text, Severity.ERROR)
             return BrokerOutcome(name, "error", text)
+
+    # ------------------------------------------------------------------ virtual (reference-touch) entries
+    async def _register_virtual(
+        self, broker: Broker, plan: TradePlan, trade: TradeRecord, sym: Any, raw_symbol: str | None
+    ) -> BrokerOutcome:
+        """``entry_trigger: reference_touch``: no order on the broker. A PENDING position carrying
+        ``data["virtual_trigger"]`` is stored (it survives a restart); the monitor watches the reference price."""
+        name = broker.name
+        ref_id = str(broker.config.reference_exchange)
+        mult = price_multiplier(sym.extra)
+        entry = float(plan.entry_price or 0.0) * mult
+        hours = float(getattr(broker.config, "virtual_trigger_max_hours", 48.0))
+        pos = BrokerPosition(
+            broker=name, broker_symbol=sym.broker_symbol, side=plan.side, status=PositionStatus.PENDING,
+            quantity=0.0, remaining_quantity=0.0,
+            stop_loss=plan.stop_loss * mult, take_profits=scaled_take_profits(plan.take_profits, mult),
+            dry_run=self.config.dry_run,
+            data={
+                "virtual_trigger": True, "virtual_state": "waiting", "trigger_price": entry,
+                "reference_exchange": ref_id, "price_multiplier": mult, "raw_symbol": raw_symbol,
+                "virtual_created_at": self._now().isoformat(), "virtual_max_hours": hours,
+            },
+        )
+        await self.db.save_broker_position(trade.id, pos)
+        text = (f"{esc(name)}: sanal tetik kuruldu: {esc(ref_label(ref_id))} fiyatı {fmt_price(plan.entry_price)} "
+                f"seviyesine değince {esc(name)}'da açılacak (en çok {fmt.fmt_number(hours)} saat beklenir)")
+        if not self.config.notifier.notify_on_execution:
+            await self._notify(f"🧭 #{trade.id} {esc(plan.base_asset)} {plan.side.value.upper()}: {text}", Severity.INFO)
+        await self._log("virtual_registered", {"trade_id": trade.id, "broker": name, "trigger": entry,
+                                                "reference": ref_id})
+        return BrokerOutcome(name, "ok", text, pos)
+
+    async def _virtual_end(
+        self, trade: TradeRecord, pos: BrokerPosition, status: PositionStatus, why: str, text: str,
+        severity: Severity = Severity.WARNING,
+    ) -> BrokerPosition:
+        """Terminal state of a virtual entry (CANCELLED / FAILED): it can never trigger again."""
+        new = pos.model_copy(deep=True)
+        new.status = status
+        new.data["virtual_state"] = "cancelled" if status is PositionStatus.CANCELLED else "failed"
+        new.data["virtual_end"] = why
+        if status is PositionStatus.FAILED:
+            new.error = why
+        await self.db.save_broker_position(trade.id, new)
+        await self._log("virtual_ended", {"trade_id": trade.id, "broker": pos.broker, "status": status.value,
+                                          "why": why})
+        label = f"#{trade.id} {esc(trade.plan.base_asset)} {trade.plan.side.value.upper()}"
+        await self._notify(f"🧭 {label} {esc(pos.broker)}: {text}", severity)
+        return new
+
+    async def _virtual_tick(self, trade: TradeRecord, pos: BrokerPosition, now: datetime) -> BrokerPosition:
+        """One look at a waiting virtual entry (monitor hook, trade lock held): expire / gap-cancel / trigger.
+        Returns the (possibly new) position."""
+        d = pos.data
+        key = (trade.id, pos.broker)
+        if d.get("virtual_state") == "firing":
+            # Saved just before the order was sent and never resolved: the process died in between. The order
+            # may or may not exist on the broker -> never send it again.
+            return await self._virtual_end(
+                trade, pos, PositionStatus.FAILED, "tetikleme yarıda kaldı (yeniden başlatma)",
+                "tetikleme sırasında sistem durdu; emrin gönderilip gönderilmediği bilinmiyor, tekrar "
+                "GÖNDERİLMEDİ. Brokerda elle kontrol edin.", Severity.ERROR)
+        try:
+            created = utc(datetime.fromisoformat(str(d.get("virtual_created_at"))))
+        except (TypeError, ValueError):
+            created = utc(trade.created_at)
+        max_hours = float(d.get("virtual_max_hours") or 48.0)
+        if now - created >= timedelta(hours=max_hours):
+            return await self._virtual_end(
+                trade, pos, PositionStatus.CANCELLED, "süre doldu",
+                f"sanal tetik {fmt.fmt_number(max_hours)} saatte tetiklenmedi, iptal edildi.", Severity.INFO)
+        broker = self._broker(pos.broker)
+        ref_id = str(d.get("reference_exchange") or "")
+        if broker is None or not ref_id:
+            return pos
+        ref = None
+        try:
+            ref = await self.reference_prices.mid(ref_id, trade.plan.base_asset, fresh=True)
+        except Exception:
+            logger.exception("Reference price failed for %s on %s", trade.plan.base_asset, ref_id)
+        if ref is None or not (math.isfinite(ref) and ref > 0):
+            last = self._virtual_warned.get(key)
+            if last is None or time.monotonic() - last >= VIRTUAL_NOTE_THROTTLE_SEC:
+                self._virtual_warned[key] = time.monotonic()
+                await self._notify(
+                    f"⚠️ #{trade.id} {esc(trade.plan.base_asset)} {trade.plan.side.value.upper()} {esc(pos.broker)}: "
+                    f"referans fiyat ({esc(ref_id)}) alınamıyor; sanal tetik beklemeye devam ediyor "
+                    "(fiyat farkı ölçülemeden işlem AÇILMAZ).", Severity.WARNING)
+            return pos
+        mult = price_multiplier(d)
+        px = float(ref) * mult
+        long = pos.side is Side.LONG
+        trigger = float(d.get("trigger_price") or 0.0)
+        stop = pos.stop_loss
+        tp1 = pos.take_profits[0].price if pos.take_profits else None
+        gap = None
+        if stop is not None and ((long and px <= stop) or (not long and px >= stop)):
+            gap = f"{esc(ref_label(ref_id))} fiyatı ({fmt_price(px / mult)}) stop seviyesini ({fmt_price(stop / mult)}) geçti"
+        elif tp1 is not None and ((long and px >= tp1) or (not long and px <= tp1)):
+            gap = f"{esc(ref_label(ref_id))} fiyatı ({fmt_price(px / mult)}) ilk hedefi ({fmt_price(tp1 / mult)}) geçti"
+        if gap:
+            return await self._virtual_end(
+                trade, pos, PositionStatus.CANCELLED, "fiyat stop/hedefi geçti",
+                f"sanal tetik iptal edildi: {gap}; giriş tetiklenmeden fiyat uzaklaştı, işlem AÇILMADI.")
+        if trigger <= 0 or not ((long and px <= trigger) or (not long and px >= trigger)):
+            return pos
+
+        # Touched: from here on at most one order may ever be sent (state saved BEFORE sending).
+        fired = pos.model_copy(deep=True)
+        fired.data["virtual_state"] = "firing"
+        await self.db.save_broker_position(trade.id, fired)
+        outcome = await self._open_on_broker(
+            broker, trade.plan, trade, d.get("raw_symbol"), virtual=fired, ref_price=float(ref))
+        label = f"#{trade.id} {esc(trade.plan.base_asset)} {trade.plan.side.value.upper()}"
+        if outcome.position is None:
+            status = PositionStatus.CANCELLED if outcome.kind in ("skipped", "unsupported") else PositionStatus.FAILED
+            return await self._virtual_end(
+                trade, pos, status, outcome.kind,
+                f"tetiklendi ({esc(ref_label(ref_id))} {fmt_price(px / mult)}) ama işlem açılmadı, sanal giriş "
+                f"iptal edildi: {outcome.text}")
+        new = outcome.position
+        icon = "✅" if outcome.kind == "ok" else "⚠️"
+        word = "açıldı" if new.status is not PositionStatus.FAILED else "açılamadı"
+        await self._notify(
+            f"{icon} <b>{label} {word}</b> — sanal tetik tetiklendi ({esc(ref_label(ref_id))} fiyatı "
+            f"{fmt_price(px / mult)}, seviye {fmt_price(trigger / mult)})\n• {outcome.text}",
+            Severity.INFO if outcome.kind == "ok" else Severity.ERROR)
+        await self._log("virtual_fired", {"trade_id": trade.id, "broker": pos.broker, "ref_price": ref,
+                                          "status": new.status.value, "kind": outcome.kind})
+        return new
 
     async def _report_position_problem(
         self, trade: TradeRecord, pos: BrokerPosition, previous_error: str | None
@@ -2076,7 +2278,8 @@ class Engine:
 
     async def _manage_position(self, plan: ManagementPlan, trade: TradeRecord, pos: BrokerPosition) -> BrokerOutcome:
         name = pos.broker
-        broker = self._broker(name)
+        virtual = is_virtual_pending(pos)
+        broker: Any = _VirtualEntryOps() if virtual else self._broker(name)
         if broker is None:
             text = f"{esc(name)}: broker bağlı değil; değişiklik uygulanamadı"
             await self._notify(text, Severity.ERROR)
@@ -2124,7 +2327,7 @@ class Engine:
                     if frac < 0.999:
                         return BrokerOutcome(name, "skipped", f"{esc(name)}: giriş dolmadı; kısmi kapatma yapılmadı")
                     new = await broker.cancel_entry(pos)
-                    text = f"{esc(name)}: bekleyen giriş iptal edildi"
+                    text = f"{esc(name)}: " + ("sanal tetik iptal edildi" if virtual else "bekleyen giriş iptal edildi")
                 else:
                     # Signal fraction is of what is still open; the adapter wants a fraction of the filled size.
                     broker_frac = 1.0
@@ -2137,7 +2340,7 @@ class Engine:
             else:  # CANCEL
                 if pos.status is PositionStatus.PENDING:
                     new = await broker.cancel_entry(pos)
-                    text = f"{esc(name)}: bekleyen giriş iptal edildi"
+                    text = f"{esc(name)}: " + ("sanal tetik iptal edildi" if virtual else "bekleyen giriş iptal edildi")
                 else:
                     new = await broker.close_position(pos, 1.0)
                     text = f"{esc(name)}: pozisyon kapatıldı"
@@ -2673,7 +2876,9 @@ class Engine:
             lines.append(self._routes_text())
         n_open = sum(1 for t in trades if t.status is TradeStatus.OPEN)
         n_pending = sum(1 for t in trades if t.status is TradeStatus.PENDING)
-        lines.append(f"Aktif işlem: {len(trades)} (açık {n_open}, bekleyen emir {n_pending})")
+        n_virtual = sum(1 for _tid, p in await self.db.active_broker_positions() if is_virtual_pending(p))
+        lines.append(f"Aktif işlem: {len(trades)} (açık {n_open}, bekleyen emir {n_pending})"
+                     + (f" · sanal tetik bekleyen {n_virtual}" if n_virtual else ""))
         lines.append(f"Bekleyen onay: {len(pending)}")
         lines.append(f"Risk: 1R = {esc(self._risk_per_r_text())}")
         return "\n".join(lines)
@@ -2692,8 +2897,15 @@ class Engine:
             price = await self._price(t.plan.base_asset, t.plan.quote_asset, t.plan.market_type)
             lines.append(f"🎯 TP: {tps}" + (f" · 💹 anlık {fmt_price(price)}" if price else ""))
             for p in await self.db.broker_positions(t.id):
-                bits = [f"• {esc(p.broker)}: {_POS_STATUS_TR.get(p.status, p.status.value)}",
-                        f"{_qty(p.remaining_quantity if p.status is PositionStatus.OPEN else p.quantity)}"]
+                if is_virtual_pending(p):
+                    ref_id = str(p.data.get("reference_exchange") or "")
+                    trig = p.data.get("trigger_price")
+                    mult = price_multiplier(p.data)
+                    bits = [f"• {esc(p.broker)}: {pos_status_text(p)}",
+                            f"{esc(ref_label(ref_id))} fiyatı {fmt_price(trig / mult if trig else None)} seviyesine değince"]
+                else:
+                    bits = [f"• {esc(p.broker)}: {_POS_STATUS_TR.get(p.status, p.status.value)}",
+                            f"{_qty(p.remaining_quantity if p.status is PositionStatus.OPEN else p.quantity)}"]
                 if p.avg_entry_price:
                     bits.append(f"giriş {fmt_price(p.avg_entry_price)}")
                 if p.stop_loss is not None:

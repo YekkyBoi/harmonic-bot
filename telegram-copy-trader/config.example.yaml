@@ -140,6 +140,15 @@ risk:
 #                    işlem AÇILMAZ ve uyarı gelir (varsayılan 1.0). Referans fiyat alınamazsa da işlem
 #                    güvenlik gereği açılmaz; seviyeler asla kaydırılmadan kullanılmaz.
 #                    Örnek:  reference_exchange: binanceusdm / offset_mode: additive / max_offset_pct: 1.0
+#   entry_trigger    LIMIT girişli KRİPTO sinyallerinde giriş nasıl beklenir (reference_exchange gerekir):
+#                    broker_limit (varsayılan) = brokerda bekleyen limit emri; fark sinyal anında ölçülür.
+#                    reference_touch = SANAL TETİK: brokerda emir YOKTUR. Bot referans borsanın fiyatını
+#                    ~2 sn'de bir izler; SHORT'ta fiyat >= giriş, LONG'da fiyat <= giriş olunca farkı O AN
+#                    ölçer, SL/TP'yi kaydırır ve brokerda MARKET emir açar. Fiyat tetiklenmeden stop veya
+#                    ilk hedefi geçerse giriş iptal edilir (uyarı gelir). Trader iptal/kapatma yazarsa veya
+#                    süre dolarsa da iptal olur. Bekleyen tetikler yeniden başlatmada korunur ve /pozisyonlar'da
+#                    "bekleyen (sanal tetik)" görünür. Referans fiyat alınamazsa bekler (uyarı gelir), farksız açmaz.
+#   virtual_trigger_max_hours  sanal tetik bu kadar saat içinde tetiklenmezse iptal edilir (varsayılan 48)
 #
 # Bir brokerı açtıktan sonra MUTLAKA 'python -m copytrader check' çalıştırın:
 # API anahtarı yanlış/eksikse burada görünür.
