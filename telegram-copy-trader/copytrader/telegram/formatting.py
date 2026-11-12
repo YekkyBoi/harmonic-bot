@@ -420,3 +420,103 @@ def format_confirmation(conf: PendingConfirmation, *, with_expiry: bool = True) 
         outcome = "bu değişiklik uygulanmaz" if conf.kind == "manage" else "işlem açılmaz"
         parts.append(f"⏳ {expiry_minutes(conf)} dk içinde yanıt gelmezse {outcome}.")
     return "\n".join(parts)
+
+
+# --------------------------------------------------------------------------- #
+# Delivery of the bot's own messages (delays, connection loss)
+# --------------------------------------------------------------------------- #
+#: Header of the outcome message for a question that never reached the owner; the question itself follows.
+UNDELIVERED_QUESTION = "⚠️ <b>Bu soru size zamanında ulaştırılamadı</b> (Telegram'a gönderilemedi):"
+
+
+def fmt_duration(seconds: float) -> str:
+    """Duration for the owner: 40 -> '40 sn', 100 -> '1 dk 40 sn', 1500 -> '25 dk', 7500 -> '2 sa 5 dk'."""
+    if not math.isfinite(seconds):
+        return "—"
+    total = max(0, int(round(seconds)))
+    if total < 60:
+        return f"{total} sn"
+    if total < 600:                      # under ten minutes the seconds still matter
+        minutes, secs = divmod(total, 60)
+        return f"{minutes} dk {secs} sn" if secs else f"{minutes} dk"
+    hours, minutes = divmod(round(total / 60), 60)
+    if not hours:
+        return f"{minutes} dk"
+    return f"{hours} sa {minutes} dk" if minutes else f"{hours} sa"
+
+
+def late_notice_prefix(age_sec: float) -> str:
+    """First line of a notice that is delivered late: says when it was really produced."""
+    return f"🕒 <i>Gecikmeli bildirim ({fmt_duration(age_sec)} önce oluştu):</i>"
+
+
+def late_question_prefix(age_sec: float) -> str:
+    """First line of a question that is asked late (the time left to answer is in the question itself)."""
+    return f"🕒 <i>Bu soru size {fmt_duration(age_sec)} gecikmeyle ulaştı; yanıt için kalan süre aşağıda yazıyor.</i>"
+
+
+def format_delivery_report(
+    *, outage_sec: float | None, late: int, oldest_age_sec: float | None = None, dropped: int = 0
+) -> str:
+    """Sent after delayed messages have gone out: how long the bot could not reach Telegram, how many
+    messages were late and how many had to be thrown away because too many were waiting."""
+    oldest = f" (en eskisi {fmt_duration(oldest_age_sec)} önce oluşmuştu)" if oldest_age_sec is not None else ""
+    lines: list[str] = []
+    if outage_sec is not None:
+        lines.append(
+            f"📶 Bildirim botu yaklaşık {fmt_duration(outage_sec)} boyunca Telegram'a bağlanamadı; "
+            "bağlantı geri geldi."
+        )
+        if late:
+            lines.append(f"📬 Bu yüzden {late} bildirim gecikti; hepsi yukarıda{oldest}.")
+        else:
+            lines.append("Bu sırada geciken bildirim olmadı.")
+        lines.append("O sırada bota yazdığınız komut ya da bastığınız düğme yanıtsız kaldıysa tekrar gönderin.")
+    elif late:
+        lines.append(f"📬 {late} bildirim size gecikmeli ulaştı; hepsi yukarıda{oldest}.")
+    if dropped:
+        lines.append(
+            f"⚠️ Çok fazla bildirim biriktiği için en eski {dropped} bildirim gönderilemeden silindi "
+            "(metinleri log dosyasında duruyor)."
+        )
+    return "\n".join(lines)
+
+
+def format_bot_status(
+    *,
+    down_for_sec: float | None,
+    queued: int,
+    oldest_queued_age_sec: float | None = None,
+    last_outage: tuple[float, float] | None = None,
+    outages: int = 0,
+    dropped: int = 0,
+) -> str:
+    """The bot's own delivery state for /durum. ``down_for_sec``: None = connected;
+    ``last_outage``: (seconds since it ended, how long it lasted)."""
+    lines = ["🤖 <b>Bildirim botu</b>"]
+    if down_for_sec is None:
+        lines.append("📶 Telegram bağlantısı: var")
+    else:
+        lines.append(
+            f"📶 Telegram bağlantısı: <b>YOK</b> ({fmt_duration(down_for_sec)} önce koptu, "
+            "yeniden bağlanmayı deniyorum)"
+        )
+    if queued:
+        oldest = (
+            f" (en eskisi {fmt_duration(oldest_queued_age_sec)} önce oluştu)"
+            if oldest_queued_age_sec is not None else ""
+        )
+        lines.append(f"📬 Gönderilmeyi bekleyen bildirim: <b>{queued}</b>{oldest}")
+    else:
+        lines.append("📬 Gönderilmeyi bekleyen bildirim: yok")
+    if last_outage is not None:
+        ago, lasted = last_outage
+        lines.append(
+            f"🕒 Son bağlantı kesintisi: {fmt_duration(ago)} önce bitti, {fmt_duration(lasted)} sürdü "
+            f"(bot açıldığından beri {outages} kesinti)."
+        )
+    else:
+        lines.append("🕒 Bot açıldığından beri bağlantı kesintisi görülmedi.")
+    if dropped:
+        lines.append(f"⚠️ Bot açıldığından beri {dropped} bildirim, çok fazla biriktiği için gönderilemeden silindi.")
+    return "\n".join(lines)

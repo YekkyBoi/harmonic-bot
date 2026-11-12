@@ -38,7 +38,7 @@ brokers:
     symbol_map: {BTC: BTCUSD, ETH: ETHUSD}
     # YER TUTUCU: sadece Tickmill'de gerçekten işlem gören varlıklar (boş = hepsi denenir).
     allowed_assets: [BTC, ETH, EUR, GBP, XAU]
-    no_hedge: true                      # aynı varlıkta ters yönlü işlem açma
+    no_hedge: true                      # aynı sembolde (ör. EURUSD) ters yönlü işlem açma
     daily_loss_limit_pct: 3             # günlük zarar %3'ü geçerse bu hesapta yeni işlem açılmaz
 
 # ---------------------------------------------------------------------

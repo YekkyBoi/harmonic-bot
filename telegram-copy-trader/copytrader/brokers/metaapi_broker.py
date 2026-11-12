@@ -8,18 +8,22 @@ this module only implements the venue primitives.
 from __future__ import annotations
 
 import asyncio
+import contextlib
+import html
 import logging
-from collections.abc import Awaitable, Callable
+import re
+from collections.abc import Awaitable, Callable, Iterator, Sequence
 from datetime import UTC, datetime, timedelta
 from typing import Any
 
 from ..config import MetaApiBrokerConfig
-from ..models import MarketType, Quote, Side, SymbolInfo
+from ..models import BrokerPosition, MarketType, OpenRequest, Quote, Severity, Side, SymbolInfo, TakeProfit
 from .base import BrokerError
 from .mt5_broker import (
     MT5,
     RETCODE_TR,
     MetaTraderLegBroker,
+    OrderReplyLostError,
     _snap,
     mapped_symbol,
     new_leg,
@@ -45,7 +49,35 @@ _TRADE_MODES = {
 }
 _DEAL_REASONS = {"DEAL_REASON_SL": "sl", "DEAL_REASON_TP": "tp", "DEAL_REASON_SO": "stop_out"}
 _MAX_TAG_PLUS_COMMENT = 26      # SDK: len(comment) + len(clientId) <= 26
-RPC_TIMEOUT_SEC = 120.0          # SDK calls have their own timeouts; this is only the last resort
+RPC_TIMEOUT_SEC = 120.0          # trade requests + connect chain. SDK calls have their own timeouts; last resort
+READ_TIMEOUT_SEC = 30.0          # pure reads (account, price, specification, positions, orders, history): one
+                                 # that is never answered must not hold the shared loops for two minutes
+HEALTH_TIMEOUT_SEC = 20.0        # health_problem(): everything it does must fit in this
+HEALTH_SYNC_GRACE_SEC = 5.0      # health_problem(): a reconnect shorter than this is not reported
+CLOSE_WAIT_SEC = 10.0            # close(): how long to wait for the SDK's own (scheduled) connection close
+SOCKET_CLOSE_SEC = 3.0           # dropping an SDK client: how long each of its sockets gets for a polite goodbye
+RECONNECT_AFTER_PROBLEMS = 3     # failed health checks in a row before the connection is rebuilt from scratch
+RECONNECT_BACKOFF_SEC = (60.0, 120.0, 300.0, 600.0)     # pause after the 1st, 2nd, 3rd and every later attempt
+RECONNECT_SLACK_SEC = 5.0        # a health check this much before the end of a pause still starts the attempt
+RECONNECT_TIMEOUT_SEC = 180.0    # one reconnect attempt: the same limit the engine gives the first connect()
+UNHEALTHY_TTL_SEC = 180.0        # a failed health check older than this no longer refuses new signals
+REQUOTE_RETRIES = 2              # extra attempts of a market order after a requote / price-changed answer
+_REQUOTE_RETCODES = (MT5.TRADE_RETCODE_REQUOTE, MT5.TRADE_RETCODE_PRICE_CHANGED, MT5.TRADE_RETCODE_PRICE_OFF)
+LOST_REPLY_CHECKS = 3            # look-ups by tag after an order request that got no trade answer
+LOST_REPLY_DELAY_SEC = 2.0       # pause between them (the order may still be on its way to the trade server)
+SOCKET_RETRY_PAUSE_SEC = 1.0     # pause after a failed connection attempt of an SDK socket (the SDK has none)
+_DETAIL_MAX = 300                # characters of ValidationException.details / TooManyRequests metadata shown
+_RATE_SYMBOL_TRIES = 3           # sizing without a tick value: listings of the conversion pair tried for a price
+# priceCalculationMode values whose profit MetaTrader computes from the tick value, not from the contract size
+_TICK_ONLY_CALC_MODES = ("FUTURES", "BONDS", "OPTIONS", "COLLATERAL")
+_CUT_TR = "bağlantı kopuk; yeniden bağlanması bekleniyor"                      # after "MetaApi <what>: "
+_DISCONNECTED_TR = "MetaApi bağlantısı kopuk; yeniden bağlanması bekleniyor."   # on its own
+_TRADE_OFF_TR = "MetaApi hesabında işlem izni kapalı görünüyor."     # the account answers: nothing to rebuild
+_RECONNECTING_TR = "MetaApi bağlantısı yenileniyor."
+_DROPPED_TR = "bağlantı yenilenirken istek yanıtsız kaldı"           # a call that was waiting on a dropped client
+_TOKEN_RE = re.compile(r"(auth-token=)[^&\s\"'<>]+")                 # never in a notice or a log line of ours
+# ReconnectPolicy events
+_DOWN, _RECONNECT, _RECONNECT_FAILED, _RECOVERED = "down", "reconnect", "reconnect_failed", "recovered"
 _EPOCH = datetime(1970, 1, 1, tzinfo=UTC)
 
 
@@ -58,11 +90,77 @@ class MetaApiError(BrokerError):
         self.string_code = string_code
 
 
+def _error_detail(exc: BaseException) -> str:
+    """What exactly was refused: ValidationException.details / TooManyRequestsException.metadata, trimmed."""
+    try:
+        extra = getattr(exc, "details", None) or getattr(exc, "metadata", None)
+    except Exception:  # noqa: BLE001 - a property of a foreign exception class; diagnostics only
+        return ""
+    if not extra or not isinstance(extra, (list, tuple, dict, str)):
+        return ""
+    text = str(extra)
+    return text if len(text) <= _DETAIL_MAX else text[: _DETAIL_MAX - 1] + "…"
+
+
+def _cancel_requested() -> bool:
+    """True when the running task itself was asked to stop (shutdown, an outer timeout): that CancelledError must
+    go on. False: nobody cancelled us, the SDK only awaited one of its own futures that somebody else cancelled."""
+    task = asyncio.current_task()
+    cancelling = getattr(task, "cancelling", None)      # Python 3.11+
+    return task is None or cancelling is None or cancelling() > 0
+
+
+def _pausing_socketio(real: Any) -> Any:
+    """``socketio`` as an SDK module sees it, with an AsyncClient that waits SOCKET_RETRY_PAUSE_SEC after a FAILED
+    connect() before it hands the error on. Everything else is the real module."""
+
+    class _PausingClient(real.AsyncClient):  # type: ignore[name-defined,misc]
+        async def connect(self, *args: Any, **kwargs: Any) -> Any:
+            try:
+                return await super().connect(*args, **kwargs)
+            except Exception:
+                await asyncio.sleep(SOCKET_RETRY_PAUSE_SEC)
+                raise
+
+    class _Socketio:
+        copytrader_paused = True
+        AsyncClient = _PausingClient
+
+        def __getattr__(self, name: str) -> Any:
+            return getattr(real, name)
+
+    return _Socketio()
+
+
+def _pause_socket_retries() -> None:
+    """SDK 29.x retries a failed socket connection in two loops that have no pause at all: the latency probe
+    (latency_service.py:272-276; every 15 minutes and when a region connects for the first time) and the first
+    connection of each trading socket (metaapi_websocket_client.py:650-659; while the adapter connects). While
+    MetaApi cannot be reached each of them keeps one CPU core of the bot busy, and the second one also prints two
+    console lines per attempt (measured: 1 800 attempts a second). The sockets of both now wait
+    SOCKET_RETRY_PAUSE_SEC after a failed attempt before the SDK tries again; a connection that succeeds, and
+    everything else the SDK does, is unchanged."""
+    try:
+        from metaapi_cloud_sdk.clients.metaapi import latency_service, metaapi_websocket_client
+    except Exception as exc:  # noqa: BLE001 - another SDK layout: leave the SDK exactly as it is
+        logger.debug("MetaApi socket retries left unchanged: %s", exc)
+        return
+    for module in (latency_service, metaapi_websocket_client):
+        try:
+            if not getattr(module.socketio, "copytrader_paused", False):
+                module.socketio = _pausing_socketio(module.socketio)
+        except Exception as exc:  # noqa: BLE001 - as above
+            logger.debug("MetaApi socket retries of %s left unchanged: %s", module.__name__, exc)
+
+
 def map_error(what: str, exc: BaseException) -> MetaApiError:
     """SDK exception (TradeException, NotFoundException, TimeoutException...) -> BrokerError."""
     code = getattr(exc, "numericCode", None)
     scode = getattr(exc, "stringCode", None)
     msg = str(exc) or exc.__class__.__name__
+    detail = _error_detail(exc)
+    if detail:
+        msg = f"{msg} {detail}"
     if isinstance(code, int) and code in RETCODE_TR:
         text = f"MetaApi {what} başarısız: {retcode_text(code, msg)}"
     else:
@@ -83,8 +181,110 @@ def _ts(x: Any) -> float:
     return _EPOCH.timestamp()
 
 
+def _lots(x: float) -> str:
+    return f"{x:.10g}"
+
+
+def _partly_done(res: Any) -> bool:
+    """A successful trade answer that says only a part of the volume was executed."""
+    res = res or {}
+    return (res.get("numericCode") == MT5.TRADE_RETCODE_DONE_PARTIAL
+            or res.get("stringCode") == "TRADE_RETCODE_DONE_PARTIAL")
+
+
+class ReconnectPolicy:
+    """When a connection that stopped answering is rebuilt, and what the owner hears about it. Pure: no clock of
+    its own, no I/O. The adapter reports every health check (:meth:`check`) and every reconnect attempt
+    (:meth:`attempt_started`, :meth:`attempt_finished`); the answers are lists of events:
+
+    "down"              the ``after``-th failed check in a row (once per outage)
+    "reconnect"         start an attempt now: with "down", and later whenever a failed check finds that
+                        ``backoff[n - 1]`` seconds have passed since attempt ``n`` ENDED (the last value repeats)
+                        and no attempt is running. The checks come on the heartbeat's own grid, so one that is
+                        up to ``slack`` seconds early counts: an attempt that ran into its time limit ends a
+                        moment after a check, and its pause would otherwise last one heartbeat longer.
+    "reconnect_failed"  an attempt did not help: it failed, or it connected and the next check failed all the
+                        same (once per outage, not once per attempt)
+    "recovered"         the first healthy check after "down" (once per outage); it resets everything
+
+    An attempt that could not be started (an order request was in flight) is simply not reported with
+    attempt_started(): the next failed check asks for it again."""
+
+    def __init__(self, after: int = RECONNECT_AFTER_PROBLEMS, backoff: Sequence[float] = RECONNECT_BACKOFF_SEC,
+                 slack: float = RECONNECT_SLACK_SEC) -> None:
+        if after < 1 or not backoff:
+            raise ValueError("after must be >= 1 and backoff must not be empty")
+        self.after = int(after)
+        self.backoff = tuple(float(x) for x in backoff)
+        self.slack = float(slack)
+        self.running = False            # an attempt is in progress
+        self.reset()
+
+    def reset(self) -> None:
+        self.problems = 0               # failed health checks in a row
+        self.attempts = 0               # attempts started in this outage
+        self.down = False               # "down" was reported
+        self.failed_told = False        # "reconnect_failed" was reported
+        self.retry_at: float | None = None      # earliest time of the next attempt
+        self._verdict_due = False       # an attempt connected: the next check says whether it helped
+
+    def check(self, healthy: bool, now: float) -> list[str]:
+        if healthy:
+            events = [_RECOVERED] if self.down else []
+            self.reset()
+            return events
+        events = []
+        self.problems += 1
+        if self.problems >= self.after and not self.down:
+            self.down = True
+            events.append(_DOWN)
+        if not self.down or self.running:
+            return events
+        if self._verdict_due:
+            self._verdict_due = False
+            if not self.failed_told:
+                self.failed_told = True
+                events.append(_RECONNECT_FAILED)
+        if self.retry_at is None or now + self.slack >= self.retry_at:
+            events.append(_RECONNECT)
+        return events
+
+    def attempt_started(self) -> int:
+        self.attempts += 1
+        self.running = True
+        return self.attempts
+
+    def attempt_finished(self, ok: bool, now: float) -> list[str]:
+        self.running = False
+        if self.attempts == 0:          # the outage was over (reset) before the attempt ended
+            return []
+        self.retry_at = now + self.pause_after(self.attempts)
+        if ok:
+            self._verdict_due = True
+            return []
+        if self.failed_told:
+            return []
+        self.failed_told = True
+        return [_RECONNECT_FAILED]
+
+    def pause_after(self, attempt: int) -> float:
+        """Seconds between the end of attempt ``attempt`` (1, 2, ...) and the earliest next one."""
+        return self.backoff[min(max(attempt, 1), len(self.backoff)) - 1]
+
+
+def _span_tr(seconds: float) -> str:
+    return f"{seconds / 60.0:g} dakika" if seconds >= 60 else f"{seconds:g} saniye"
+
+
 class MetaApiBroker(MetaTraderLegBroker):
-    """One MetaApi-hosted MT4/MT5 account. ``connection`` / ``api_factory`` are test seams."""
+    """One MetaApi-hosted MT4/MT5 account. ``connection`` / ``api_factory`` are test seams.
+
+    Self-healing: the heartbeat (engine/health.py) calls :meth:`health_problem` every minute. After
+    RECONNECT_AFTER_PROBLEMS failed checks in a row the adapter drops its whole SDK client and connects from
+    scratch (:meth:`reconnect`) in a task of its own, again after 1, 2, 5, 10, 10 ... minutes while that does not
+    help (:class:`ReconnectPolicy`). While the latest check failed, the calls a NEW signal makes are refused at
+    once instead of waiting for their timeouts. Nothing of this is active for a ``connection`` handed in from
+    outside (tests)."""
 
     kind = "metaapi"
     tag_limit = 16      # clientId length; leaves room for a short comment
@@ -102,19 +302,80 @@ class MetaApiBroker(MetaTraderLegBroker):
         self._owns_conn = connection is None     # created by connect(): dropped on close so a retry starts clean
         self._api_factory = api_factory
         self._api: Any | None = None
+        self._half_open: Any | None = None       # SDK connection of a connect() that did not finish
+        self._lost: dict[tuple[str, str], tuple[OrderReplyLostError, str]] = {}   # (symbol, leg tag) -> unanswered
+        self._snapshot_failures = 0
         self._connected = False
         self._platform = "mt5"
         self._symbols: list[str] | None = None
         self._specs: dict[str, dict[str, Any]] = {}
+        self._notifier: Any | None = None        # set_notifier(): for the one notice the heartbeat cannot send
+        self._policy = ReconnectPolicy()
+        self._wanted = False                     # connect() succeeded and close() was not called since
+        self._reconnecting = False               # reconnect() is tearing down / connecting right now
+        self._heal_task: asyncio.Task[None] | None = None
+        self._notices: set[asyncio.Task[None]] = set()
+        self._orders_in_flight = 0               # trade requests waiting for their answer
+        self._flows = 0                          # open / close / modify / cancel flows in progress
+        self._unhealthy: str | None = None       # what the latest health check found (None: the link works)
+        self._unhealthy_at = 0.0                 # ... and when (loop time)
 
     # ---- plumbing ------------------------------------------------------------
-    async def _rpc(self, what: str, fn: Callable[..., Awaitable[Any]], *args: Any, **kwargs: Any) -> Any:
+    def _latency_service(self) -> Any | None:
+        """The SDK object that gates every RPC on "is a terminal instance connected" (private; best effort)."""
+        for holder, attr in ((self._api, "_metaapi_websocket_client"), (self._conn, "_websocket_client"),
+                             (self._half_open, "_websocket_client")):
+            try:
+                service = getattr(getattr(holder, attr), "_latency_service")
+            except Exception:  # noqa: BLE001 - private SDK attributes, a test fake, or nothing there yet
+                continue
+            if service is not None:
+                return service
+        return None
+
+    def _drop_cancelled_wait_futures(self) -> None:
+        """SDK 29.x: while no terminal instance is connected every RPC awaits ONE shared future
+        (LatencyService._wait_connect_promises[account], latency_service.py:187-202). A caller that gives up (our
+        timeout, the engine's) cancels that future and the SDK never replaces it: every later call made while
+        disconnected then raises CancelledError at once, also after a reconnect followed by a new outage."""
         try:
-            return await asyncio.wait_for(fn(*args, **kwargs), RPC_TIMEOUT_SEC)
+            waiting = self._latency_service()._wait_connect_promises    # type: ignore[union-attr]
+            for key, fut in list(waiting.items()):
+                if fut.cancelled():
+                    del waiting[key]
+        except Exception:  # noqa: BLE001 - private SDK attributes; best effort
+            pass
+
+    def _synchronized(self) -> bool | None:
+        """What the SDK says about the RPC connection: True = synchronized with the terminal, False = not (the
+        terminal lost the broker, or the link to MetaApi is being re-established), None = cannot tell."""
+        try:
+            return bool(self._conn._meta_api_connection.is_synchronized())     # type: ignore[union-attr]
+        except Exception:  # noqa: BLE001 - private SDK attribute or a test fake
+            return None
+
+    async def _call(self, what: str, timeout: float, fn: Callable[..., Awaitable[Any]], *args: Any,
+                    **kwargs: Any) -> Any:
+        """Every SDK request of this adapter. Raises BrokerError only, or a CancelledError that was really meant
+        for the running task."""
+        self._drop_cancelled_wait_futures()
+        try:
+            return await asyncio.wait_for(fn(*args, **kwargs), timeout)
         except BrokerError:
             raise
         except asyncio.TimeoutError as exc:      # backstop: a hung cloud call must not block the shared loops
-            err = MetaApiError(f"MetaApi {what}: {int(RPC_TIMEOUT_SEC)} sn içinde yanıt gelmedi.")
+            self._drop_cancelled_wait_futures()
+            hint = " (MetaApi bağlantısı kopuk görünüyor)" if self._synchronized() is False else ""
+            err = MetaApiError(f"MetaApi {what}: {int(timeout)} sn içinde yanıt gelmedi{hint}.")
+            logger.warning("%s: %s", self.name, err)
+            raise err from exc
+        except asyncio.CancelledError as exc:
+            self._drop_cancelled_wait_futures()
+            if _cancel_requested():
+                raise                             # a real cancellation (shutdown, the caller's own timeout)
+            # Nobody cancelled this task: the SDK's shared future was (see above). It must never end the
+            # caller's task (the monitor loop of ALL brokers, an open / close flow half-way).
+            err = MetaApiError(f"MetaApi {what}: {_CUT_TR}.")
             logger.warning("%s: %s", self.name, err)
             raise err from exc
         except Exception as exc:
@@ -122,16 +383,51 @@ class MetaApiBroker(MetaTraderLegBroker):
             logger.warning("%s: %s", self.name, err)
             raise err from exc
 
+    async def _rpc(self, what: str, fn: Callable[..., Awaitable[Any]], *args: Any, **kwargs: Any) -> Any:
+        """A trade request or a step of the connect chain. Counted while it waits for its answer: the connection
+        is never rebuilt under an order request (see reconnect())."""
+        self._orders_in_flight += 1
+        try:
+            return await self._call(what, RPC_TIMEOUT_SEC, fn, *args, **kwargs)
+        finally:
+            self._orders_in_flight -= 1
+
+    async def _read(self, what: str, fn: Callable[..., Awaitable[Any]], *args: Any, **kwargs: Any) -> Any:
+        """A pure read: nothing changes on the account, so giving up early is safe."""
+        return await self._call(what, min(READ_TIMEOUT_SEC, RPC_TIMEOUT_SEC), fn, *args, **kwargs)
+
     def _require(self) -> Any:
+        if self._reconnecting:
+            raise BrokerError("MetaApi bağlantısı şu an yenileniyor (hesap yanıt vermediği için bot bağlantıyı "
+                              "sıfırdan kuruyor); bu işlem yapılamadı.")
         if not self._connected or self._conn is None:
+            if self._wanted:
+                raise BrokerError("MetaApi bağlantısı yok (yeniden bağlanma denemesi sonuç vermedi; bot aralıklarla "
+                                  "tekrar deniyor).")
             raise BrokerError(f"{self.name}: MetaApi bağlı değil (connect çağrılmadı).")
         return self._conn
+
+    def _refuse_while_unhealthy(self) -> None:
+        """For the calls a NEW signal makes (symbol, balance, the order itself): the latest health check got no
+        answer, so they would only wait for their timeouts on a connection that is known to be dead. Calls that
+        manage an EXISTING position are not refused here; they still try."""
+        reason = self._unhealthy
+        if reason is None or self._reconnecting or not self._connected:
+            return                          # healthy, or _require() has the better text
+        if asyncio.get_running_loop().time() - self._unhealthy_at > UNHEALTHY_TTL_SEC:
+            return                          # no health check ran since (no heartbeat): not known any more
+        if reason == _DISCONNECTED_TR and self._synchronized() is True:
+            return                          # the SDK reports that the link is back: try (the next check confirms)
+        raise BrokerError(f"MetaApi şu an yanıt vermiyor ({reason.rstrip('. ')}); bu hesapta yeni işlem açılmadı. "
+                          "Bot bağlantıyı kendisi yeniliyor.")
 
     # ---- lifecycle -------------------------------------------------------------
     async def connect(self) -> None:
         if self._connected:
             return
         if self._conn is None:
+            if self._api is not None or self._half_open is not None:
+                await self._teardown()            # leftovers of an attempt that failed without close()
             if not (self.cfg.token and self.cfg.account_id):
                 raise BrokerError("MetaApi token veya hesap kimliği (account_id) boş. .env dosyasında "
                                   "METAAPI_TOKEN ve METAAPI_ACCOUNT_ID satırlarını doldurun.")
@@ -148,6 +444,8 @@ class MetaApiBroker(MetaTraderLegBroker):
             opts: dict[str, Any] = {"region": self.cfg.region} if self.cfg.region else {}
             try:
                 self._api = factory(self.cfg.token, opts)
+                if hasattr(self._api, "_metaapi_websocket_client"):      # the real SDK object
+                    _pause_socket_retries()
                 account = await self._api.metatrader_account_api.get_account(self.cfg.account_id)
                 if account.state not in ("DEPLOYING", "DEPLOYED"):
                     logger.info("%s: deploying MetaApi account %s", self.name, self.cfg.account_id)
@@ -155,44 +453,393 @@ class MetaApiBroker(MetaTraderLegBroker):
                 await account.wait_deployed()
                 await account.wait_connected()
                 conn = account.get_rpc_connection()
+                self._half_open = conn            # close() must reach it even if we never get further
                 await conn.connect()
                 await conn.wait_synchronized()
             except BrokerError:
                 raise
+            except asyncio.CancelledError as exc:
+                self._drop_cancelled_wait_futures()
+                if _cancel_requested():
+                    raise                         # the engine's connect timeout / shutdown; close() cleans up
+                raise MetaApiError(_DISCONNECTED_TR) from exc
             except Exception as exc:
                 raise map_error("bağlantı", exc) from exc
             self._conn = conn
+            self._half_open = None
         info = await self._rpc("hesap bilgisi", self._conn.get_account_information)
         if info.get("investorMode") or info.get("tradeAllowed") is False:
             raise BrokerError("MetaApi hesabında işlem izni yok (yatırımcı şifresi mi girildi?).")
         self._platform = str(info.get("platform") or "mt5").lower()
         self._netting = info.get("marginMode") in _NETTING_MODES
         self._connected = True
+        self._wanted = True
         logger.info(
             "%s: MetaApi connected platform=%s broker=%s currency=%s netting=%s",
             self.name, self._platform, info.get("broker"), info.get("currency"), self._netting,
         )
 
+    async def _close_connection(self, conn: Any) -> None:
+        try:
+            await conn.close()
+            # The SDK's close() only SCHEDULES the real close (unsubscribe; that also stops the SDK's subscribe
+            # loops). Wait for it before the api object is torn down: otherwise those loops keep reconnecting and
+            # the scheduled task dies with a KeyError ("Task exception was never retrieved").
+            inner = getattr(conn, "_meta_api_connection", None)
+            if inner is None or not getattr(inner, "_opened", False):
+                return
+            loop = asyncio.get_running_loop()
+            deadline = loop.time() + CLOSE_WAIT_SEC
+            while not getattr(inner, "_closed", True) and loop.time() < deadline:
+                await asyncio.sleep(0.1)
+            if not getattr(inner, "_closed", True):
+                # MetaApi does not answer (unreachable): the api object is torn down anyway. The SDK's close task
+                # then fails on what that removes; nobody holds that task, so its error would only reach the log
+                # as "Task exception was never retrieved".
+                logger.warning("%s: MetaApi connection close did not finish in %.0f s; closing the client anyway",
+                               self.name, CLOSE_WAIT_SEC)
+                for task in asyncio.all_tasks():
+                    frame = getattr(task.get_coro(), "cr_frame", None)
+                    if frame is not None and frame.f_code.co_name == "close" and frame.f_locals.get("self") is inner:
+                        task.add_done_callback(lambda t: t.cancelled() or t.exception())
+        except asyncio.CancelledError:
+            if _cancel_requested():
+                raise
+            logger.warning("%s: MetaApi connection close was interrupted by the SDK", self.name)
+        except Exception as exc:  # noqa: BLE001 - best effort on shutdown
+            logger.warning("%s: MetaApi connection close failed: %s", self.name, exc)
+
+    async def _teardown(self) -> None:
+        """Close the SDK connection(s) and the api object of this adapter; nothing of them may stay alive."""
+        half_open, self._half_open = self._half_open, None
+        conn = self._conn
+        if self._owns_conn:
+            self._conn = None
+        api, self._api = self._api, None
+        try:
+            if half_open is not None and half_open is not conn:
+                await self._close_connection(half_open)
+            if conn is not None:
+                await self._close_connection(conn)
+        finally:
+            if api is not None:
+                try:
+                    await self._drop_client(api)
+                finally:
+                    try:
+                        api.close()
+                    except Exception as exc:  # noqa: BLE001
+                        logger.warning("%s: MetaApi close failed: %s", self.name, exc)
+
+    async def _drop_client(self, api: Any) -> None:
+        """SDK 29.x: MetaApi.close() only SCHEDULES the close of its sockets (one after the other, each waits up
+        to 10 s for the server's goodbye) and never stops the two interval jobs of every socket, the 60 s status
+        timers or a latency probe that is still looking for the server. A client that is dropped while MetaApi
+        does not answer therefore lives on, and its loops can open sockets and subscribe again when MetaApi comes
+        back. Here every part is stopped and the object is made unable to start anything again; api.close()
+        follows. Private attributes of the SDK, best effort: never raises (a real cancellation excepted)."""
+        try:
+            ws = api._metaapi_websocket_client
+            instances = [inst for by_number in ws._socket_instances.values() for insts in by_number.values()
+                         for inst in insts]
+        except Exception:  # noqa: BLE001 - another SDK layout or a test fake: api.close() is all there is
+            return
+
+        async def never_again(*_args: Any, **_kwargs: Any) -> None:
+            raise ConnectionError(_DROPPED_TR)
+
+        async def no_subscribe(*_args: Any, **_kwargs: Any) -> None:
+            return None
+
+        with contextlib.suppress(Exception):
+            manager = ws._subscription_manager
+            for key in list(manager._subscriptions):
+                manager.cancel_subscribe(key)               # the SDK's "subscribe until authenticated" loops
+            for waiting in manager._awaiting_resubscribe.values():
+                waiting.clear()
+            manager.schedule_subscribe = no_subscribe       # ... and none may start later
+            ws.connect = never_again                        # no new socket either
+        with contextlib.suppress(Exception):
+            promises = ws._latency_service._wait_connect_promises
+            for fut in list(promises.values()):
+                if not fut.done():                          # calls still waiting for "a terminal is connected"
+                    fut.set_exception(ConnectionError(_DROPPED_TR))
+                    fut.exception()
+            promises.clear()
+        for inst in instances:
+            inst["connected"] = False                       # ends the SDK's reconnect loop of that socket
+        try:
+            await asyncio.gather(*(self._close_socket(inst.get("socket")) for inst in instances))
+        except asyncio.CancelledError:
+            if _cancel_requested():
+                raise
+        for inst in instances:
+            with contextlib.suppress(Exception):
+                inst["socket"].connect = never_again
+                pending, inst["requestResolves"] = inst["requestResolves"], {}
+                for fut in pending.values():
+                    if not fut.done():                      # requests that were sent and never answered
+                        fut.set_exception(ConnectionError(_DROPPED_TR))
+                        fut.exception()
+            with contextlib.suppress(Exception):
+                result = inst.get("connectResult")
+                if result is not None:                      # the SDK puts a connection error there; nobody reads it
+                    result.add_done_callback(lambda f: f.cancelled() or f.exception())
+            with contextlib.suppress(Exception):
+                throttler = inst["synchronizationThrottler"]
+                throttler.start = lambda: None              # the socket's disconnect handler restarts it otherwise
+                throttler.stop()
+        with contextlib.suppress(Exception):
+            for timer in list(ws._status_timers.values()):
+                timer.cancel()
+        with contextlib.suppress(Exception):
+            service = ws._latency_service
+            for task in asyncio.all_tasks():
+                coro = task.get_coro()
+                frame = getattr(coro, "cr_frame", None)
+                owner = frame.f_locals.get("self") if frame is not None else None
+                name = getattr(coro, "__qualname__", "")
+                if name == "LatencyService.on_connected" and owner is service:
+                    task.cancel()                           # a latency probe of this client, still connecting
+                elif name == "RpcMetaApiConnection.close" and getattr(owner, "_websocket_client", None) is ws:
+                    task.cancel()                           # the SDK's own close of a connection of this client:
+                    #                                         it waits (up to a minute) to unsubscribe through
+                    #                                         sockets that no longer exist
+
+    async def _close_socket(self, sock: Any) -> None:
+        """One socket.io client of a dropped SDK client: a polite disconnect, then whatever is left of it."""
+        if sock is None:
+            return
+        try:
+            await asyncio.wait_for(sock.disconnect(), SOCKET_CLOSE_SEC)
+        except asyncio.CancelledError:
+            if _cancel_requested():
+                raise
+        except Exception as exc:  # noqa: BLE001 - also the timeout: the peer does not answer
+            logger.debug("%s: a MetaApi socket did not close politely: %s", self.name, exc or type(exc).__name__)
+        with contextlib.suppress(Exception):
+            eio = sock.eio
+            eio.state = "disconnected"                      # its three loops run "while connected"
+            with contextlib.suppress(Exception):
+                eio.queue.put_nowait(None)
+            if getattr(eio, "ping_loop_event", None) is not None:
+                eio.ping_loop_event.set()
+            http = getattr(eio, "http", None)
+            if http is not None and not getattr(http, "closed", True):
+                await http.close()                          # the TCP connection itself, without waiting for the peer
+            await asyncio.sleep(0)
+            for name in ("read_loop_task", "write_loop_task", "ping_loop_task"):
+                task = getattr(eio, name, None)
+                if task is not None and not task.done():
+                    task.cancel()
+
     async def close(self) -> None:
+        self._wanted = False
+        await self._stop_healing()
         self._connected = False
-        if self._conn is not None:
+        await self._teardown()
+
+    # ---- self-healing ----------------------------------------------------------
+    def set_notifier(self, notifier: Any) -> None:
+        """The engine hands its notifier to every adapter that has this method, before connect(). Used for the
+        one notice the heartbeat cannot send: a reconnect was tried and did not help."""
+        self._notifier = notifier
+
+    @property
+    def busy(self) -> bool:
+        """An order request is waiting for its answer, or an open / close / modify / cancel flow is between two
+        of its requests: the connection must not be rebuilt under it."""
+        return self._orders_in_flight > 0 or self._flows > 0
+
+    @contextlib.contextmanager
+    def _flow(self) -> Iterator[None]:
+        self._flows += 1
+        try:
+            yield
+        finally:
+            self._flows -= 1
+
+    def _begin_reconnect(self) -> None:
+        """The checks and the flag in one step, without an await between them: from here on _require() refuses
+        every call, so no order request can start under the reconnect."""
+        if self._reconnecting:
+            raise BrokerError("MetaApi bağlantısı zaten yenileniyor.")
+        if self.busy:
+            raise BrokerError("Bir emir isteği sürerken MetaApi bağlantısı yenilenmez.")
+        if not self._owns_conn:
+            raise BrokerError("Bu MetaApi bağlantısı dışarıdan verildi; yeniden kurulamaz.")
+        self._reconnecting = True
+
+    async def reconnect(self) -> None:
+        """Drop the present SDK client completely and connect from scratch, exactly as connect() does (deploy if
+        needed, wait until synchronized, read the account). Raises BrokerError when it cannot start now (it is
+        already running, an order request is in flight) or when the new connection could not be made: the
+        adapter is then cleanly "not connected" (no SDK object left) and the next call can try again."""
+        self._begin_reconnect()
+        await self._reconnect_now()
+
+    async def _reconnect_now(self) -> None:
+        try:
+            self._connected = False
+            await self._teardown()
+            await asyncio.wait_for(self.connect(), RECONNECT_TIMEOUT_SEC)
+            self._unhealthy = None
+        except BaseException as exc:
+            self._connected = False
             try:
-                await self._conn.close()
-            except Exception as exc:  # noqa: BLE001 - best effort on shutdown
-                logger.warning("%s: MetaApi connection close failed: %s", self.name, exc)
-            if self._owns_conn:
-                self._conn = None
-        if self._api is not None:
+                await self._teardown()          # also the half-open client of the attempt that just failed
+            except Exception:
+                logger.exception("%s: cleaning up after a failed MetaApi reconnect", self.name)
+            if isinstance(exc, asyncio.TimeoutError):
+                raise MetaApiError(
+                    f"MetaApi yeniden bağlanma {int(RECONNECT_TIMEOUT_SEC)} sn içinde tamamlanamadı.") from exc
+            raise
+        finally:
+            self._reconnecting = False
+
+    def _checked(self, problem: str | None, *, heal: bool = True) -> str | None:
+        """Book one health check: the fail-fast flag, the reconnect policy, and what the heartbeat is told."""
+        dead = problem is not None and problem != _TRADE_OFF_TR
+        now = asyncio.get_running_loop().time()
+        if not self._reconnecting:
+            self._unhealthy, self._unhealthy_at = (problem if dead else None), now
+        events = self._policy.check(not dead, now)
+        if _RECOVERED in events:
+            logger.info("%s: MetaApi answers again", self.name)
+        if _DOWN in events:
+            logger.warning("%s: MetaApi failed %d health checks in a row: %s", self.name, self._policy.problems,
+                           problem)
+        if _RECONNECT_FAILED in events:
+            self._tell_reconnect_failed(problem or "", connected=True)
+        if _RECONNECT in events and heal:
+            self._start_heal()
+        if dead and problem is not None and self._policy.attempts:
+            return (f"{problem.rstrip('. ')}. Bot bağlantıyı kendisi sıfırdan kuruyor "
+                    f"({self._policy.attempts}. deneme).")
+        return problem
+
+    def _start_heal(self) -> None:
+        if self._heal_task is not None and not self._heal_task.done():
+            return
+        try:
+            self._begin_reconnect()
+        except BrokerError as exc:
+            logger.warning("%s: MetaApi reconnect put off to the next health check: %s", self.name, exc)
+            return
+        attempt = self._policy.attempt_started()
+        self._heal_task = asyncio.ensure_future(self._heal(attempt))
+
+    async def _heal(self, attempt: int) -> None:
+        loop = asyncio.get_running_loop()
+        logger.warning("%s: MetaApi does not answer; dropping the connection and connecting from scratch "
+                       "(attempt %d)", self.name, attempt)
+        try:
+            await self._reconnect_now()
+        except asyncio.CancelledError:
+            if _cancel_requested():
+                self._policy.attempt_finished(False, loop.time())
+                raise
+            reason = _DISCONNECTED_TR
+        except BrokerError as exc:
+            reason = str(exc)
+        except Exception as exc:        # whatever it was, this attempt failed
+            logger.exception("%s: MetaApi reconnect failed unexpectedly", self.name)
+            reason = str(exc) or type(exc).__name__
+        else:
+            self._policy.attempt_finished(True, loop.time())
+            logger.warning("%s: MetaApi connection rebuilt (attempt %d); the next health check confirms it",
+                           self.name, attempt)
+            return
+        logger.warning("%s: MetaApi reconnect attempt %d failed: %s", self.name, attempt,
+                       _TOKEN_RE.sub(r"\1***", reason))
+        if _RECONNECT_FAILED in self._policy.attempt_finished(False, loop.time()):
+            self._tell_reconnect_failed(reason, connected=False)
+
+    def _tell_reconnect_failed(self, reason: str, *, connected: bool) -> None:
+        """Once per outage. Never waits (the heartbeat bounds health_problem()), never raises."""
+        reason = _TOKEN_RE.sub(r"\1***", reason).rstrip(". ") or "?"
+        logger.warning("%s: rebuilding the MetaApi connection did not help: %s", self.name, reason)
+        notifier = self._notifier
+        if notifier is None:
+            return
+        what = ("MetaApi bağlantısı sıfırdan kuruldu ama hesap hâlâ yanıt vermiyor" if connected
+                else "MetaApi bağlantısı sıfırdan kurulamadı")
+        pause = _span_tr(self._policy.pause_after(max(self._policy.attempts, 1)))
+        text = (f"🔌 <b>{html.escape(self.name, quote=False)}</b>: {what}: "
+                f"<code>{html.escape(reason, quote=False)}</code>. Bot yaklaşık {pause} sonra yeniden dener ve "
+                f"denemeleri, aralarını {_span_tr(self._policy.backoff[-1])} kadar açarak sürdürür. Bu sırada bu "
+                "hesapta yeni işlem açılmaz; diğer hesaplar etkilenmez. Hesap yanıt verince ayrıca haber verilir "
+                "(bu uyarı tekrarlanmaz).")
+
+        async def send() -> None:
             try:
-                self._api.close()
-            except Exception as exc:  # noqa: BLE001
-                logger.warning("%s: MetaApi close failed: %s", self.name, exc)
-            self._api = None
+                await notifier.notify(text, Severity.WARNING)
+            except Exception:           # a notice must never break the adapter
+                logger.exception("%s: could not send a notice to the owner", self.name)
+
+        task = asyncio.ensure_future(send())
+        self._notices.add(task)
+        task.add_done_callback(self._notices.discard)
+
+    async def _stop_healing(self) -> None:
+        task, self._heal_task = self._heal_task, None
+        if task is not None and not task.done():
+            task.cancel()
+            await asyncio.wait({task})          # its own clean-up is over before close() tears down
+        for notice in list(self._notices):
+            notice.cancel()
+        self._reconnecting = False
+        self._unhealthy = None
+        self._policy = ReconnectPolicy()
+
+    async def health_problem(self) -> str | None:
+        """None while the connection works: the SDK reports the RPC connection as synchronized with the terminal
+        and one cheap read is answered, all within HEALTH_TIMEOUT_SEC. Otherwise a short text for the owner.
+        Never raises a CancelledError that nobody asked for (see _call); a real cancellation goes on.
+
+        Called by the heartbeat every minute. For a connection this adapter made itself the result also drives
+        the self-healing (see the class text): it never waits for a reconnect, that runs in its own task."""
+        if not (self._wanted and self._owns_conn):
+            return await self._health_check()
+        if self._reconnecting:
+            return self._checked(_RECONNECTING_TR)
+        try:
+            problem = await self._health_check()
+        except asyncio.CancelledError:
+            self._checked("MetaApi bağlantı kontrolü yarıda kesildi.", heal=False)      # the caller's time limit
+            raise
+        return self._checked(problem)
+
+    async def _health_check(self) -> str | None:
+        conn = self._conn
+        if not self._connected or conn is None:
+            return "MetaApi bağlı değil."
+        try:
+            loop = asyncio.get_running_loop()
+            start = loop.time()
+            while self._synchronized() is False:
+                if loop.time() - start >= min(HEALTH_SYNC_GRACE_SEC, HEALTH_TIMEOUT_SEC):
+                    return _DISCONNECTED_TR
+                await asyncio.sleep(0.25)
+            left = max(0.1, HEALTH_TIMEOUT_SEC - (loop.time() - start))
+            info = await self._call("bağlantı kontrolü", left, conn.get_account_information) or {}
+            if info.get("investorMode") or info.get("tradeAllowed") is False:
+                return _TRADE_OFF_TR
+        except BrokerError as exc:
+            return str(exc)
+        except asyncio.CancelledError:
+            if _cancel_requested():
+                raise
+            return _DISCONNECTED_TR
+        except Exception as exc:  # noqa: BLE001 - whatever it is, the owner should hear about it
+            return f"MetaApi bağlantı kontrolü başarısız: {str(exc) or type(exc).__name__}"
+        return None
 
     # ---- account -----------------------------------------------------------------
     async def _info(self) -> dict[str, Any]:
+        self._refuse_while_unhealthy()
         conn = self._require()
-        return await self._rpc("hesap bilgisi", conn.get_account_information)
+        return await self._read("hesap bilgisi", conn.get_account_information)
 
     async def get_equity(self) -> float:
         info = await self._info()
@@ -208,7 +855,7 @@ class MetaApiBroker(MetaTraderLegBroker):
     async def _spec(self, symbol: str) -> dict[str, Any]:
         if symbol not in self._specs:
             conn = self._require()
-            spec = await self._rpc(f"{symbol} sembol bilgisi", conn.get_symbol_specification, symbol)
+            spec = await self._read(f"{symbol} sembol bilgisi", conn.get_symbol_specification, symbol)
             if not spec:
                 raise BrokerError(f"{symbol} sembol bilgisi alınamadı.")
             self._specs[symbol] = spec
@@ -225,8 +872,9 @@ class MetaApiBroker(MetaTraderLegBroker):
         market_type: MarketType | None = None,
         raw_symbol: str | None = None,
     ) -> SymbolInfo | None:
+        self._refuse_while_unhealthy()
         conn = self._require()
-        mapped = mapped_symbol(self.cfg.symbol_map, base_asset, raw_symbol)
+        mapped = mapped_symbol(self.cfg.symbol_map, base_asset, raw_symbol, quote_asset)
         if mapped:
             try:
                 spec = await self._spec(mapped)
@@ -235,12 +883,14 @@ class MetaApiBroker(MetaTraderLegBroker):
             return self._symbol_info_model(mapped, spec, base_asset, quote_asset)
 
         if self._symbols is None:
-            self._symbols = list(await self._rpc("sembol listesi", conn.get_symbols) or [])
+            self._symbols = list(await self._read("sembol listesi", conn.get_symbols) or [])
         by_upper = {s.upper(): s for s in self._symbols}
-        candidates = symbol_candidates(base_asset, quote_asset)
+        candidates = symbol_candidates(base_asset, quote_asset, market_type)
         names = [by_upper[c] for c in candidates if c in by_upper]
+        whole = (base_asset.upper(),)       # the bare CFD name, if it is a candidate: no longer names
         ranked = sorted(
-            (r, s) for s in self._symbols if s not in names and (r := rank_symbol(s, candidates)) is not None
+            (r, s) for s in self._symbols
+            if s not in names and (r := rank_symbol(s, candidates, whole)) is not None
         )
         names += [s for _, s in ranked]
         for name in names:
@@ -277,7 +927,7 @@ class MetaApiBroker(MetaTraderLegBroker):
 
     async def _price(self, symbol: str) -> dict[str, Any]:
         conn = self._require()
-        price = await self._rpc(f"{symbol} fiyatı", conn.get_symbol_price, symbol)
+        price = await self._read(f"{symbol} fiyatı", conn.get_symbol_price, symbol)
         if not price or _f(price.get("bid")) <= 0 or _f(price.get("ask")) <= 0:
             raise BrokerError(f"{symbol} için fiyat yok (piyasa kapalı olabilir).")
         return price
@@ -300,13 +950,61 @@ class MetaApiBroker(MetaTraderLegBroker):
             # CURRENT conversion rate. If the quote currency is not the account currency the real loss at the
             # stop drifts with that FX rate (small for normal stops).
             return distance / tick * loss_tick_value
+        # No tick value in the price. For forex / CFD contracts MetaTrader's loss is distance x contract size in
+        # the profit currency; futures-type contracts are computed from the tick value only: never guessed.
+        mode = str(spec.get("priceCalculationMode") or "").upper()
+        if any(word in mode for word in _TICK_ONLY_CALC_MODES):
+            raise BrokerError(
+                f"{name}: tick değeri alınamadı; bu sözleşme türünde ({mode}) zarar yalnızca tick değeriyle "
+                f"hesaplanabildiği için lot güvenle hesaplanamıyor."
+            )
         profit_ccy = str(spec.get("profitCurrency") or "").upper()
-        if profit_ccy and profit_ccy == (await self.account_currency()).upper():
-            return distance * (_f(spec.get("contractSize")) or 1.0)
+        account_ccy = (await self.account_currency()).upper()
+        contract = _f(spec.get("contractSize"))
+        if profit_ccy and profit_ccy == account_ccy:
+            return distance * (contract or 1.0)
+        if profit_ccy and account_ccy and contract > 0:
+            rate = await self._loss_rate(name, price, profit_ccy, account_ccy)
+            if rate is not None:
+                return distance * contract * rate
+            raise BrokerError(
+                f"{name}: tick değeri alınamadı ve kâr para birimi ({profit_ccy}) hesap para biriminden "
+                f"({account_ccy}) farklı; çevirmek için gereken {account_ccy}{profit_ccy} ya da "
+                f"{profit_ccy}{account_ccy} fiyatı da okunamadı. Lot güvenle hesaplanamıyor."
+            )
         raise BrokerError(
             f"{name}: tick değeri alınamadı ve kâr para birimi ({profit_ccy or '?'}) hesap para biriminden farklı; "
             f"lot güvenle hesaplanamıyor."
         )
+
+    async def _loss_rate(self, name: str, price: dict[str, Any], profit_ccy: str, account_ccy: str) -> float | None:
+        """Account-currency value of ONE unit of the profit currency when a LOSS is converted, read from the
+        current price of the pair between the two (USDJPY for a JPY loss on a USD account: 1 / bid; GBPUSD for a
+        GBP loss: ask; always the dearer side of the quote, so the loss is never understated by the spread).
+        None: the account lists no such pair, or it has no price right now."""
+        for pair, inverse in ((account_ccy + profit_ccy, True), (profit_ccy + account_ccy, False)):
+            try:
+                quotes: list[tuple[str, dict[str, Any] | None]]
+                if rank_symbol(name, (pair,)) is not None:
+                    quotes = [(name, price)]          # the instrument itself is the pair (USDJPY, USD account)
+                else:
+                    if self._symbols is None:
+                        self._symbols = list(await self._read("sembol listesi", self._require().get_symbols) or [])
+                    ranked = sorted((r, s) for s in self._symbols if (r := rank_symbol(s, (pair,))) is not None)
+                    quotes = [(s, None) for _, s in ranked[:_RATE_SYMBOL_TRIES]]
+                for symbol, quote in quotes:
+                    try:
+                        quote = quote or await self._price(symbol)
+                    except BrokerError as exc:
+                        logger.warning("%s: no %s rate from %s: %s", self.name, pair, symbol, exc)
+                        continue
+                    rate = 1.0 / _f(quote["bid"]) if inverse else _f(quote["ask"])
+                    logger.info("%s: %s has no tick value; its %s loss is converted to %s with %s (%.10g %s per %s)",
+                                self.name, name, profit_ccy, account_ccy, symbol, rate, account_ccy, profit_ccy)
+                    return rate
+            except BrokerError as exc:
+                logger.warning("%s: cannot look for the %s rate: %s", self.name, pair, exc)
+        return None
 
     async def _margin_for(self, symbol: SymbolInfo, side: Side, lots: float, entry: float) -> float | None:
         conn = self._require()
@@ -317,12 +1015,34 @@ class MetaApiBroker(MetaTraderLegBroker):
             "openPrice": float(entry),
         }
         try:
-            res = await self._rpc("teminat hesabı", conn.calculate_margin, order)
+            res = await self._read("teminat hesabı", conn.calculate_margin, order)
         except BrokerError as exc:
             logger.warning("%s: margin calculation failed: %s", self.name, exc)
             return None
         margin = (res or {}).get("margin")
         return None if margin is None else float(margin)
+
+    # ---- flows a reconnect must wait for ------------------------------------------------
+    async def open_position(self, req: OpenRequest) -> BrokerPosition:
+        self._refuse_while_unhealthy()
+        with self._flow():
+            return await super().open_position(req)
+
+    async def update_stop_loss(self, pos: BrokerPosition, new_stop_loss: float) -> BrokerPosition:
+        with self._flow():
+            return await super().update_stop_loss(pos, new_stop_loss)
+
+    async def update_take_profits(self, pos: BrokerPosition, take_profits: list[TakeProfit]) -> BrokerPosition:
+        with self._flow():
+            return await super().update_take_profits(pos, take_profits)
+
+    async def close_position(self, pos: BrokerPosition, fraction: float = 1.0) -> BrokerPosition:
+        with self._flow():
+            return await super().close_position(pos, fraction)
+
+    async def cancel_entry(self, pos: BrokerPosition) -> BrokerPosition:
+        with self._flow():
+            return await super().cancel_entry(pos)
 
     # ---- order primitives -------------------------------------------------------------
     def _options(self, tag: str) -> dict[str, Any]:
@@ -343,6 +1063,121 @@ class MetaApiBroker(MetaTraderLegBroker):
                 return str(p["ticket"])
         return None
 
+    def _lost_text(self, problem: str, tag: str, *, readable: bool = True) -> str:
+        """What the owner reads when an order got no trade answer AND the look-up by tag found nothing."""
+        looked = (f"Hesapta '{tag}' etiketli emir ya da pozisyon şu an görünmüyor; yine de" if readable else
+                  f"Hesap şu an okunamadığı için '{tag}' etiketli emrin hesaba ulaşıp ulaşmadığı doğrulanamadı;")
+        return (f"{problem} Emir GÖNDERİLMİŞ OLABİLİR; aynı emir ikinci kez gönderilmedi. {looked} "
+                f"{self.name} hesabını MetaTrader'dan kontrol edin.")
+
+    def _reply_lost(self, symbol: str, tag: str, problem: str) -> OrderReplyLostError:
+        """The order MAY exist on the account: MetaTraderLegBroker looks it up by its tag and adopts it."""
+        err = OrderReplyLostError(self._lost_text(problem, tag))
+        self._lost[(symbol, tag)] = (err, problem)
+        logger.error("%s: no trade answer for the %s order tagged %s (%s); looking it up, not sending it again",
+                     self.name, symbol, tag, problem)
+        return err
+
+    async def _send_order(
+        self, what: str, symbol: str, tag: str, fn: Callable[..., Awaitable[Any]], *args: Any,
+        requote_retries: int = 0, **kwargs: Any,
+    ) -> Any:
+        """A request that CREATES an order. An answer with a trade return code is final (MetaApiError; a requote
+        of a market order is sent again, the price is the market's at that moment). Anything else (timeout,
+        connection closed, an answer without a return code) means the order MAY have been executed:
+        OrderReplyLostError, never sent again. So does the one return code that says the trade server did not
+        answer in time (10012, "request cancelled by timeout"; Mt5Broker treats it the same way)."""
+        attempt = 0
+        while True:
+            try:
+                return await self._rpc(what, fn, *args, **kwargs)
+            except MetaApiError as exc:
+                if (exc.code is None and exc.string_code is None) or exc.code == MT5.TRADE_RETCODE_TIMEOUT:
+                    raise self._reply_lost(symbol, tag, str(exc)) from exc
+                if exc.code not in _REQUOTE_RETCODES or attempt >= requote_retries:
+                    raise
+                attempt += 1
+                logger.info("%s: %s for %s answered %s, sending again (%d of %d)",
+                            self.name, what, symbol, exc.code, attempt, requote_retries)
+                if self.retry_delay_sec:
+                    await asyncio.sleep(self.retry_delay_sec)
+
+    async def _adopt_lost_leg(
+        self, symbol: str, tag: str, volume: float, sl: float, tp: float | None
+    ) -> dict[str, Any] | None:
+        """Look the unanswered order up by its tag a few times (it may still be on its way to the trade server)."""
+        for i in range(LOST_REPLY_CHECKS):
+            if i:
+                await asyncio.sleep(LOST_REPLY_DELAY_SEC)
+            failures = self._snapshot_failures
+            leg = await super()._adopt_lost_leg(symbol, tag, volume, sl, tp)
+            if leg is not None:
+                self._lost.pop((symbol, tag), None)
+                if leg["state"] == "open" and float(leg["filled"]) < float(volume) - _EPS:
+                    leg["unfilled"] = float(volume) - float(leg["filled"])     # reported once by _open_position
+                return leg
+            if self._snapshot_failures != failures:
+                # The account cannot be read right now: more tries would only keep the shared flows waiting.
+                if (symbol, tag) in self._lost:
+                    err, problem = self._lost[(symbol, tag)]
+                    err.args = (self._lost_text(problem, tag, readable=False),)
+                break
+        return None
+
+    async def _open_position(self, req: OpenRequest) -> BrokerPosition:
+        symbol = req.symbol.broker_symbol
+        try:
+            pos = await super()._open_position(req)
+        except BrokerError as exc:
+            text = self._unsure_not_failed(symbol, str(exc))
+            if text != str(exc):
+                raise BrokerError(text) from exc
+            raise
+        finally:
+            lost = [self._lost.pop(key)[0] for key in list(self._lost) if key[0] == symbol]
+        if pos.error:
+            pos.error = self._unsure_not_failed(symbol, pos.error, lost)
+        legs = pos.data.get("legs") or []
+        notes = pos.data.setdefault("warnings", [])
+        for leg in legs:
+            label = f"#{leg['ticket']}" if len(legs) > 1 else "Emir"
+            if leg.get("unfilled"):
+                notes.append(
+                    f"{label} kısmen gerçekleşti: {_lots(float(leg['filled']) + float(leg['unfilled']))} lotun "
+                    f"{_lots(float(leg['filled']))} lotu açıldı, {_lots(float(leg['unfilled']))} lot açılmadı "
+                    f"(gerçek risk hedefin altında)."
+                )
+            elif leg.get("partial_fill"):
+                notes.append(
+                    f"{label}: broker emrin yalnızca bir kısmını gerçekleştirdiğini bildirdi ama açılan lot henüz "
+                    f"okunamadı; {self.name} hesabını kontrol edin."
+                )
+        return pos
+
+    def _unsure_not_failed(self, symbol: str, text: str, lost: list[OrderReplyLostError] | None = None) -> str:
+        """MetaTraderLegBroker words every leg error as "... açılamadı: <reason>". For an order whose answer was
+        lost that is not known: the owner must read that its state is unknown."""
+        if lost is None:
+            lost = [err for key, (err, _) in self._lost.items() if key[0] == symbol]
+        for err in lost:
+            text = text.replace(f"açılamadı: {err}", f"durumu belirsiz: {err}")
+        return text
+
+    async def _refresh_open(self, leg: dict[str, Any], positions: dict[str, dict[str, Any]]) -> None:
+        p = positions.get(str(leg["ticket"]))
+        if p is not None and leg.get("partial_fill"):
+            # First look at a market order the venue reported as partly executed (TRADE_RETCODE_DONE_PARTIAL):
+            # what the position holds is what was filled. Without this the missing part would be booked as an
+            # already closed part with 0 PnL.
+            del leg["partial_fill"]
+            asked, got = float(leg["filled"]), float(p["volume"])
+            if got < asked - _EPS:
+                leg["unfilled"] = asked - got
+                leg["filled"] = leg["open_volume"] = got
+                logger.warning("%s: position %s was only partly filled: %s of %s lots", self.name, leg["ticket"],
+                               _lots(got), _lots(asked))
+        await super()._refresh_open(leg, positions)
+
     async def _open_market_leg(
         self, symbol: SymbolInfo, side: Side, volume: float, sl: float, tp: float | None, tag: str
     ) -> dict[str, Any]:
@@ -352,25 +1187,31 @@ class MetaApiBroker(MetaTraderLegBroker):
         opts = self._options(tag)
         naked = False
         try:
-            res = await self._rpc("piyasa emri", fn, name, float(volume),
-                                  stop_loss=float(sl), take_profit=float(tp) if tp else None, options=opts)
+            res = await self._send_order("piyasa emri", name, tag, fn, name, float(volume), stop_loss=float(sl),
+                                         take_profit=float(tp) if tp else None, options=opts,
+                                         requote_retries=REQUOTE_RETRIES)
         except MetaApiError as exc:
             if exc.code != MT5.TRADE_RETCODE_INVALID_STOPS:
                 raise
             # Stops refused on the entry: open without, attach right after (rule 1, handled by the caller).
             logger.warning("%s: stops rejected on entry, opening without and attaching", self.name)
-            res = await self._rpc("piyasa emri", fn, name, float(volume), stop_loss=None, take_profit=None, options=opts)
+            res = await self._send_order("piyasa emri", name, tag, fn, name, float(volume), stop_loss=None,
+                                         take_profit=None, options=opts, requote_retries=REQUOTE_RETRIES)
             naked = True
         pid = (res or {}).get("positionId") or (res or {}).get("orderId")
         if not pid:
-            pid = await self._find_tagged_position(name, tag)
+            try:
+                pid = await self._find_tagged_position(name, tag)
+            except BrokerError:
+                pid = None
         if not pid:
-            raise BrokerError(
-                f"{name} emri gönderildi ama pozisyon numarası alınamadı; MetaTrader'da '{tag}' etiketli "
-                f"pozisyonu kontrol edin."
-            )
-        return new_leg(ticket=str(pid), state="open", volume=float(volume), filled=float(volume),
-                       sl=None if naked else float(sl), tp=tp, tag=tag)
+            # Accepted, but which position it is is not known yet: same look-up as for a lost answer.
+            raise self._reply_lost(name, tag, f"{name} piyasa emri gönderildi ama pozisyon numarası alınamadı.")
+        leg = new_leg(ticket=str(pid), state="open", volume=float(volume), filled=float(volume),
+                      sl=None if naked else float(sl), tp=tp, tag=tag)
+        if _partly_done(res):
+            leg["partial_fill"] = True        # the real volume is read from the position (_refresh_open)
+        return leg
 
     async def _open_pending_leg(
         self, symbol: SymbolInfo, side: Side, volume: float, price: float, sl: float,
@@ -398,17 +1239,18 @@ class MetaApiBroker(MetaTraderLegBroker):
             }
         what = "limit emri" if limit else "stop emri"
         try:
-            res = await self._rpc(what, fn, name, float(volume), float(price),
-                                  stop_loss=float(sl), take_profit=float(tp) if tp else None, options=opts)
+            res = await self._send_order(what, name, tag, fn, name, float(volume), float(price),
+                                         stop_loss=float(sl), take_profit=float(tp) if tp else None, options=opts)
         except MetaApiError as exc:
             if exc.code != MT5.TRADE_RETCODE_INVALID_EXPIRATION or "expiration" not in opts:
                 raise
             opts.pop("expiration")      # engine still cancels after pending_entry_expiry_min
-            res = await self._rpc(what, fn, name, float(volume), float(price),
-                                  stop_loss=float(sl), take_profit=float(tp) if tp else None, options=opts)
+            res = await self._send_order(what, name, tag, fn, name, float(volume), float(price),
+                                         stop_loss=float(sl), take_profit=float(tp) if tp else None, options=opts)
         oid = (res or {}).get("orderId")
         if not oid:
-            raise BrokerError(f"{name} bekleyen emri gönderildi ama emir numarası alınamadı; '{tag}' etiketini kontrol edin.")
+            # Accepted, but which order it is is not known: same look-up as for a lost answer.
+            raise self._reply_lost(name, tag, f"{name} bekleyen emri gönderildi ama emir numarası alınamadı.")
         leg = new_leg(ticket=str(oid), order_ticket=str(oid), state="pending", volume=float(volume),
                       entry=float(price), sl=float(sl), tp=tp, tag=tag)
         leg["order_type"] = ("BUY_" if side is Side.LONG else "SELL_") + ("LIMIT" if limit else "STOP")
@@ -450,8 +1292,12 @@ class MetaApiBroker(MetaTraderLegBroker):
     # ---- state primitives ---------------------------------------------------------------
     async def _snapshot(self, symbol: str) -> tuple[dict[str, dict[str, Any]], dict[str, dict[str, Any]]]:
         conn = self._require()
-        raw_positions = await self._rpc("pozisyon listesi", conn.get_positions) or []
-        raw_orders = await self._rpc("emir listesi", conn.get_orders) or []
+        try:
+            raw_positions = await self._read("pozisyon listesi", conn.get_positions) or []
+            raw_orders = await self._read("emir listesi", conn.get_orders) or []
+        except BrokerError:
+            self._snapshot_failures += 1      # _adopt_lost_leg: "not found" and "could not look" are different
+            raise
         magic = int(self.cfg.magic)
 
         def own_tag(item: dict[str, Any]) -> str:
@@ -479,7 +1325,7 @@ class MetaApiBroker(MetaTraderLegBroker):
 
     async def _history_order(self, order_ticket: Any) -> dict[str, Any] | None:
         conn = self._require()
-        res = await self._rpc("emir geçmişi", conn.get_history_orders_by_ticket, str(order_ticket)) or {}
+        res = await self._read("emir geçmişi", conn.get_history_orders_by_ticket, str(order_ticket)) or {}
         items = res.get("historyOrders") or []
         if not items:
             return None
@@ -497,7 +1343,7 @@ class MetaApiBroker(MetaTraderLegBroker):
 
     async def _deal_summary(self, position_id: Any) -> dict[str, Any] | None:
         conn = self._require()
-        res = await self._rpc("işlem geçmişi", conn.get_deals_by_position, str(position_id)) or {}
+        res = await self._read("işlem geçmişi", conn.get_deals_by_position, str(position_id)) or {}
         deals = res.get("deals") or []
         if not deals:
             return None
@@ -518,4 +1364,4 @@ class MetaApiBroker(MetaTraderLegBroker):
         }
 
 
-__all__ = ["MetaApiBroker", "MetaApiError", "map_error"]
+__all__ = ["MetaApiBroker", "MetaApiError", "ReconnectPolicy", "map_error"]

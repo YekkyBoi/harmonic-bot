@@ -22,6 +22,7 @@ from ..models import (
     ActionType,
     EntryType,
     ManagementPlan,
+    MarketType,
     ParsedAction,
     Side,
     TakeProfit,
@@ -30,13 +31,26 @@ from ..models import (
     TradeStatus,
     ValidationIssue,
 )
-from .symbols import canonical_asset, normalize_symbol
+from .symbols import CFD_QUOTES, FIAT_CURRENCIES, canonical_asset, normalize_symbol
 
 logger = logging.getLogger(__name__)
 
 _MANAGEMENT_ACTIONS = frozenset({ActionType.MOVE_SL, ActionType.MOVE_TP, ActionType.CLOSE, ActionType.CANCEL})
 _ACTIVE = frozenset({TradeStatus.OPENING, TradeStatus.PENDING, TradeStatus.OPEN})
 _SPLIT_SUM_TOLERANCE = 0.01
+
+# Plausible entry-to-stop distance in percent of the entry, per instrument class: (minimum, maximum). Outside
+# it the stop was probably misread (on the correct side, so nothing else catches it) and the owner is asked.
+# The risk config overrides them when it carries min_stop_distance_pct_<class> / max_stop_distance_pct_<class>
+# (0 switches a bound off).
+STOP_DISTANCE_PCT_DEFAULTS: dict[str, tuple[float, float]] = {
+    "crypto": (0.15, 25.0),
+    "fx": (0.03, 3.0),         # currency pairs: about 3.5 .. 350 pips on EURUSD
+    "cfd": (0.05, 8.0),        # metals, indices, oil
+}
+_STOP_CLASS_TR = {"crypto": "Kripto", "fx": "Döviz pariteleri", "cfd": "Altın, endeks, petrol gibi ürünler"}
+_CRYPTO_MARKETS = frozenset({MarketType.PERP, MarketType.SPOT})
+_PIP_MAJOR_QUOTES = frozenset({"USD", "EUR", "GBP", "CHF", "CAD", "AUD", "NZD"})
 
 
 # --------------------------------------------------------------------------- #
@@ -69,6 +83,85 @@ def _profit_side(side: Side, price: float, ref: float) -> bool:
 
 def _distance_pct(a: float, ref: float) -> float:
     return abs(a - ref) / ref * 100.0
+
+
+def _near_entry(market: float, entry: float, stop: float | None, risk: RiskConfig) -> bool:
+    """The live price is close enough to the signal's entry to enter at market: within
+    risk.market_entry_tolerance_pct of the entry, or (risk.market_entry_tolerance_r set and the stop known)
+    within that fraction of the entry-to-stop distance."""
+    if _distance_pct(market, entry) <= risk.market_entry_tolerance_pct:
+        return True
+    if risk.market_entry_tolerance_r is None or stop is None:
+        return False
+    # The tiny factor keeps a price exactly on the edge (5 pips of a 20-pip stop) inside despite float rounding.
+    return abs(market - entry) <= risk.market_entry_tolerance_r * abs(entry - stop) * (1.0 + 1e-9)
+
+
+def _instrument_class(base: str | None, market_type: MarketType | None, route_kind: str | None) -> str:
+    """Key of STOP_DISTANCE_PCT_DEFAULTS for a signal: "crypto" (a crypto topic, or a perp / spot market),
+    "fx" (the base is a currency: a forex pair, whatever market type the model wrote), "cfd" (metals, indices,
+    oil and everything else of an fx topic). An unknown ticker with no market type and no topic kind is taken
+    as crypto."""
+    if route_kind == "crypto" or market_type in _CRYPTO_MARKETS:
+        return "crypto"
+    if base in FIAT_CURRENCIES:
+        return "fx"
+    if market_type in (MarketType.FOREX, MarketType.CFD) or base in CFD_QUOTES or route_kind == "fx":
+        return "cfd"
+    return "crypto"
+
+
+def _stop_distance_bounds(risk: RiskConfig, cls: str) -> tuple[float, float]:
+    """(minimum, maximum) plausible stop distance in percent for the class; 0 = that bound is off."""
+    def read(name: str, default: float) -> float:
+        value = getattr(risk, name, None)
+        if value is None:                # the config has no such field (or it is unset): the default
+            return default
+        try:
+            number = float(value)
+        except (TypeError, ValueError):
+            return default
+        return number if math.isfinite(number) and number > 0 else 0.0
+    low, high = STOP_DISTANCE_PCT_DEFAULTS[cls]
+    return read(f"min_stop_distance_pct_{cls}", low), read(f"max_stop_distance_pct_{cls}", high)
+
+
+def _pip_size(quote: str | None, price: float) -> float | None:
+    """Size of one pip of a currency pair: 0.01 for JPY pairs, 0.0001 for the major quotes; None when the
+    quote is exotic (conventions differ). Unknown quote: decided from the size of the price."""
+    if quote == "JPY":
+        return 0.01
+    if quote in _PIP_MAJOR_QUOTES:
+        return 0.0001
+    if quote is None:
+        return 0.01 if price >= 20 else 0.0001
+    return None
+
+
+def _stop_distance_issue(
+    ref: float, stop: float, cls: str, quote: str | None, risk: RiskConfig, *, ref_is_entry: bool = True
+) -> tuple[str, str] | None:
+    """(code, Turkish text) when |ref - stop| is implausibly small or large for the instrument class.
+    ``ref``: the signal's entry, or the live price for a market signal without an entry price."""
+    low, high = _stop_distance_bounds(risk, cls)
+    pct = _distance_pct(stop, ref)
+    # The tiny factor keeps a stop exactly on a bound (100 -> 99.85 = 0.15%) inside despite float rounding.
+    tight = low > 0 and pct < low * (1.0 - 1e-9)
+    wide = high > 0 and pct > high * (1.0 + 1e-9)
+    if not (tight or wide):
+        return None
+    pips = ""
+    pip = _pip_size(quote, ref) if cls == "fx" else None
+    if pip:
+        pips = f" ({_fmt(round(abs(ref - stop) / pip, 1))} pip)"
+    name, near, far = ("giriş", "girişe", "girişten") if ref_is_entry else ("anlık fiyat", "anlık fiyata", "anlık fiyattan")
+    head = (f"{name} {_fmt(ref)}, stop {_fmt(stop)} — aradaki mesafe %{_pct(pct)}{pips}. "
+            f"{_STOP_CLASS_TR[cls]} için")
+    if tight:
+        return "stop_too_tight", (f"Stop {near} çok yakın: {head} en az %{_pct(low)} beklenir; stop yanlış okunmuş "
+                                  "olabilir (bu mesafeyle pozisyon çok büyük açılır).")
+    return "stop_too_wide", (f"Stop {far} çok uzak: {head} en fazla %{_pct(high)} beklenir; stop yanlış okunmuş "
+                             "olabilir.")
 
 
 class _Issues:
@@ -307,11 +400,17 @@ def build_open_plan(
     plan_id: str | None = None,
     route: str | None = None,
     broker_names: list[str] | None = None,
+    route_kind: str | None = None,
+    risk_pct_applies: bool = True,
 ) -> tuple[TradePlan | None, list[ValidationIssue]]:
     """Validate an OPEN action and turn it into a TradePlan.
 
     ``route`` / ``broker_names``: the forum topic route the signal came from (TopicRoute.name) and the
     brokers it may be traded on (empty = every enabled broker); copied onto the plan unchanged.
+    ``route_kind``: that route's TopicRoute.kind ("crypto" / "fx" / "any") when the caller knows it; only
+    used to choose the plausible stop distance (see below). Without it the market type and the asset decide.
+    ``risk_pct_applies``: False when every broker the plan can be traded on risks a fixed amount per R
+    (``risk_usd``): the texts then leave out the percentage of equity, which would be wrong for all of them.
 
     Blocking issues (plan is None): missing asset / side / stop loss; stop on the
     wrong side of entry (long: SL >= entry; short: SL <= entry); market price
@@ -320,22 +419,49 @@ def build_open_plan(
     Non-blocking issues (plan returned, but ask first): confidence below
     llm.min_confidence; parser ambiguities; risk_r missing and
     risk.ask_if_r_missing; risk_r > risk.max_r_per_trade; entry farther than
-    risk.max_entry_distance_pct from market; market price already beyond TP1;
-    no take profit given; market_price unknown.
+    risk.max_entry_distance_pct from market; market price already beyond TP1
+    (not for the signal's own pullback limit, see below); no take profit given;
+    market_price unknown; an implausible entry-to-stop distance
+    (``stop_too_tight`` / ``stop_too_wide``: the distance in percent of the
+    entry is outside STOP_DISTANCE_PCT_DEFAULTS for the instrument class, or
+    outside risk.min_stop_distance_pct_<class> / max_stop_distance_pct_<class>
+    when the risk config has those fields; a stop misread on the correct side
+    would otherwise pass and multiply or shrink the position).
     Decisions: entry type from risk.entry_mode ("auto": market if the market is
-    within market_entry_tolerance_pct of the entry or no entry price given,
-    otherwise limit at the entry; an explicit entry_type from the signal wins),
-    risk_r defaults to risk.default_r, risk_pct = risk_r * risk.risk_per_r_pct,
-    take profits sorted nearest-first with close_fraction set per
-    risk.multi_tp_split (fractions sum to 1.0) unless the signal gave a split.
+    near the entry or no entry price given, otherwise limit at the entry; an
+    explicit entry_type from the signal wins, except for a MARKET signal that
+    drifted, see below), risk_r defaults to risk.default_r,
+    risk_pct = risk_r * risk.risk_per_r_pct, take profits sorted nearest-first
+    with close_fraction set per risk.multi_tp_split (fractions sum to 1.0)
+    unless the signal gave a split.
+
+    "Near the entry" (the same test for the automatic choice and for an explicit
+    MARKET signal): the market is within risk.market_entry_tolerance_pct of the
+    entry, or, when risk.market_entry_tolerance_r is set and the stop is known,
+    within that fraction of the entry-to-stop distance.
+    An explicit MARKET signal whose market price is known and not near its entry:
+    risk.explicit_market_drift "ask" keeps it a MARKET plan and asks
+    (``market_far_from_entry``); "follow" raises no such issue. When the price
+    ran away from the entry (long: above it) "follow" decides the entry type as
+    if the signal had stated none (entry_mode "auto" and "limit": LIMIT at the
+    signal's entry, "market": MARKET) and every later check uses that type. When
+    the price is on the better side (long: below the entry, towards the stop)
+    the plan stays MARKET: a limit there would be marketable anyway, and the
+    signal asked for a market entry. An explicit LIMIT signal is never turned
+    into a market order. ``entry_far_from_market`` (risk.max_entry_distance_pct)
+    and ``market_beyond_stop`` are checked whatever the entry type.
 
     Additional rules: the reference price for side checks is the entry if given,
     else the market price (neither known -> blocking ``price_unknown``); market
-    beyond TP1 is blocking for a MARKET entry (the TP would be behind the fill);
+    beyond TP1 is blocking for a MARKET entry (the TP would be behind the fill),
+    a question for a limit the signal did not ask for, and nothing at all for
+    the signal's own LIMIT whose entry the price has not reached yet (a pullback
+    limit: its first target may lie between the entry and today's price);
     a LIMIT entry needs a price; a marketable limit (long above / short below the
-    market), an explicit market entry that drifted beyond the tolerance and a
-    symbol/asset mismatch are non-blocking. ``auto`` with an unknown market price
-    chooses LIMIT at the entry (never chase blindly).
+    market), an explicit market entry that drifted beyond the tolerance
+    (explicit_market_drift "ask") and a symbol/asset mismatch are non-blocking.
+    ``auto`` with an unknown market price chooses LIMIT at the entry (never chase
+    blindly).
     """
     issues = _Issues()
     market = _sanitize_market(market_price)
@@ -412,9 +538,33 @@ def build_open_plan(
                 "market_beyond_stop",
                 f"Piyasa fiyatı ({_fmt(market)}) zaten stop seviyesinin ({_fmt(stop)}) {where} — işlem geçersiz.",
             )
+    if side is not None and ref is not None and stop is not None and _loss_side(side, stop, ref):
+        # A stop on the correct side but implausibly close to / far from the entry: probably misread.
+        doubt = _stop_distance_issue(ref, stop, _instrument_class(base, market_type, route_kind), quote, risk,
+                                     ref_is_entry=entry is not None)
+        if doubt is not None:
+            issues.warn(*doubt)
 
     # ---- entry type ------------------------------------------------------------
+    # near: the market is close enough to the signal's entry to enter at market (None: cannot tell)
+    near = _near_entry(market, entry, stop, risk) if market is not None and entry is not None else None
     explicit_type = action.entry_type
+    better_price = False     # explicit MARKET signal that drifted to a better price than its entry ("follow")
+    if explicit_type is EntryType.MARKET and near is False and risk.explicit_market_drift == "follow":
+        if side is not None and _loss_side(side, market, entry):
+            # The price moved towards the stop: entering now is a BETTER price than the trader's own entry.
+            # The signal stays a market order and nothing is asked about the drift (a limit at the entry would
+            # be marketable anyway; the engine limits the size, risk.max_size_multiple). A price at or beyond
+            # the stop is blocked above, one beyond max_entry_distance_pct is asked about below.
+            better_price = True
+            logger.info("%s: MARKET signal, the market (%s) is %s%% from its entry (%s) on the better side: "
+                        "kept as a market order", base, _fmt(market), _pct(_distance_pct(market, entry)), _fmt(entry))
+        else:
+            # The price ran away from the entry the trader marked: no question, the signal is handled like
+            # one without an entry type (entry_mode "auto": a limit at the signal's entry).
+            logger.info("%s: MARKET signal, but the market (%s) is %s%% from its entry (%s): handled like a signal "
+                        "without an entry type", base, _fmt(market), _pct(_distance_pct(market, entry)), _fmt(entry))
+            explicit_type = None
     if explicit_type is not None:
         entry_type = explicit_type
     elif risk.entry_mode == "market":
@@ -430,8 +580,7 @@ def build_open_plan(
     elif market is None:
         entry_type = EntryType.LIMIT
     else:
-        within = _distance_pct(market, entry) <= risk.market_entry_tolerance_pct
-        entry_type = EntryType.MARKET if within else EntryType.LIMIT
+        entry_type = EntryType.MARKET if near else EntryType.LIMIT
 
     if entry_type is EntryType.LIMIT and entry is None and action.entry_price is None:
         issues.block("missing_limit_price", "Limit emir için giriş fiyatı yok.")
@@ -451,7 +600,7 @@ def build_open_plan(
                 f"Giriş ({_fmt(entry)}) piyasa fiyatından ({_fmt(market)}) %{_pct(dist)} uzak — "
                 f"fiyat yanlış okunmuş olabilir.",
             )
-        if explicit_type is EntryType.MARKET and dist > risk.market_entry_tolerance_pct:
+        if explicit_type is EntryType.MARKET and not near and not better_price:
             issues.warn(
                 "market_far_from_entry",
                 f"Sinyal piyasa emri diyor ama anlık fiyat ({_fmt(market)}) girişten ({_fmt(entry)}) "
@@ -475,6 +624,10 @@ def build_open_plan(
             text = f"Piyasa fiyatı ({_fmt(market)}) ilk hedefin ({_fmt(tp1.price)}) {where}."
             if entry_type is EntryType.MARKET:
                 issues.block("market_beyond_tp", text + " Piyasa emriyle girilemez.")
+            elif action.entry_type is EntryType.LIMIT and _loss_side(side, entry, market):
+                # The trader's own pullback limit (long: entry below the price, short: above) that the price
+                # has not reached yet: a first target between the entry and today's price is normal there.
+                pass
             else:
                 issues.warn("market_beyond_tp", text)
 
@@ -490,9 +643,10 @@ def build_open_plan(
     if not _positive(risk_r):
         issues.block("invalid_risk", f"Geçersiz risk değeri ({risk_r}R).")
     elif risk_r > risk.max_r_per_trade:
+        share = f" (%{_pct(risk_r * risk.risk_per_r_pct)})" if risk_pct_applies else ""
         issues.warn(
             "risk_r_too_high",
-            f"Sinyal riski {_fmt(risk_r)}R (%{_pct(risk_r * risk.risk_per_r_pct)}) — izin verilen en fazla "
+            f"Sinyal riski {_fmt(risk_r)}R{share} — izin verilen en fazla "
             f"{_fmt(risk.max_r_per_trade)}R. Onaylanırsa {_fmt(risk_r)}R ile açılır.",
         )
 
@@ -528,11 +682,13 @@ def build_open_plan(
         route=route,
         broker_names=list(broker_names or []),
     )
-    plan.summary_tr = _open_summary(plan, entry_is_market_price=entry is None)
+    plan.summary_tr = _open_summary(plan, entry_is_market_price=entry is None, show_risk_pct=risk_pct_applies)
     return plan, issues.items
 
 
-def _open_summary(plan: TradePlan, *, entry_is_market_price: bool) -> str:
+def _open_summary(plan: TradePlan, *, entry_is_market_price: bool, show_risk_pct: bool = True) -> str:
+    """One line for the owner. ``show_risk_pct`` False: no "(%2)" after the R (every broker of the plan risks
+    a fixed amount per R, so a percentage of equity would be wrong)."""
     kind = "piyasa" if plan.entry_type is EntryType.MARKET else "limit"
     if plan.entry_price is None:
         entry = "giriş ?"
@@ -543,8 +699,10 @@ def _open_summary(plan: TradePlan, *, entry_is_market_price: bool) -> str:
     tps = " / ".join(_fmt(tp.price) for tp in plan.take_profits) or "yok"
     out = (
         f"{plan.base_asset} {plan.side.value.upper()} ({kind}), {entry}, SL {_fmt(plan.stop_loss)}, "
-        f"TP {tps}, risk {_fmt(plan.risk_r)}R (%{_pct(plan.risk_pct)})"
+        f"TP {tps}, risk {_fmt(plan.risk_r)}R"
     )
+    if show_risk_pct:
+        out += f" (%{_pct(plan.risk_pct)})"
     if plan.route:
         out += f" · konu {plan.route} → {', '.join(plan.broker_names) or 'tüm brokerlar'}"
     return out

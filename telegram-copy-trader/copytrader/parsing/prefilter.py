@@ -57,6 +57,34 @@ _STEMS = (
 # Words that start with a stem but are plain chatter.
 _STEM_EXCEPTIONS = ("yarin",)          # "yarın" (tomorrow), "yarına"...
 
+# Short management wording that names no instrument, level or order word. Stems that are trading talk wherever
+# they stand (prefix match on folded words): "Patladı" / "Patladık" (stopped out), "Başabaş yaptık", "Sıfırladık"
+# (stop to entry), "Tetiklendi" (the entry triggered), "Geçersiz" (setup invalid), "Kilitledik" (profit locked),
+# "Azalttık" / "Küçülttük" (reduced), "Taşıdık" (stop / target moved), "filled", "Düzeltme" (a correction of the
+# signal).
+_STATUS_STEMS = (
+    "patla", "basabas", "sifirla", "tetikle", "gecersiz", "kilitle", "azalt", "kucult",
+    "tasidi", "tasiyor", "tasiyin", "tasiyal", "tasindi", "fill", "duzelt",
+)
+# Two-word forms: "Başa baş" (both words exact), "Tersine döndük" / "tersine dönüyoruz" (second word by prefix).
+_STATUS_PAIRS = (("basa", "bas", True), ("tersine", "don", False))
+# Everyday words that are a status report only when they are (nearly) the whole message: "Geldi", "Tamamdır",
+# "Açtık", "Açıldı", "Yedik", "Bitti", "Tuttu", "Olmadı", "Devam", "Bekliyoruz", "Bırakın", "Dokunmayın", "Tut",
+# "Yanlış oldu", "done", "hit". Inside a longer sentence ("kargo geldi mi", "tamamdır hocam") they stay chatter.
+_LONE_STATUS_WORDS = frozenset({"tamamdir", "olmadi", "devam", "done", "hit", "pardon"})
+_LONE_STATUS_STEMS = (
+    "geldi", "gelmedi", "acti", "acil", "yedi", "bitti", "bitir", "tut", "bekl", "birak", "dokunma", "yanlis",
+)
+# Words that may stand next to a status word without making the message a sentence about something else.
+_LONE_STATUS_FILLERS = frozenset({
+    "oldu", "olduk", "yaptik", "yaptim", "ettik", "ettim", "arkadaslar", "beyler", "simdi", "yine", "tekrar",
+    "artik", "sonunda", "nihayet", "hala", "de", "da", "ve",
+})
+_LONE_STATUS_MAX_WORDS = 4
+# A message made of emoji only is a status report when it carries one of these (check marks, target, cross,
+# stop sign): "✅", "🎯".
+_STATUS_MARKS = frozenset("✅✔☑🎯❌✖🛑⛔")
+
 # Common tickers / instrument names (folded, lower-case), beyond the alias table.
 _TICKERS = frozenset({
     "btc", "eth", "sol", "xrp", "bnb", "ada", "doge", "dot", "avax", "link", "ltc", "bch", "trx",
@@ -115,6 +143,44 @@ def _is_ticker_like(word: str) -> bool:
     return any(word.endswith(q) and len(word) > len(q) + 1 for q in _USD_QUOTES)  # wifusdt
 
 
+def _has_status_pair(words: list[str]) -> bool:
+    return any(a == first and (b == second if exact else b.startswith(second))
+               for a, b in zip(words, words[1:]) for first, second, exact in _STATUS_PAIRS)
+
+
+def _is_lone_status(raw: str, words: list[str]) -> bool:
+    """A short status report without any trading word: "Geldi", "Geldi ✅", "Tamamdır", "Yanlış oldu", or an
+    emoji-only message with a check mark / target ("✅", "🎯"). Every word must be a status word or a filler
+    ("oldu", "arkadaşlar"...), so the same words inside a sentence about something else do not count."""
+    if not words:
+        return any(c in _STATUS_MARKS for c in raw)
+    if len(words) > _LONE_STATUS_MAX_WORDS:
+        return False
+
+    def status(word: str) -> bool:
+        return word in _LONE_STATUS_WORDS or word.startswith(_LONE_STATUS_STEMS)
+
+    return any(status(w) for w in words) and all(status(w) or w in _LONE_STATUS_FILLERS for w in words)
+
+
+def _has_trading_content(text: str, words: list[str]) -> bool:
+    """``text`` (folded) names a trading word, a level, an instrument or a management status word."""
+    if "%" in text or _R_MULTIPLE.search(text) or _LEVERAGE.search(text):
+        return True
+    if _TICKER_MARK.search(text) or _PRICE.search(text):
+        return True
+    if "kara gec" in text:     # "kâra geçti" (in profit) -> may be followed by a stop move
+        return True
+    for word in words:
+        if word in _KEYWORDS or _has_stem(word) or _TP_SL.fullmatch(word):
+            return True
+        if _is_ticker_like(word):
+            return True
+        if word.startswith(_STATUS_STEMS):
+            return True
+    return _has_status_pair(words)
+
+
 def looks_relevant(msg: StoredMessage) -> bool:
     """True if the message might contain or modify a trade.
 
@@ -122,9 +188,13 @@ def looks_relevant(msg: StoredMessage) -> bool:
     (Turkish or English: long, short, buy, sell, al, sat, giriş, entry, stop,
     sl, tp, hedef, target, kapat, close, iptal, cancel, be, breakeven, R
     multiples like "1R"/"0.5r", "%", leverage like "10x"), a ticker-looking
-    token (ETH, BTCUSDT, XAUUSD, $SOL, #eth) or a price-looking number. False for
-    short greetings / emoji-only / empty messages. Prefer false positives over
-    false negatives.
+    token (ETH, BTCUSDT, XAUUSD, $SOL, #eth), a price-looking number, a
+    management status word ("Patladık", "Başa baş", "Tetiklendi", "Geçersiz",
+    "filled") or when the whole message is a short status report ("Geldi",
+    "Tamamdır", "Bitti ✅", a lone "✅" / "🎯"). False for short greetings /
+    other emoji-only / empty messages and for chatter that merely contains an
+    everyday status word ("tamamdır hocam", "kargo geldi mi"). Prefer false
+    positives over false negatives.
     """
     if msg.media_path or msg.media_type:
         return True
@@ -132,15 +202,22 @@ def looks_relevant(msg: StoredMessage) -> bool:
     text = _fold(raw)
     if not text.strip():
         return False
-    if "%" in text or _R_MULTIPLE.search(text) or _LEVERAGE.search(text):
+    words = _WORD.findall(text)
+    if _has_trading_content(text, words) or _is_lone_status(raw, words):
         return True
-    if _TICKER_MARK.search(text) or _PRICE.search(text):
-        return True
-    if "kara gec" in text:     # "kâra geçti" (in profit) -> may be followed by a stop move
-        return True
-    for word in _WORD.findall(text):
-        if word in _KEYWORDS or _has_stem(word) or _TP_SL.fullmatch(word):
-            return True
-        if _is_ticker_like(word):
-            return True
     return any(w not in _CAPS_STOPWORDS for w in _CAPS_WORD.findall(raw))
+
+
+def is_bare_status(msg: StoredMessage) -> bool:
+    """True for a text-only message that is relevant ONLY as a short status report: an everyday word or a
+    mark with no trading word, level or instrument ("Geldi", "Tamamdır", "Bitti ✅", a lone "✅"). Such a
+    message does not say what happened (entry filled? target? stop?), so nothing should be done on it without
+    asking. False for "Stop", "TP geldi", "Başa baş", "Aktif" and for every message with a picture."""
+    if msg.media_path or msg.media_type:
+        return False
+    raw = msg.text or ""
+    text = _fold(raw)
+    if not text.strip():
+        return False
+    words = _WORD.findall(text)
+    return _is_lone_status(raw, words) and not _has_trading_content(text, words)

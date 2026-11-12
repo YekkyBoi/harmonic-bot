@@ -22,6 +22,7 @@ Money-safety rules every adapter must follow
 
 from __future__ import annotations
 
+import re
 from abc import ABC, abstractmethod
 from typing import Any
 
@@ -39,6 +40,17 @@ from ..models import (
 
 class BrokerError(Exception):
     """A broker operation failed. ``str(err)`` is shown to the owner."""
+
+
+# Contract multiplier an exchange puts before a low-priced coin: "1000PEPE" = 1000 PEPE, "1MBABYDOGE" =
+# 1000000 BABYDOGE. The same prefixes as ccxt_broker._PREFIX_RE plus the "1M" spelling, and only before a
+# letter, so a coin whose real name starts with a digit ("1INCH") is left alone.
+_MULTIPLIER_PREFIX_RE = re.compile(r"^(?:1000000|100000|10000|1000|1M)(?=[A-Z])")
+
+
+def _asset_key(asset: str) -> str:
+    """Upper-case asset name without a contract multiplier prefix: "1000pepe" -> "PEPE", "1INCH" -> "1INCH"."""
+    return _MULTIPLIER_PREFIX_RE.sub("", asset.upper(), count=1)
 
 
 class Broker(ABC):
@@ -154,5 +166,6 @@ class Broker(ABC):
         self.risk_config = risk_config
 
     def accepts_asset(self, base_asset: str) -> bool:
-        allowed = [a.upper() for a in getattr(self.config, "allowed_assets", [])]
-        return not allowed or base_asset.upper() in allowed
+        """``config.allowed_assets`` (empty = everything). "PEPE" and the "1000PEPE" contract are the same asset."""
+        allowed = {_asset_key(a) for a in getattr(self.config, "allowed_assets", [])}
+        return not allowed or _asset_key(base_asset) in allowed

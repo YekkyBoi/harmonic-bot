@@ -273,7 +273,7 @@ async def test_model_sees_the_current_stop_and_not_the_original_one() -> None:
     (block,) = [b["text"] for b in content if b["text"].startswith(prompts.OPEN_TRADES_HEADER)]
     (shown,) = json.loads(block.split("\n", 1)[1])
     assert shown == {
-        "trade_id": 1, "asset": "BTC", "side": "short", "entry": 74868.8,
+        "trade_id": 1, "asset": "BTC", "quote": "USDT", "side": "short", "entry": 74868.8,
         "stop_loss": 74868.8,                                       # the CURRENT stop (moved to the entry)
         "take_profits": [{"price": 73095.0, "close_fraction": 1.0, "hit": False}],
         "open_fraction": 1.0, "status": "open", "source_message_ids": SIGNAL_IDS, "opened_at": NOW.isoformat(),

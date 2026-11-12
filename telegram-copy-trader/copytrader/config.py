@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import os
 import re
+import unicodedata
 from pathlib import Path
 from typing import Annotated, Any, Literal, Union
 from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
@@ -32,6 +33,18 @@ def fold_tr(text: str) -> str:
     return " ".join(text.translate(_TR_FOLD).casefold().split())
 
 
+_ASCII_I = str.maketrans({"ı": "i", "İ": "i"})    # the two letters NFKD does not turn into a plain "i"
+
+
+def fold_ascii(text: str) -> str:
+    """Comparison key for text typed WITHOUT Turkish letters ('Islemleri' == 'İşlemleri' == 'ISLEMLERI'):
+    compatibility-decomposed, accents and dots dropped, dotless / dotted i -> i, case-folded. Also equal for
+    letters written as a base letter plus a combining mark."""
+    plain = "".join(ch for ch in unicodedata.normalize("NFKD", text.translate(_ASCII_I))
+                    if not unicodedata.combining(ch))
+    return " ".join(plain.casefold().split())
+
+
 class TopicRoute(_Base):
     """Which forum topics of the source group to follow, and where their trades go.
 
@@ -47,9 +60,14 @@ class TopicRoute(_Base):
     market_entry_tolerance_pct: float | None = Field(None, gt=0)  # auto: market only if price is this close to entry
     max_entry_distance_pct: float | None = Field(None, gt=0)      # entry farther than this from market -> ask / skip
     duplicate_tolerance_pct: float | None = Field(None, gt=0)     # repost check: entries this close are "the same"
+    # Per-route overrides of risk.market_entry_tolerance_r / risk.explicit_market_drift. Unset: kind "fx" uses
+    # FX_MARKET_ENTRY_TOLERANCE_R and "follow", other kinds use the global values.
+    market_entry_tolerance_r: float | None = Field(None, gt=0)    # also market within this fraction of the entry-to-stop distance
+    explicit_market_drift: Literal["ask", "follow"] | None = None  # explicit MARKET signal outside the tolerance: ask / follow
 
 
 FX_MARKET_ENTRY_TOLERANCE_PCT = 0.03     # ~3 pips on EURUSD
+FX_MARKET_ENTRY_TOLERANCE_R = 0.25       # ... or within a quarter of the signal's own entry-to-stop distance
 FX_MAX_ENTRY_DISTANCE_PCT = 1.0
 FX_DUPLICATE_TOLERANCE_PCT = 0.05
 DEFAULT_DUPLICATE_TOLERANCE_PCT = 0.5
@@ -73,24 +91,41 @@ def route_thresholds(risk: "RiskConfig", route: "TopicRoute | None") -> tuple[fl
 
 
 def effective_risk(risk: "RiskConfig", route: "TopicRoute | None") -> "RiskConfig":
-    """``risk`` with the route's entry thresholds applied (the global object when nothing differs)."""
+    """``risk`` with the route's entry settings applied (the global object when nothing differs).
+
+    Percent thresholds: see ``route_thresholds``. ``market_entry_tolerance_r`` / ``explicit_market_drift``: the
+    route's own value wins; otherwise kind "fx" uses FX_MARKET_ENTRY_TOLERANCE_R / "follow" and every other
+    kind the global values."""
     tol, dist, _dup = route_thresholds(risk, route)
-    ask = risk.ask_if_limit_marketable and not (route is not None and route.kind == "fx")
-    if (tol == risk.market_entry_tolerance_pct and dist == risk.max_entry_distance_pct
-            and ask == risk.ask_if_limit_marketable):
+    fx = route is not None and route.kind == "fx"
+    tol_r, drift = risk.market_entry_tolerance_r, risk.explicit_market_drift
+    if route is not None and route.market_entry_tolerance_r is not None:
+        tol_r = route.market_entry_tolerance_r
+    elif fx:
+        tol_r = FX_MARKET_ENTRY_TOLERANCE_R
+    if route is not None and route.explicit_market_drift is not None:
+        drift = route.explicit_market_drift
+    elif fx:
+        drift = "follow"
+    update = {
+        "market_entry_tolerance_pct": tol, "max_entry_distance_pct": dist,
+        "ask_if_limit_marketable": risk.ask_if_limit_marketable and not fx,
+        "market_entry_tolerance_r": tol_r, "explicit_market_drift": drift,
+    }
+    if all(getattr(risk, name) == value for name, value in update.items()):
         return risk
-    return risk.model_copy(update={
-        "market_entry_tolerance_pct": tol, "max_entry_distance_pct": dist, "ask_if_limit_marketable": ask,
-    })
+    return risk.model_copy(update=update)
 
 
 def match_topic(routes: list[TopicRoute], title: str | None) -> TopicRoute | None:
-    """First route whose title_contains matches ``title`` (None if no title or no match)."""
+    """First route whose title_contains matches ``title`` (None if no title or no match). A part matches when
+    the title contains it on the Turkish key (:func:`fold_tr`) or on the ASCII key (:func:`fold_ascii`): a
+    topic created from a keyboard without Turkish letters ("Aralik Ayi Kripto Islemleri") is still followed."""
     if not title:
         return None
-    key = fold_tr(title)
+    key, plain = fold_tr(title), fold_ascii(title)
     for route in routes:
-        if any(fold_tr(part) in key for part in route.title_contains if part.strip()):
+        if any(fold_tr(part) in key or fold_ascii(part) in plain for part in route.title_contains if part.strip()):
             return route
     return None
 
@@ -145,6 +180,12 @@ class RiskConfig(_Base):
     daily_loss_limit_pct: float = 10.0            # per broker; stop opening new trades for the day after this realized loss
     entry_mode: Literal["auto", "market", "limit"] = "auto"
     market_entry_tolerance_pct: float = 0.5       # auto: |price-entry|/entry <= this -> market, else limit at entry
+    # also enter at market when the live price is within this fraction of the entry-to-stop distance from the
+    # entry (None = off)
+    market_entry_tolerance_r: float | None = Field(None, gt=0)
+    # explicit MARKET signal whose live price is outside the tolerance: "ask" the owner (old behaviour) or
+    # "follow" = treat it like a signal without entry type
+    explicit_market_drift: Literal["ask", "follow"] = "ask"
     max_entry_distance_pct: float = 10.0          # entry this far from market -> probably misread -> ask
     ask_if_limit_marketable: bool = True          # a limit entry already at/through the market: ask (False for fx routes: the broker opens it at market)
     pending_entry_expiry_min: int = 1440          # unfilled limit entries are cancelled after this
@@ -155,6 +196,18 @@ class RiskConfig(_Base):
     use_equity: bool = True                       # True: equity incl. unrealized PnL; False: free balance
     allow_min_qty_round_up: bool = False          # if 1R is below the minimum order size: False = skip, True = use min size
     max_margin_usage_pct: float = 90.0            # never lock more than this % of free balance as margin
+    # never size a position larger than this many times the size implied by the signal's own entry-to-stop
+    # distance (applied by the engine and the MetaTrader adapters)
+    max_size_multiple: float = Field(2.0, ge=1)
+    # Plausible entry-to-stop distance in percent of the entry, per kind of instrument (crypto; currency pairs;
+    # "cfd" = metals, indices, oil). A stop closer or farther than this was probably misread: the owner is asked
+    # (parsing/validator.py: stop_too_tight / stop_too_wide). 0 switches that bound off.
+    min_stop_distance_pct_crypto: float = Field(0.15, ge=0)
+    max_stop_distance_pct_crypto: float = Field(25.0, ge=0)
+    min_stop_distance_pct_fx: float = Field(0.03, ge=0)      # about 3.5 pips on EURUSD
+    max_stop_distance_pct_fx: float = Field(3.0, ge=0)
+    min_stop_distance_pct_cfd: float = Field(0.05, ge=0)
+    max_stop_distance_pct_cfd: float = Field(8.0, ge=0)
 
 
 # --------------------------------------------------------------------------- #
@@ -170,8 +223,13 @@ class _BrokerBase(_Base):
     allowed_assets: list[str] = Field(default_factory=list)     # empty = all assets
     risk_multiplier: float = 1.0                  # scale risk on this broker only (1.0 = 2% per R)
     risk_usd: float | None = Field(None, gt=0)    # fixed money at risk for 1R on this broker (instead of a % of equity)
-    no_hedge: bool = False                        # never open the opposite direction of an active position on the same asset (prop firms / netting)
+    no_hedge: bool = False                        # never open the opposite direction of an active position on the same instrument (broker symbol; prop firms / netting)
     daily_loss_limit_pct: float | None = Field(None, ge=0)  # replaces risk.daily_loss_limit_pct for this broker (0 = off)
+    # True (prop accounts): the daily limit also counts what is still at risk. A new trade is refused when
+    # today's realized loss + the loss of this broker's open and pending positions at their current stops + the
+    # new trade's own risk would be more than the limit. False: only the realized loss counts (a day can then
+    # end near twice the limit).
+    daily_loss_include_open_risk: bool = False
     # Price-offset brokers (CFD price differs from the exchange the signal charts come from): None = off.
     reference_exchange: str | None = None         # ccxt id of the chart's exchange, e.g. "binanceusdm"
     offset_mode: Literal["additive", "ratio"] = "additive"  # shift levels by (broker - ref) or scale by broker / ref
@@ -374,9 +432,30 @@ def _expand_env(node: Any) -> Any:
     return node
 
 
+def _beside(folder: Path, value: str) -> str:
+    """``value`` (a path from the config) as it is meant: a relative path is relative to ``folder``, the
+    folder of the config file. Returned exactly as written: absolute paths, "~" paths, and everything when
+    the config file is given without a folder ("config.yaml": the folder is the current one anyway)."""
+    if folder == Path("."):
+        return value
+    try:
+        path = Path(value).expanduser()
+    except RuntimeError:            # "~" without a home directory: left to its users, as before
+        return value
+    return value if path.is_absolute() else str(folder / path)
+
+
 def load_config(path: str | os.PathLike[str] = "config.yaml") -> AppConfig:
+    """Load and validate the config file. A relative ``data_dir`` / ``telegram.session_path`` is resolved
+    against the folder of the config file, not against the folder the program was started from: the same
+    database, Telegram session and logs are used wherever the bot is started (a scheduled task without a
+    "Start in" folder, a shortcut). Started in the bot folder with the default ``config.yaml`` nothing changes
+    ("data" stays "data")."""
     p = Path(path)
     _load_dotenv(p.parent / ".env")
     _load_dotenv(Path.cwd() / ".env")
     raw = yaml.safe_load(p.read_text(encoding="utf-8")) or {}
-    return AppConfig.model_validate(_expand_env(raw))
+    config = AppConfig.model_validate(_expand_env(raw))
+    config.data_dir = _beside(p.parent, config.data_dir)
+    config.telegram.session_path = _beside(p.parent, config.telegram.session_path)
+    return config

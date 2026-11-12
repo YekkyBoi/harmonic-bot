@@ -35,6 +35,8 @@ from ..models import (
     TakeProfit,
 )
 from . import prompts
+from .prefilter import is_bare_status
+from .symbols import FIAT_CURRENCIES, normalize_symbol
 
 logger = logging.getLogger(__name__)
 
@@ -171,6 +173,7 @@ _ERR_MAX_TOKENS = "Yapay zekâ yanıtı yarıda kesildi (token limiti); sinyal o
 _ERR_STOP = "Yapay zekâ yanıtı beklenmedik şekilde bitti ({reason}); sinyal okunamadı."
 _ERR_NO_TEXT = "Yapay zekâ boş yanıt döndürdü; sinyal okunamadı."
 _ERR_BAD_JSON = "Yapay zekâ geçersiz bir yanıt döndürdü; sinyal okunamadı."
+_ERR_BAD_BODY = "Yapay zekâ servisinden okunamayan bir yanıt geldi; sinyal okunamadı."
 _ERR_TIMEOUT = "Yapay zekâ servisi zamanında yanıt vermedi; sinyal okunamadı."
 _ERR_CONNECTION = "Yapay zekâ servisine bağlanılamadı; sinyal okunamadı."
 _ERR_RATE_LIMIT = "Yapay zekâ servisi istek limitine takıldı; sinyal okunamadı."
@@ -191,6 +194,13 @@ _ERR_OTHER = "Yapay zekâ servisine erişilemedi (yapılandırma hatası); sinya
 _AMB_NO_ACTIONS = "Yapay zekâ bu mesajlar için hiçbir sonuç döndürmedi; işlem talimatı olup olmadığını kontrol et."
 _AMB_IDS_GUESSED = (
     "Yapay zekâ bu talimatın hangi mesajdan geldiğini belirtmedi; aynı yanıtta başka talimatlar da var."
+)
+_AMB_IMAGE_MISSING = (
+    "Mesajdaki grafik görseli okunamadı (indirilemedi ya da açılamadı); seviyeler görselden doğrulanamadı."
+)
+_AMB_BARE_STATUS = (
+    "Mesajda yalnızca “{text}” yazıyor; ne olduğu (giriş mi doldu, hedef mi geldi, stop mu oldu) belli değil, "
+    "bu yüzden sormadan uygulanmadı."
 )
 _SPEND_LIMIT_CODE = "enforced_spend_limit_reached"
 
@@ -244,7 +254,8 @@ class ClaudeSignalParser:
             return ParseResult(actions=[], model=None, raw_response=None)
 
         messages = sorted(messages, key=lambda m: (_as_utc(m.date), m.message_id))
-        content = await self._build_content(messages, context)
+        unseen: set[int] = set()        # ids of messages whose picture could not be given to the model
+        content = await self._build_content(messages, context, unseen)
         request = self.build_request(content)
 
         try:
@@ -276,6 +287,10 @@ class ClaudeSignalParser:
             logger.warning("Claude API error %s: %s", e.status_code, e)
             transient = e.status_code >= 500 or e.status_code in (408, 409)
             raise ParserError(_ERR_STATUS.format(code=e.status_code), transient=transient) from e
+        except (anthropic.APIResponseValidationError, json.JSONDecodeError) as e:
+            # HTTP 200 whose body is not the API's JSON (empty or cut off, a proxy page): worth another try.
+            logger.warning("Claude answered with an unreadable body: %s", e)
+            raise ParserError(_ERR_BAD_BODY, transient=True) from e
         except anthropic.AnthropicError as e:
             logger.error("Claude client error: %s", e)
             raise ParserError(_ERR_OTHER, transient=False) from e
@@ -286,7 +301,7 @@ class ClaudeSignalParser:
             logger.error("No Anthropic API credentials: %s", e)
             raise ParserError(_ERR_NO_KEY, transient=False) from e
 
-        return self._handle_response(response, messages, context)
+        return self._handle_response(response, messages, context, unseen)
 
     # ------------------------------------------------------------------ #
     def build_request(self, content: list[dict[str, Any]]) -> dict[str, Any]:
@@ -312,16 +327,24 @@ class ClaudeSignalParser:
 
     # ------------------------------------------------------------------ #
     async def _build_content(
-        self, messages: list[StoredMessage], context: ParseContext
+        self, messages: list[StoredMessage], context: ParseContext, unseen: set[int] | None = None
     ) -> list[dict[str, Any]]:
+        """The user turn. ``unseen`` (when given) receives the ids of the messages, the replied-to one
+        included, whose picture exists but could not be attached (not downloaded, unreadable, too large)."""
         budget = max(0, self._config.max_images)
         msg_ids = {m.message_id for m in messages}
+        unseen = unseen if unseen is not None else set()
+        not_downloaded = prompts.IMAGE_UNREADABLE_NOTE.format(reason=prompts.IMAGE_NOT_DOWNLOADED_REASON)
 
         # Pick the most recent images first; unreadable ones don't use budget.
         images: dict[int, dict[str, Any]] = {}
         notes: dict[int, str] = {}
         for m in reversed(messages):
             if not m.media_path:
+                if m.media_type:
+                    # A photo / image document whose download failed: the model must know a picture exists.
+                    notes[m.message_id] = not_downloaded
+                    unseen.add(m.message_id)
                 continue
             if len(images) >= budget:
                 notes[m.message_id] = prompts.IMAGE_LIMIT_NOTE
@@ -329,6 +352,7 @@ class ClaudeSignalParser:
             block, reason = await _load_image_block(m.media_path)
             if block is None:
                 notes[m.message_id] = prompts.IMAGE_UNREADABLE_NOTE.format(reason=reason)
+                unseen.add(m.message_id)
             else:
                 images[m.message_id] = block
 
@@ -359,6 +383,10 @@ class ClaudeSignalParser:
                         reply_image, reason = await _load_image_block(reply.media_path)
                         if reply_image is None:
                             note = prompts.IMAGE_UNREADABLE_NOTE.format(reason=reason)
+                            unseen.add(reply.message_id)
+                elif reply.media_type:
+                    note = not_downloaded
+                    unseen.add(reply.message_id)
                 content.append(
                     {"type": "text", "text": prompts.REPLY_TO_HEADER + "\n" + _render_message(reply, note)}
                 )
@@ -389,8 +417,19 @@ class ClaudeSignalParser:
 
     # ------------------------------------------------------------------ #
     def _handle_response(
-        self, response: Any, messages: list[StoredMessage], context: ParseContext
+        self, response: Any, messages: list[StoredMessage], context: ParseContext,
+        unseen: set[int] | None = None,
     ) -> ParseResult:
+        """``unseen``: ids of the messages whose picture could not be given to the model (see _build_content).
+
+        Failures worth another try (``ParserError.transient`` True; the engine's retry loop reads that flag):
+        a body that is not a Messages API object, a reply cut by the token limit, a reply without text and
+        one that is not valid JSON of the schema. A refusal (unless the fallback model was only busy) and an
+        unknown stop reason are final."""
+        if response is None or isinstance(response, (str, bytes)):
+            # The SDK hands back the raw text when the body was not JSON (a proxy / gateway page).
+            logger.warning("Claude answered with a body that is not a message: %.200r", response)
+            raise ParserError(_ERR_BAD_BODY, transient=True)
         stop_reason = getattr(response, "stop_reason", None)
         model = getattr(response, "model", None)
         request_id = getattr(response, "_request_id", None)
@@ -407,8 +446,9 @@ class ClaudeSignalParser:
                 raise ParserError(_ERR_REFUSAL_BUSY, transient=True)
             raise ParserError(_ERR_REFUSAL, transient=False)
         if stop_reason == "max_tokens":
+            # The length of the model's own deliberation varies from call to call: another try can fit.
             logger.warning("Claude hit max_tokens=%s (request_id=%s)", self._config.max_tokens, request_id)
-            raise ParserError(_ERR_MAX_TOKENS, transient=False)
+            raise ParserError(_ERR_MAX_TOKENS, transient=True)
         if stop_reason not in ("end_turn", "stop_sequence"):
             logger.warning("Unexpected stop_reason %r (request_id=%s)", stop_reason, request_id)
             raise ParserError(_ERR_STOP.format(reason=stop_reason), transient=False)
@@ -416,14 +456,14 @@ class ClaudeSignalParser:
         text = _final_text(getattr(response, "content", None) or [])
         if text is None:
             logger.warning("Claude response has no text block (request_id=%s)", request_id)
-            raise ParserError(_ERR_NO_TEXT, transient=False)
+            raise ParserError(_ERR_NO_TEXT, transient=True)
 
         try:
             data = json.loads(text, parse_constant=_reject_constant)
             wire = _WireResult.model_validate(data)
         except (ValueError, ValidationError) as e:   # JSONDecodeError is a ValueError
             logger.warning("Claude output does not match the schema: %s; raw=%.500s", e, text)
-            raise ParserError(_ERR_BAD_JSON, transient=False) from e
+            raise ParserError(_ERR_BAD_JSON, transient=True) from e
 
         usage = getattr(response, "usage", None)
         if usage is not None:
@@ -439,6 +479,7 @@ class ClaudeSignalParser:
                 [_to_action(w, messages, context) for w in wire.actions], [m.message_id for m in messages]
             )
             actions = [_check_trader_sizing(_apply_topic_kind(a, context), messages, context) for a in actions]
+            actions = [_flag_bare_status(_flag_unseen_image(a, unseen or set()), messages) for a in actions]
         else:
             # Schema-valid but against the rules ("no instruction" is one "none"): never consume the
             # messages silently; an unsure "none" makes the engine ask the owner.
@@ -731,7 +772,9 @@ _AMB_LOT = (
 
 def _apply_topic_kind(a: ParsedAction, context: ParseContext) -> ParsedAction:
     """Fill what the forum topic's kind makes certain and flag a contradiction (new signals only):
-    fx topic: EUR/GBP/AUD/NZD -> quote USD forex, XAU/XAG -> USD cfd; crypto topic: USDT perpetual."""
+    fx topic: EUR/GBP/AUD/NZD and XAU/XAG without a quote -> the fiat quote their own symbol names ("EURGBP"),
+    else USD; a missing market type -> forex for a currency, cfd for everything else (metals, indices, oil);
+    crypto topic: USDT perpetual."""
     kind = context.topic_kind
     if a.action not in _OPENING or kind not in ("crypto", "fx"):
         return a
@@ -740,10 +783,16 @@ def _apply_topic_kind(a: ParsedAction, context: ParseContext) -> ParsedAction:
     if kind == "fx":
         if a.market_type in _CRYPTO_MARKETS:
             update["ambiguities"] = [*a.ambiguities, _AMB_TOPIC_KIND.format(kind="Forex", market="kripto")]
-        elif base in _FX_USD_QUOTED | _METALS and a.quote_asset in (None, "USD"):
-            update["quote_asset"] = "USD"
-            if a.market_type is None:
-                update["market_type"] = MarketType.FOREX if base in _FX_USD_QUOTED else MarketType.CFD
+        else:
+            s_base, s_quote, s_type = normalize_symbol(a.symbol) if a.symbol else (None, None, None)
+            if base in _FX_USD_QUOTED | _METALS and a.quote_asset in (None, "USD"):
+                # "EUR" alone is EURUSD; a pair spelled out in the action's own symbol keeps its quote.
+                named = a.quote_asset is None and s_base == base and s_quote in FIAT_CURRENCIES and s_quote != base
+                update["quote_asset"] = s_quote if named else "USD"
+            asset = base or s_base
+            # A perpetual written in the symbol ("ETHUSDT.P") is not relabelled.
+            if a.market_type is None and asset and s_type is not MarketType.PERP:
+                update["market_type"] = MarketType.FOREX if asset in FIAT_CURRENCIES else MarketType.CFD
     else:
         if a.market_type in _FX_MARKETS:
             update["ambiguities"] = [*a.ambiguities, _AMB_TOPIC_KIND.format(kind="Kripto", market="forex/CFD")]
@@ -800,6 +849,34 @@ def _check_trader_sizing(a: ParsedAction, messages: list[StoredMessage], context
         return a.model_copy(update={"ambiguities": [*a.ambiguities, text],
                                     "confidence": min(a.confidence, _LOW_CONFIDENCE_CAP)})
     return a
+
+
+_IMAGE_WORDS = ("görsel", "gorsel", "görüntü", "goruntu", "resim", "screenshot")   # in text folded with fold_tr
+
+
+def _flag_unseen_image(a: ParsedAction, unseen: set[int]) -> ParsedAction:
+    """A new trade ("open" / "incomplete") built on a message whose picture the model could not see: the levels
+    cannot have been checked against the screenshot. The owner is told so in an ambiguity (any ambiguity makes
+    the engine ask), unless the model already said it."""
+    if a.action not in _OPENING or not unseen.intersection(a.used_message_ids):
+        return a
+    if any(word in fold_tr(text) for text in a.ambiguities for word in _IMAGE_WORDS):
+        return a
+    return a.model_copy(update={"ambiguities": [*a.ambiguities, _AMB_IMAGE_MISSING]})
+
+
+def _flag_bare_status(a: ParsedAction, messages: list[StoredMessage]) -> ParsedAction:
+    """A management action read from nothing but a bare status word or mark ("Geldi", "Tamamdır", a lone "✅";
+    see ``prefilter.is_bare_status``): the text does not say what happened, so the reading is a guess. It gets
+    an ambiguity (the engine then asks the owner instead of acting), unless the model already raised one."""
+    if a.action not in _MANAGEMENT or a.ambiguities:
+        return a
+    used = [m for m in messages if m.message_id in a.used_message_ids] or list(messages)
+    if not used or not all(is_bare_status(m) for m in used):
+        return a
+    text = " / ".join(" ".join(m.text.split()) for m in used)
+    text = text if len(text) <= 40 else text[:39] + "…"
+    return a.model_copy(update={"ambiguities": [_AMB_BARE_STATUS.format(text=text)]})
 
 
 def _fill_missing_ids(actions: list[ParsedAction], provided: list[int]) -> list[ParsedAction]:

@@ -52,6 +52,8 @@ telegram:
   # Boş ([]) = gruptaki bütün mesajlar okunur (konusuz gruplar için).
   # brokers: aşağıdaki "brokers" listesindeki name değerleri; boş = tüm açık brokerlar.
   # kind: crypto (USDT perpetual) | fx (ör. "EUR" = EURUSD) | any
+  #       Fiyat farkı kaydırması ve sanal tetik (broker ayarı reference_exchange) yalnızca crypto konularında
+  #       uygulanır; fx konularında seviyeler hiç kaydırılmaz.
   topics: []
   # Örnek:
   # topics:
@@ -63,9 +65,11 @@ telegram:
   #     title_contains: ["Fx İşlemleri"]
   #     brokers: [mt5]
   #     kind: fx
-  #     # İsteğe bağlı eşikler (fiyatın %'si). fx konusunda boş bırakırsanız FX değerleri kullanılır,
-  #     # diğerlerinde risk bölümündeki genel değerler:
+  #     # İsteğe bağlı eşikler. fx konusunda boş bırakırsanız aşağıdaki FX değerleri kullanılır (risk
+  #     # bölümündeki genel değerler fx konusunda geçerli değildir), diğerlerinde risk bölümündeki genel değerler:
   #     # market_entry_tolerance_pct: 0.03   # fx varsayılanı; fiyat girişe bu kadar yakınsa piyasa emri, değilse limit (~3 pip EURUSD)
+  #     # market_entry_tolerance_r: 0.25     # fx varsayılanı; fiyat girişe, giriş-stop mesafesinin dörtte biri kadar yakınsa da piyasa emri
+  #     # explicit_market_drift: follow      # fx varsayılanı; sinyal "piyasadan" dese de fiyat girişten uzaksa sorulmaz, girişe limit emir konur (ask = size sorulur)
   #     # max_entry_distance_pct: 1.0        # fx varsayılanı; giriş piyasadan bu kadar uzaksa yanlış okunmuş sayılır
   #     # duplicate_tolerance_pct: 0.05      # fx varsayılanı; tekrar paylaşılan sinyal kontrolünde "aynı giriş" payı
 
@@ -106,6 +110,11 @@ risk:
   entry_mode: auto              # auto | market | limit
                                 #   auto: anlık fiyat girişe yakınsa piyasa emri, değilse girişte limit emir
   market_entry_tolerance_pct: 0.5  # auto: fiyat girişten en fazla %0.5 uzaksa piyasa emri
+  market_entry_tolerance_r:     # auto: fiyat girişe, giriş-stop mesafesinin bu katı kadar yakınsa da piyasa emri
+                                #   (ör. 0.25 = mesafenin dörtte biri). Boş = kapalı; fx konularında 0.25
+  explicit_market_drift: ask    # sinyal "piyasadan" diyor ama fiyat girişten yukarıdaki paylardan fazla uzak:
+                                #   ask = size sorulur; follow = sorulmaz, giriş tipi yazılmamış sinyal gibi
+                                #   işlenir (auto: girişe limit emir konur). fx konularında follow
   max_entry_distance_pct: 10.0  # giriş anlık fiyattan %10'dan uzaksa (yanlış okuma olabilir) size sorulur
   pending_entry_expiry_min: 1440   # dolmayan limit giriş 24 saat sonra iptal edilir (0 = hiç)
   include_fees_in_risk: true    # komisyon da 1R'nin içine sayılır (stopta toplam kayıp ≈ 1R)
@@ -117,6 +126,9 @@ risk:
   allow_min_qty_round_up: false # 1R borsanın minimum miktarının altında kalırsa: false = işlemi atla,
                                 #   true = minimum miktarla aç (risk en fazla 2R'ye kadar çıkabilir)
   max_margin_usage_pct: 90.0    # serbest bakiyenin en fazla %90'ı teminat olarak kullanılır
+  max_size_multiple: 2.0        # fiyat stopa çok yaklaşmışsa miktar büyümez: pozisyon, sinyalin kendi giriş-stop
+                                #   mesafesiyle çıkan miktarın en fazla 2 katı olur (en az 1). Sınır devreye
+                                #   girerse gerçek risk 1R'nin altında kalır ve size bildirilir
 
 # ---------------------------------------------------------------------
 # Brokerlar / borsalar
@@ -133,14 +145,17 @@ risk:
 #                    bir yeniden bağlanmayı dener; bağlanınca haber verir. Çalışırken çıkan hatalar da diğer
 #                    hesapların kopyalarını engellemez. Varsayılan false: bağlanamayan broker bugünkü gibi
 #                    ERROR ile bildirilir. Örnek: config.tickmill.example.yaml
-#   symbol_map       sembol eşleme, ör: {ETH: ETHUSD, XAU: GOLD}
-#   allowed_assets   boş = tüm varlıklar; ör: [BTC, ETH] = sadece bunlar
+#   symbol_map       sembol eşleme, ör: {ETH: ETHUSD, XAU: GOLD}. Döviz paritesini parite adıyla yazın,
+#                    ör: {EURJPY: EURJPY.x} (EUR diye yazmayın: bütün EUR paritelerini değiştirir)
+#   allowed_assets   boş = tüm varlıklar; ör: [BTC, ETH] = sadece bunlar (PEPE yazmak 1000PEPE'yi de kapsar)
 #   risk_multiplier  bu hesapta riski ölçekle (1.0 = 1R başına %2, 0.5 = %1)
 #   reference_exchange  (isteğe bağlı, her broker tipinde) sinyal grafiklerinin geldiği borsanın ccxt adı,
 #                    ör: binanceusdm. Doluysa KRİPTO sinyallerinde broker fiyatı ile bu borsanın fiyatı
 #                    karşılaştırılır ve sinyaldeki giriş/stop/TP seviyeleri aradaki farkla KAYDIRILIR
 #                    (ör. Binance 73200, CFD brokerı 73400 -> giriş 73200 ise 73400 kullanılır).
 #                    Boş = kapalı (seviyeler olduğu gibi kullanılır). FX/CFD sinyallerine hiç uygulanmaz.
+#                    Kripto olup olmadığına konunun türü karar verir: kind: crypto konusunda uygulanır,
+#                    kind: fx konusunda hiç uygulanmaz (konu yoksa ya da kind: any ise sinyalin türüne bakılır).
 #   offset_mode      additive = fark kadar topla/çıkar (varsayılan) | ratio = broker/referans oranıyla çarp
 #   max_offset_pct   broker ve referans fiyatı arasındaki fark bu yüzdeyi aşarsa (yanlış sembol, eski fiyat)
 #                    işlem AÇILMAZ ve uyarı gelir (varsayılan 1.0). Referans fiyat alınamazsa da işlem
@@ -255,10 +270,13 @@ brokers:
   #   filling: auto                 # emir doldurma tipi: auto | fok | ioc | return
   #   symbol_map: {XAU: XAUUSD}     # broker sembolleri farklıysa, ör: {XAU: GOLD, ETH: ETHUSD}
   #                                 # (altın broker listesinde GOLD ise mutlaka: symbol_map: {XAU: GOLD})
+  #                                 # Endeksler NAS100 / US30 ya da NAS100.cash gibi adlarla kendiliğinden bulunur;
+  #                                 # brokerda ad farklıysa (US100, USTEC, DJ30...) ekleyin: {NAS100: US100}
   #   # Vantage Raw/ECN hesapta komisyon vardır: lot başına gidiş-dönüş tutarı yazın (ör: 6 USD);
   #   # Standard STP hesapta komisyon yoktur, boş bırakın.
   #   commission_per_lot: 6
-  #   no_hedge: true                # aynı varlıkta ters yönlü işlem açma (hedging yasağı / netting hesap)
+  #   no_hedge: true                # aynı sembolde ters yönlü işlem açma (hedging yasağı / netting hesap):
+  #                                 # EURUSD long açıkken EURUSD short açılmaz; EURJPY short açılır
   #   daily_loss_limit_pct: 3       # prop firma günlük zarar limitinin altında tutun, ör. 3 (boş = genel risk.daily_loss_limit_pct)
   #   allowed_assets: []
   #   risk_multiplier: 1.0

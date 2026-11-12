@@ -84,12 +84,14 @@ async def test_optional_connect_failure_does_not_stop_bot_and_warns_once(db) -> 
         await engine.stop()
 
 
-async def test_required_broker_failure_unchanged(db) -> None:
+async def test_required_broker_failure_is_an_alarm_and_is_retried_in_the_background(db) -> None:
     tm = FakeBroker("tickmill", fail={"connect": BrokerError("x")})
-    engine, notifier = await make(db, [FakeBroker("binance"), tm])
+    engine, notifier = await make(db, [FakeBroker("binance"), tm], retry_sec=3600)
     try:
         assert any("tickmill bağlanamadı" in t for t in notifier.texts(Severity.ERROR))
-        assert engine.optional_down == {} and not engine._tasks      # no background retry for normal brokers
+        assert engine.optional_down == {}                    # an alarm, not the optional broker's short warning
+        # ops finding 4: a required broker is retried in the background too (it used to stay down until a restart)
+        assert [t.get_name() for t in engine._tasks] == ["retry-tickmill"]
     finally:
         await engine.stop()
 

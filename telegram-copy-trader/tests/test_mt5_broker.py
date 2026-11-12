@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import ctypes
 import fnmatch
 from collections.abc import Callable
 from datetime import UTC, datetime
@@ -41,10 +42,60 @@ def make_symbol(name: str, **kw: Any) -> SimpleNamespace:
     return SimpleNamespace(**base)
 
 
-class FakeMT5:
-    """Just enough of MetaTrader5 to exercise the adapter: orders, positions, deals, history."""
+# order_send request fields in the order the real package (MetaTrader5 5.0.x, _core.pyd) reads them, with the
+# only Python type it accepts for each. A missing key counts as 0 / empty.
+REQUEST_FIELDS: tuple[tuple[str, type], ...] = (
+    ("action", int), ("magic", int), ("order", int), ("symbol", str), ("volume", float), ("price", float),
+    ("stoplimit", float), ("sl", float), ("tp", float), ("deviation", int), ("type", int), ("type_filling", int),
+    ("type_time", int), ("expiration", int), ("comment", str), ("position", int), ("position_by", int),
+)
+MAX_TEXT = 29       # symbol / comment: the package refuses a longer str
+ZERO_TICK = dict(time=0, bid=0.0, ask=0.0, last=0.0, volume=0, time_msc=0, flags=0, volume_real=0.0)
 
-    def __init__(self, *, margin_mode: int = MT5.ACCOUNT_MARGIN_MODE_RETAIL_HEDGING) -> None:
+# The package's order_send refuses a positional request that arrives together with ANY keyword dict, even an
+# empty one: None, last_error (-2, "Unnamed arguments not allowed"), nothing is sent. That is how every order
+# of the first live signal failed: the adapter called func(*args, **kwargs) with empty kwargs. A Python
+# function cannot tell f(request) from f(request, **{}); a C function can (no keyword dict vs. an empty one).
+# The strict fake therefore exposes order_send as a real builtin function (METH_VARARGS | METH_KEYWORDS, built
+# with ctypes) that applies the package's rule.
+_C_FUNCTION = ctypes.PYFUNCTYPE(ctypes.py_object, ctypes.c_void_p, ctypes.py_object, ctypes.c_void_p)
+
+
+class _PyMethodDef(ctypes.Structure):
+    _fields_ = [("ml_name", ctypes.c_char_p), ("ml_meth", ctypes.c_void_p), ("ml_flags", ctypes.c_int),
+                ("ml_doc", ctypes.c_char_p)]
+
+
+# PyCFunction_NewEx(method table, self, module) through a handle of our own: ctypes.pythonapi.PyCFunction_NewEx
+# is ONE shared object, and another module that sets its argtypes differently would break this one (or be broken).
+_new_builtin = ctypes.PYFUNCTYPE(ctypes.py_object, ctypes.c_void_p, ctypes.py_object, ctypes.py_object)(
+    ("PyCFunction_NewEx", ctypes.pythonapi))
+
+
+class FakeMT5:
+    """Just enough of MetaTrader5 to exercise the adapter: orders, positions, deals, history.
+
+    ``terminal`` is what terminal_info() answers (connected / trade_allowed / tradeapi_disabled); order_send
+    honours it like a terminal: Python-API trading disabled -> None with last_error -8, Algo Trading off ->
+    retcode 10027.
+
+    ``strict=True`` also makes the fake as unforgiving as the real package where the lenient default hid bugs:
+      * a symbol that was not in Market Watch answers its first ``cold_ticks`` tick requests after
+        symbol_select with an all-zero tick (no quote yet), not with a price;
+      * order_send checks its argument types / lengths like the package (see REQUEST_FIELDS) and answers None
+        with last_error (-2, 'Invalid "<key>" argument') instead of accepting anything;
+      * order_send is a real builtin function that refuses a positional request passed together with a keyword
+        dict, even an empty one (see _C_FUNCTION): None with last_error (-2, "Unnamed arguments not allowed").
+    The default stays lenient: older tests build requests and symbols the quick way."""
+
+    def __init__(self, *, margin_mode: int = MT5.ACCOUNT_MARGIN_MODE_RETAIL_HEDGING, strict: bool = False) -> None:
+        self.strict = strict
+        self.cold_ticks = 2                     # strict: all-zero ticks after symbol_select of a hidden symbol
+        self._cold: dict[str, int] = {}
+        self.terminal = SimpleNamespace(
+            connected=True, trade_allowed=True, tradeapi_disabled=False, dlls_allowed=False, build=5430,
+            company="Fake Broker Ltd", name="Fake MetaTrader 5",
+        )
         self.calls: list[tuple[str, tuple[Any, ...], dict[str, Any]]] = []
         self.sent: list[dict[str, Any]] = []
         self.hooks: list[Callable[[dict[str, Any]], int | None]] = []
@@ -69,6 +120,8 @@ class FakeMT5:
         self.last = (MT5.RES_S_OK, "Success")
         self.init_count = 0
         self._next = 1000
+        if strict:
+            self.order_send = self._order_send_builtin()   # type: ignore[method-assign]
 
     # -- helpers ------------------------------------------------------------
     def _id(self) -> int:
@@ -142,7 +195,7 @@ class FakeMT5:
 
     def terminal_info(self) -> Any:
         self._log("terminal_info")
-        return SimpleNamespace(trade_allowed=True)
+        return self.terminal
 
     def symbol_info(self, name: str) -> Any:
         self._log("symbol_info", name)
@@ -150,12 +203,17 @@ class FakeMT5:
 
     def symbol_info_tick(self, name: str) -> Any:
         self._log("symbol_info_tick", name)
+        if self._cold.get(name, 0) > 0:         # strict: just added to Market Watch, no quote has arrived yet
+            self._cold[name] -= 1
+            return SimpleNamespace(**ZERO_TICK)
         return self.ticks.get(name)
 
     def symbol_select(self, name: str, enable: bool) -> bool:
         self._log("symbol_select", name, enable)
         s = self.symbols.get(name)
         if s is not None:
+            if self.strict and enable and not s.visible:
+                self._cold[name] = self.cold_ticks
             s.visible = True
         return s is not None
 
@@ -193,9 +251,60 @@ class FakeMT5:
         return tuple(d for d in self.deals
                      if (ticket is None or d.order == ticket) and (position is None or d.position_id == position))
 
+    def request_problem(self, request: Any) -> str | None:
+        """The package's own argument check: the message it puts into last_error, or None when acceptable."""
+        if not isinstance(request, dict):
+            return "Invalid arguments"
+        for key, kind in REQUEST_FIELDS:
+            if key not in request:
+                continue
+            value = request[key]
+            ok = isinstance(value, kind) and (kind is not str or len(value) <= MAX_TEXT)
+            if not ok:
+                return f'Invalid "{key}" argument'
+        return None
+
+    def _order_send_builtin(self) -> Any:
+        """order_send as a builtin function object with the package's calling rule (see _C_FUNCTION)."""
+        python_order_send = self.order_send     # the Python implementation below
+
+        def impl(_self: Any, args: tuple[Any, ...], kwargs_ptr: Any) -> Any:
+            try:
+                if kwargs_ptr:                  # called with a keyword dict (even an empty one)
+                    kwargs = ctypes.cast(kwargs_ptr, ctypes.py_object).value
+                    if args:
+                        self.calls.append(("order_send", args, dict(kwargs)))
+                        self.last = (-2, "Unnamed arguments not allowed")
+                        return None
+                    return python_order_send(dict(kwargs))      # order_send(action=..., symbol=..., ...)
+                if len(args) != 1:
+                    self.calls.append(("order_send", args, {}))
+                    self.last = (-2, "Invalid arguments")
+                    return None
+                return python_order_send(args[0])
+            except BaseException as exc:  # noqa: BLE001 - an exception must never leave a ctypes callback
+                self.last = (-1, f"fake order_send raised {exc!r}")
+                return None
+
+        callback = _C_FUNCTION(impl)
+        method = _PyMethodDef(b"order_send", ctypes.cast(callback, ctypes.c_void_p), 0x0001 | 0x0002,
+                              b"strict fake of MetaTrader5.order_send")
+        # the builtin keeps the callback and its method table alive (they are its "self")
+        return _new_builtin(ctypes.addressof(method), (callback, method), None)
+
     def order_send(self, request: dict[str, Any]) -> Any:
         self._log("order_send", request)
+        if self.strict:
+            problem = self.request_problem(request)
+            if problem is not None:             # refused by the package itself: nothing reaches the terminal
+                self.last = (-2, problem)
+                return None
+        if self.terminal.tradeapi_disabled:     # the terminal refuses trading through the Python API
+            self.last = (-8, "Auto-Trading using Python API disabled in Terminal")
+            return None
         self.sent.append(dict(request))
+        if not self.terminal.trade_allowed:     # Algo Trading button off
+            return self._result(10027, comment="AutoTrading disabled by client")
         for hook in self.hooks:
             rc = hook(request)
             if rc is not None:

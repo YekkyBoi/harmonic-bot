@@ -57,9 +57,10 @@ logger = logging.getLogger(__name__)
 
 T = TypeVar("T")
 
-# Contract prefixes used by exchanges for low-priced coins (1000PEPE = 1000 PEPE).
+# Contract prefixes used by exchanges for low-priced coins (1000PEPE = 1000 PEPE, 1MBABYDOGE = 1000000 BABYDOGE).
 _MULTIPLIER_PREFIXES = (1000, 10000, 100000, 1000000)
 _PREFIX_RE = re.compile(r"^(1000000|100000|10000|1000)([A-Z0-9]+)$")
+_PREFIX_1M_RE = re.compile(r"^1M([A-Z][A-Z0-9]*)$")     # only before a letter: "1MBABYDOGE", not "1M0..."
 _STABLE_QUOTES = ("USDT", "USDC")
 _FAMILIES = ("binance", "bybit", "okx", "bitget")
 _CLIENT_ID_MAX = {"binance": 36, "bybit": 36, "okx": 32, "bitget": 40, "generic": 32}
@@ -70,15 +71,34 @@ _ALREADY_SET_RE = re.compile(
     r"not modified|no need to change|already|is the same|unchanged|110043|110026|-4046", re.IGNORECASE
 )
 _CANCELED = ("canceled", "cancelled", "expired", "rejected")
-# set_leverage refused because the value is above the symbol's maximum (binance -4028, bybit 10001...).
-_LEVERAGE_INVALID_RE = re.compile(r"-4028|leverage .*not valid|leverage.*(exceed|too (high|large)|invalid|out of range)|110013|10001", re.IGNORECASE)
+# set_leverage refused because the value is too high for the symbol or for the account (bybit 110013 / 10001...).
+# binance: -4028 invalid, -4209 / -4208 above the symbol's maximum, -4202 / -4203 / -4205 / -4206 / -4403 account
+# limits (verification level, account age, country). All of them are answered the same way: use less.
+_LEVERAGE_INVALID_RE = re.compile(
+    r"-4028|-4209|-4208|-4202|-4203|-4205|-4206|-4403|leverage .*not valid|max(imum)? leverage"
+    r"|leverage.*(exceed|too (high|large)|invalid|out of range|can only|greater than)|more than \d+x leverage"
+    r"|110013|10001", re.IGNORECASE)
+# The same refusal for reasons of the ACCOUNT (not of this coin): the limit then holds for every symbol.
+_LEVERAGE_ACCOUNT_RE = re.compile(r"-4202|-4203|-4205|-4206|-4403")
+# The limit named in the refusal: "The max leverage of Symbol is 20x", "leverage can only up to 10x in your
+# region", "More than 20x leverage is available ...", "a maximum leverage of 20", "cannot exceed 20 when ...".
+_LEVERAGE_HINT_RE = re.compile(
+    r"(?<![\d.\-])(\d{1,3})\s*x\b|(?:leverage of|leverage is|limit is|exceed|up to|over)\s+(\d{1,3})(?![\d.])",
+    re.IGNORECASE)
 _LEVERAGE_STEPS = (125, 100, 75, 50, 40, 25, 20, 15, 10, 8, 5, 4, 3, 2, 1)
+_LEVERAGE_INFO_TTL_MS = 6 * 3600 * 1000     # leverage brackets / limits learned from refusals are re-read after this
+_CLOCK_RESYNC_MS = 30 * 60 * 1000           # the offset to the exchange clock is measured again after this
+_LOST_ORDER_MISSES = 3                      # "not found" this many passes in a row: the order never reached the venue
+_SHRUNK_NOTE_TTL_MS = 2 * 60 * 1000         # a size cut for margin by size_position is "the same order" this long
+_HEALTH_TIMEOUT_SEC = 20.0
 _TP_PLACE_ATTEMPTS = 3
 # pos.error is a " | "-joined list of notes; these markers find the notes that clear themselves.
 _ERR_SEP = " | "
 _STALE_MARK = "eski stop emri"
 _UNCONFIRMED_MARK = "sonucu okunamadı"
 _CRITICAL_MARK = "KRİTİK"
+_SYNC_MARK = "durum güncellenemedi"
+_UNSURE_MARK = "doğrulanamıyor"
 
 
 # --------------------------------------------------------------------------- #
@@ -144,14 +164,26 @@ def _lookup_symbol_map(symbol_map: dict[str, str], keys: Iterable[str | None]) -
     return None
 
 
-def _base_variants(base: str) -> list[tuple[str, float]]:
-    """(market base, price multiplier) candidates: PEPE -> 1000PEPE (x1000), 1000PEPE -> PEPE (x0.001)."""
-    out = [(base, 1.0)]
-    out += [(f"{p}{base}", float(p)) for p in _MULTIPLIER_PREFIXES]
+def _split_prefix(base: str) -> tuple[float, str] | None:
+    """(contract multiplier, coin) of a prefixed name: 1000PEPE -> (1000, PEPE), 1MBABYDOGE -> (1000000, BABYDOGE)."""
+    m = _PREFIX_1M_RE.match(base)
+    if m:
+        return 1_000_000.0, m.group(1)
     m = _PREFIX_RE.match(base)
     if m:
-        out.append((m.group(2), 1.0 / float(m.group(1))))
-    return out
+        return float(m.group(1)), m.group(2)
+    return None
+
+
+def _base_variants(base: str) -> list[tuple[str, float]]:
+    """(market base, price multiplier) candidates: PEPE -> 1000PEPE (x1000), 1000PEPE -> PEPE (x0.001),
+    BABYDOGE -> 1MBABYDOGE (x1000000), 1000000BABYDOGE -> 1MBABYDOGE (x1). The name as written comes first."""
+    split = _split_prefix(base)
+    own, coin = split if split else (1.0, base)
+    names = [(coin, 1.0)] if split else []
+    names += [(f"{p}{coin}", float(p)) for p in _MULTIPLIER_PREFIXES]
+    names.append((f"1M{coin}", 1_000_000.0))
+    return [(base, 1.0)] + [(name, mult / own) for name, mult in names if name != base]
 
 
 def find_market(
@@ -287,6 +319,12 @@ def _fmt(x: float | None) -> str:
     return format(Decimal(f"{x:.10g}").normalize(), "f")
 
 
+def _venue_code(err: BaseException) -> str | None:
+    """The exchange's own error code in a ccxt error text ('binanceusdm {"code":-2015,"msg":...}' -> "-2015")."""
+    m = re.search(r'"code"\s*:\s*"?(-?\d+)', str(err))
+    return m.group(1) if m else None
+
+
 def _join_error(old: str | None, msg: str) -> str:
     """Add ``msg`` to an existing error text (once)."""
     if not old:
@@ -364,6 +402,14 @@ class CcxtBroker(Broker):
         self._locks: dict[str, asyncio.Lock] = {}
         self._known_order_ids: set[str] = set()
         self._margin_mode_set: set[str] = set()
+        self._leverage_tiers: dict[str, Any] | None = None   # ccxt fetch_leverage_tiers() result
+        self._leverage_tiers_ms = 0                          # when it was read
+        self._set_leverage: dict[str, int] = {}              # leverage really accepted by the venue, per symbol
+        # limits learned from refused set_leverage calls: symbol (or "*" = whole account) -> (leverage, when)
+        self._leverage_caps: dict[str, tuple[int, int]] = {}
+        # sizes that size_position cut down for margin: symbol -> (quantity, when); read by open_position
+        self._margin_shrunk: dict[str, tuple[float, int]] = {}
+        self._clock_synced_ms = 0
         self.fill_poll_attempts = 6
         self.fill_poll_delay = 0.5
         self.retry_delay = 1.0
@@ -373,10 +419,13 @@ class CcxtBroker(Broker):
         klass = getattr(ccxt_async, self.cfg.exchange, None)
         if klass is None:
             raise BrokerError(f"{self.name}: bilinmeyen ccxt borsası '{self.cfg.exchange}'.")
-        params: dict[str, Any] = {
-            "enableRateLimit": True,
-            "options": {"defaultType": self.cfg.market_type, **self.cfg.options},
-        }
+        options: dict[str, Any] = {"defaultType": self.cfg.market_type}
+        if self.cfg.exchange.lower().startswith("binance"):
+            # Binance refuses signed requests whose timestamp is off (-1021): do not trust the machine's clock,
+            # measure the offset to the exchange (see _sync_clock). An explicit value in the config wins.
+            options["adjustForTimeDifference"] = True
+        options.update(self.cfg.options)
+        params: dict[str, Any] = {"enableRateLimit": True, "options": options}
         for key, value in (("apiKey", self.cfg.api_key), ("secret", self.cfg.secret), ("password", self.cfg.password)):
             if value:
                 params[key] = value
@@ -399,6 +448,9 @@ class CcxtBroker(Broker):
             except cx.BaseError as e:
                 raise BrokerError(f"{self.name}: demo işlem açılamadı: {_short(e)}") from e
             logger.info("%s: demo trading enabled (orders go to the exchange's demo environment)", self.name)
+        # ccxt measures the clock offset only inside load_markets, AFTER its first signed request (the currency
+        # list): with a clock that is off that request already fails. So measure it first.
+        await self._sync_clock(force=True)
         await self._ccxt("piyasa bilgileri yüklenemedi", self.exchange.load_markets())
         if self.cfg.api_key and self.cfg.secret:
             # Catch wrong/expired keys at startup instead of on the first signal.
@@ -427,6 +479,25 @@ class CcxtBroker(Broker):
 
     def _lock(self, symbol: str) -> asyncio.Lock:
         return self._locks.setdefault(symbol, asyncio.Lock())
+
+    async def _sync_clock(self, *, force: bool = False) -> bool:
+        """binance: (re)measure the offset between this machine's clock and the exchange; signed requests are
+        stamped with it. Done at connect, every ``_CLOCK_RESYNC_MS`` and after a "timestamp outside recvWindow"
+        answer (a clock that drifts, or that Windows corrects, makes an old offset wrong). True = measured now."""
+        ex = self.exchange
+        if self._family != "binance" or not (getattr(ex, "options", None) or {}).get("adjustForTimeDifference"):
+            return False
+        now = self._now_ms()
+        if not force and now - self._clock_synced_ms < _CLOCK_RESYNC_MS:
+            return False
+        try:
+            await ex.load_time_difference()
+        except Exception as e:      # best effort: the old offset stays
+            logger.warning("%s: could not measure the clock offset to the exchange: %s", self.name, e)
+            return False
+        self._clock_synced_ms = now
+        logger.info("%s: clock offset to the exchange: %s ms", self.name, ex.options.get("timeDifference"))
+        return True
 
     async def _ccxt(self, what: str, awaitable: Awaitable[T]) -> T:
         try:
@@ -537,7 +608,14 @@ class CcxtBroker(Broker):
 
     # ------------------------------------------------------------------ account
     async def _balance_figures(self) -> tuple[float | None, float | None]:
-        bal = await self._ccxt("bakiye alınamadı", self.exchange.fetch_balance())
+        await self._sync_clock()        # only when the last measurement is old
+        try:
+            bal = await self._ccxt("bakiye alınamadı", self.exchange.fetch_balance())
+        except BrokerError as e:
+            # binance -1021 (timestamp outside the window): our clock offset is stale; measure it and ask once more.
+            if not isinstance(e.__cause__, cx.InvalidNonce) or not await self._sync_clock(force=True):
+                raise
+            bal = await self._ccxt("bakiye alınamadı", self.exchange.fetch_balance())
         ccy = self.cfg.quote_currency.upper()
         acct = bal.get(ccy) or {}
         equity, free = num(acct.get("total")), num(acct.get("free"))
@@ -649,40 +727,149 @@ class CcxtBroker(Broker):
             allow_min_qty_round_up=risk.allow_min_qty_round_up,
         )
         free = await self.get_free_margin()
-        leverage, margin = choose_leverage(
-            notional=result.notional,
-            free_margin=free,
-            stop_distance_frac=abs(entry_price - stop_loss) / entry_price,
-            preferred=self.cfg.leverage,
-            max_leverage=self.cfg.max_leverage,
-            venue_max_leverage=symbol.max_leverage,
-            max_margin_usage_pct=risk.max_margin_usage_pct,
-            liquidation_cap=self.cfg.margin_mode == "isolated",
-        )
+        frac = abs(entry_price - stop_loss) / entry_price
+        ladder = await self._leverage_ladder(symbol, frac)
+
+        def pick(notional: float) -> tuple[int, float]:
+            return choose_leverage(
+                notional=notional, free_margin=free, stop_distance_frac=frac, preferred=self.cfg.leverage,
+                max_leverage=self.cfg.max_leverage, venue_max_leverage=self._ladder_leverage(ladder, notional),
+                max_margin_usage_pct=risk.max_margin_usage_pct, liquidation_cap=self.cfg.margin_mode == "isolated",
+            )
+
+        self._margin_shrunk.pop(symbol.broker_symbol, None)
+        try:
+            leverage, margin = pick(result.notional)
+        except SizingError as err:
+            # The margin does not fit at the highest leverage a position of this size may use: open the largest
+            # size that fits (less than the target risk, never more) instead of skipping the trade.
+            result = self._shrink_to_margin(symbol, result, entry_price, free, ladder, err)
+            leverage, margin = pick(result.notional)
+            # open_position marks the position it opens with this size ("size_capped"): the engine then tells
+            # the owner about the smaller risk even when execution reports are switched off.
+            self._margin_shrunk[symbol.broker_symbol] = (result.quantity, self._now_ms())
         return result.model_copy(update={"leverage": float(leverage), "margin_required": margin})
+
+    def _loss_per_unit(self, symbol: SymbolInfo, entry: float, stop: float) -> float:
+        """Money lost at the stop per 1 quantity (the formula of compute_linear_size)."""
+        loss = abs(entry - stop) * symbol.contract_size
+        if self._risk().include_fees_in_risk:
+            loss += self._taker_fee(symbol) * (entry + stop) * symbol.contract_size
+        return loss
+
+    def _shrink_to_margin(self, symbol: SymbolInfo, result: SizingResult, entry_price: float, free: float,
+                          ladder: list[tuple[int, float | None]], err: SizingError) -> SizingResult:
+        """``result`` cut down to the largest quantity whose margin fits ``max_margin_usage_pct`` of the free
+        balance, with a warning naming the planned size, the new size and the risk it carries. Raises
+        SizingError (nothing is opened) when not even the smallest order fits."""
+        allowed = free * self._risk().max_margin_usage_pct / 100.0
+        unit = symbol.contract_size * entry_price
+        if not (math.isfinite(allowed) and allowed > 0 and unit > 0 and result.quantity > 0):
+            raise err
+        value, lev = self._largest_fit(ladder, allowed)
+        qty = min(result.quantity, floor_to_step(value / unit * 0.999, symbol.qty_step))
+        if qty <= 0 or qty < symbol.min_qty or (symbol.min_notional and qty * unit < symbol.min_notional * (1 - 1e-9)):
+            smallest = max(symbol.min_qty, symbol.qty_step)
+            if symbol.min_notional:
+                smallest = max(smallest, symbol.min_notional / unit)
+            raise SizingError(
+                f"Yetersiz teminat: en küçük emir (~{smallest * unit:.2f} {symbol.quote_asset}) için bile "
+                f"{self._ladder_leverage(ladder, smallest * unit)}x kaldıraçla ~"
+                f"{smallest * unit / self._ladder_leverage(ladder, smallest * unit):.2f} teminat gerekiyor; "
+                f"kullanılabilir {allowed:.2f} (serbest bakiye {free:.2f}). İşlem açılmadı."
+            ) from err
+        ratio = qty / result.quantity
+        loss = result.est_loss_at_sl * ratio
+        note = (f"Teminat yetmediği için pozisyon küçültüldü: planlanan {_fmt(result.quantity)} yerine {_fmt(qty)} "
+                f"açılıyor; stopta kayıp ~{loss:.2f} (hedef {result.risk_amount:.2f}). Serbest bakiye {free:.2f}, "
+                f"bu büyüklükte kullanılabilen en yüksek kaldıraç {lev}x.")
+        return result.model_copy(update={
+            "quantity": qty, "notional": qty * unit, "est_loss_at_sl": loss, "warnings": [*result.warnings, note],
+        })
+
+    @staticmethod
+    def _ladder_leverage(ladder: list[tuple[int, float | None]], notional: float) -> int:
+        """Highest leverage a position worth ``notional`` may use."""
+        for lev, top in ladder:
+            if top is None or notional <= top:
+                return lev
+        return ladder[-1][0]
+
+    @staticmethod
+    def _largest_fit(ladder: list[tuple[int, float | None]], allowed_margin: float) -> tuple[float, int]:
+        """(largest position value whose margin fits ``allowed_margin``, the leverage it needs)."""
+        best, best_lev = 0.0, ladder[-1][0]
+        for lev, top in ladder:
+            value = allowed_margin * lev if top is None else min(allowed_margin * lev, top)
+            if value > best:
+                best, best_lev = value, lev
+        return best, best_lev
+
+    async def _leverage_ladder(self, symbol: SymbolInfo, stop_frac: float) -> list[tuple[int, float | None]]:
+        """[(usable leverage, largest position value the venue allows at it; None = no limit)], highest leverage
+        first, never empty. Limits: config, liquidation beyond the stop (isolated only), the venue's maximum
+        (binance: the account's leverage brackets, which allow less for larger positions) and what refused
+        set_leverage calls taught us."""
+        cap = max(1, int(self.cfg.max_leverage))
+        if self.cfg.margin_mode == "isolated":   # cross: liquidation depends on the whole account
+            cap = min(cap, max(1, math.floor(1 / (stop_frac * 1.5 + 0.005))))
+        if symbol.max_leverage and symbol.max_leverage >= 1:
+            cap = min(cap, int(symbol.max_leverage))
+        learned = self._learned_cap(symbol.broker_symbol)
+        if learned:
+            cap = min(cap, learned)
+        tiers = await self._tiers(symbol.broker_symbol)
+        return [(max(1, min(cap, int(lev))), top) for lev, top in tiers] or [(cap, None)]
+
+    def _learned_cap(self, symbol: str) -> int | None:
+        """Leverage limit learned from refused set_leverage calls (for the symbol or the whole account)."""
+        now = self._now_ms()
+        caps = [lev for lev, at in (self._leverage_caps.get(key, (0, 0)) for key in (symbol, "*"))
+                if lev >= 1 and now - at < _LEVERAGE_INFO_TTL_MS]
+        return min(caps) if caps else None
+
+    async def _tiers(self, symbol: str) -> list[tuple[float, float | None]]:
+        """The symbol's leverage brackets as (maximum leverage, largest position value) pairs, highest leverage
+        first; [] = unknown. ccxt's binance markets carry no leverage limit, so it is read from the account's
+        leverage brackets (one request for all symbols, repeated every few hours)."""
+        ex = self.exchange
+        if self._family != "binance" or not (getattr(ex, "has", {}) or {}).get("fetchLeverageTiers"):
+            return []
+        now = self._now_ms()
+        if self._leverage_tiers is None or now - self._leverage_tiers_ms >= _LEVERAGE_INFO_TTL_MS:
+            try:
+                self._leverage_tiers = await ex.fetch_leverage_tiers() or {}
+                self._leverage_tiers_ms = now
+            except Exception as e:   # best effort: without it the maximum is found by trial (see _prepare_symbol)
+                logger.warning("%s: leverage brackets unavailable (%s); the symbol maximum is found by trial",
+                               self.name, e)
+                if self._leverage_tiers is None:
+                    return []
+        out: list[tuple[float, float | None]] = []
+        for tier in self._leverage_tiers.get(symbol) or []:
+            lev = num(tier.get("maxLeverage"))
+            if lev and lev >= 1:
+                out.append((lev, num(tier.get("maxNotional")) or None))
+        return sorted(out, key=lambda t: -t[0])
 
     async def _resolve_leverage(self, req: OpenRequest, qty: float, ref_price: float) -> int:
         frac = abs(ref_price - req.stop_loss) / ref_price
-        caps = [max(1, self.cfg.max_leverage)]
-        if self.cfg.margin_mode == "isolated":   # cross: liquidation depends on the whole account
-            caps.append(max(1, math.floor(1 / (frac * 1.5 + 0.005))))
-        if req.symbol.max_leverage:
-            caps.append(max(1, int(req.symbol.max_leverage)))
+        notional = qty * req.symbol.contract_size * ref_price
+        cap = self._ladder_leverage(await self._leverage_ladder(req.symbol, frac), notional)
         if req.leverage:
             lev = math.ceil(req.leverage - 1e-9)
         else:
-            notional = qty * req.symbol.contract_size * ref_price
             lev, _ = choose_leverage(
                 notional=notional,
                 free_margin=await self.get_free_margin(),
                 stop_distance_frac=frac,
                 preferred=self.cfg.leverage,
                 max_leverage=self.cfg.max_leverage,
-                venue_max_leverage=req.symbol.max_leverage,
+                venue_max_leverage=cap,
                 max_margin_usage_pct=self._risk().max_margin_usage_pct,
                 liquidation_cap=self.cfg.margin_mode == "isolated",
             )
-        return max(1, min([lev, *caps]))
+        return max(1, min(lev, cap))
 
     async def _prepare_symbol(self, symbol: str, leverage: int, side: Side,
                               isolated_safe_leverage: int | None = None) -> list[str]:
@@ -694,6 +881,7 @@ class CcxtBroker(Broker):
         existing mode, so the leverage chosen for cross could liquidate it before the stop."""
         warnings: list[str] = []
         fam, mode = self._family, self.cfg.margin_mode
+        mode_unsure = False
         key = symbol   # once per symbol and session (bybit UTA: the call is account-wide)
         if (fam != "okx" and key not in self._margin_mode_set
                 and (getattr(self.exchange, "has", {}) or {}).get("setMarginMode", True)):
@@ -710,6 +898,7 @@ class CcxtBroker(Broker):
                     # Not a stop-safety issue: liquidation stays beyond the stop in both modes.
                     logger.warning("%s: set_margin_mode(%s, %s) failed: %s", self.name, mode, symbol, e)
                     warnings.append(f"Marjin modu '{mode}' ayarlanamadı: {_short(e, 120)}")
+                    mode_unsure = True
                     if mode == "cross" and isolated_safe_leverage is not None and leverage > isolated_safe_leverage:
                         warnings.append(
                             f"Coin izole kalmış olabilir: kaldıraç {leverage}x yerine {isolated_safe_leverage}x "
@@ -723,25 +912,71 @@ class CcxtBroker(Broker):
                 lev_params["posSide"] = side.value
         elif fam == "bitget" and self._hedged and mode == "isolated":
             lev_params["holdSide"] = side.value
-        # The exchange's per-symbol maximum is often unknown up front (e.g. 125x BTC, 50x for many
-        # alts): when the wanted leverage is refused, step down to the next common level.
-        candidates = [leverage] + [x for x in _LEVERAGE_STEPS if x < leverage]
+        # The maximum for this symbol and this account is not always known up front (a new or restricted
+        # account may be limited to 20x whatever the coin allows). Every "too high" answer is treated alike:
+        # jump to the limit named in the message when there is one, else to the next common level.
+        lev: int | None = leverage
         last_error: Exception | None = None
-        for lev in candidates:
+        account_limit: int | None = None
+        network_retry = True
+        while lev is not None and lev >= 1:
             try:
                 await self.exchange.set_leverage(lev, symbol, lev_params)
             except cx.NoChange:
                 pass
+            except cx.NetworkError as e:             # no answer (timeout, rate limit...): not a refusal
+                last_error = e
+                if network_retry:
+                    network_retry = False            # setting a leverage twice is harmless
+                    if isinstance(e, cx.InvalidNonce):
+                        await self._sync_clock(force=True)
+                    await self._sleep(self.retry_delay)
+                    continue
+                break
             except cx.BaseError as e:
-                if not _ALREADY_SET_RE.search(str(e)):
+                text = str(e)
+                if not _ALREADY_SET_RE.search(text):
                     last_error = e
-                    if _LEVERAGE_INVALID_RE.search(str(e)):
+                    if _LEVERAGE_INVALID_RE.search(text):
+                        hints = [int(h) for pair in _LEVERAGE_HINT_RE.findall(text) for h in pair if h and 1 <= int(h) < lev]
+                        lev = max(hints) if hints else next((x for x in _LEVERAGE_STEPS if x < lev), None)
+                        if _LEVERAGE_ACCOUNT_RE.search(text):
+                            account_limit = lev
                         continue
-                    raise BrokerError(f"{self.name}: kaldıraç {lev}x ayarlanamadı: {_short(e)}") from e
+                    break                            # any other refusal: see what the symbol has right now
+            now = self._now_ms()
             if lev != leverage:
-                warnings.append(f"Kaldıraç {leverage}x yerine {lev}x (bu coinde borsanın izin verdiği en yüksek).")
+                warnings.append(f"Kaldıraç {leverage}x yerine {lev}x (borsanın bu coin / hesap için izin verdiği en yüksek).")
+                self._leverage_caps[symbol] = (lev, now)         # later trades are sized with it from the start
+                if account_limit is not None:
+                    self._leverage_caps["*"] = (max(lev, account_limit), now)
+            self._set_leverage[symbol] = lev
             return warnings
-        raise BrokerError(f"{self.name}: kaldıraç ayarlanamadı: {_short(last_error)}")
+        # No leverage could be set. The symbol still HAS a leverage on the exchange: trade with that one when
+        # it is known and safe (cross: any; isolated: not above the wanted one, whose liquidation is beyond the
+        # stop) instead of giving the trade up. The margin check after this call sizes the position to it.
+        current = await self._current_leverage(symbol)
+        if current is not None and (current <= leverage or (mode == "cross" and not mode_unsure)):
+            logger.warning("%s: set_leverage on %s refused (%s); using the symbol's current %sx",
+                           self.name, symbol, last_error, current)
+            warnings.append(f"Kaldıraç ayarlanamadı ({_short(last_error or Exception(), 100)}); borsadaki mevcut "
+                            f"kaldıraç {current}x ile devam edildi.")
+            self._set_leverage[symbol] = current
+            return warnings
+        raise BrokerError(f"{self.name}: kaldıraç ayarlanamadı: {_short(last_error or Exception())}")
+
+    async def _current_leverage(self, symbol: str) -> int | None:
+        """The leverage the symbol has on the venue right now (binance: symbol configuration). None = unknown."""
+        ex = self.exchange
+        if self._family != "binance" or not (getattr(ex, "has", {}) or {}).get("fetchLeverages"):
+            return None
+        try:
+            info = (await ex.fetch_leverages([symbol]) or {}).get(symbol) or {}
+        except Exception as e:      # read-only helper: a failure only means "unknown"
+            logger.warning("%s: current leverage of %s unreadable: %s", self.name, symbol, e)
+            return None
+        lev = num(info.get("longLeverage")) or num(info.get("shortLeverage"))
+        return int(lev) if lev and lev >= 1 else None
 
     # ------------------------------------------------------------------ order lookups
     async def _fetch_order(self, order_id: str, symbol: str, kind: str, since: int | None = None) -> dict[str, Any]:
@@ -771,6 +1006,28 @@ class CcxtBroker(Broker):
                 if str(o.get("id")) == str(order_id):
                     return o
             raise cx.OrderNotFound(f"bitget plan order {order_id} not found")
+        if fam == "binance" and trigger:
+            try:
+                return await ex.fetch_order(order_id, symbol, {"trigger": True})
+            except cx.OrderNotFound as missing:
+                # Binance has answered -2013 for conditional orders that are live or just completed: look the id
+                # up in the conditional-order history (GET allAlgoOrders from this algoId on) before believing it.
+                fetch_history = getattr(ex, "fetch_orders", None)
+                if fetch_history is None:
+                    raise
+                try:
+                    history = await fetch_history(symbol, None, 10, {"trigger": True, "algoId": order_id})
+                except cx.OrderNotFound:
+                    raise missing from None
+                except cx.OperationFailed:
+                    raise                       # no answer: unknown, the caller asks again on the next pass
+                except cx.BaseError as e:
+                    logger.warning("%s: conditional order history of %s unreadable: %s", self.name, symbol, e)
+                    raise missing from None
+                for o in history or []:
+                    if str(o.get("id")) == str(order_id):
+                        return o
+                raise
         if fam in ("binance", "okx") or not trigger:
             return await ex.fetch_order(order_id, symbol, {"trigger": True} if trigger else {})
         try:
@@ -784,16 +1041,26 @@ class CcxtBroker(Broker):
         order = await self._fetch_order(order_id, symbol, kind, since)
         state = parse_order_state(order, trigger=kind in ("sl", "tp"))
         if state.status == "filled" and kind in ("sl", "tp") and self._family == "binance" and state.linked_ids:
-            # A triggered binance algo order is "closed" even if its market child was rejected.
+            # A triggered binance algo order reads "closed" whatever became of its market child. Only the child
+            # tells what really executed: it may have been rejected, or have ended early with part of the size.
             try:
                 child = parse_order_state(await self.exchange.fetch_order(state.linked_ids[0], symbol, {}), trigger=False)
-                if child.status == "canceled" and not child.filled:
+            except cx.OperationFailed:
+                raise                           # no answer: book nothing on a guess, read it again next pass
+            except cx.BaseError as e:           # not readable at all: the algo order's own data has to do
+                logger.warning("%s: could not read triggered child %s of %s: %s", self.name, state.linked_ids[0],
+                               order_id, e)
+                return state
+            if child.status == "open":          # the market child is still executing: read it again next time
+                return OrderState("open", child.filled, child.average, state.amount, state.linked_ids, order)
+            if child.status == "canceled":
+                if not child.filled:
                     return OrderState("canceled", 0.0, None, state.amount, state.linked_ids, order)
-                if child.status == "filled":
-                    state.filled = child.filled or state.filled
-                    state.average = child.average or state.average
-            except cx.BaseError as e:
-                logger.debug("%s: could not fetch triggered child %s: %s", self.name, state.linked_ids[0], e)
+                state.filled = child.filled     # ended early: only what it executed is closed
+                state.average = child.average or state.average
+            elif child.status == "filled":
+                state.filled = child.filled or state.filled
+                state.average = child.average or state.average
         return state
 
     def _cancel_param_sets(self, kind: str) -> list[dict[str, Any]]:
@@ -817,6 +1084,11 @@ class CcxtBroker(Broker):
                 await self.exchange.cancel_order(order_id, symbol, params)
                 return True
             except cx.OrderNotFound:
+                # binance has answered "unknown order" for conditional orders that were still live: believe it
+                # only when the order is not among the open conditional orders either (else: retried later).
+                if kind in ("sl", "tp") and await self._is_live_trigger(symbol, str(order_id)) is not False:
+                    raise BrokerError(f"{self.name}: emir iptal edilemedi ({order_id}): borsa emri tanımadı ama "
+                                      f"emir hâlâ açık görünüyor ya da açık emirler okunamadı") from None
                 return False
             except cx.BaseError as e:
                 last = e
@@ -911,6 +1183,9 @@ class CcxtBroker(Broker):
             quantity=qty, stop_loss=sl, take_profits=tps, risk_amount=None, data=data,
         )
         data = pos.data   # pydantic copied the dict
+        shrunk = self._margin_shrunk.pop(symbol, None)
+        if shrunk and abs(shrunk[0] - qty) <= info.qty_step / 2 and 0 <= now - shrunk[1] < _SHRUNK_NOTE_TTL_MS:
+            data["size_capped"] = True      # sized below the target risk because of margin (see size_position)
 
         leverage = await self._resolve_leverage(req, qty, ref_price)
         data["leverage"] = leverage
@@ -924,11 +1199,30 @@ class CcxtBroker(Broker):
                 data.update(attached=True, attached_sl_price=sl,
                             attached_tp_price=tps[0].price if tps else None)
 
+        planned = qty
         async with self._lock(symbol):
+            if not self._hedged:
+                await self._refuse_netting(pos, info)       # before anything is sent or changed on the venue
             frac = abs(ref_price - req.stop_loss) / ref_price
             safe = max(1, math.floor(1 / (frac * 1.5 + 0.005)))
             data["warnings"] += await self._prepare_symbol(symbol, leverage, side, isolated_safe_leverage=safe)
-            entry = await self._create_entry(symbol, req.entry_type, self._order_side(side), qty, limit_price, params, client_id, now)
+            actual = self._set_leverage.get(symbol, leverage)
+            data["leverage"] = actual                       # what the venue accepted, not what was asked for
+            why = None
+            # lower than the size was planned with (req.leverage: what size_position checked the margin at)
+            if actual < max(leverage, math.ceil((req.leverage or 0) - 1e-9)):
+                qty = await self._fit_to_leverage(pos, info, qty, ref_price, actual)
+                why = f"Kaldıraç {actual}x ile teminat yetmediği için" if qty < planned else None
+            entry, sent = await self._send_entry(pos, req, qty, ref_price, limit_price, params, now)
+            if sent < qty:
+                qty, why = sent, "Borsa teminatı yetersiz bulduğu için"
+        if qty < planned:
+            # Never larger than planned; the owner is told the planned size, the opened size and its risk.
+            pos.quantity = qty
+            data["size_capped"] = True
+            loss = qty * self._loss_per_unit(info, ref_price, req.stop_loss)
+            data["warnings"].append(f"{why} pozisyon küçültüldü: planlanan {_fmt(planned)} yerine {_fmt(qty)} "
+                                    f"açıldı; stopta kayıp ~{loss:.2f}.")
         data["entry_order_id"] = str(entry.get("id"))
         self._known_order_ids.add(data["entry_order_id"])
         logger.info("%s: entry %s %s %s qty=%s id=%s", self.name, req.entry_type.value, side.value, symbol, qty, data["entry_order_id"])
@@ -941,6 +1235,100 @@ class CcxtBroker(Broker):
         except (BrokerError, cx.BaseError) as e:
             logger.warning("%s: initial limit fill check failed: %s", self.name, e)
         return pos
+
+    async def _refuse_netting(self, pos: BrokerPosition, info: SymbolInfo) -> None:
+        """One-way mode: the exchange nets an order against an opposite position (or a resting opposite entry)
+        on the same symbol: the old trade shrinks instead of a new one opening and both are booked wrongly.
+        Raises BrokerError before anything is sent. The engine's no_hedge check normally skips such a signal
+        earlier; this also sees what the bot did not open. A read that fails does not stop the entry: the
+        owner gets a warning instead."""
+        symbol, side = pos.broker_symbol, pos.side
+        step = info.qty_step
+        try:
+            held = await self._venue_position_size(symbol, side)
+        except Exception as e:      # this check runs before every entry: nothing that breaks in it may cost the trade
+            logger.warning("%s: positions of %s unreadable before the entry: %r", self.name, symbol, e)
+            held = None
+        if held is not None and held < -step / 2:
+            raise BrokerError(
+                f"{self.name}: {symbol} için borsada ters yönde açık pozisyon var ({side.opposite.value.upper()} "
+                f"{_fmt(-held)}). Tek yönlü modda yeni {side.value.upper()} emri yeni işlem açmaz, o pozisyonu "
+                f"kapatırdı; işlem açılmadı."
+            )
+        if held is None and (getattr(self.exchange, "has", {}) or {}).get("fetchPositions", True):
+            pos.data["warnings"].append("Borsadaki açık pozisyonlar okunamadı; ters yönde pozisyon kontrolü yapılamadı.")
+        try:
+            orders = await self.exchange.fetch_open_orders(symbol)
+            opposite = self._close_side(side)
+            resting = [o for o in orders or []
+                       if o.get("side") == opposite and not o.get("reduceOnly") and not num(o.get("triggerPrice"))]
+            amount = sum(max(0.0, (num(o.get("amount")) or 0.0) - (num(o.get("filled")) or 0.0)) for o in resting)
+        except Exception as e:      # as above: also an error that is not the exchange's
+            logger.warning("%s: open orders of %s unreadable before the entry: %r", self.name, symbol, e)
+            pos.data["warnings"].append("Borsadaki bekleyen emirler okunamadı; ters yönde emir kontrolü yapılamadı.")
+            return
+        if amount - max(held or 0.0, 0.0) > step / 2:      # more than would only close what we hold in our direction
+            raise BrokerError(
+                f"{self.name}: {symbol} için borsada ters yönde bekleyen giriş emri var ({side.opposite.value.upper()} "
+                f"{_fmt(amount)}). Tek yönlü modda iki emir birbirini kapatırdı; işlem açılmadı."
+            )
+
+    async def _fit_to_leverage(self, pos: BrokerPosition, info: SymbolInfo, qty: float, ref_price: float,
+                               leverage: int) -> float:
+        """The venue accepted a lower leverage than the size was planned with. When its margin no longer fits
+        ``max_margin_usage_pct`` of the free balance: the largest quantity that does (never larger), or
+        BrokerError before any order is sent when not even the smallest order fits."""
+        try:
+            free = await self.get_free_margin()
+        except BrokerError as e:
+            # Without the balance the margin cannot be checked here. The exchange checks it when the order arrives
+            # (_send_entry then tries a smaller size): an unreadable balance must not cost the trade.
+            logger.warning("%s: free balance unreadable after the leverage change (%s); the exchange decides",
+                           self.name, e)
+            return qty
+        allowed = free * self._risk().max_margin_usage_pct / 100.0
+        unit = info.contract_size * ref_price
+        if qty * unit / leverage <= allowed:
+            return qty
+        new_qty = min(qty, floor_to_step(allowed * leverage / unit * 0.999, info.qty_step))
+        if (new_qty <= 0 or new_qty < info.min_qty
+                or (info.min_notional and new_qty * unit < info.min_notional * (1 - 1e-9))):
+            raise BrokerError(
+                f"{self.name}: yetersiz teminat: borsa {pos.broker_symbol} için en fazla {leverage}x kaldıraca izin "
+                f"verdi; {_fmt(qty)} için {qty * unit / leverage:.2f} teminat gerekiyor, kullanılabilir {allowed:.2f} "
+                f"(serbest bakiye {free:.2f}) en küçük emre bile yetmiyor. İşlem açılmadı."
+            )
+        return new_qty
+
+    async def _send_entry(
+        self, pos: BrokerPosition, req: OpenRequest, qty: float, ref_price: float, limit_price: float | None,
+        params: dict[str, Any], since: int,
+    ) -> tuple[dict[str, Any], float]:
+        """Send the entry order; returns (order, quantity sent). The exchange's own margin requirement is a
+        little above notional / leverage (fees, mark price): on "margin is insufficient" the order was refused
+        as a whole, so it is sent again smaller (3/4, then 1/2 of the size) instead of losing the trade."""
+        info, d = req.symbol, pos.data
+        unit = info.contract_size * ref_price
+        refused: BrokerError | None = None
+        for attempt, share in enumerate((1.0, 0.75, 0.5)):
+            q = qty if not attempt else floor_to_step(qty * share, info.qty_step)
+            if attempt and (q <= 0 or q < info.min_qty
+                            or (info.min_notional and q * unit < info.min_notional * (1 - 1e-9))):
+                break
+            cid = d["entry_client_id"] if not attempt else self._client_id(req.client_tag, f"e{attempt + 1}")
+            try:
+                entry = await self._create_entry(pos.broker_symbol, req.entry_type, self._order_side(pos.side), q,
+                                                 limit_price, {**params, "clientOrderId": cid}, cid, since)
+            except BrokerError as e:
+                if not isinstance(e.__cause__, cx.InsufficientFunds):
+                    raise
+                refused = e
+                logger.warning("%s: entry of %s %s refused for margin: %s", self.name, _fmt(q), pos.broker_symbol, e)
+                continue
+            d["entry_client_id"] = cid
+            return entry, q
+        assert refused is not None
+        raise refused
 
     async def _create_entry(
         self, symbol: str, entry_type: EntryType, side: str, qty: float, price: float | None,
@@ -960,7 +1348,11 @@ class CcxtBroker(Broker):
         except cx.InsufficientFunds as e:
             raise BrokerError(f"{self.name}: giriş emri reddedildi: yetersiz bakiye ({_short(e)})") from e
         except cx.BaseError as e:
-            raise BrokerError(f"{self.name}: giriş emri reddedildi: {_short(e)}") from e
+            hint = ""
+            if "-4061" in str(e):       # binance: the ACCOUNT is in the other position mode than position_mode says
+                hint = (" Hesabın pozisyon modu ayarla uyuşmuyor: Binance'te Tercihler > Pozisyon Modu'nu "
+                        + ("çift yönlü (hedge)" if self._hedged else "tek yönlü") + " yapın.")
+            raise BrokerError(f"{self.name}: giriş emri reddedildi: {_short(e)}{hint}") from e
 
     async def _await_fill(self, order: dict[str, Any], symbol: str, kind: str) -> OrderState | None:
         """Poll a market order until it is filled/cancelled. None = state could not be read."""
@@ -1006,21 +1398,114 @@ class CcxtBroker(Broker):
         return await self._protect_new_fill(pos, emergency_status=PositionStatus.FAILED)
 
     async def _place_sl(self, pos: BrokerPosition, qty: float, price: float) -> tuple[str | None, Exception | None]:
+        return await self._place_trigger(pos, "sl", qty, price, attempts=2)
+
+    async def _place_trigger(self, pos: BrokerPosition, kind: str, qty: float, price: float, *,
+                             attempts: int) -> tuple[str | None, Exception | None]:
+        """Place one reduce-only stop ("sl") or take-profit ("tp") order. Returns (order id, None) or (None, error).
+
+        binance: every request carries a client id of our own. When a request fails, the order is looked up by
+        that id: if it exists the reply was only lost, and it is adopted instead of sending a second one. When
+        the outcome stays unknown (no clear answer from the venue), the id is kept in ``lost_orders`` and settled
+        by the following syncs (_resolve_lost_orders), so no order of ours can stay behind untracked."""
+        d = pos.data
+        base = self._sl_params(price) if kind == "sl" else self._tp_params(price)
         last: Exception | None = None
-        for attempt in range(2):
+        for attempt in range(attempts):
             if attempt:
                 await self._sleep(self.retry_delay)
+            params, cid = base, None
+            if self._family == "binance":
+                d["prot_seq"] = int(d.get("prot_seq", 0)) + 1
+                cid = self._client_id(d.get("client_tag", "ct"), f"{kind[0]}{d['prot_seq']}")
+                params = {**base, "clientOrderId": cid}
             try:
                 order = await self.exchange.create_order(
-                    pos.broker_symbol, "market", self._close_side(pos.side), qty, None, self._sl_params(price)
+                    pos.broker_symbol, "market", self._close_side(pos.side), qty, None, params
                 )
                 oid = str(order.get("id"))
                 self._known_order_ids.add(oid)
                 return oid, None
             except cx.BaseError as e:
                 last = e
-                logger.error("%s: SL order attempt %d failed: %s", self.name, attempt + 1, e)
+                logger.error("%s: %s order attempt %d failed: %s", self.name, kind.upper(), attempt + 1, e)
+                oid, clear = await self._find_trigger(pos, cid, qty, price)
+                if oid:
+                    return oid, None
+                if cid and (isinstance(e, cx.OperationFailed) or not clear):
+                    d.setdefault("lost_orders", []).append({"cid": cid, "kind": kind, "misses": 0})
         return None, last
+
+    async def _find_trigger(self, pos: BrokerPosition, cid: str | None, qty: float, price: float) -> tuple[str | None, bool]:
+        """After a failed create request: look the conditional order up by OUR client id. Returns (its id when
+        it exists as the order we asked for -- live or already triggered --, did the venue give a clear answer)."""
+        if not cid:
+            return None, True
+        try:
+            found = await self.exchange.fetch_order("", pos.broker_symbol, {"trigger": True, "clientOrderId": cid})
+        except cx.OrderNotFound:
+            return None, True
+        except cx.BaseError as e:
+            logger.warning("%s: could not look up conditional order %s: %s", self.name, cid, e)
+            return None, False
+        if parse_order_state(found, trigger=True).status == "canceled":
+            return None, True                   # refused / expired: nothing of ours is live
+        step, _, tick, _ = self._market_rules(pos)
+        amount, trigger = num(found.get("amount")), num(found.get("triggerPrice"))
+        if (amount is None or trigger is None or abs(amount - qty) > max(step / 2, 1e-12)
+                or abs(trigger - price) > max(tick / 2, 1e-12)):
+            return None, False                  # something with our id that is not what we asked for
+        oid = str(found.get("id"))
+        logger.warning("%s: conditional order %s (client id %s) exists although its request failed; adopting it",
+                       self.name, oid, cid)
+        self._known_order_ids.add(oid)
+        return oid, True
+
+    async def _resolve_lost_orders(self, pos: BrokerPosition) -> bool:
+        """Settle the protective orders whose create request ended without a clear answer (``lost_orders``).
+        One that exists after all becomes our stop when the position has none (same size and trigger), else it
+        is cancelled: a second reduce-only order must not stay behind. One the venue does not know for
+        ``_LOST_ORDER_MISSES`` passes never arrived. True = nothing is left to settle."""
+        d, symbol = pos.data, pos.broker_symbol
+        keep: list[dict[str, Any]] = []
+        for lo in list(d.get("lost_orders") or []):
+            try:
+                found = await self.exchange.fetch_order("", symbol, {"trigger": True, "clientOrderId": lo["cid"]})
+            except cx.OrderNotFound:
+                lo["misses"] = int(lo.get("misses", 0)) + 1
+                if lo["misses"] < _LOST_ORDER_MISSES:
+                    keep.append(lo)
+                continue
+            except cx.BaseError as e:
+                logger.warning("%s: could not look up conditional order %s: %s", self.name, lo["cid"], e)
+                keep.append(lo)
+                continue
+            oid = str(found.get("id"))
+            state = parse_order_state(found, trigger=True)
+            self._remember(d, oid)
+            if state.status != "open":
+                if state.status == "filled":    # it triggered: its trades belong to this position
+                    d.setdefault("linked_order_ids", []).extend(state.linked_ids)
+                continue
+            step, _, tick, _ = self._market_rules(pos)
+            amount, trigger = num(found.get("amount")), num(found.get("triggerPrice"))
+            unprotected = (pos.status is PositionStatus.OPEN and not d.get("closing") and pos.remaining_quantity > 0
+                           and (d.get("unprotected") or not d.get("sl_order_id")))
+            if (lo.get("kind") == "sl" and unprotected and amount is not None and trigger is not None
+                    and abs(amount - pos.remaining_quantity) <= max(step / 2, 1e-12)
+                    and abs(trigger - float(d["sl_price"])) <= max(tick / 2, 1e-12)):
+                logger.warning("%s: stop %s (client id %s) was placed after all; adopting it", self.name, oid, lo["cid"])
+                d.update(sl_order_id=oid, protected_qty=pos.remaining_quantity, unprotected=False, sl_cancelled=False)
+                pos.stop_loss = float(d["sl_price"])
+                pos.error = _drop_error(pos.error, _CRITICAL_MARK)
+                continue
+            try:
+                await self._cancel(oid, symbol, lo.get("kind") or "sl")
+            except BrokerError as e:
+                logger.error("%s: %s", self.name, e)
+                keep.append(lo)
+        d["lost_orders"] = keep
+        return not keep
 
     async def _exit_fill(self, order: dict[str, Any], symbol: str, qty: float) -> tuple[float | None, float | None]:
         """(executed size, average price) of a reduce-only market exit. Executed None = unknown.
@@ -1195,16 +1680,11 @@ class CcxtBroker(Broker):
 
     async def _place_tp(self, pos: BrokerPosition, entry: dict[str, Any]) -> str | None:
         entry["attempts"] = int(entry.get("attempts", 0)) + 1
-        try:
-            order = await self.exchange.create_order(
-                pos.broker_symbol, "market", self._close_side(pos.side), entry["qty"], None, self._tp_params(entry["price"])
-            )
-        except cx.BaseError as e:
+        oid, err = await self._place_trigger(pos, "tp", entry["qty"], float(entry["price"]), attempts=1)
+        if oid is None:
             entry["status"] = "failed"
-            logger.error("%s: TP %s order failed: %s", self.name, entry["price"], e)
-            return f"TP {_fmt(entry['price'])}: {_short(e, 120)}"
-        entry.update(id=str(order.get("id")), status="open")
-        self._known_order_ids.add(entry["id"])
+            return f"TP {_fmt(entry['price'])}: {_short(err or Exception(), 120)}"
+        entry.update(id=oid, status="open")
         return None
 
     def _rearm_tp_rest(self, pos: BrokerPosition, tp: dict[str, Any], executed: float, rest: float,
@@ -1278,6 +1758,8 @@ class CcxtBroker(Broker):
             d["stale_orders"] = [s for s in d["stale_orders"] if s["id"] != so["id"]]
         if not d.get("stale_orders"):
             pos.error = _drop_error(pos.error, _STALE_MARK)
+        if d.get("lost_orders") and not await self._resolve_lost_orders(pos):
+            ok = False                      # an order of ours may exist that we could not confirm yet
         return await self._cleanup_attached(pos) and ok
 
     async def _cleanup_attached(self, pos: BrokerPosition) -> bool:
@@ -1347,7 +1829,7 @@ class CcxtBroker(Broker):
             return
         new_id, err = await self._place_sl(pos, pos.remaining_quantity, float(d["sl_price"]))
         if new_id is None:
-            if d.get("sl_order_id"):
+            if d.get("sl_order_id") and not d.get("unprotected"):   # unprotected: that id is a stop that is gone
                 pos.error = f"{self.name}: stop miktarı güncellenemedi (eski stop aktif): {_short(err or Exception())}"
             else:
                 d["unprotected"] = True     # nothing protects the open size: next sync retries / closes
@@ -1366,13 +1848,17 @@ class CcxtBroker(Broker):
         if not old_id:
             return
         self._remember(pos.data, old_id)
+        cancel_failed = False
         try:
             if await self._cancel(old_id, pos.broker_symbol, "sl"):
                 return
         except BrokerError as e:
             logger.error("%s: %s", self.name, e)
+            cancel_failed = True
         state = await self._check_old_sl_filled(pos, old_id, old_qty)
-        if state is None or state.status == "open":
+        # "missing" after a cancel that FAILED proves nothing (binance has answered "unknown order" for orders
+        # that were still listed as open): it stays tracked until a cancel or a lookup gives a clear answer.
+        if state is None or state.status == "open" or (cancel_failed and state.status == "missing"):
             self._add_stale(pos, old_id, "sl", old_qty)
 
     def _add_stale(self, pos: BrokerPosition, order_id: str, kind: str, qty: float) -> None:
@@ -1495,6 +1981,8 @@ class CcxtBroker(Broker):
             logger.warning("%s: fetch_my_trades failed, estimating pnl: %s", self.name, e)
         if not entry:
             return None
+        if not d.get("exits"):
+            return None                     # closed outside our orders (flat on the venue): PnL unknown, not 0
         fee_rate = self._risk().fee_rate
         total = 0.0
         for ex in d.get("exits") or []:
@@ -1666,6 +2154,8 @@ class CcxtBroker(Broker):
             state = await self._order_state(str(d["entry_order_id"]), pos.broker_symbol, "entry")
         except cx.BaseError as e:
             logger.warning("%s: entry state unknown: %s", self.name, e)
+            if isinstance(e, cx.InvalidNonce):
+                await self._sync_clock(force=True)      # -1021: our offset to the exchange clock is stale
             return None
         actual = state.filled or 0.0
         if state.status == "filled" and not state.filled:
@@ -1685,6 +2175,7 @@ class CcxtBroker(Broker):
         if pos.dry_run or pos.data.get("simulated"):
             logger.warning("%s: simulated position %s not synced on the real account", self.name, pos.broker_symbol)
             return pos
+        before = pos
         pos = pos.model_copy(deep=True)
         self._register(pos)
         try:
@@ -1692,10 +2183,27 @@ class CcxtBroker(Broker):
                 await self._sync_entry(pos)
             if pos.status is PositionStatus.OPEN:
                 await self._sync_open(pos)
-        except cx.NetworkError as e:
-            logger.warning("%s: sync of %s interrupted by a network error: %s", self.name, pos.broker_symbol, e)
-        except cx.BaseError as e:
-            raise BrokerError(f"{self.name}: durum güncellenemedi: {_short(e)}") from e
+        except cx.OperationFailed as e:
+            # No clear answer (network, timeout, "server busy / internal error" = binance -1000/-1001/-1008...):
+            # transient. The copy is returned, so orders placed and fills booked earlier in this pass are kept.
+            logger.warning("%s: sync of %s interrupted by a transient error: %s", self.name, pos.broker_symbol, e)
+            if isinstance(e, cx.InvalidNonce):
+                await self._sync_clock(force=True)      # -1021: our offset to the exchange clock is stale
+            return pos
+        except Exception as e:
+            if pos.model_dump() == before.model_dump():
+                if isinstance(e, cx.BaseError):
+                    raise BrokerError(f"{self.name}: {_SYNC_MARK}: {_short(e)}") from e
+                raise
+            # Something was placed or booked before the error. It must reach the database, or the next pass
+            # would do it a second time (a second stop, a fill booked twice): keep the new state and report
+            # the error through pos.error instead of raising.
+            logger.error("%s: sync of %s failed after changes were made (kept): %r", self.name, pos.broker_symbol, e)
+            text = _short(e).removeprefix(f"{self.name}: ")
+            pos.error = _join_error(_drop_error(pos.error, _SYNC_MARK), f"{self.name}: {_SYNC_MARK}: {text}")
+            return pos
+        if pos.error and _SYNC_MARK in pos.error:
+            pos.error = _drop_error(pos.error, _SYNC_MARK)
         return pos
 
     async def _sync_entry(self, pos: BrokerPosition) -> None:
@@ -1745,8 +2253,10 @@ class CcxtBroker(Broker):
             return await self._order_state(order_id, symbol, kind, since)
         except cx.OrderNotFound:
             return OrderState("missing")
-        except cx.NetworkError as e:
+        except cx.OperationFailed as e:     # network trouble, or the venue is busy (binance -1000/-1001/-1008)
             logger.warning("%s: could not read order %s: %s", self.name, order_id, e)
+            if isinstance(e, cx.InvalidNonce):
+                await self._sync_clock(force=True)      # -1021: our offset to the exchange clock is stale
             return None
 
     async def _settle_unconfirmed(self, pos: BrokerPosition) -> None:
@@ -1799,13 +2309,22 @@ class CcxtBroker(Broker):
             await self._retry_stale_orders(pos)
             if self._done(pos):
                 return
+        if d.get("lost_orders") and not d.get("closing"):
+            had_stop = bool(d.get("sl_order_id")) and not d.get("unprotected")
+            await self._resolve_lost_orders(pos)
+            if not had_stop and d.get("sl_order_id") and not d.get("unprotected") and not d.get("tp_order_ids"):
+                # A stop that had arrived after all was adopted: the take profits that follow a stop are missing.
+                await self._replace_take_profits(pos, [TakeProfit(**lv) for lv in self._unfilled_levels(pos)],
+                                                 pos.remaining_quantity)
         if d.get("closing"):
             await self._finalize_closed(pos, d.get("closed_reason") or "closing")
             if pos.status is PositionStatus.CLOSED and d.get("closed_reason") != "emergency":
-                pos.error = None
+                pos.error = self._flat_note(pos) if d.get("closed_outside") else None
             return
 
         if d.get("unprotected") or not d.get("sl_order_id"):
+            if await self._gone_on_venue(pos):
+                return
             await self._protect_new_fill(pos, emergency_status=PositionStatus.CLOSED)
             if self._done(pos) or d.get("unprotected"):
                 return
@@ -1813,6 +2332,26 @@ class CcxtBroker(Broker):
         sl = await self._try_state(str(d["sl_order_id"]), symbol, "sl", since)
         if sl is None:
             return
+        unsure = False
+        if sl.status == "missing":
+            live = await self._is_live_trigger(symbol, str(d["sl_order_id"]))
+            if live is not False:
+                # An "order does not exist" answer is not proof (binance has returned it for live conditional
+                # orders): the stop is still listed as open, or the list could not be read. Nothing is re-placed;
+                # it is asked again next pass, and if nothing can be read for several passes the owner is told.
+                # The rest of the pass still runs (take profits, position gone on the venue): a stop that stays
+                # unreadable by its id must not freeze the trade.
+                logger.warning("%s: stop %s on %s not found by id but not confirmed gone; re-checking", self.name,
+                               d["sl_order_id"], symbol)
+                unsure = True
+                d["sl_unsure"] = int(d.get("sl_unsure", 0)) + 1
+                if live is None and d["sl_unsure"] >= 3:
+                    pos.error = _join_error(pos.error, f"{self.name}: stop emri ({d['sl_order_id']}) borsada "
+                                                       f"{_UNSURE_MARK}: emir numarasıyla bulunamadı ve açık "
+                                                       f"emirler okunamıyor. {symbol} stopunu borsada kontrol edin.")
+                sl = OrderState("open")
+        if not unsure and d.pop("sl_unsure", None):
+            pos.error = _drop_error(pos.error, _UNSURE_MARK)
         if sl.status == "filled":
             sl_id = str(d["sl_order_id"])
             d.setdefault("linked_order_ids", []).extend(sl.linked_ids)
@@ -1832,10 +2371,11 @@ class CcxtBroker(Broker):
                                                    f"kalan {_fmt(left)} için yeni stop konuldu.")
             return
         if sl.status in ("canceled", "missing"):
+            if await self._gone_on_venue(pos):
+                return                      # nothing left to protect: closed after two flat reads
             logger.error("%s: our SL %s on %s is %s; re-placing", self.name, d["sl_order_id"], symbol, sl.status)
-            self._remember(d, d["sl_order_id"])
-            d["sl_order_id"] = None
-            d["protected_qty"] = 0.0
+            # The old id stays in place: _protect_new_fill places the new stop first and then cancels the old one
+            # once more (should the exchange have hidden a live order, it must not stay behind as a second stop).
             await self._protect_new_fill(pos, emergency_status=PositionStatus.CLOSED)
             if self._done(pos) or d.get("unprotected"):
                 return
@@ -1880,16 +2420,260 @@ class CcxtBroker(Broker):
             if self._done(pos):
                 return
 
-        size = await self._venue_position_size(symbol, pos.side)
+        await self._gone_on_venue(pos)
+
+    async def _gone_on_venue(self, pos: BrokerPosition) -> bool:
+        """True when the venue holds nothing in our direction (the caller must not place protection for it).
+        After two consecutive flat reads (position APIs can lag behind fills) the trade is closed."""
+        d = pos.data
+        size = await self._venue_position_size(pos.broker_symbol, pos.side)
         step = self._market_rules(pos)[0]
-        if size is not None and size < step / 2:
-            d["flat_seen"] = int(d.get("flat_seen", 0)) + 1
-            if d["flat_seen"] >= 2:   # two consecutive reads: position APIs can lag behind fills
-                pos.remaining_quantity = 0.0      # gone on the venue (closed there by hand)
-                await self._finalize_closed(pos, "flat_on_exchange")
-                pos.error = pos.error or f"{self.name}: pozisyon borsada kapalı bulundu; kalan emirler iptal edildi."
-        else:
+        if size is None or size >= step / 2:
             d["flat_seen"] = 0
+            return False
+        d["flat_seen"] = int(d.get("flat_seen", 0)) + 1
+        if d["flat_seen"] >= 2:
+            outside = pos.remaining_quantity  # gone on the venue (closed there by hand, liquidated, netted...)
+            pos.remaining_quantity = 0.0
+            d["unprotected"] = False
+            if outside > 0:
+                d["closed_outside"] = outside
+            await self._finalize_closed(pos, "flat_on_exchange")
+            pos.error = self._flat_note(pos) if not pos.error or _CRITICAL_MARK in pos.error else pos.error
+        return True
+
+    def _flat_note(self, pos: BrokerPosition) -> str:
+        d = pos.data
+        note = f"{self.name}: pozisyon borsada kapalı bulundu; kalan emirler iptal edildi."
+        outside = float(d.get("closed_outside") or 0.0)
+        if outside > 0:                       # no order of ours closed that size: its result is not known to us
+            note += (" Kapanış botun emirleriyle olmadığı için kâr/zarar bilinmiyor." if pos.realized_pnl is None else
+                     f" {_fmt(outside)} botun emirleri dışında kapandı; kâr/zarar yalnızca botun kendi "
+                     f"emirlerini içerir.")
+        return note
+
+    async def _is_live_trigger(self, symbol: str, order_id: str) -> bool | None:
+        """Is our conditional order in the venue's list of open conditional orders? None = could not tell."""
+        if self._family != "binance":
+            return False                    # other venues: keep the old behaviour (treat as gone)
+        try:
+            orders = await self.exchange.fetch_open_orders(symbol, None, None, {"trigger": True})
+        except cx.BaseError as e:
+            logger.warning("%s: open conditional orders unreadable: %s", self.name, e)
+            return None
+        return any(str(o.get("id")) == str(order_id) for o in orders or [])
+
+    # ------------------------------------------------------------------ health / self-test (read-only)
+    async def health_problem(self) -> str | None:
+        """None when one cheap signed read (the balance) answers within ``_HEALTH_TIMEOUT_SEC`` seconds, else a
+        short Turkish reason (API key refused, IP not allowed, clock difference, no connection...). Read-only;
+        never raises (a real cancellation of the calling task still passes through)."""
+        if self.exchange is None:
+            return "borsa bağlantısı kurulmamış"
+        try:
+            return await asyncio.wait_for(self._health_read(), _HEALTH_TIMEOUT_SEC)
+        except asyncio.TimeoutError:
+            return f"borsa {int(_HEALTH_TIMEOUT_SEC)} saniye içinde yanıt vermedi (bağlantı yok ya da çok yavaş)"
+        except Exception as e:
+            return f"beklenmeyen hata: {_short(e, 120)}"
+
+    async def _health_read(self) -> str | None:
+        await self._sync_clock()            # keeps the clock offset fresh while the bot runs (only when it is old)
+        for attempt in (0, 1):
+            try:
+                await self.exchange.fetch_balance()
+                return None
+            except cx.InvalidNonce as e:    # -1021: measure the offset again and ask once more
+                if attempt or not await self._sync_clock(force=True):
+                    return self._health_text(e)
+            except cx.BaseError as e:
+                return self._health_text(e)
+        return None
+
+    @staticmethod
+    def _health_text(e: Exception) -> str:
+        """Plain Turkish reason for a failed signed read (binance codes where they are known)."""
+        code = _venue_code(e)
+        if isinstance(e, cx.InvalidNonce) or code == "-1021":
+            return "bu bilgisayarın saati borsa saatiyle uyuşmuyor (Windows saat eşitlemesini kontrol edin)"
+        if code in ("-1005", "-1011"):
+            return "bu bilgisayarın IP adresi API anahtarında izinli değil"
+        if code == "-2015":     # ccxt reports it as a rate limit once a signed call has worked; the code decides
+            return ("API anahtarı reddedildi: anahtar silinmiş / geçersiz, bu bilgisayarın IP adresi izinli değil ya "
+                    "da vadeli işlem yetkisi yok")
+        if code == "-1022":
+            return "API gizli anahtarı (secret) yanlış: imza reddedildi"
+        if isinstance(e, cx.AuthenticationError):     # also PermissionDenied / AccountSuspended
+            return f"API anahtarı reddedildi (yetki ya da IP kısıtı): {_short(e, 100)}"
+        if isinstance(e, (cx.RateLimitExceeded, cx.DDoSProtection)):
+            return "borsa çok fazla istek nedeniyle geçici olarak engelledi"
+        if isinstance(e, cx.ExchangeNotAvailable):    # also OnMaintenance
+            return "borsa bakımda ya da ulaşılamıyor"
+        if isinstance(e, cx.RequestTimeout):
+            return "borsa zamanında yanıt vermedi (bağlantı çok yavaş)"
+        if isinstance(e, cx.NetworkError):
+            return f"borsaya bağlanılamıyor (internet / ağ sorunu): {_short(e, 100)}"
+        return f"borsa hata verdi: {_short(e, 120)}"
+
+    async def preflight_report(self, bases: list[str]) -> list[str]:
+        """Self-test lines for the owner, in plain Turkish, each starting with TAMAM or DİKKAT: the clock, the
+        account's position mode and multi-assets mode, for every base the contract with its maximum leverage and
+        minimum order, and what is already on the account (positions, orders, conditional orders), so that the
+        owner knows about things the bot did not create.
+
+        Strictly read-only: GET requests only, no leverage / margin-mode change, no order. A check that cannot
+        be read becomes a DİKKAT line; the method does not raise."""
+        ex = self.exchange
+        if ex is None:
+            return ["DİKKAT Borsa bağlantısı kurulmamış; kontroller yapılamadı."]
+        lines: list[str] = []
+
+        async def section(what: str, check: Callable[[], Awaitable[list[str]]]) -> None:
+            try:
+                lines.extend(await check())
+            except Exception as e:      # one unreadable check must not hide the others
+                lines.append(f"DİKKAT {what} okunamadı: {_short(e, 140)}")
+
+        has = getattr(ex, "has", {}) or {}
+        binance = self._family == "binance"
+        # the signed reads below need a fresh clock offset (a GET; nothing changes on the venue)
+        await self._sync_clock(force=True)
+        if has.get("fetchTime"):
+            await section("Saat farkı", self._pf_clock)
+        if binance:
+            await section("Pozisyon modu", self._pf_position_mode)
+            await section("Çoklu varlık modu", self._pf_multi_assets)
+        for base in bases:
+            await section(f"{base} sözleşme bilgisi", lambda base=base: self._pf_symbol(base))
+        if binance and self._leverage_tiers:
+            # The bracket table is per symbol; limits of the ACCOUNT only show when a leverage is set (not done
+            # here: this report changes nothing). Said once, so that "125x" is not read as a promise.
+            lines.append("TAMAM Not: kaldıraç tablosu hesaba özel sınırları (yeni açılmış hesap, kimlik doğrulama, "
+                         "ülke) göstermez. Borsa daha azına izin verirse bot ilk işlemde kaldıracı kendisi düşürür; "
+                         "bu, işlem raporundaki uyarıda yazar.")
+        if has.get("fetchPositions", True):
+            await section("Açık pozisyonlar", self._pf_positions)
+        if binance:
+            await section("Bekleyen emirler", self._pf_orders)
+        return lines
+
+    async def _pf_clock(self) -> list[str]:
+        ex = self.exchange
+        t0 = time.time() * 1000
+        server = await ex.fetch_time()
+        t1 = time.time() * 1000
+        if not server:
+            return ["DİKKAT Saat farkı okunamadı: borsa saat bilgisini vermedi."]
+        ahead = (t0 + t1) / 2 - float(server)
+        where = "ileride" if ahead >= 0 else "geride"
+        adjusted = bool((getattr(ex, "options", None) or {}).get("adjustForTimeDifference"))
+        if abs(ahead) < 1000:
+            return [f"TAMAM Saat farkı: bu bilgisayarın saati borsadan {abs(ahead):.0f} ms {where}"
+                    + (" (bot bu farkı kendisi düzeltiyor)." if adjusted else ".")]
+        return [f"DİKKAT Saat farkı büyük: bu bilgisayarın saati borsadan {abs(ahead) / 1000:.1f} saniye {where}. "
+                + ("Bot farkı kendisi düzeltiyor; yine de Windows saat eşitlemesini açın." if adjusted else
+                   "Borsa istekleri reddedebilir; Windows saat eşitlemesini açın.")]
+
+    async def _pf_position_mode(self) -> list[str]:
+        mode = await self.exchange.fetch_position_mode()
+        hedged = bool((mode or {}).get("hedged"))
+        name = "çift yönlü (hedge)" if hedged else "tek yönlü"
+        if hedged == self._hedged:
+            return [f"TAMAM Pozisyon modu: {name} (ayarla uyumlu)."]
+        wanted = "çift yönlü (hedge)" if self._hedged else "tek yönlü"
+        return [f"DİKKAT Hesabın pozisyon modu {name}, ayarda ise {wanted} yazıyor: bu hâlde borsa giriş emirlerini "
+                f"reddeder. Binance'te Tercihler > Pozisyon Modu'nu {wanted} yapın."]
+
+    async def _pf_multi_assets(self) -> list[str]:
+        answer = await self.exchange.fapiPrivateGetMultiAssetsMargin()
+        if str((answer or {}).get("multiAssetsMargin")).lower() == "true":
+            return ["DİKKAT Çoklu varlık modu açık: bot yalnızca USDT bakiyesine göre hesap yapar ve izole marjin "
+                    "kullanılamaz. Binance'te kapatmanız önerilir."]
+        return ["TAMAM Çoklu varlık modu kapalı."]
+
+    async def _pf_symbol(self, base: str) -> list[str]:
+        sym = await self.resolve_symbol(base)
+        if sym is None:
+            return [f"DİKKAT {base}: borsada {self.cfg.quote_currency.upper()} vadeli sözleşmesi bulunamadı; "
+                    f"bu coinin sinyalleri bu hesapta açılmaz."]
+        market = (getattr(self.exchange, "markets", None) or {}).get(sym.broker_symbol) or {}
+        quote = sym.quote_asset or self.cfg.quote_currency.upper()
+        text = f"{base}: {sym.broker_symbol} sözleşmesi"
+        mult = float(sym.extra.get("price_multiplier") or 1.0)
+        if mult != 1.0:
+            text += f" (fiyatlar {_fmt(mult)} ile çarpılır)"
+        text += f"; en küçük emir {_fmt(sym.min_qty)} {market.get('base') or base}"
+        if sym.min_notional:
+            text += f" ve {_fmt(sym.min_notional)} {quote}"
+        problems: list[str] = []
+        tiers = await self._tiers(sym.broker_symbol)
+        venue_max = int(tiers[0][0]) if tiers else (int(sym.max_leverage) if sym.max_leverage else None)
+        learned = self._learned_cap(sym.broker_symbol)
+        if venue_max is not None and learned:
+            venue_max = min(venue_max, learned)
+        if venue_max is None:
+            problems.append("en yüksek kaldıraç okunamadı (ilk işlemde deneyerek bulunur)")
+        else:
+            text += f"; borsanın kaldıraç tablosunda en yüksek {venue_max}x"
+            if tiers and tiers[0][1]:
+                text += f" ({_fmt(tiers[0][1])} {quote} büyüklüğe kadar)"
+            wanted = min(self.cfg.leverage, self.cfg.max_leverage)
+            if venue_max < wanted:      # not a fault, but the owner should know why such a coin needs more margin
+                text += f", ayardaki {wanted}x yerine bu kullanılır (aynı işlem daha çok teminat ister)"
+        types = (market.get("info") or {}).get("orderTypes") if isinstance(market.get("info"), dict) else None
+        if types and not {"MARKET", "LIMIT", "STOP_MARKET", "TAKE_PROFIT_MARKET"} <= set(types):
+            problems.append("stop / kâr al emir tipleri bu sözleşmede yok")
+        if problems:
+            return [f"DİKKAT {text}. Sorun: {'; '.join(problems)}."]
+        return [f"TAMAM {text}."]
+
+    async def _pf_positions(self) -> list[str]:
+        positions = [p for p in await self.exchange.fetch_positions() or [] if abs(num(p.get("contracts")) or 0.0) > 0]
+        if not positions:
+            return ["TAMAM Hesapta açık pozisyon yok."]
+        out = [f"DİKKAT Hesapta {len(positions)} açık pozisyon var (botun açtıkları dahil; tek yönlü modda aynı "
+               f"coindeki bot işlemleriyle birleşir):"]
+        for p in positions[:10]:
+            lev = num(p.get("leverage"))
+            out.append(f"DİKKAT   {p.get('symbol')} {str(p.get('side') or '?').upper()} {_fmt(num(p.get('contracts')))}"
+                       f", giriş {_fmt(num(p.get('entryPrice')))}"
+                       + (f", kaldıraç {_fmt(lev)}x" if lev else "")
+                       + (f", {p.get('marginMode')}" if p.get("marginMode") else ""))
+        if len(positions) > 10:
+            out.append(f"DİKKAT   ... ve {len(positions) - 10} pozisyon daha.")
+        return out
+
+    async def _pf_orders(self) -> list[str]:
+        ex = self.exchange
+        options = ex.options
+        key, missing = "warnOnFetchOpenOrdersWithoutSymbol", object()
+        old = options.get(key, missing)
+        options[key] = False        # a client-side reminder of ccxt (the request is heavier), not an exchange setting
+        try:
+            plain = await ex.fetch_open_orders()
+            conditional = await ex.fetch_open_orders(None, None, None, {"trigger": True})
+        finally:
+            if old is missing:
+                options.pop(key, None)
+            else:
+                options[key] = old
+        if not plain and not conditional:
+            return ["TAMAM Hesapta bekleyen emir yok (normal ve koşullu)."]
+        out = [f"DİKKAT Hesapta bekleyen emir var: {len(plain)} normal, {len(conditional)} koşullu (stop / kâr al). "
+               f"Botun açık işlemlerine ait değillerse borsada iptal edin:"]
+        sides = {"buy": "ALIŞ", "sell": "SATIŞ"}
+        for o in [*plain, *conditional][:12]:
+            price, trigger = num(o.get("price")), num(o.get("triggerPrice"))
+            kind = "koşullu emir" if trigger else ("limit emri" if o.get("type") == "limit" else f"{o.get('type')} emri")
+            out.append(f"DİKKAT   {o.get('symbol')} {sides.get(str(o.get('side')), '?')} {kind}, miktar "
+                       f"{_fmt(num(o.get('amount')))}"
+                       + (f", fiyat {_fmt(price)}" if price else "")
+                       + (f", tetik fiyatı {_fmt(trigger)}" if trigger else "")
+                       + (", yalnızca pozisyon azaltır" if o.get("reduceOnly") else "")
+                       + f" (emir no {o.get('id')})")
+        if len(plain) + len(conditional) > 12:
+            out.append(f"DİKKAT   ... ve {len(plain) + len(conditional) - 12} emir daha.")
+        return out
 
     async def _venue_position_size(self, symbol: str, side: Side) -> float | None:
         """Size on the venue in our direction (one-way: signed net, positive = ours). None = unknown."""

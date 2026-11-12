@@ -149,7 +149,7 @@ async def test_f5_status_errors_have_explicit_transient_flag(code: int, transien
     assert ei.value.transient is transient
 
 
-@pytest.mark.parametrize("stop_reason", ["refusal", "max_tokens", "pause_turn"])
+@pytest.mark.parametrize("stop_reason", ["refusal", "pause_turn"])       # max_tokens is retried (transient) now
 async def test_f5_permanent_failures_are_explicitly_not_transient(stop_reason: str) -> None:
     with pytest.raises(ParserError) as ei:
         await parser_for(Client(response({"actions": [wire()]}, stop_reason=stop_reason))).parse(

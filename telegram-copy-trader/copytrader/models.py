@@ -193,6 +193,26 @@ class TradePlan(BaseModel):
     broker_names: list[str] = Field(default_factory=list)  # brokers to trade on; empty = every enabled broker
 
 
+_PAIR_METALS = frozenset({"XAU", "XAG", "XPT", "XPD"})
+
+
+def instrument_label(plan: TradePlan) -> str:
+    """Name of a trade's instrument in texts shown to the OWNER (lists, labels, notices): the base asset
+    ("BTC", "NAS100"); for a currency or metal pair the PAIR ("GBPUSD", "USDJPY", "XAUUSD"), because GBPUSD
+    and GBPJPY are different trades that share the base. A coin is always its base alone, whatever quote the
+    signal named (crypto market types, or a base that is neither a currency nor a metal).
+    Not used for the parser context: :meth:`TradeRecord.summary` gives the model ``asset`` (base) + ``quote``."""
+    from .parsing.symbols import FIAT_CURRENCIES     # imported here: that module imports this one
+
+    base = plan.base_asset.strip().upper()
+    quote = (plan.quote_asset or "").strip().upper()
+    if plan.market_type in (MarketType.PERP, MarketType.SPOT) or quote not in FIAT_CURRENCIES or quote == base:
+        return plan.base_asset
+    if base in FIAT_CURRENCIES or base in _PAIR_METALS:
+        return base + quote
+    return plan.base_asset
+
+
 class ManagementPlan(BaseModel):
     """An instruction for an EXISTING trade."""
 
@@ -246,9 +266,13 @@ class TradeRecord(BaseModel):
     ) -> dict[str, Any]:
         """Compact dict for the LLM parser context and status messages.
 
+        ``asset``: the BASE asset, for every instrument ("USD" for USDJPY; the prompt explains it together
+        with ``quote``). The pair as one word is :func:`instrument_label` (owner-facing texts only).
         ``take_profits``: one ``{"price", "close_fraction"}`` per current level (fraction of the original
         size), plus ``"hit": true/false`` when ``tp_hit`` (aligned with ``current_take_profits``) is given.
         ``open_fraction`` (when known): share of the filled size still open (after TP hits / partial closes).
+        ``quote`` (when the plan names one): the second currency of the instrument, so that two forex pairs
+        of one base currency can be told apart (asset USD + quote JPY = USDJPY, not USDCAD).
         """
         tps: list[dict[str, Any]] = []
         for i, tp in enumerate(self.current_take_profits):
@@ -267,6 +291,8 @@ class TradeRecord(BaseModel):
             "source_message_ids": self.plan.source_message_ids,
             "opened_at": self.created_at.isoformat(),
         }
+        if self.plan.quote_asset:
+            out["quote"] = self.plan.quote_asset
         if open_fraction is not None:
             out["open_fraction"] = round(min(1.0, max(0.0, open_fraction)), 4)
         return out

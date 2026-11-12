@@ -179,10 +179,25 @@ def test_route_threshold_defaults_and_overrides() -> None:
 async def test_fx_route_auto_entry_far_from_market_is_limit_at_signal_entry(entry: float) -> None:
     e = await make()
     try:
-        await e.say(eur(entry=entry, sl=1.0700))
+        # 20-pip stop: the market (1.0850 / 1.0851) is more than a quarter of the stop distance from the entry
+        await e.say(eur(entry=entry, sl=entry - 0.0020))
         assert e.sent(MT5.TRADE_ACTION_DEAL) == []
         (req,) = e.sent(MT5.TRADE_ACTION_PENDING)
         assert req["type"] == MT5.ORDER_TYPE_BUY_LIMIT and req["price"] == pytest.approx(entry)
+        assert e.notifier.confirmations == []
+    finally:
+        await finish(e)
+
+
+@pytest.mark.parametrize("entry", [1.0840, 1.0830])
+async def test_fx_route_auto_entry_within_a_quarter_of_the_stop_distance_is_market(entry: float) -> None:
+    # 10 / 20 pips from the market with a 140 / 130 pip stop: more than the 0.03% band, but inside 0.25R.
+    e = await make()
+    try:
+        await e.say(eur(entry=entry, sl=1.0700))
+        assert e.sent(MT5.TRADE_ACTION_PENDING) == []
+        (deal,) = e.sent(MT5.TRADE_ACTION_DEAL)
+        assert deal["type"] == MT5.ORDER_TYPE_BUY and deal["sl"] == 1.0700
         assert e.notifier.confirmations == []
     finally:
         await finish(e)
@@ -202,7 +217,7 @@ async def test_fx_route_entry_within_three_pips_is_market() -> None:
 def _build(kind: str | None, market: float, **kw: Any):
     route = TopicRoute(name="r", title_contains=["x"], kind=kind) if kind else None
     return validator.build_open_plan(
-        eur(entry=1.0840, sl=1.0700), risk=effective_risk(RiskConfig(), route), llm=AppConfig.model_fields["llm"].default_factory(),
+        eur(entry=1.0840, sl=1.0820), risk=effective_risk(RiskConfig(), route), llm=AppConfig.model_fields["llm"].default_factory(),
         market_price=market, source_chat_id=1, now=datetime.now(UTC), **kw)
 
 
@@ -236,10 +251,11 @@ async def test_market_drift_guard_uses_fx_distance() -> None:
 async def test_fx_duplicate_tolerance_is_tight() -> None:
     e = await make()
     try:
-        await e.say(eur(entry=1.0840, sl=1.0700))
-        await e.say(eur(entry=1.0830, sl=1.0700))     # 0.09% apart: a different level on FX, not a repost
+        # stops 10-20 pips away: every entry is more than a quarter of its stop distance from the market -> limits
+        await e.say(eur(entry=1.0840, sl=1.0820))
+        await e.say(eur(entry=1.0830, sl=1.0820))     # 0.09% apart: a different level on FX, not a repost
         assert len(e.sent(MT5.TRADE_ACTION_PENDING)) == 2 and e.notifier.confirmations == []
-        await e.say(eur(entry=1.08404, sl=1.0700))    # 0.004% apart: a repost -> asked
+        await e.say(eur(entry=1.08404, sl=1.0820))    # 0.004% apart: a repost -> asked
         assert len(e.notifier.confirmations) == 1
         assert any(i.code == "duplicate_signal" for i in e.notifier.confirmations[0].issues)
     finally:

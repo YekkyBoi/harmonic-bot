@@ -10,6 +10,11 @@ Design notes
   sortable) and always returned timezone-aware in UTC. Naive input = UTC.
 * File databases use WAL + ``synchronous=FULL`` (trade state must survive a
   power loss). ``":memory:"`` works for tests.
+* Schema changes: ``MIGRATIONS`` (with a version bump: an older program then
+  refuses the file) or, for optional columns an older program can ignore,
+  ``ADDITIVE_COLUMNS`` (no bump: the previous version can still open the file).
+* "Pinned" messages (``pin_messages``) are an in-memory mark of the listener:
+  messages of a batch it has triggered and the engine has not processed yet.
 """
 
 from __future__ import annotations
@@ -58,6 +63,31 @@ MIGRATIONS: dict[int, list[str]] = {
 }
 
 _ADD_COLUMN = re.compile(r"\s*ALTER\s+TABLE\s+(\w+)\s+ADD\s+COLUMN\s+(\w+)", re.IGNORECASE)
+
+# Optional columns added WITHOUT a schema-version bump: checked at every open and added when missing,
+# in the same transaction as the migrations. The previous program version names its columns
+# explicitly and ignores these, so a database this version has opened can still be opened by the
+# version before it (after a version bump the old program refuses the file). Only nullable columns or
+# columns with a default; "ALTER TABLE t ADD COLUMN c ..." statements only. Append, never edit.
+ADDITIVE_COLUMNS: list[str] = [
+    "ALTER TABLE messages ADD COLUMN media_id INTEGER",                       # Telegram id of the stored image
+    "ALTER TABLE messages ADD COLUMN forwarded INTEGER NOT NULL DEFAULT 0",   # forwarded into the chat
+    "ALTER TABLE messages ADD COLUMN deleted INTEGER NOT NULL DEFAULT 0",     # deleted in the source chat
+]
+_MESSAGE_META = ("media_id", "forwarded", "deleted")
+_MESSAGE_FLAGS = ("forwarded", "deleted")
+# StoredMessage fields that mirror the flag columns: filled in as soon as the model has them (none today).
+_OPTIONAL_MESSAGE_FIELDS = tuple(f for f in _MESSAGE_FLAGS if f in StoredMessage.model_fields)
+
+
+class _AnySender:
+    """Default of ``recent_messages(sender_id=...)``: no sender filter (``None`` = sender is NULL)."""
+
+    def __repr__(self) -> str:
+        return "ANY_SENDER"
+
+
+ANY_SENDER: Any = _AnySender()
 
 _SCHEMA = """
 CREATE TABLE IF NOT EXISTS schema_version (
@@ -255,6 +285,7 @@ class Database:
         self._clock = clock or (lambda: datetime.now(timezone.utc))
         self._conn: aiosqlite.Connection | None = None
         self._lock: asyncio.Lock | None = None
+        self._pinned: dict[int, set[int]] = {}     # chat -> message ids of triggered, unprocessed batches
 
     @property
     def is_memory(self) -> bool:
@@ -298,6 +329,19 @@ class Database:
             self._lock = None
             await conn.close()
 
+    def close_nowait(self) -> None:
+        """Last resort when ``await close()`` cannot run (shutdown interrupted): tell the connection's
+        worker thread to close the file and end, without waiting for it. Never blocks, never raises."""
+        conn = self._conn
+        self._conn = None
+        self._lock = None
+        stop = getattr(conn, "stop", None)
+        if stop is not None:
+            try:
+                stop()
+            except Exception as exc:
+                log.debug("close_nowait: %s", exc)
+
     async def __aenter__(self) -> "Database":
         await self.open()
         return self
@@ -337,6 +381,13 @@ class Database:
                 if current < SCHEMA_VERSION or len(rows) > 1:
                     await conn.execute("DELETE FROM schema_version")
                     await conn.execute("INSERT INTO schema_version (version) VALUES (?)", (SCHEMA_VERSION,))
+            for stmt in ADDITIVE_COLUMNS:
+                add = _ADD_COLUMN.match(stmt)
+                if add is None:
+                    raise RuntimeError(f"ADDITIVE_COLUMNS accepts only ALTER TABLE ... ADD COLUMN: {stmt!r}")
+                if add.group(2) not in await _columns(conn, add.group(1)):
+                    log.info("Database %s: adding column %s.%s", self.path, add.group(1), add.group(2))
+                    await conn.execute(stmt)
             await conn.execute("COMMIT")
         except BaseException:
             await _rollback_quietly(conn)
@@ -446,19 +497,30 @@ class Database:
         self,
         chat_id: int,
         since: datetime,
-        sender_id: int | None = None,
+        sender_id: int | None | _AnySender = ANY_SENDER,
         only_unconsumed: bool = True,
         limit: int = 50,
         topic_id: int | None = None,
     ) -> list[StoredMessage]:
         """Messages with ``date >= since``, oldest first.
 
+        ``sender_id``: omitted (``ANY_SENDER``) = every sender; an id = that sender; ``None`` = only
+        messages WITHOUT a sender (anonymous admin, channel post), never the other senders' ones.
         ``topic_id`` not None: only messages of that forum topic (None = every topic).
+        ``only_unconsumed``: pinned messages (see :meth:`pin_messages`) are included even when they
+        are older than ``since``.
         When more than ``limit`` match, the NEWEST ``limit`` are returned (still
         oldest first) so the latest signal is never cut off."""
-        where = ["chat_id = ?", "date >= ?"]
-        params: list[Any] = [chat_id, _dt_to_db(since)]
-        if sender_id is not None:
+        pinned = sorted(self._pinned.get(chat_id, ())) if only_unconsumed else []
+        if pinned:
+            where = ["chat_id = ?", f"(date >= ? OR message_id IN ({', '.join('?' for _ in pinned)}))"]
+            params: list[Any] = [chat_id, _dt_to_db(since), *pinned]
+        else:
+            where = ["chat_id = ?", "date >= ?"]
+            params = [chat_id, _dt_to_db(since)]
+        if sender_id is None:
+            where.append("sender_id IS NULL")
+        elif not isinstance(sender_id, _AnySender):
             where.append("sender_id = ?")
             params.append(sender_id)
         if topic_id is not None:
@@ -489,12 +551,74 @@ class Database:
         """Mark every unconsumed message older than ``before`` consumed. Returns how many.
 
         Used at startup: a message that was waiting (e.g. for a parse retry) when the
-        process stopped must never be picked up later as part of a fresh signal."""
+        process stopped must never be picked up later as part of a fresh signal.
+        Pinned messages (see :meth:`pin_messages`) are left alone: their batch is still coming."""
+        sql = "UPDATE messages SET consumed = 1 WHERE consumed = 0 AND date < ?"
+        params: list[Any] = [_dt_to_db(before)]
+        for chat_id, ids in self._pinned.items():
+            if ids:
+                sql += f" AND NOT (chat_id = ? AND message_id IN ({', '.join('?' for _ in ids)}))"
+                params += [chat_id, *sorted(ids)]
         async with self._write() as conn:
-            cur = await conn.execute(
-                "UPDATE messages SET consumed = 1 WHERE consumed = 0 AND date < ?", (_dt_to_db(before),)
-            )
+            cur = await conn.execute(sql, params)
             return cur.rowcount or 0
+
+    # ---- batches defined at trigger time (in memory) ----------------------------
+    def pin_messages(self, chat_id: int, message_ids: Iterable[int]) -> None:
+        """Messages of a batch the listener has triggered and the engine has not processed yet.
+
+        Until :meth:`unpin_messages`, ``recent_messages(only_unconsumed=True)`` returns them even when
+        they are older than ``since`` and ``consume_stale_messages`` skips them, so waiting (behind a
+        slow broker call, or for the brokers to connect at start) cannot push a message out of the
+        batch it triggered. Consumed messages are never returned, pinned or not. Not persisted."""
+        ids = {int(i) for i in message_ids}
+        if ids:
+            self._pinned.setdefault(chat_id, set()).update(ids)
+
+    def unpin_messages(self, chat_id: int, message_ids: Iterable[int]) -> None:
+        left = self._pinned.get(chat_id)
+        if left is None:
+            return
+        left.difference_update(int(i) for i in message_ids)
+        if not left:
+            del self._pinned[chat_id]
+
+    def pinned_messages(self, chat_id: int) -> set[int]:
+        return set(self._pinned.get(chat_id, ()))
+
+    # ---- optional extras of a stored message --------------------------------------
+    async def set_message_meta(self, chat_id: int, message_id: int, **fields: Any) -> None:
+        """Set ``media_id`` (Telegram id of the stored image, None = unknown), ``forwarded`` and / or
+        ``deleted`` (bools) of a stored message. Other keys raise ValueError; a missing row is a no-op."""
+        unknown = sorted(set(fields) - set(_MESSAGE_META))
+        if unknown:
+            raise ValueError(f"unknown message meta field(s): {', '.join(unknown)}")
+        if not fields:
+            return
+        values: dict[str, Any] = dict(fields)
+        for flag in _MESSAGE_FLAGS:
+            if flag in values:
+                values[flag] = int(bool(values[flag]))
+        if values.get("media_id") is not None:
+            values["media_id"] = int(values["media_id"])
+        sets = ", ".join(f"{name} = ?" for name in values)
+        async with self._write() as conn:
+            await conn.execute(
+                f"UPDATE messages SET {sets} WHERE chat_id = ? AND message_id = ?",
+                (*values.values(), chat_id, message_id),
+            )
+
+    async def message_meta(self, chat_id: int, message_id: int) -> dict[str, Any] | None:
+        """``{"media_id": int | None, "forwarded": bool, "deleted": bool}`` of a stored message
+        (``deleted``: deleted in the source chat after it was stored); None = no such row."""
+        async with self._read() as conn:
+            row = await self._fetchone(
+                conn, "SELECT media_id, forwarded, deleted FROM messages WHERE chat_id = ? AND message_id = ?",
+                (chat_id, message_id),
+            )
+        if row is None:
+            return None
+        return {"media_id": row["media_id"], **{flag: bool(row[flag]) for flag in _MESSAGE_FLAGS}}
 
     # ---- trades --------------------------------------------------------------
     async def create_trade(self, plan: TradePlan, status: TradeStatus = TradeStatus.OPENING) -> TradeRecord:
@@ -795,6 +919,7 @@ def _row_to_message(row: sqlite3.Row) -> StoredMessage:
         topic_title=row["topic_title"],
         edited=bool(row["edited"]),
         consumed=bool(row["consumed"]),
+        **{name: bool(row[name]) for name in _OPTIONAL_MESSAGE_FIELDS},
     )
 
 
