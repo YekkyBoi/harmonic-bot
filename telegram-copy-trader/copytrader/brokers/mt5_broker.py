@@ -1198,7 +1198,15 @@ class Mt5Broker(MetaTraderLegBroker):
     async def _call(self, name: str, *args: Any, **kwargs: Any) -> tuple[Any, tuple[int, str] | None]:
         def job(mt5: Any) -> tuple[Any, tuple[int, str] | None]:
             func = getattr(mt5, name)
-            res = func(*args, **kwargs)
+
+            def invoke() -> Any:
+                # Never pass an EMPTY keyword dict: the MetaTrader5 package's order_send / order_check refuse a
+                # positional request together with ANY keyword dict, even an empty one, and answer
+                # (-2, "Unnamed arguments not allowed") without sending anything. ``f(*args, **{})`` hands a
+                # C function an empty dict, not "no keywords".
+                return func(*args, **kwargs) if kwargs else func(*args)
+
+            res = invoke()
             if res is not None:
                 return res, None
             err = _last_error(mt5)
@@ -1208,7 +1216,7 @@ class Mt5Broker(MetaTraderLegBroker):
                     # Never re-send: the first request may have reached the server and only the reply was lost,
                     # a second send would duplicate the order. The caller looks the order up by its tag.
                     return None, err
-                res = func(*args, **kwargs)
+                res = invoke()
                 if res is not None:
                     return res, None
                 err = _last_error(mt5)
