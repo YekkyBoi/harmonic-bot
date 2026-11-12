@@ -9,6 +9,19 @@ parse  - show how a message would be understood (never trades)
 
 from __future__ import annotations
 
+import os as _os
+
+# Windows' certificate store may lack the root CA some services use (MetaApi's websocket failed with
+# CERTIFICATE_VERIFY_FAILED). Point OpenSSL at certifi's bundle before any SSL context is created; on Windows the
+# system store is still loaded as well, so this only adds trusted roots.
+if not _os.environ.get("SSL_CERT_FILE"):
+    try:
+        import certifi as _certifi
+
+        _os.environ["SSL_CERT_FILE"] = _certifi.where()
+    except ImportError:  # pragma: no cover - certifi ships with httpx/requests
+        pass
+
 import argparse
 import asyncio
 import html

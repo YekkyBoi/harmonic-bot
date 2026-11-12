@@ -22,7 +22,8 @@ from .models import Severity
 logger = logging.getLogger(__name__)
 
 _HANDLER_TAG = "_copytrader_handler"
-_NOISY_LOGGERS = ("telethon", "aiosqlite", "asyncio", "httpx", "httpcore", "anthropic", "ccxt", "urllib3", "metaapi")
+_NOISY_LOGGERS = ("telethon", "aiosqlite", "asyncio", "httpx", "httpcore", "anthropic", "ccxt", "urllib3", "metaapi",
+                  "metaapi_cloud_sdk", "engineio", "socketio")
 LOG_FILE_MAX_BYTES = 10 * 1024 * 1024
 LOG_FILE_BACKUPS = 5
 MIN_PARSE_DEADLINE_SEC = 60.0      # a slow (image + high effort) reading must still fit
