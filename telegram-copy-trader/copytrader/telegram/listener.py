@@ -38,6 +38,14 @@ Messages that arrive while the listener is away
 The owner is also told when an image cannot be downloaded (after three tries), when an unprocessed
 message or the signal of an open trade is deleted in the group (nothing is ever closed
 automatically), and when a message could not be stored or its batch failed.
+
+The copy of the group for the owner's friend (``/grup``, group_mirror.py)
+-------------------------------------------------------------------------
+Every new message, edit and catch-up find of the source chats is offered to the GroupMirror AFTER the
+listener's own handling of it has been started (live) or done (catch-up): the offer never waits and never
+raises, and nothing of the handling above depends on it. The mirror reads the topic-title cache (it never
+asks Telegram for a title), uploads the image the listener already downloaded for a followed topic, and
+moves media only while :meth:`TelegramListener.trading_busy` is False.
 """
 
 from __future__ import annotations
@@ -410,6 +418,8 @@ class TelegramListener:
         self._topic_listing = False                              # start(): one notice for the whole listing
         self._topic_notice_lock = asyncio.Lock()
         self._noticed_at: dict[str, float] = {}                  # throttle of repeated problem notices
+        self._mirror: Any = None                                 # the group copy for the owner's friend (/grup)
+        self._editing = 0                                        # edits being stored / passed on (the group copy waits)
 
     @property
     def chat_ids(self) -> set[int]:
@@ -427,6 +437,56 @@ class TelegramListener:
 
     def release_batches(self) -> None:
         self._ready.set()
+
+    # ---- the copy of the group for the owner's friend (/grup, group_mirror.py) ------------------------
+    def set_group_mirror(self, mirror: Any) -> None:
+        """The GroupMirror: offered every message of the source chats (it copies them only when switched on)."""
+        self._mirror = mirror
+
+    def _offer_mirror(self, message: Any, handled: Any = None, *, edited: bool = False, catchup: bool = False) -> None:
+        mirror = self._mirror
+        if mirror is None or self._stopping:
+            return
+        try:
+            mirror.offer(message, handled=handled, edited=edited, catchup=catchup)
+        except Exception:
+            log.exception("Group copy: a message was not offered")
+
+    def trading_busy(self) -> bool:
+        """A source message is being stored (topic title, image download) or edited (its new image, the engine's
+        on_edit), or a batch waits for / is in the engine."""
+        return bool(self._storing or self._inflight or self._timers or self._in_engine or self._editing)
+
+    def mirror_known_topics(self) -> list[str]:
+        """The titles of the forum topics in the cache (every source chat), for /grup: which goes where."""
+        titles: list[str] = []
+        for (_chat, _topic), title in sorted(self._topic_titles.items(), key=lambda kv: (kv[0][0], kv[0][1])):
+            if title and title not in titles:
+                titles.append(title)
+        return titles
+
+    def mirror_topic(self, message: Any) -> tuple[str | None, str | None, int]:
+        """(chat title, forum topic title or None for a chat without topics, number of source chats) of a message,
+        from the cache only: never a request, never a change of the cache."""
+        chat_id = getattr(message, "chat_id", None)
+        chat_title = getattr(self._entities.get(chat_id), "title", None) if chat_id is not None else None
+        topic: str | None = None
+        if chat_id in self._forums or _in_forum_topic(message):
+            topic_id = topic_id_of(message)
+            key = (chat_id, topic_id or GENERAL_TOPIC_ID)
+            title = self._topic_titles.get(key) if key not in self._topic_unknown_until else None
+            topic = title or (GENERAL_TOPIC_TITLE if topic_id is None else f"Konu #{topic_id}")
+        return chat_title, topic, max(1, len(self._entities))
+
+    async def mirror_stored_media(self, chat_id: int, msg_id: int) -> str | None:
+        """The image the listener downloaded for this message (a followed topic), if its file is there."""
+        try:
+            row = await self._db.get_message(chat_id, msg_id)
+        except Exception as exc:
+            log.debug("Group copy: stored message %s/%s not readable: %s", chat_id, msg_id, exc)
+            return None
+        path = getattr(row, "media_path", None) if row is not None else None
+        return path if path and Path(path).is_file() else None
 
     async def _notify(self, text: str, severity: Severity = Severity.WARNING) -> None:
         if self._notifier is None:
@@ -594,10 +654,12 @@ class TelegramListener:
 
     # ---- Telethon handlers (thin; spawn tracked tasks) ----------------------
     async def _on_new_message_event(self, event: Any) -> None:
-        self._spawn(self.handle_message(event.message, live=True))
+        task = self._spawn(self.handle_message(event.message, live=True))
+        self._offer_mirror(event.message, task)
 
     async def _on_edited_event(self, event: Any) -> None:
         self._spawn(self.handle_edit(event.message))
+        self._offer_mirror(event.message, edited=True)
 
     async def _on_deleted_event(self, event: Any) -> None:
         chat_id = getattr(event, "chat_id", None)
@@ -774,7 +836,15 @@ class TelegramListener:
             await self.handle_edit(late_edit)
 
     async def handle_edit(self, message: Any) -> None:
-        """Edited message: store the new version, then ``on_edit`` (only for followed topics)."""
+        """Edited message: store the new version, then ``on_edit`` (only for followed topics). Counted in
+        ``_editing`` while it runs (only read by :meth:`trading_busy`)."""
+        self._editing += 1
+        try:
+            await self._handle_edit(message)
+        finally:
+            self._editing -= 1
+
+    async def _handle_edit(self, message: Any) -> None:
         if not self._accepts(message):
             return
         chat_id, msg_id = message.chat_id, message.id
@@ -827,10 +897,13 @@ class TelegramListener:
 
     async def _pass_edit(self, stored: StoredMessage) -> None:
         await self._ready.wait()
+        self._editing += 1
         try:
             await self._on_edit(stored)
         except Exception:
             log.exception("on_edit failed for %s/%s", stored.chat_id, stored.message_id)
+        finally:
+            self._editing -= 1
 
     def _media_changed(
         self,
@@ -1502,6 +1575,8 @@ class TelegramListener:
                 # is known; a skipped one gets its own notice).
                 self._spawn(self.handle_message(msg, live=True))
         log.info("Catch-up %s: %d missed message(s), %d recent enough to process", chat_id, len(missed), fresh)
+        for msg in missed:
+            self._offer_mirror(msg, catchup=True)       # (after their handling: the copy never comes first)
 
     async def _prefetch_topics(self, chat_id: int, messages: list[Any]) -> None:
         """One request for the titles of every uncached topic among missed messages (filtered forums)."""
