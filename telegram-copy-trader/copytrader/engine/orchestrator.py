@@ -53,7 +53,7 @@ from datetime import datetime, timedelta, timezone
 from typing import Any, Literal, TypeVar
 
 from ..brokers.base import Broker, BrokerError, BrokerUnavailableError, OrderOutcomeUnknownError, outcome_unknown
-from ..config import AppConfig, TopicRoute, effective_risk, match_topic, route_thresholds
+from ..config import AppConfig, TopicRoute, effective_risk, fold_ascii, match_topic, route_thresholds
 from ..errors import ParserError
 from ..interfaces import (
     NO_CORRECTION_FRIEND_TEXT,
@@ -243,8 +243,9 @@ _LATE_KEY = "late_open_legs"       # storage state: legs that were waiting for t
 # Catch-up of a signal an optional broker (a friend's account) missed because it was not connected or its link was
 # known down (nothing was sent to it: BrokerOutcome.unavailable, or it was in ``optional_down``). Kept in storage
 # (_MISSED_KEY: "<trade id>:<broker>" -> what Engine._remember_missed stored) until that broker is healthy again
-# (connected, or a heartbeat check it passed); then the owner is asked ONCE whether to open it there after all
-# (Engine._catch_up_check), or told once why it is not.
+# (connected, or a heartbeat check it passed); then, when the conditions hold, it is opened there after all
+# (Engine._catch_up_check): at once in mode "otomatik" (the default) or after the owner's (or the friend's) "Evet" in
+# mode "sor" (the owner's /sonradan; _CATCH_UP_MODE_KEY) - or told once why it is not.
 _MISSED_KEY = "missed_optional_legs"
 CATCH_UP_MAX_AGE_SEC = 900.0       # only a signal at most this old (15 min) is offered, and opened on "Evet"
 CATCH_UP_ASK_SEC = 300.0           # the question expires after this (never later than the signal's maximum age)
@@ -257,6 +258,16 @@ MISSED_KEEP_SEC = 86400.0
 # with ``guncelle.py --geri-al`` after a crash with a question open would not start). Same record as the table's.
 _CATCH_UP_KEY = "catch_up_questions"
 _FRIEND_KEY = "friend_chat_id"     # storage state: the owner's friend's chat (``/arkadas``), or absent
+# How a missed signal is caught up once its optional broker is back (owner's /sonradan, kept in storage): "otomatik"
+# opens it at once when every condition of the "Evet" path holds (the same checks, the same open); "sor" asks
+# ✅ Evet / ❌ Hayır first. Nothing stored: CATCH_UP_DEFAULT_MODE.
+_CATCH_UP_MODE_KEY = "catch_up_mode"
+CATCH_UP_MODES = ("otomatik", "sor")
+CATCH_UP_DEFAULT_MODE = "otomatik"
+CATCH_UP_UNFORGOTTEN = "kayıt silinemedi; iki kez açılmaması için açılmadı"     # (otomatik: see _forget_missed)
+CATCH_UP_STOPPED = "bot kapandığı için emir gönderilmedi"
+CATCH_UP_STOP_NOTICE_SEC = 3.0     # the best-effort notice of a catch-up the stop interrupted waits at most this
+AUTO_APPROVAL = "otomatik; şartlar uygundu"     # how the open's own notice names who decided, in "otomatik"
 CATCH_UP_QUESTION_KEEP_SEC = 86400.0     # answered / expired questions are kept this long (a late tap is answered)
 CLOSE_QUESTION_WAIT_SEC = 5.0            # stop(): a question being answered right now is waited for this long at most
 # Broker outcomes of an open flow that mean "this broker of the route has not taken the trade".
@@ -1576,8 +1587,14 @@ class Engine:
             up = {b.name for b in self.brokers} | {name}
             self.brokers = [b for b in self.configured_brokers if b.name in up]
             logger.info("Optional broker %s connected after the start", name)
-            skipped = (" (kendiliğinden açılmaz; bağlantı yokken atlananlar için ayrıca bilgi verilecek)"
-                       if name in self._missed_brokers else "")
+            skipped = ""
+            if name in self._missed_brokers:
+                mode = await self._catch_up_mode_or_none()
+                skipped = (" (şartlar uygunsa şimdi sonradan açılacak, uygun değilse nedeni bildirilecek)"
+                           if mode == "otomatik" else
+                           " (kendiliğinden açılmaz; bağlantı yokken atlananlar için ayrıca bilgi verilecek)"
+                           if mode == "sor" else
+                           " (bağlantı yokken atlananlar için ayrıca bilgi verilecek)")     # (true in both modes)
             await self._notify(f"✅ <b>{esc(name)}</b> bağlandı (bot başladıktan sonra). Bundan sonraki sinyaller bu "
                                f"hesapta da açılacak; bağlanana kadar gelen sinyaller bu hesapta açılmadı{skipped}.",
                                Severity.INFO)
@@ -1717,8 +1734,14 @@ class Engine:
                 up = {b.name for b in self.brokers} | {name}
                 self.brokers = [b for b in self.configured_brokers if b.name in up]
                 logger.info("%s broker %s connected after retry", kind, name)
-                skipped = ("atlanan sinyaller kendiliğinden açılmaz; bağlantı yokken atlananlar için ayrıca bilgi "
-                           "verilecek" if name in self._missed_brokers else "atlanan eski sinyaller açılmaz")
+                skipped = "atlanan eski sinyaller açılmaz"
+                if name in self._missed_brokers:
+                    mode = await self._catch_up_mode_or_none()
+                    skipped = ("bağlantı yokken atlananlar şartlar uygunsa şimdi sonradan açılacak, uygun değilse "
+                               "nedeni bildirilecek" if mode == "otomatik" else
+                               "atlanan sinyaller kendiliğinden açılmaz; bağlantı yokken atlananlar için ayrıca bilgi "
+                               "verilecek" if mode == "sor" else
+                               "bağlantı yokken atlananlar için ayrıca bilgi verilecek")     # (true in both modes)
                 await self._notify(f"✅ <b>{esc(name)}</b> bağlandı. Bundan sonraki sinyaller bu hesapta da açılacak "
                                    f"({skipped}).", Severity.INFO)
                 self._spawn(self._owed_after_connect(name), f"owed-{name}")
@@ -1842,17 +1865,23 @@ class Engine:
         except Exception:
             logger.exception("Could not remember that %s missed trade #%s", name, trade_id)
 
-    async def _forget_missed(self, key: str) -> None:
-        """Drop one remembered miss (before the owner is asked or told about it: never twice). Never raises."""
+    async def _forget_missed(self, key: str) -> bool:
+        """Drop one remembered miss (before the owner is asked or told about it: never twice in this process).
+        True only when storage no longer holds it (read and written back here), so that a restart cannot bring it
+        back: an automatic open needs that (:meth:`_catch_up_check`). Never raises."""
         self._missed_done.add(key)
         async with self._missed_lock:
             try:
-                data = await self._missed_state()
+                data = await self.db.get_state(_MISSED_KEY, {}) or {}
+                if not isinstance(data, dict):
+                    data = {}
                 if data.pop(key, None) is not None:
                     await self.db.set_state(_MISSED_KEY, data)
                 self._missed_brokers = self._missed_names(data)
             except Exception:
                 logger.exception("Could not drop the missed optional leg %s", key)
+                return False
+        return True
 
     def _broker_healthy(self, name: str) -> None:
         """Heartbeat hook: broker ``name`` passed a health check. Its remembered misses are looked at."""
@@ -1867,11 +1896,12 @@ class Engine:
         task.add_done_callback(lambda _t, n=name: self._catching_up.discard(n))
 
     async def _catch_up_check(self, name: str) -> None:
-        """Optional broker ``name`` is healthy again (connected, or it passed a heartbeat check): for every signal it
-        missed while it was not connected the owner is asked ONCE whether to open it there after all, when the
-        conditions of :meth:`_catch_up_problem` hold; the misses that cannot be caught up are told in one notice
-        (why for each). Each miss is dropped before its question / notice: never asked or told twice. A miss that
-        fails only because the broker does not answer (again) is kept for its next healthy check."""
+        """Optional broker ``name`` is healthy again (connected, or it passed a heartbeat check): every signal it
+        missed while it was not connected is, when the conditions of :meth:`_catch_up_problem` hold, opened there
+        after all in mode "otomatik" (:meth:`_auto_catch_up`: the "Evet" path without the question) or asked ONCE in
+        mode "sor"; the misses that cannot be caught up are told in one notice (why for each). Each miss is dropped
+        before its open / question / notice: never opened, asked or told twice. A miss that fails only because the
+        broker does not answer (again) is kept for its next healthy check."""
         broker = self._broker(name)
         if broker is None or name in self.optional_down:
             return
@@ -1881,7 +1911,44 @@ class Engine:
                        key=lambda kv: str(kv[1].get("missed_at", "")))
         asking = {(c.catch_up or {}).get("trade_id") for c in await self._catch_up_pending()
                   if (c.catch_up or {}).get("broker") == name}
+        try:
+            auto = await self.catch_up_mode() == "otomatik"
+        except Exception:               # (never opened on a guess: the misses stay for the next healthy check)
+            logger.exception("Catch-up check on %s skipped: the catch-up mode could not be read", name)
+            return
         told: list[str] = []
+        kept: list[str] = []
+        try:
+            await self._catch_up_items(broker, items, asking, auto, told, kept)
+        except asyncio.CancelledError:  # (the stop: what was found so far is still told, best effort)
+            if told or kept:
+                with contextlib.suppress(Exception, asyncio.CancelledError):
+                    await asyncio.wait_for(self._tell_not_caught_up(name, told, kept), CATCH_UP_STOP_NOTICE_SEC)
+            raise
+        await self._tell_not_caught_up(name, told, kept)
+
+    async def _tell_not_caught_up(self, name: str, told: list[str], kept: list[str]) -> None:
+        """``told``: the misses that will not be opened (why for each); ``kept``: those not opened now whose
+        removal from storage failed (otomatik), so a restart within the age limit can still open each once."""
+        n = esc(name)
+        if told:
+            await self._notify(
+                f"ℹ️ <b>{n}</b> yeniden bağlı. Bağlantı yokken atlanan "
+                + ("şu işlem" if len(told) == 1 else "şu işlemler") + f" {n} hesabında sonradan AÇILMAYACAK:\n"
+                + "\n".join(told), Severity.INFO)
+        if kept:
+            one = len(kept) == 1
+            await self._notify(
+                f"ℹ️ <b>{n}</b> yeniden bağlı. Bağlantı yokken atlanan " + ("şu işlem" if one else "şu işlemler")
+                + f" {n} hesabında şimdi açılmadı:\n" + "\n".join(kept)
+                + f"\nBot sinyalden sonraki {fmt.fmt_duration(CATCH_UP_MAX_AGE_SEC)} içinde yeniden başlarsa şartlar "
+                + ("uygunsa bir kez açılabilir." if one else "uygunsa her biri bir kez açılabilir."), Severity.INFO)
+
+    async def _catch_up_items(self, broker: Broker, items: list[tuple[str, dict[str, Any]]], asking: set[Any],
+                              auto: bool, told: list[str], kept: list[str]) -> None:
+        """The loop of :meth:`_catch_up_check`: ``told`` gets the misses that are not caught up (why for each),
+        ``kept`` (otomatik) those not opened now because their removal from storage failed."""
+        name = broker.name
         for key, item in items:
             if not self._accepting or self._brokers_closed:
                 break
@@ -1895,27 +1962,103 @@ class Engine:
                 continue
             try:
                 trade = await self.db.get_trade(trade_id)
-                problem, facts, again = await self._catch_up_problem(broker, trade, item, asking=True)
+                # (no answer is waited for in "otomatik": only the signal's age counts, not the time left to answer)
+                problem, facts, again = await self._catch_up_problem(broker, trade, item, asking=not auto)
             except Exception as exc:
                 logger.exception("Catch-up check of trade #%s on %s failed", trade_id, name)
                 problem, facts, again = f"kontrol sırasında hata ({esc(exc)})", {}, False
             if problem is not None and again:
                 logger.info("Catch-up of trade #%s on %s waits for its next healthy check: %s", trade_id, name, problem)
                 continue
-            await self._forget_missed(key)
+            if not self._accepting or self._brokers_closed:
+                break                                   # (kept: the next start looks at it, with every check)
+            forgotten = await self._forget_missed(key)
             label = esc(item.get("label") or f"#{trade_id}")
+            if auto and not forgotten:  # (still stored: never opened now - a restart while the order is unanswered
+                # would open it again - and the next start looks at it again, with every check: no "AÇILMAYACAK")
+                kept.append(f"• <b>{label}</b>: "
+                            + (CATCH_UP_UNFORGOTTEN if problem is None else f"{problem}; kayıt da silinemedi"))
+                await self._log("catch_up_not_offered", {"trade_id": trade_id, "broker": name,
+                                                         "why": problem or CATCH_UP_UNFORGOTTEN, "kept": True})
+                continue
             if problem is not None:
                 told.append(f"• <b>{label}</b>: {problem}")
                 await self._log("catch_up_not_offered", {"trade_id": trade_id, "broker": name, "why": problem})
                 continue
             assert trade is not None
-            await self._ask_catch_up(broker, trade, item, facts)
-        if told:
-            one = len(told) == 1
-            await self._notify(
-                f"ℹ️ <b>{esc(name)}</b> yeniden bağlı. Bağlantı yokken atlanan "
-                + ("şu işlem" if one else "şu işlemler") + f" {esc(name)} hesabında sonradan AÇILMAYACAK:\n"
-                + "\n".join(told), Severity.INFO)
+            if not auto:
+                await self._ask_catch_up(broker, trade, item, facts)
+                continue
+            launched: list[bool] = []
+            try:
+                problem = await self._auto_catch_up(broker, trade, item, facts, launched=launched)
+            except asyncio.CancelledError:
+                if not launched:
+                    told.append(f"• <b>{label}</b>: {CATCH_UP_STOPPED}")
+                raise
+            if problem is not None:
+                told.append(f"• <b>{label}</b>: {problem}")
+                await self._log("catch_up_not_offered", {"trade_id": trade_id, "broker": name, "why": problem})
+
+    async def _auto_catch_up(self, broker: Broker, trade: TradeRecord, item: dict[str, Any],
+                             facts: dict[str, Any], *, launched: list[bool] | None = None) -> str | None:
+        """Mode "otomatik": open the missed trade on ``broker`` now, as the "Evet" path does (the conditions just
+        checked by :meth:`_catch_up_problem`; then, under the trade lock, the fresh venue read and the trade and
+        position checks again; the same open), and tell the owner (and the friend) once before its result. Returns
+        why it was not opened (HTML), or None. ``launched`` gets True once the order is on its way."""
+        name = broker.name
+        n = esc(name)
+        label = esc(item.get("label") or f"#{trade.id}")
+        notice = (f"🔁 <b>{label}</b> {n} hesabında sonradan açılıyor (bağlantı yokken atlanmıştı; şartlar uygun):\n"
+                  + "\n".join(self._catch_up_facts(name, trade, facts))
+                  + "\nPiyasa emriyle, işlemin şu anki stop ve hedefleriyle, normal miktarla açılıyor; sonuç ayrıca "
+                    "bildirilecek.")
+        if not self._accepting or self._brokers_closed:
+            return "bot kapanıyor"
+        try:
+            problem = await self._start_catch_up_leg(broker, trade, item, approval=AUTO_APPROVAL, notice=notice,
+                                                     launched=launched)
+        except Exception as exc:
+            logger.exception("Automatic catch-up of trade #%s on %s could not be started", trade.id, name)
+            problem = f"emir başlatılamadı (<code>{esc(exc)}</code>)"
+        if problem is None:
+            await self._log("catch_up_auto", {"trade_id": trade.id, "broker": name})
+        return problem
+
+    async def catch_up_mode(self) -> str:
+        """"otomatik" or "sor" (owner's /sonradan; nothing valid stored: CATCH_UP_DEFAULT_MODE). Raises when the
+        setting cannot be read: never taken for "otomatik" then."""
+        mode = await self.db.get_state(_CATCH_UP_MODE_KEY)
+        return mode if mode in CATCH_UP_MODES else CATCH_UP_DEFAULT_MODE
+
+    async def _catch_up_mode_or_none(self) -> str | None:
+        """The catch-up mode, or None when it cannot be read (a text must then be true in both modes)."""
+        try:
+            return await self.catch_up_mode()
+        except Exception:
+            logger.exception("Could not read the catch-up mode")
+            return None
+
+    async def catch_up_command(self, args: str) -> str:
+        """/sonradan [otomatik|sor]: show or set the catch-up mode. Returns the owner's reply (HTML)."""
+        names = _names([b.name for b in self.configured_brokers if self._is_optional(b)]) or "isteğe bağlı hesap"
+        what = f"Bağlantı yokken atlanan {names} işlemleri"
+        explain = {"otomatik": "bağlantı gelince şartlar uygunsa sormadan açılır",
+                   "sor": "bağlantı gelince şartlar uygunsa Evet / Hayır diye sorulur (arkadaş ayarlıysa ona)"}
+        arg = fold_ascii(args)                          # ("OTOMATİK", "Otomatık", "SOR")
+        if not arg:
+            try:
+                mode = await self.catch_up_mode()
+            except Exception as exc:
+                logger.exception("Could not read the catch-up mode")
+                return f"⚠️ Ayar şu an okunamadı (<code>{esc(exc)}</code>); biraz sonra tekrar deneyin."
+            return (f"🔁 {what}: <b>{mode}</b> — {explain[mode]}. Değiştirmek için: <code>/sonradan otomatik</code> ya "
+                    "da <code>/sonradan sor</code>")
+        if arg not in CATCH_UP_MODES:
+            return "Kullanım: <code>/sonradan otomatik</code>, <code>/sonradan sor</code> ya da <code>/sonradan</code>"
+        await self.db.set_state(_CATCH_UP_MODE_KEY, arg)
+        await self._log("catch_up_mode", {"mode": arg})
+        return f"✅ {what} artık: <b>{arg}</b> — {explain[arg]}."
 
     def _catch_up_trade_problem(self, trade: TradeRecord, positions: list[BrokerPosition],
                                 name: str) -> tuple[str | None, bool]:
@@ -2101,11 +2244,21 @@ class Engine:
         expires = min(now + timedelta(seconds=CATCH_UP_ASK_SEC), signal_at + timedelta(seconds=CATCH_UP_MAX_AGE_SEC))
         label = str(item.get("label") or f"#{trade.id} {plan.base_asset} {plan.side.value.upper()}")
         n = esc(name)
-        shifted = bool(facts.get("shifted"))
         lines = [f"Bu sinyal geldiğinde {n} bağlı değildi (bağlantısı yoktu ya da kopuktu); işlem orada açılmadı. "
-                 f"İşlem {_accounts(facts.get('open_on') or [])} açık. {n} şimdi yeniden bağlı."]
-        lines.append(f"• Sinyal fiyatı: {fmt_price(trade.plan.entry_price)} "
-                     f"({fmt.fmt_duration(float(facts.get('age_sec') or 0.0))} önce)")
+                 f"İşlem {_accounts(facts.get('open_on') or [])} açık. {n} şimdi yeniden bağlı.",
+                 *self._catch_up_facts(name, trade, facts)]
+        lines.append(f"Evet derseniz şartlar o an yeniden kontrol edilir; uygunsa {n} hesabında piyasa emriyle, "
+                     "işlemin o anki stop ve hedefleriyle, normal miktarla açılır. Hayır derseniz bu hesapta bir şey "
+                     "yapılmaz.")
+        await self._send_catch_up_question(broker, trade, item, facts, lines, label, now, expires, signal_at)
+
+    def _catch_up_facts(self, name: str, trade: TradeRecord, facts: dict[str, Any]) -> list[str]:
+        """The lines (HTML) a catch-up question / notice shows: signal and live price, stop, targets, the risk."""
+        plan = self._catch_up_plan(trade)
+        n = esc(name)
+        shifted = bool(facts.get("shifted"))
+        lines = [(f"• Sinyal fiyatı: {fmt_price(trade.plan.entry_price)} "
+                  f"({fmt.fmt_duration(float(facts.get('age_sec') or 0.0))} önce)")]
         if shifted:
             lines.append(f"• Şimdiki fiyat: {fmt_price(facts['live'])} ({n} fiyatı; sinyal grafiğinde "
                          f"~{fmt_price(facts['live_sig'])})")
@@ -2134,9 +2287,14 @@ class Engine:
             # (sized from the signal's own stop, see _open_on_broker size_stop)
             risk_line += "; miktar sinyalin ilk stopuna göre hesaplanır, şimdiki stopta kayıp bundan az olur"
         lines.append(risk_line)
-        lines.append(f"Evet derseniz şartlar o an yeniden kontrol edilir; uygunsa {n} hesabında piyasa emriyle, "
-                     "işlemin o anki stop ve hedefleriyle, normal miktarla açılır. Hayır derseniz bu hesapta bir şey "
-                     "yapılmaz.")
+        return lines
+
+    async def _send_catch_up_question(self, broker: Broker, trade: TradeRecord, item: dict[str, Any],
+                                      facts: dict[str, Any], lines: list[str], label: str, now: datetime,
+                                      expires: datetime, signal_at: datetime) -> None:
+        name = broker.name
+        n = esc(name)
+        plan = self._catch_up_plan(trade)
         action = ParsedAction(
             action=ActionType.OPEN, base_asset=plan.base_asset, quote_asset=plan.quote_asset,
             market_type=plan.market_type, side=plan.side, entry_type=EntryType.MARKET,
@@ -2207,11 +2365,14 @@ class Engine:
         return text
 
     async def _start_catch_up_leg(self, broker: Broker, trade: TradeRecord, info: dict[str, Any], *,
-                                  approval: str = "onayınızla") -> str | None:
+                                  approval: str = "onayınızla", notice: str | None = None,
+                                  launched: list[bool] | None = None) -> str | None:
         """Start the approved catch-up open (see :meth:`_approve_catch_up`). Returns why it was not started (HTML).
         Under the trade lock the trade's positions on the owner's brokers are first read from their venues (one sync,
         as a monitor pass does: a stop or target that filled there since the monitor's last look is seen), then the
-        trade is checked again; the open itself runs outside the lock."""
+        trade is checked again; the open itself runs outside the lock. Once the bot began to stop, nothing is sent.
+        ``notice``: told (after the lock) once the open has started and before its result can be told; ``launched``
+        gets True once the order is on its way."""
         name = broker.name
         async with self.trade_lock(trade.id):
             began = time.monotonic()
@@ -2237,14 +2398,22 @@ class Engine:
                       and p.status in ACTIVE_POSITION and not self.monitor.synced_since(trade.id, p.broker, began)]
             if unread:
                 return f"{_accounts(unread)} pozisyonun durumu şu an okunamadı"
+            if not self._accepting or self._brokers_closed:     # (a stop began meanwhile: no order after it)
+                return "bot kapanıyor"
             plan = self._catch_up_plan(fresh)
             flow = _OpenFlow(released=True)     # the leg writes its position under the trade lock itself
             task = asyncio.ensure_future(self._open_leg(
                 broker, plan, fresh, info.get("raw_symbol"), flow, mute_errors=True, size_stop=fresh.plan.stop_loss))
             task.set_name(f"open-{plan.plan_id}-{name}-catch-up")
+            if launched is not None:
+                launched.append(True)
             label = str(info.get("label") or f"#{fresh.id} {plan.base_asset} {plan.side.value.upper()}")
             leg = self._watch_late_leg(fresh, plan, name, task, label, catch_up=True, approval=approval)
             await self._late_state(add=[leg])
+        try:
+            if notice is not None:
+                await self._notify(notice, Severity.INFO)
+        finally:
             leg.announced.set()                 # nothing else reports it: its own notice comes when it answers
         await self._log("catch_up_open", {"trade_id": trade.id, "broker": name})
         return None

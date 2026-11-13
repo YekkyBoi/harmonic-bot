@@ -76,6 +76,13 @@ MISSED = "missed_optional_legs"
 # --------------------------------------------------------------------------- #
 # helpers
 # --------------------------------------------------------------------------- #
+@pytest.fixture(autouse=True)
+def _ask_mode(monkeypatch: pytest.MonkeyPatch) -> None:
+    """These tests are about the Evet / Hayır question: mode "sor" (the default is "otomatik", tests/test_catch_up_auto.py)."""
+    from copytrader.engine import orchestrator as orch
+    monkeypatch.setattr(orch, "CATCH_UP_DEFAULT_MODE", "sor")
+
+
 @pytest.fixture
 async def live(tmp_path: Path, monkeypatch: pytest.MonkeyPatch):
     p = await Prod.create(tmp_path, monkeypatch, replica="live")
