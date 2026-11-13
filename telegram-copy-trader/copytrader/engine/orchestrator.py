@@ -55,7 +55,15 @@ from typing import Any, Literal, TypeVar
 from ..brokers.base import Broker, BrokerError, BrokerUnavailableError, OrderOutcomeUnknownError, outcome_unknown
 from ..config import AppConfig, TopicRoute, effective_risk, match_topic, route_thresholds
 from ..errors import ParserError
-from ..interfaces import SHUTDOWN_TEXT, STARTING_TEXT, Notifier, SignalParser, Storage
+from ..interfaces import (
+    NO_CORRECTION_FRIEND_TEXT,
+    NO_CORRECTION_TEXT,
+    SHUTDOWN_TEXT,
+    STARTING_TEXT,
+    Notifier,
+    SignalParser,
+    Storage,
+)
 from ..models import (
     ActionType,
     BrokerPosition,
@@ -248,6 +256,7 @@ MISSED_KEEP_SEC = 86400.0
 # of the bot validates every pending row of that table at its start and does not know the kind "catch_up" (a rollback
 # with ``guncelle.py --geri-al`` after a crash with a question open would not start). Same record as the table's.
 _CATCH_UP_KEY = "catch_up_questions"
+_FRIEND_KEY = "friend_chat_id"     # storage state: the owner's friend's chat (``/arkadas``), or absent
 CATCH_UP_QUESTION_KEEP_SEC = 86400.0     # answered / expired questions are kept this long (a late tap is answered)
 CLOSE_QUESTION_WAIT_SEC = 5.0            # stop(): a question being answered right now is waited for this long at most
 # Broker outcomes of an open flow that mean "this broker of the route has not taken the trade".
@@ -367,6 +376,7 @@ class _LateLeg:
     # the open of a missed signal on an optional broker that the owner approved afterwards (Engine catch-up): it is
     # watched like a late leg from the start (changes of the trade meanwhile reach it), reported in its own words
     reopen: bool = False
+    approval: str = "onayınızla"             # a reopen: who approved it, as its notice says
     raw_symbol: str | None = None            # the signal's symbol as written (a miss of this leg is caught up with it)
 
 
@@ -980,6 +990,7 @@ class Engine:
         self._missed_done: set[str] = set()
         self._missed_lock = asyncio.Lock()
         self._catch_up_lock = asyncio.Lock()
+        self._friend_chat: int | None = None       # the owner's friend's chat (/arkadas), as handed to the notifier
         self.monitor.heartbeat.on_healthy = self._broker_healthy
 
     # ------------------------------------------------------------------ utils
@@ -1411,6 +1422,7 @@ class Engine:
         reconciled, owner actions that would trade are answered with STARTING_TEXT (they stay pending)."""
         self._retry_failed = True
         self._starting = True
+        await self._load_friend()          # first: what the owner gets from here on reaches the friend too
         try:
             await self._connect_at_start()
             for broker in self.configured_brokers:
@@ -2138,6 +2150,8 @@ class Engine:
             catch_up={"trade_id": trade.id, "broker": name, "label": label, "signal_at": signal_at.isoformat(),
                       "raw_symbol": item.get("raw_symbol"),
                       "question": f"{esc(label)} {n} hesabında da açılsın mı?",
+                      # who answers it: the owner's friend set now (/arkadas), else the owner (None)
+                      "decider": self._friend_chat,
                       "details": "\n".join(lines)},
         )
         await self._post_question(conf)
@@ -2150,7 +2164,8 @@ class Engine:
         info = conf.catch_up or {}
         return {"trade_id": info.get("trade_id"), "broker": info.get("broker")}
 
-    async def _approve_catch_up(self, conf: PendingConfirmation) -> str:
+    async def _approve_catch_up(self, conf: PendingConfirmation, *, who: str = "",
+                                approval: str = "onayınızla") -> str:
         """The owner said "Evet" (conf lock held): every condition is checked again now; then the trade is opened on
         that broker - a market order with the trade's current stop and targets, sized as a normal open (never from a
         stop moved closer than the signal's own) - in the background, watched like a late leg (changes of the trade
@@ -2177,13 +2192,13 @@ class Engine:
             await self._save_confirmation(conf)
             self._disarm_expiry(conf.id)
             try:
-                problem = await self._start_catch_up_leg(broker, trade, info)
+                problem = await self._start_catch_up_leg(broker, trade, info, approval=approval)
             except Exception as exc:
                 logger.exception("Catch-up approval %s: the open could not be started", conf.id)
                 problem = f"emir başlatılamadı (<code>{esc(exc)}</code>)"
             if problem is None:
-                text = (f"✅ Evet: {n} hesabına emir gönderiliyor (işlemin şu anki stop ve hedefleriyle); sonuç ayrıca "
-                        "bildirilecek.")
+                text = (f"✅ Evet{who}: {n} hesabına emir gönderiliyor (işlemin şu anki stop ve hedefleriyle); sonuç "
+                        "ayrıca bildirilecek.")
                 await self._finish(conf, ConfirmationStatus.APPROVED, text)
                 return text
         text = f"⛔ {n} hesabında işlem açılmadı: {problem}."
@@ -2191,7 +2206,8 @@ class Engine:
         await self._log("catch_up_refused", {"id": conf.id, **self._catch_up_ref(conf), "why": problem})
         return text
 
-    async def _start_catch_up_leg(self, broker: Broker, trade: TradeRecord, info: dict[str, Any]) -> str | None:
+    async def _start_catch_up_leg(self, broker: Broker, trade: TradeRecord, info: dict[str, Any], *,
+                                  approval: str = "onayınızla") -> str | None:
         """Start the approved catch-up open (see :meth:`_approve_catch_up`). Returns why it was not started (HTML).
         Under the trade lock the trade's positions on the owner's brokers are first read from their venues (one sync,
         as a monitor pass does: a stop or target that filled there since the monitor's last look is seen), then the
@@ -2227,7 +2243,7 @@ class Engine:
                 broker, plan, fresh, info.get("raw_symbol"), flow, mute_errors=True, size_stop=fresh.plan.stop_loss))
             task.set_name(f"open-{plan.plan_id}-{name}-catch-up")
             label = str(info.get("label") or f"#{fresh.id} {plan.base_asset} {plan.side.value.upper()}")
-            leg = self._watch_late_leg(fresh, plan, name, task, label, catch_up=True)
+            leg = self._watch_late_leg(fresh, plan, name, task, label, catch_up=True, approval=approval)
             await self._late_state(add=[leg])
             leg.announced.set()                 # nothing else reports it: its own notice comes when it answers
         await self._log("catch_up_open", {"trade_id": trade.id, "broker": name})
@@ -3642,12 +3658,12 @@ class Engine:
 
     def _watch_late_leg(
         self, trade: TradeRecord, plan: TradePlan, name: str, task: asyncio.Task[BrokerOutcome], label: str,
-        *, catch_up: bool = False, raw_symbol: str | None = None,
+        *, catch_up: bool = False, raw_symbol: str | None = None, approval: str = "onayınızla",
     ) -> _LateLeg:
         """Register a leg that missed the deadline and start the background task that books it when it answers.
         That task counts as a running order flow: shutdown waits for it like for any critical section.
         ``catch_up``: the leg is the approved open of a missed signal (Engine catch-up), watched from its start."""
-        leg = _LateLeg(trade.id, name, label, task, reopen=catch_up, raw_symbol=raw_symbol)
+        leg = _LateLeg(trade.id, name, label, task, reopen=catch_up, raw_symbol=raw_symbol, approval=approval)
         self._late_legs[(trade.id, name)] = leg
         if catch_up:
             logger.info("Open %s: the approved catch-up open on %s runs in the background", plan.plan_id, name)
@@ -3804,13 +3820,13 @@ class Engine:
             return f"{icon} <b>{esc(leg.label)}</b> — {esc(name)}'da açılmadı\n" + "\n".join(lines), severity
         if leg.reopen:          # the open the owner approved afterwards (catch-up of a missed signal)
             if opened:
-                what = "sonradan açıldı (onayınızla)"
+                what = f"sonradan açıldı ({leg.approval})"
             elif outcome.unknown:
-                what = "sonradan açma emri gönderildi ama sonucu bilinmiyor (onayınızla)"
+                what = f"sonradan açma emri gönderildi ama sonucu bilinmiyor ({leg.approval})"
             elif active:
-                what = "sonradan açıldı (onayınızla); ayrıntı aşağıda"
+                what = f"sonradan açıldı ({leg.approval}); ayrıntı aşağıda"
             else:
-                what = "sonradan açılamadı (onayınızla)"
+                what = f"sonradan açılamadı ({leg.approval})"
             return f"{icon} <b>{esc(leg.label)}</b> — {esc(name)} hesabında {what}\n" + "\n".join(lines), severity
         return f"{icon} <b>{esc(leg.label)}</b> — {esc(name)} geç yanıt verdi\n" + "\n".join(lines), severity
 
@@ -6217,6 +6233,62 @@ class Engine:
             await self._notify(f"#{trade.id} {text}", Severity.ERROR)
             return BrokerOutcome(name, "error", text)
 
+    # ------------------------------------------------------------------ the owner's friend (/arkadas)
+    async def friend_chat(self) -> int | None:
+        """The friend's chat id the owner set (``/arkadas``), or None."""
+        try:
+            raw = await self.db.get_state(_FRIEND_KEY)
+        except Exception:
+            logger.exception("Could not read the friend's chat")
+            return None
+        return raw if isinstance(raw, int) and not isinstance(raw, bool) and raw > 0 else None
+
+    async def set_friend_chat(self, chat_id: int | None) -> None:
+        """Store (None: remove) the friend's chat and hand it to the notifier. Raises when it cannot be stored. The
+        open catch-up questions the earlier friend was to answer go to the owner now, with their buttons."""
+        old = self._friend_chat
+        if chat_id is None:
+            await self.db.set_state(_FRIEND_KEY, None)
+        else:
+            await self.db.set_state(_FRIEND_KEY, int(chat_id))
+        self._hand_friend(chat_id)
+        await self._log("friend_chat", {"set": chat_id is not None})
+        if old is not None and old != chat_id:
+            await self._questions_to_owner(old)
+
+    async def _questions_to_owner(self, old: int) -> None:
+        ask_owner = getattr(self.notifier, "ask_owner", None)
+        for item in await self._catch_up_pending():
+            if (item.catch_up or {}).get("decider") != old:
+                continue
+            async with self._conf_lock(item.id):
+                conf = await self._get_confirmation(item.id)
+                if conf is None or conf.status is not ConfirmationStatus.PENDING:
+                    continue
+                conf.catch_up = {**(conf.catch_up or {}), "decider": None}     # the owner answers it now
+                await self._save_confirmation(conf)
+                if callable(ask_owner):
+                    try:
+                        await ask_owner(conf)
+                    except Exception:
+                        logger.exception("Could not give the owner the catch-up question %s", conf.id)
+
+    async def load_friend(self) -> None:
+        """Read the friend's chat and hand it to the notifier (serve() does it before the notifier starts)."""
+        self._hand_friend(await self.friend_chat())
+
+    async def _load_friend(self) -> None:
+        await self.load_friend()
+
+    def _hand_friend(self, chat_id: int | None) -> None:
+        self._friend_chat = int(chat_id) if chat_id else None
+        set_friend = getattr(self.notifier, "set_friend", None)
+        if callable(set_friend):
+            try:
+                set_friend(chat_id)
+            except Exception:
+                logger.exception("The notifier did not take the friend's chat")
+
     # ------------------------------------------------------------------ confirmations
     async def _catch_up_store(self) -> dict[str, Any]:
         try:
@@ -6407,7 +6479,9 @@ class Engine:
             logger.exception("close_confirmation failed for %s", conf.id)
         await self._log("confirmation_" + status.value, {"id": conf.id, "result": text})
 
-    async def handle_confirmation(self, conf_id: str, approved: bool) -> str:
+    async def handle_confirmation(self, conf_id: str, approved: bool, *, by_friend: bool = False) -> str:
+        """``by_friend``: the owner's friend (the optional broker's owner, ``/arkadas``) pressed it: only a catch-up
+        question may be answered so; anything else is refused before it is even looked at."""
         if approved and not self._accepting:
             return SHUTDOWN_TEXT     # stays pending: restored (with its expiry) after the restart
         if approved and self._starting:
@@ -6416,6 +6490,11 @@ class Engine:
             conf = await self._get_confirmation(conf_id)
             if conf is None:
                 return "Bu onay bulunamadı."
+            if by_friend and (conf.kind != "catch_up" or self._friend_chat is None
+                              or (conf.catch_up or {}).get("decider") != self._friend_chat):
+                # (only a catch-up question that was given to this friend: never another one, never a forged press)
+                logger.warning("Confirmation %s (%s) pressed from the friend's chat: refused", conf_id, conf.kind)
+                return "Bu soruyu yalnızca bot sahibi cevaplayabilir."
             if conf.status is not ConfirmationStatus.PENDING:
                 return f"Bu onay artık geçerli değil ({_CONF_STATUS_TR.get(conf.status, conf.status.value)})."
             if utc(conf.expires_at) <= self._now():
@@ -6423,12 +6502,20 @@ class Engine:
                 await self._finish(conf, ConfirmationStatus.EXPIRED, text)
                 return text
             if conf.kind == "catch_up":
+                name = esc((conf.catch_up or {}).get("broker") or "?")
+                if by_friend:
+                    who, approval = f" (yanıtlayan: {name} hesabının sahibi)", f"{name} hesabının sahibinin onayıyla"
+                elif self._friend_chat is not None:         # (the friend reads along: name the owner)
+                    who, approval = " (yanıtlayan: bot sahibi)", "bot sahibinin onayıyla"
+                else:
+                    who, approval = "", "onayınızla"
                 if not approved:
-                    text = f"❌ Hayır: {esc((conf.catch_up or {}).get('broker') or '?')} hesabında işlem açılmadı."
+                    text = f"❌ Hayır{who}: {name} hesabında işlem açılmadı."
                     await self._finish(conf, ConfirmationStatus.REJECTED, text)
-                    await self._log("catch_up_declined", {"id": conf.id, **self._catch_up_ref(conf)})
+                    await self._log("catch_up_declined", {"id": conf.id, **self._catch_up_ref(conf),
+                                                          **({"by_friend": True} if by_friend else {})})
                     return text
-                return await self._approve_catch_up(conf)
+                return await self._approve_catch_up(conf, who=who, approval=approval)
             if not approved:
                 text = "❌ İptal edildi; işlem yapılmadı."
                 await self._finish(conf, ConfirmationStatus.REJECTED, text)
@@ -6542,7 +6629,9 @@ class Engine:
             return STARTING_TEXT
         asked = await self._get_confirmation(conf_id)
         if asked is not None and asked.kind == "catch_up":
-            return "Bu soruda düzeltme yok: ✅ Evet ya da ❌ Hayır'a basın."
+            decider = (asked.catch_up or {}).get("decider")
+            return NO_CORRECTION_FRIEND_TEXT if decider is not None and decider == self._friend_chat \
+                else NO_CORRECTION_TEXT
         # Only one confirmation waits for a correction text at a time.
         for other in await self.db.pending_confirmations():
             if other.awaiting_correction and other.id != conf_id:

@@ -1,6 +1,11 @@
 """Owner notification bot (Telethon client logged in as a BOT).
 
-Talks to ``notifier.owner_user_id`` only; everybody else is ignored.
+Talks to ``notifier.owner_user_id``; everybody else is ignored - except the owner's friend (the owner of the
+optional tickmill account), when the owner has set his chat with ``/arkadas <id>``: every message the owner gets is
+mirrored to the friend as read-only text (a message with buttons goes without them), and the friend answers the
+tickmill catch-up question ("... hesabında da açılsın mı?"). Delivery to the friend never delays, blocks or fails
+anything for the owner (a queue and a task of its own; see "the owner's friend" below). The friend's commands and
+messages are never executed, and his button presses count for catch-up questions only.
 Texts are Telegram HTML. Text passed to :meth:`BotNotifier.notify` and text
 returned by the engine is treated as HTML that our own code produced (use
 ``formatting.esc`` for anything untrusted inside it).
@@ -47,7 +52,7 @@ from telethon.extensions import html as tl_html
 
 from .. import __version__
 from ..config import NotifierConfig, TelegramConfig
-from ..interfaces import SHUTDOWN_TEXT, STARTING_TEXT, EngineControl
+from ..interfaces import NO_CORRECTION_FRIEND_TEXT, SHUTDOWN_TEXT, STARTING_TEXT, EngineControl
 from ..models import ConfirmationStatus, PendingConfirmation, Severity
 from .formatting import (
     CATCH_UP_NO,
@@ -107,6 +112,8 @@ HELP_TEXT = (
     "/devam — yeni işlem açmaya devam et\n"
     "/hepsini_kapat — tüm pozisyonları kapat (onay ister)\n"
     "/test &lt;metin&gt; — bir mesajın nasıl anlaşılacağını dene (işlem açmaz)\n"
+    "/arkadas &lt;sohbet_id&gt; — tickmill hesabının sahibine bildirimlerin kopyası (/arkadas: göster, "
+    "/arkadas sil: kaldır)\n"
     "/yardim — bu mesaj\n\n"
     "Onay mesajlarında: ✅ Onayla · ✏️ Düzelt (doğrusunu yazarsınız) · ❌ İptal\n"
     "Bir onay mesajını yanıtlayarak da düzeltme yazabilirsiniz."
@@ -120,6 +127,27 @@ START_FAILED_TEXT = (
     "İnternet bağlantısını kontrol edip botu yeniden başlatın."
 )
 _PREFIX = {Severity.INFO: "ℹ️", Severity.WARNING: "⚠️", Severity.ERROR: "🚨"}
+# ---- the owner's friend (``/arkadas``): read-only copies, and the tickmill catch-up question ----
+FRIEND_QUEUE_MAX = 200            # messages waiting for the friend's chat (the oldest dropped first)
+FRIEND_ALERT_EVERY_SEC = 3600.0   # the owner is told about a failing friend chat at most this often
+FRIEND_REPLY_EVERY_SEC = 60.0     # the friend's own messages get the refusal line at most this often
+FRIEND_OWNER_DECIDES = "👤 Bu mesajdaki seçimi bot sahibi yapar (düğmeler yalnızca onda)."
+FRIEND_DECIDES = ("👤 Bu soruyu tickmill hesabının sahibi (arkadaşınız) cevaplayacak; düğmeler onda. Size bilgi için "
+                  "gönderildi.")
+FRIEND_REFUSED = "Bu bot komutlarını yalnızca sahibi kullanabilir."
+FRIEND_BUTTON_REFUSED = "Bu düğme yalnızca bot sahibi içindir."
+FRIEND_HELLO = (
+    "👋 Merhaba! Bu sohbet, kopya-trade botunun bildirimlerini almak için bot sahibi tarafından eklendi. Bundan sonra "
+    "bot sahibine giden her bildirim buraya da gelir; tickmill hesabında \"sonradan açılsın mı?\" sorularını siz "
+    "cevaplarsınız (✅ Evet / ❌ Hayır). Bu sohbetten bot komutları çalıştırılamaz."
+)
+FRIEND_REMOVED = "ℹ️ Bot sahibi bu sohbeti bildirim listesinden çıkardı; buraya artık mesaj gelmeyecek."
+FRIEND_NOT_YOURS = "Bu soru artık size ait değil; bot sahibi cevaplayacak."
+FRIEND_NOT_YOURS_TAP = "Bu soru artık size ait değil."
+OWNER_REASKED = "♻️ Arkadaş ayarı değişti; bu soruyu artık siz cevaplıyorsunuz."
+_FRIEND_UNREACHABLE_TR = ("Bot, kendisine hiç yazmamış (Start'a basmamış) ya da botu engellemiş bir kullanıcıya mesaj "
+                          "gönderemez.")
+_USER_ID_RE = re.compile(r"^\d{1,20}$")       # a user's own id (a group or channel id is negative: refused)
 
 
 def _with_prefix(text: str, severity: Severity) -> str:
@@ -153,6 +181,7 @@ _COMMANDS = {
     "devam": "resume", "resume": "resume",
     "hepsini_kapat": "closeall", "closeall": "closeall",
     "test": "test",
+    "arkadas": "friend", "arkadaş": "friend",
 }
 _COMMAND_RE = re.compile(r"^/([^\s@]+)(?:@\S+)?\s*(.*)$", re.S)
 _SENT, _RETRY, _DROP = "sent", "retry", "drop"
@@ -181,6 +210,21 @@ def _abandoned(state: Any) -> bool:
     """A Telethon request state whose caller stopped waiting (its future is cancelled)."""
     future = getattr(state, "future", None)
     return future is not None and future.cancelled()
+
+
+@dataclass(eq=False)
+class _FriendMessage:
+    """One message for the owner's friend: a new message, or (``conf_id`` with ``closing``) the outcome of a question
+    - the friend's own copy of it is edited when he got it with buttons, else it goes as a message."""
+
+    text: str
+    buttons: Any = None
+    conf_id: str | None = None                       # a question (``buttons``) or its outcome (``closing``)
+    closing: bool = False
+    conf: PendingConfirmation | None = None          # the question itself (re-rendered when it goes out late)
+    created: float = field(default_factory=time.time)
+    task: asyncio.Task[Any] | None = None            # its send that got no answer in time (waited for, never resent)
+    attempts: int = 0                                # sends of it started so far
 
 
 @dataclass(eq=False)
@@ -217,6 +261,8 @@ class _Outgoing:
     failures: int = 0
     queued: bool = False                             # went through the queue (not delivered at the first try)
     cancelled: bool = False                          # question closed meanwhile: do not ask it any more
+    mirror: bool = True                              # a copy goes to the owner's friend (when he is set)
+    decider: str | None = None                       # a question someone else answers: this line, no buttons
 
 
 class BotNotifier:
@@ -257,6 +303,18 @@ class BotNotifier:
         self._dropped = 0                                      # thrown away (queue full) since the last report
         self._dropped_total = 0
         self._shut = False                                     # stop() has finished: nothing is sent any more
+        # ---- the owner's friend (/arkadas) ----
+        self._friend: int | None = None                        # his chat id (stored by the engine)
+        self._friend_queue: deque[_FriendMessage] = deque()
+        self._friend_pump: asyncio.Task[Any] | None = None     # delivers that queue, one message at a time
+        self._friend_alert_at: float | None = None             # monotonic: the owner was told about a failure then
+        self._friend_reply_at = float("-inf")                  # monotonic: the friend got the refusal line then
+        # conf id -> (the friend's message id, its text) of a question he got with buttons
+        self._friend_msgs: OrderedDict[str, tuple[int, str]] = OrderedDict()
+        self._friend_routed: OrderedDict[str, None] = OrderedDict()    # conf ids of questions given to the friend
+        self._former_friends: set[int] = set()                 # earlier friends: their taps get a short answer
+        self._owner_reask: dict[str, int] = {}                 # conf id -> the owner's re-sent question (with buttons)
+        self._friend_wake = asyncio.Event()                    # cuts a retry pause short (a question was closed...)
 
     # ---- lifecycle -------------------------------------------------------
     def _make_client(self) -> Any:
@@ -336,11 +394,15 @@ class BotNotifier:
                 if left <= 0 or self._hold_until - time.monotonic() > left:
                     break
                 await asyncio.wait({pump}, timeout=min(left, 0.5))
+        pump = self._friend_pump              # what the friend still gets (the "stopped" notice), within the grace
+        self._friend_wake.set()
+        if pump is not None and not pump.done():
+            await asyncio.wait({pump}, timeout=max(0.0, min(STOP_FLUSH_MIN_SEC, deadline - time.monotonic())))
         self._shut = True
         self._wake.set()
         self._sup_wake.set()
         background = [
-            t for t in (self._pump_task, self._sup_task, self._probe_task, *self._send_tasks)
+            t for t in (self._pump_task, self._sup_task, self._probe_task, self._friend_pump, *self._send_tasks)
             if t is not None and not t.done()
         ]
         for task in background:
@@ -395,7 +457,16 @@ class BotNotifier:
             previous.cancelled = True
             previous.outcome = _outcome(_STATUS_OUTCOME[ConfirmationStatus.SUPERSEDED])
         self._closed.pop(conf.id, None)    # re-asked (e.g. after a correction): open again
-        item = _Outgoing(text=text, importance=2, buttons=[row], conf=conf, closed_html=closed_html)
+        decider = (conf.catch_up or {}).get("decider") if conf.kind == "catch_up" else None
+        if decider is not None and self._friend is not None and decider == self._friend:
+            # The friend answers it (the engine wrote him into the question): he gets it with the buttons, the owner
+            # the same text without them and who decides.
+            self._remember(self._friend_routed, conf.id, None)
+            self._friend_put(_FriendMessage(text=text, buttons=[row], conf_id=conf.id, conf=conf))
+            item = _Outgoing(text=format_confirmation(conf, decider=FRIEND_DECIDES), importance=2, conf=conf,
+                             closed_html=closed_html, mirror=False, decider=FRIEND_DECIDES)
+        else:
+            item = _Outgoing(text=text, importance=2, buttons=[row], conf=conf, closed_html=closed_html)
         self._questions[conf.id] = item    # until it is delivered (then _sent / _by_msg know it)
         try:
             return await self._submit(item)
@@ -410,7 +481,10 @@ class BotNotifier:
         so that the owner knows which trade the outcome is about."""
         try:
             outcome = _outcome(result_text or _STATUS_OUTCOME.get(conf.status, ""))
+            if conf.id in self._friend_routed and conf.id not in self._friend_msgs:
+                outcome += f"\n{self._not_reached(conf)}"       # (never "he did not answer")
             self._remember(self._closed, conf.id, result_text or "")
+            self._friend_wake.set()            # a retry of this question for the friend ends now
             waiting = self._questions.pop(conf.id, None)
             if waiting is not None:        # not delivered so far: never ask it now
                 waiting.cancelled = True
@@ -422,14 +496,42 @@ class BotNotifier:
                 late = self._sent.get(conf.id)
                 msg_id = late[0] if late else None
             closed_html = format_confirmation(conf, with_expiry=False)
+            if self._friend is not None:   # (his copy of the question shows the outcome too)
+                self._friend_put(_FriendMessage(text=f"{closed_html}\n\n{outcome}", conf_id=conf.id, closing=True))
+            reasked = self._owner_reask.pop(conf.id, None)
+            if reasked is not None and reasked != msg_id:  # the copy sent to the owner with buttons after a change
+                await self._edit(reasked, f"{closed_html}\n\n{outcome}")
             if msg_id is None:
-                await self._send(f"{UNDELIVERED_QUESTION}\n\n{closed_html}\n\n{outcome}", importance=2)
+                await self._send(f"{UNDELIVERED_QUESTION}\n\n{closed_html}\n\n{outcome}", importance=2, mirror=False)
                 return
             # The question's message shows the outcome (buttons removed); if that cannot be done, the outcome goes
             # out as a reply that edits the question first. The caller waits at most CALLER_WAIT_SEC.
             await self._edit_or_send(msg_id, closed_html + "\n\n" + outcome, outcome)
         except Exception:
             log.exception("close_confirmation failed for %s", conf.id)
+
+    async def ask_owner(self, conf: PendingConfirmation) -> int | None:
+        """A catch-up question the friend had, sent to the OWNER with its buttons (the friend was removed or changed:
+        the owner answers it now). Returns the message id (None: queued)."""
+        try:
+            row = [Button.inline(CATCH_UP_YES, f"ok:{conf.id}".encode()),
+                   Button.inline(CATCH_UP_NO, f"no:{conf.id}".encode())]
+            text = f"{OWNER_REASKED}\n{format_confirmation(conf)}"
+        except Exception:
+            log.exception("Could not build confirmation %s", conf.id)
+            return None
+
+        def sent(msg_id: int, conf_id: str = conf.id) -> None:
+            self._owner_reask[conf_id] = msg_id
+            self._remember(self._by_msg, msg_id, conf_id)
+
+        self._friend_routed.pop(conf.id, None)
+        return await self._send(text, buttons=[row], importance=2, on_sent=sent, mirror=False)
+
+    @staticmethod
+    def _not_reached(conf: PendingConfirmation) -> str:
+        broker = esc((conf.catch_up or {}).get("broker") or "?")
+        return f"Soru {broker} hesabının sahibine (arkadaşınıza) ulaştırılamadı; bu yüzden yanıt gelmedi."
 
     def bot_status_text(self) -> str:
         """The bot's own delivery state (connection, waiting messages, last outage) for /durum."""
@@ -484,6 +586,9 @@ class BotNotifier:
     async def handle_message(self, event: Any) -> None:
         if getattr(event, "out", False):
             return
+        if self._is_friend(getattr(event, "sender_id", None)):
+            self._friend_refuse()          # never executed, whatever it is
+            return
         if not self._is_owner(getattr(event, "sender_id", None), "message"):
             return
         if not getattr(event, "is_private", True):
@@ -511,7 +616,7 @@ class BotNotifier:
         conf_id = self._by_msg.get(reply_to) if reply_to is not None else None
         if conf_id is not None and conf_id not in self._closed:
             refused = await engine.request_correction(conf_id)     # reply to a confirmation = correction
-            if refused in _NOT_NOW:
+            if refused in _NOT_NOW or refused == NO_CORRECTION_FRIEND_TEXT:
                 # Shutting down / still starting: nothing was taken (no "correction received"); the question
                 # stays as it is and the owner sends the correction again later.
                 await self._send(refused)
@@ -554,6 +659,9 @@ class BotNotifier:
         elif command == "closeall":
             await self._ask_close_all()
             return
+        elif command == "friend":
+            await self._friend_command(args)
+            return
         else:                            # test
             if not args:
                 await self._send("Kullanım: <code>/test eth 1R long, giriş 2232, SL 2205, TP 2310</code>")
@@ -584,6 +692,12 @@ class BotNotifier:
 
     # ---- button presses (testable) ------------------------------------------
     async def handle_callback(self, event: Any) -> None:
+        if self._is_friend(getattr(event, "sender_id", None)):
+            await self._handle_friend_callback(event)
+            return
+        if getattr(event, "sender_id", None) in self._former_friends and getattr(event, "sender_id", None) != self._owner:
+            await self._answer(event, FRIEND_NOT_YOURS_TAP, alert=True)
+            return
         if not self._is_owner(getattr(event, "sender_id", None), "button press"):
             return
         data = bytes(getattr(event, "data", None) or b"").decode("utf-8", "replace")
@@ -639,8 +753,9 @@ class BotNotifier:
             return
         base = await self._original_html(conf_id, msg_id)
         body = (base + "\n\n" if base else "") + _outcome(result)
+        self._mirror(body)
         if not await self._edit(msg_id, body):
-            await self._send(_outcome(result), importance=2, edit_first=(msg_id, body))
+            await self._send(_outcome(result), importance=2, edit_first=(msg_id, body), mirror=False)
 
     async def _original_html(self, conf_id: str, msg_id: int) -> str:
         sent = self._sent.get(conf_id)
@@ -666,11 +781,13 @@ class BotNotifier:
         if choice != "yes":
             await self._answer(event, "Vazgeçildi")
             if msg_id is not None:
+                self._mirror("❌ Vazgeçildi, hiçbir pozisyon kapatılmadı.")
                 await self._edit(msg_id, "❌ Vazgeçildi, hiçbir pozisyon kapatılmadı.")
             return
         if not valid:
             await self._answer(event, "Bu onayın süresi doldu; /hepsini_kapat komutunu tekrar gönderin.", alert=True)
             if msg_id is not None:
+                self._mirror("⌛ Süresi doldu, hiçbir pozisyon kapatılmadı.")
                 await self._edit(msg_id, "⌛ Süresi doldu, hiçbir pozisyon kapatılmadı.")
             return
         engine = self._engine
@@ -696,8 +813,10 @@ class BotNotifier:
             await self._send(result)
             return
         final = result or "✔️ Tamamlandı."
+        self._mirror(final)
         if not await self._edit(msg_id, final):
-            await self._send(final, importance=2, edit_first=(msg_id, final) if msg_id is not None else None)
+            await self._send(final, importance=2, edit_first=(msg_id, final) if msg_id is not None else None,
+                             mirror=False)
 
     async def _answer(self, event: Any, text: str, *, alert: bool = False) -> None:
         started = time.monotonic()
@@ -708,6 +827,315 @@ class BotNotifier:
             self._mark_down(f"no answer to a button reply within {SEND_TIMEOUT_SEC:.0f}s", since=started)
         except Exception as exc:
             log.debug("Callback answer failed: %s", exc)
+
+    # ---- the owner's friend (/arkadas) ---------------------------------------
+    def set_friend(self, chat_id: int | None) -> None:
+        """The friend's chat (the engine keeps it in its database and hands it over at start and on /arkadas). A
+        change forgets what was waiting for the earlier friend; his later taps get a short answer."""
+        new = int(chat_id) if chat_id else None
+        old = self._friend
+        if old is not None and old != new:
+            self._former_friends.add(old)
+        if new is not None:
+            self._former_friends.discard(new)
+        if new != old:
+            self._friend_queue.clear()
+            self._friend_msgs.clear()
+            self._friend_routed.clear()
+            self._friend_wake.set()
+        self._friend = new
+
+    @property
+    def friend_chat_id(self) -> int | None:
+        return self._friend
+
+    def _is_friend(self, sender_id: int | None) -> bool:
+        return self._friend is not None and sender_id is not None and sender_id == self._friend \
+            and sender_id != self._owner
+
+    def _mirror(self, text: str, *, buttons: bool = False) -> None:
+        """A read-only copy of an owner message for the friend (a message with buttons: without them, and one line
+        saying that the owner decides). Never waits, never raises."""
+        if self._friend is None or not text or not text.strip():
+            return
+        self._friend_put(_FriendMessage(text=f"{text}\n\n{FRIEND_OWNER_DECIDES}" if buttons else text))
+
+    def _friend_put(self, message: _FriendMessage) -> None:
+        if self._friend is None or self._client is None or self._shut:
+            return
+        self._friend_queue.append(message)
+        while len(self._friend_queue) > FRIEND_QUEUE_MAX:
+            dropped = self._friend_queue.popleft()
+            log.warning("Too many messages wait for the friend's chat (limit %d): dropped %.200s",
+                        FRIEND_QUEUE_MAX, dropped.text)
+        task = self._friend_pump
+        if task is None or task.done():
+            self._friend_pump = asyncio.ensure_future(self._friend_run())
+
+    async def _friend_run(self) -> None:
+        """Deliver the friend's queue in order, one message at a time, each bounded by SEND_TIMEOUT_SEC. A message that
+        cannot be delivered is dropped (logged; the owner is told at most once per FRIEND_ALERT_EVERY_SEC) - except an
+        open question with buttons (only he can answer it): it stays first and is tried again, after the wait Telegram
+        asks for (FloodWait) or with back-off, until it is delivered or the question is closed."""
+        delay = RETRY_BASE_SEC
+        while self._friend_queue and not self._shut:
+            message = self._friend_queue[0]
+            chat = self._friend
+            if chat is None:
+                self._friend_queue.clear()
+                return
+            try:
+                await self._friend_deliver(chat, message)
+            except asyncio.CancelledError:
+                raise
+            except Exception as exc:          # noqa: BLE001 - the friend's chat must never break anything
+                await self._friend_failed(chat, exc)
+                if self._friend_keep(message, chat):
+                    seconds = getattr(exc, "seconds", None)
+                    wait = (float(seconds) + FLOOD_MARGIN_SEC if isinstance(exc, errors.FloodError) and seconds
+                            else delay)
+                    delay = min(delay * 2.0, RETRY_MAX_SEC)
+                    await self._friend_pause(wait)
+                    continue              # (still first: tried again, unless it was closed meanwhile)
+            delay = RETRY_BASE_SEC
+            if self._friend_queue and self._friend_queue[0] is message:
+                self._friend_queue.popleft()
+
+    def _friend_keep(self, message: _FriendMessage, chat: int) -> bool:
+        """An open question with buttons for this very friend: never dropped."""
+        return (message.buttons is not None and message.conf_id is not None and not message.closing
+                and message.conf_id not in self._closed and chat == self._friend and not self._shut
+                and bool(self._friend_queue) and self._friend_queue[0] is message)
+
+    async def _friend_pause(self, seconds: float) -> None:
+        """Wait before a retry; a closed question, a change of friend or shutdown cut it short."""
+        self._friend_wake.clear()
+        with contextlib.suppress(asyncio.TimeoutError):
+            await asyncio.wait_for(self._friend_wake.wait(), max(0.0, seconds))
+
+    async def _friend_deliver(self, chat: int, message: _FriendMessage) -> None:
+        conf_id = message.conf_id
+        if message.closing and conf_id is not None:
+            sent = self._friend_msgs.pop(conf_id, None)
+            if sent is not None and await self._friend_request(self._friend_edit(chat, sent[0], message.text)):
+                return                        # his question now shows the outcome, buttons removed
+            await self._friend_send(chat, message.text)
+            return
+        if message.buttons is not None and conf_id is not None:
+            await self._friend_question(chat, message)
+            return
+        await self._friend_send(chat, message.text)
+
+    async def _friend_question(self, chat: int, message: _FriendMessage) -> None:
+        """A question the friend answers (with its buttons). Closed before it got to him: not sent (its outcome
+        follows). Too little time left: not sent either. Going out late: says so, with the time really left. A send
+        that got no answer in time is waited for again on the next try, never sent a second time."""
+        conf_id = message.conf_id
+        assert conf_id is not None
+        task = message.task
+        if task is None:
+            if conf_id in self._closed:
+                return
+            text = message.text
+            conf = message.conf
+            if conf is not None:
+                now = datetime.now(timezone.utc)
+                age = time.time() - message.created
+                late = message.attempts > 0 or age >= self._caller_wait()     # (not at its first chance)
+                if late and (_utc(conf.expires_at) - now).total_seconds() < QUESTION_MIN_LEFT_SEC:
+                    log.warning("Question %s is not sent to the friend any more: too little time left", conf_id)
+                    return
+                if age >= LATE_MARK_SEC:
+                    text = late_question_prefix(age) + "\n" + format_confirmation(
+                        conf.model_copy(update={"created_at": now}))
+            chunk = self._chunks(text)[-1]
+            if isinstance(chunk, str):
+                request = self._client.send_message(chat, chunk, parse_mode="html", buttons=message.buttons,
+                                                    link_preview=False)
+            else:
+                request = self._client.send_message(chat, chunk[0], formatting_entities=chunk[1],
+                                                    buttons=message.buttons, link_preview=False)
+            task = message.task = self._track(asyncio.ensure_future(request))
+            message.text = text
+            message.attempts += 1
+        done, _ = await asyncio.wait({task}, timeout=SEND_TIMEOUT_SEC)
+        if not done:
+            raise asyncio.TimeoutError("Telegram yanıt vermedi")     # (the request stays with Telethon)
+        message.task = None
+        if task.cancelled():
+            raise asyncio.TimeoutError("istek yarıda kesildi")
+        exc = task.exception()
+        if exc is not None:
+            raise exc
+        msg_id = getattr(task.result(), "id", None)
+        if msg_id is not None:
+            closed = format_confirmation(message.conf, with_expiry=False) if message.conf is not None else message.text
+            if chat != self._friend:
+                # The friend changed while this copy was on its way: it is not his question any more. Take its
+                # buttons away in the chat it reached; never record it (an edit would go to the new friend's chat).
+                await self._friend_request(self._friend_edit(chat, msg_id, f"{closed}\n\n{FRIEND_NOT_YOURS}"))
+                return
+            self._remember(self._friend_msgs, conf_id, (msg_id, closed))     # (its text once the buttons are gone)
+
+    async def _friend_send(self, chat: int, text: str, *, buttons: Any = None) -> int | None:
+        msg_id: int | None = None
+        chunks = self._chunks(text)
+        for i, chunk in enumerate(chunks):
+            kwargs: dict[str, Any] = {"buttons": buttons if i == len(chunks) - 1 else None, "link_preview": False}
+            if isinstance(chunk, str):
+                request = self._client.send_message(chat, chunk, parse_mode="html", **kwargs)
+            else:
+                request = self._client.send_message(chat, chunk[0], formatting_entities=chunk[1], **kwargs)
+            result = await self._friend_request(request, raise_errors=True)
+            msg_id = getattr(result, "id", None)
+        return msg_id
+
+    def _friend_edit(self, chat: int, msg_id: int, text: str) -> Coroutine[Any, Any, Any]:
+        chunk = split_html(text, limit=4096)[-1]
+        if isinstance(chunk, str):
+            return self._client.edit_message(chat, msg_id, chunk, parse_mode="html", buttons=None, link_preview=False)
+        return self._client.edit_message(chat, msg_id, chunk[0], formatting_entities=chunk[1], buttons=None,
+                                         link_preview=False)
+
+    async def _friend_request(self, request: Coroutine[Any, Any, Any], *, raise_errors: bool = False) -> Any:
+        """One request for the friend's chat, waited for at most SEND_TIMEOUT_SEC. A request without an answer by
+        then is left to Telethon (not cancelled, as for the owner's messages) and counts as failed. Returns its
+        result (an edit: True), or None / raises (``raise_errors``) when it failed."""
+        task = self._track(asyncio.ensure_future(request))
+        done, _ = await asyncio.wait({task}, timeout=SEND_TIMEOUT_SEC)
+        if not done:
+            if raise_errors:
+                raise asyncio.TimeoutError("Telegram yanıt vermedi")
+            return None
+        exc = None if task.cancelled() else task.exception()
+        if task.cancelled() or exc is not None:
+            if isinstance(exc, errors.MessageNotModifiedError):
+                return True
+            if raise_errors:
+                raise exc if exc is not None else asyncio.TimeoutError("istek yarıda kesildi")
+            log.warning("A request for the friend's chat failed: %s", exc)
+            return None
+        return task.result() if raise_errors else True
+
+    @staticmethod
+    def _friend_why(exc: BaseException) -> str:
+        if isinstance(exc, asyncio.TimeoutError):
+            return "Telegram yanıt vermedi"
+        return f"<code>{esc(str(exc) or type(exc).__name__)}</code>"
+
+    async def _friend_failed(self, chat: int, exc: BaseException) -> None:
+        log.error("A message for the friend's chat %s could not be delivered: %s", chat, exc)
+        now = time.monotonic()
+        if self._friend_alert_at is not None and now - self._friend_alert_at < FRIEND_ALERT_EVERY_SEC:
+            return
+        self._friend_alert_at = now
+        why = (f" {_FRIEND_UNREACHABLE_TR} Size gelen mesajlar etkilenmez." if isinstance(exc, Exception)
+               and self._is_unreachable(exc) else "")
+        await self._send(f"⚠️ Arkadaşınıza (<code>{chat}</code>) mesaj iletilemedi: {self._friend_why(exc)}.{why} "
+                         "(Bu uyarı en fazla saatte bir gönderilir.)", mirror=False)
+
+    def _friend_refuse(self) -> None:
+        """A message from the friend's chat: never executed; one refusal line now and then."""
+        log.info("A message from the friend's chat was not executed (commands are the owner's)")
+        now = time.monotonic()
+        if now - self._friend_reply_at < FRIEND_REPLY_EVERY_SEC:
+            return
+        self._friend_reply_at = now
+        self._friend_put(_FriendMessage(text=FRIEND_REFUSED))
+
+    async def _handle_friend_callback(self, event: Any) -> None:
+        """A button press of the friend: ✅ Evet / ❌ Hayır of a catch-up question only (the engine checks the kind);
+        everything else is the owner's."""
+        data = bytes(getattr(event, "data", None) or b"").decode("utf-8", "replace")
+        kind, _, conf_id = data.partition(":")
+        engine = self._engine
+        if kind not in ("ok", "no") or not conf_id:
+            await self._answer(event, FRIEND_BUTTON_REFUSED, alert=True)
+            return
+        if engine is None:
+            await self._answer(event, "Sistem henüz hazır değil", alert=True)
+            return
+        if conf_id in self._inflight:
+            await self._answer(event, "⏳ Zaten işleniyor…")
+            return
+        self._inflight.add(conf_id)
+        try:
+            approved = kind == "ok"
+            closed_before = conf_id in self._closed
+            await self._answer(event, "⏳ İşleniyor…")
+            result = await engine.handle_confirmation(conf_id, approved, by_friend=True)
+            shown = self._closed.get(conf_id)
+            if closed_before or shown is None:
+                # Nothing was decided now (not his question, answered / expired already, shutting down): to him only.
+                self._friend_put(_FriendMessage(text=result or "—"))
+            elif result and result.strip() and result.strip() != shown.strip():
+                await self._send(result, importance=2)          # (mirrored to him as well)
+        except Exception as exc:
+            log.exception("The friend's button %s for confirmation %s failed", kind, conf_id)
+            self._friend_put(_FriendMessage(text=f"🚨 İşlem sırasında hata: <code>{esc(exc)}</code>"))
+        finally:
+            self._inflight.discard(conf_id)
+
+    async def _friend_dropped(self, old: int | None, questions: dict[str, tuple[int, str]]) -> None:
+        """The friend ``old`` was removed / replaced: his question messages lose their buttons, and he is told."""
+        if old is None:
+            return
+        for msg_id, text in questions.values():
+            await self._friend_request(self._friend_edit(old, msg_id, f"{text}\n\n{FRIEND_NOT_YOURS}"))
+        try:
+            await self._friend_send(old, FRIEND_REMOVED)
+        except Exception as exc:              # noqa: BLE001 - only a courtesy
+            log.warning("Could not tell the friend's chat %s that it was removed: %s", old, exc)
+
+    async def _friend_command(self, args: str) -> None:
+        """/arkadas (show), /arkadas <chat id> (set, after a test message reached it), /arkadas sil (remove)."""
+        engine = self._engine
+        store = getattr(engine, "set_friend_chat", None)
+        arg = args.strip()
+        if not arg:
+            if self._friend is None:
+                await self._send("👤 Arkadaş sohbeti ayarlı değil. Eklemek için: <code>/arkadas &lt;sohbet_id&gt;</code> "
+                                 "(arkadaşınız önce botu Telegram'da açıp Start'a basmalı).", mirror=False)
+            else:
+                await self._send(f"👤 Arkadaşınızın sohbeti: <code>{self._friend}</code>. Size gelen her bildirim ona "
+                                 "da gider; tickmill 'sonradan açılsın mı?' sorularını o cevaplar. Kaldırmak için: "
+                                 "<code>/arkadas sil</code>", mirror=False)
+            return
+        if store is None:
+            await self._send("⏳ Sistem henüz hazır değil, biraz sonra tekrar deneyin.", mirror=False)
+            return
+        if arg.lower() in ("sil", "kaldır", "kaldir"):
+            old, questions = self._friend, dict(self._friend_msgs)
+            await store(None)                 # (the engine gives the owner the questions the friend had)
+            await self._friend_dropped(old, questions)
+            await self._send("✅ Arkadaş sohbeti kaldırıldı; bildirimler artık yalnızca size gelir, tickmill sorularını "
+                             "siz cevaplarsınız.", mirror=False)
+            return
+        if not _USER_ID_RE.match(arg) or int(arg) == 0:
+            await self._send("Kullanım: <code>/arkadas &lt;sohbet_id&gt;</code> (arkadaşınızın kullanıcı kimliği: "
+                             "pozitif bir sayı; grup ya da kanal olmaz), <code>/arkadas</code> ya da "
+                             "<code>/arkadas sil</code>", mirror=False)
+            return
+        chat = int(arg)
+        if chat == self._owner:
+            await self._send("Bu sizin kendi kimliğiniz; arkadaşınızın sohbet kimliğini yazın.", mirror=False)
+            return
+        try:
+            await self._friend_send(chat, FRIEND_HELLO)
+        except Exception as exc:              # noqa: BLE001 - told to the owner
+            reason = "" if self._is_unreachable(exc) else f" ({self._friend_why(exc)})"
+            await self._send(f"❌ Deneme mesajı <code>{chat}</code> sohbetine ulaştırılamadı{reason}; kaydedilmedi. "
+                             "Bir bot, kendisine hiç yazmamış (botu Telegram'da açıp Start'a basmamış) ya da botu "
+                             "engellemiş bir kullanıcıya mesaj gönderemez. Arkadaşınız botu açıp Start'a bassın, sonra "
+                             f"<code>/arkadas {chat}</code> komutunu tekrar gönderin.", mirror=False)
+            return
+        old, questions = self._friend, dict(self._friend_msgs)
+        await store(chat)
+        if old is not None and old != chat:
+            await self._friend_dropped(old, questions)
+        await self._send(f"✅ Arkadaşınızın sohbeti kaydedildi (<code>{chat}</code>); deneme mesajı ulaştı. Bundan sonra "
+                         "size gelen her bildirim ona da gider; tickmill 'sonradan açılsın mı?' sorularını o cevaplar.",
+                         mirror=False)
 
     # ---- sending ------------------------------------------------------------
     async def _send(
@@ -720,8 +1148,10 @@ class BotNotifier:
         importance: int = 1,
         on_sent: Callable[[int], None] | None = None,
         edit_first: tuple[int, str] | None = None,
+        mirror: bool = True,
     ) -> int | None:
-        """Send HTML to the owner. Never raises and never waits longer than SEND_TIMEOUT_SEC.
+        """Send HTML to the owner. Never raises and never waits longer than SEND_TIMEOUT_SEC. ``mirror``: a copy goes
+        to the owner's friend (when he is set; never for an outcome that edits an earlier message).
 
         Returns the (last) message id, or None when it could not be sent now. It is then queued and
         delivered later, in order, unless Telegram refused this very message (``on_sent`` gets the
@@ -732,7 +1162,7 @@ class BotNotifier:
         if not text or not text.strip():
             return None
         item = _Outgoing(text=text, importance=importance, buttons=buttons, reply_to=reply_to, on_sent=on_sent,
-                         edit_first=edit_first)
+                         edit_first=edit_first, mirror=mirror and edit_first is None)
         try:
             return await self._submit(item)
         except Exception:
@@ -748,6 +1178,8 @@ class BotNotifier:
         """Deliver now if nothing is in the way, else queue. The caller waits at most CALLER_WAIT_SEC for the
         whole message: a request without an answer by then stays with the item, which is queued in its place,
         and the delivery task gives it the rest of SEND_TIMEOUT_SEC before it takes the connection for down."""
+        if item.mirror and self._friend is not None:
+            self._mirror(item.text, buttons=item.buttons is not None)     # (never waits)
         if not self._client_connected():
             self._mark_down("the client is disconnected")
         if self._queue or self._down_since is not None:
@@ -828,7 +1260,8 @@ class BotNotifier:
             if age < LATE_MARK_SEC:
                 return item.text
             # "created now": the expiry line then shows the time that is really left.
-            return late_question_prefix(age) + "\n" + format_confirmation(conf.model_copy(update={"created_at": now}))
+            return late_question_prefix(age) + "\n" + format_confirmation(conf.model_copy(update={"created_at": now}),
+                                                                         decider=item.decider)
         if item.queued and not item.report and age >= LATE_MARK_SEC:
             return late_notice_prefix(age) + "\n" + item.text
         return item.text
@@ -950,7 +1383,7 @@ class BotNotifier:
         left to the delivery task with its request still running (see ``_Outgoing.edit``)."""
         if self._client is None or self._shut or self._link_down():
             # No edit is tried (it would only time out): the fallback is queued until Telegram answers, as before.
-            await self._send(fallback, reply_to=msg_id, importance=2, edit_first=(msg_id, body))
+            await self._send(fallback, reply_to=msg_id, importance=2, edit_first=(msg_id, body), mirror=False)
             return
         item = _Outgoing(text=fallback, importance=2, reply_to=msg_id, edit_first=(msg_id, body), edit=(msg_id, body))
         if self._queue:

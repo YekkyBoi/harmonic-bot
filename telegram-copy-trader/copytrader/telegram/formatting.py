@@ -382,13 +382,14 @@ def confirmation_question(conf: PendingConfirmation) -> str | None:
     return None
 
 
-def format_confirmation(conf: PendingConfirmation, *, with_expiry: bool = True) -> str:
+def format_confirmation(conf: PendingConfirmation, *, with_expiry: bool = True, decider: str | None = None) -> str:
     """The 'I understood X, is that right?' message (``with_expiry=False`` once it is closed).
 
     A confirmation that can be approved starts with the question itself in one bold line and, while its
-    buttons are live, a line that says what the buttons do; the details follow."""
+    buttons are live, a line that says what the buttons do; the details follow. ``decider`` (a catch-up question
+    someone else answers): that line instead of the buttons' line, for the copy without buttons."""
     if conf.kind == "catch_up":
-        return _format_catch_up(conf, with_expiry=with_expiry)
+        return _format_catch_up(conf, with_expiry=with_expiry, decider=decider)
     action = conf.action
     parts: list[str] = []
     question = confirmation_question(conf)
@@ -430,13 +431,13 @@ def format_confirmation(conf: PendingConfirmation, *, with_expiry: bool = True) 
     return "\n".join(parts)
 
 
-def _format_catch_up(conf: PendingConfirmation, *, with_expiry: bool) -> str:
+def _format_catch_up(conf: PendingConfirmation, *, with_expiry: bool, decider: str | None = None) -> str:
     """A catch-up question: the engine wrote its question and details (HTML) into ``conf.catch_up``."""
     info = conf.catch_up or {}
     broker = esc(info.get("broker") or "?")
     parts = [f"❓ <b>{confirmation_question(conf) or '?'}</b>"]
     if with_expiry:
-        parts.append(f"{CATCH_UP_YES} = {broker} hesabında aç · {CATCH_UP_NO} = açma")
+        parts.append(decider or f"{CATCH_UP_YES} = {broker} hesabında aç · {CATCH_UP_NO} = açma")
     parts += ["", str(info.get("details") or "")]
     if with_expiry:
         parts.append(f"⏳ {expiry_minutes(conf)} dk içinde yanıt gelmezse {broker} hesabında işlem açılmaz.")

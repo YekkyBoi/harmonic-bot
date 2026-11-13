@@ -569,6 +569,11 @@ async def serve(app: App, stop: asyncio.Event | None = None, *, stop_file: Path 
     failure: BaseException | None = None
     try:
         await app.db.open()
+        load_friend = getattr(app.engine, "load_friend", None)
+        if callable(load_friend):
+            # (the owner's friend, /arkadas: known before the notifier's first message, so he gets that one too)
+            with contextlib.suppress(Exception):
+                await load_friend()
         await app.notifier.start(app.engine)
         for err in app.broker_errors:
             if err.split(":", 1)[0] in app.engine.optional_down:

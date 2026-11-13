@@ -32,6 +32,10 @@ SHUTDOWN_TEXT = "⏳ Bot kapanıyor; şu an işlem yapılamıyor. Bot yeniden ba
 # connecting the owner's brokers at start-up. Nothing was decided: the confirmation stays pending, so the notifier
 # keeps its buttons (as with SHUTDOWN_TEXT) and the owner taps again a few seconds later.
 STARTING_TEXT = "⏳ Bot başlıyor; birkaç saniye sonra tekrar deneyin."
+# The engine's answer to a correction of a catch-up question (it has none: yes / no only); the second one while the
+# owner's friend answers it (the owner's copy has no buttons). Nothing waits for a correction text then.
+NO_CORRECTION_TEXT = "Bu soruda düzeltme yok: ✅ Evet ya da ❌ Hayır'a basın."
+NO_CORRECTION_FRIEND_TEXT = "Bu soruyu tickmill hesabının sahibi (arkadaşınız) cevaplıyor; bu soruda düzeltme yok."
 
 
 @runtime_checkable
@@ -114,7 +118,9 @@ class SignalParser(Protocol):
 
 
 class Notifier(Protocol):
-    """Talks to the OWNER only (never to the source group)."""
+    """Talks to the OWNER (never to the source group); a notifier that has ``set_friend(chat_id | None)`` also mirrors
+    everything to the owner's friend and lets him answer the catch-up questions (the engine calls it, see
+    Engine.set_friend_chat)."""
 
     async def start(self, engine: "EngineControl") -> None: ...
     async def stop(self) -> None: ...
@@ -130,7 +136,9 @@ class Notifier(Protocol):
 class EngineControl(Protocol):
     """What the notifier bot may ask the engine to do. All return Turkish text for the owner."""
 
-    async def handle_confirmation(self, conf_id: str, approved: bool) -> str: ...
+    async def handle_confirmation(self, conf_id: str, approved: bool) -> str:
+        """The owner's ✅ / ❌. (Engine also takes ``by_friend=True``: a press from the owner's friend, accepted for a
+        catch-up question only.)"""
     async def request_correction(self, conf_id: str) -> str:
         """Owner pressed 'Düzelt': mark the confirmation as awaiting a correction text."""
 
