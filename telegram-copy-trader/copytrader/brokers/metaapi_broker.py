@@ -12,6 +12,7 @@ import contextlib
 import html
 import logging
 import re
+import weakref
 from collections.abc import Awaitable, Callable, Iterator, Sequence
 from datetime import UTC, datetime, timedelta
 from typing import Any
@@ -78,13 +79,18 @@ RECONNECT_AFTER_PROBLEMS = 3     # failed health checks in a row before the conn
 RECONNECT_BACKOFF_SEC = (60.0, 120.0, 300.0, 600.0)     # pause after the 1st, 2nd, 3rd and every later attempt
 RECONNECT_SLACK_SEC = 5.0        # a health check this much before the end of a pause still starts the attempt
 RECONNECT_TIMEOUT_SEC = 180.0    # one reconnect attempt: the same limit the engine gives the first connect()
-LINK_WATCH_SEC = 2.0             # the adapter looks at the SDK's own view of the link this often (no request is made)
-LINK_CONFIRM_SEC = 20.0          # ... and rebuilds the connection when the SDK has reported its sockets ended this long
-                                 # without bringing them back itself (its own socket reconnect takes about 3 s when
-                                 # it works; in production it made one attempt after a drop and then none for hours).
-                                 # "Not synchronized" on live sockets (the terminal lost the broker) is NOT rebuilt
-                                 # fast: a new MetaApi client does not bring the broker back; the health checks'
-                                 # three-check rule decides there, as before
+LINK_WATCH_SEC = 0.5             # the adapter looks at the SDK's own view of the link this often (no request is made);
+                                 # a socket that ends wakes it at once (_handle_eio_disconnect), this is the fallback
+LINK_CONFIRM_SEC = 0.0           # ... and rebuilds the connection when the SDK has reported its sockets ended this long
+                                 # without bringing them back itself: at once. Production (2026-11-13): MetaApi closed
+                                 # both sockets every 10-15 min and the SDK's own socket reconnect never brought them
+                                 # back within the 20 s this used to wait (it made one attempt and then none for hours
+                                 # on an earlier day); every drop was rebuilt after those 20 s. "Not synchronized" on
+                                 # live sockets (the terminal lost the broker) is NOT rebuilt fast: a new MetaApi
+                                 # client does not bring the broker back; the health checks' three-check rule decides
+                                 # there, as before
+SYNC_POLL_SEC = 0.05             # connect(): how often "synchronized" is looked at (the SDK itself: once a second)
+SDK_SYNC_TIMEOUT_SEC = 300.0     # RpcMetaApiConnectionInstance.wait_synchronized(): the SDK's default limit
 LINK_SETTLE_SEC = 90.0           # a rebuilt link that stayed up this long ends the outage without a health check, but
                                  # only when the account answered a request after the rebuild and no check failed
                                  # since (longer than one heartbeat: with the heartbeat running, its check decides)
@@ -228,21 +234,53 @@ def _cancel_requested() -> bool:
     return task is None or cancelling is None or cancelling() > 0
 
 
+_LINK_WATCHERS: weakref.WeakSet[MetaApiBroker] = weakref.WeakSet()    # adapters whose link watch runs
+
+
+def _socket_dropped() -> None:
+    """An SDK socket's engine.io connection just ended: every link watch of this event loop looks at once (cheap,
+    no request; each looks at its own client's sockets only)."""
+    try:
+        loop = asyncio.get_running_loop()
+    except RuntimeError:
+        return
+    for broker in list(_LINK_WATCHERS):
+        task = broker._watch_task
+        if task is not None and not task.done() and task.get_loop() is loop:
+            broker._wake_link_watch()
+
+
 def _pausing_socketio(real: Any) -> Any:
     """``socketio`` as an SDK module sees it, with an AsyncClient that waits SOCKET_RETRY_PAUSE_SEC after a FAILED
-    connect() before it hands the error on. Everything else is the real module."""
+    connect() before it hands the error on, and that says at once when its engine.io connection ended. Everything
+    else is the real module."""
 
     class _PausingClient(real.AsyncClient):  # type: ignore[name-defined,misc]
+        copytrader_dropped = False      # the engine.io connection ended and connect() did not succeed since
+
         def __init__(self, *args: Any, **kwargs: Any) -> None:
             super().__init__(*args, **kwargs)
             _patient_keepalive(getattr(self, "eio", None))
 
         async def connect(self, *args: Any, **kwargs: Any) -> Any:
             try:
-                return await super().connect(*args, **kwargs)
+                result = await super().connect(*args, **kwargs)
             except Exception:
                 await asyncio.sleep(SOCKET_RETRY_PAUSE_SEC)
                 raise
+            self.copytrader_dropped = False
+            return result
+
+        async def _handle_eio_disconnect(self) -> None:
+            # python-socketio 4.6.1 runs the SDK's 'disconnect' handler INSIDE this call, and that handler is the
+            # SDK's whole socket reconnect loop (metaapi_websocket_client.py _reconnect: it sleeps first, then
+            # calls disconnect()). Until then the socket still reads as connected, so the link watch would see
+            # the drop only a second or more later. Marked and told here, before that handler runs.
+            self.copytrader_dropped = True
+            _socket_dropped()
+            result = super()._handle_eio_disconnect()
+            if asyncio.iscoroutine(result):     # python-socketio 4.x / 5.x: a coroutine
+                await result
 
     class _Socketio:
         copytrader_paused = True
@@ -336,6 +374,44 @@ def _pause_socket_retries() -> None:
                 module.socketio = _pausing_socketio(module.socketio)
         except Exception as exc:  # noqa: BLE001 - as above
             logger.debug("MetaApi socket retries of %s left unchanged: %s", module.__name__, exc)
+
+
+def _broker_connected(account: Any) -> bool:
+    """What MetatraderAccount.wait_connected() waits for, read from the account as it was last loaded: its API
+    server (or one of its replicas) is connected to the terminal and the broker. False when it cannot tell
+    (another SDK layout, a test double): wait_connected() is then called as before."""
+    try:
+        statuses = [account.connection_status] + [replica.connection_status for replica in account.replicas]
+    except Exception:  # noqa: BLE001 - not the SDK's account object
+        return False
+    return "CONNECTED" in statuses
+
+
+async def _wait_synchronized(conn: Any) -> None:
+    """conn.wait_synchronized() without its one-second steps. SDK 29.x (rpc_metaapi_connection.py
+    wait_synchronized) looks at "synchronized" once a second, so a subscription that MetaApi answered after 0.05 s
+    still waited a whole second (measured in the real-SDK rig: all of the 1.0 s a rebuild took). The same flag
+    is looked at every SYNC_POLL_SEC first; the SDK call then finds it set and only makes its waitSynchronized
+    request. Together they wait as long as the SDK call alone would (its default, SDK_SYNC_TIMEOUT_SEC; the
+    callers' own limits are shorter). Without that private flag (another SDK layout, a test double) the SDK call
+    does everything."""
+    is_synchronized = getattr(getattr(conn, "_meta_api_connection", None), "is_synchronized", None)
+    if not callable(is_synchronized):
+        await conn.wait_synchronized()
+        return
+    loop = asyncio.get_running_loop()
+    deadline = loop.time() + SDK_SYNC_TIMEOUT_SEC
+    try:
+        while not is_synchronized() and loop.time() < deadline:
+            await asyncio.sleep(SYNC_POLL_SEC)
+    except Exception:  # noqa: BLE001 - private SDK attribute: the SDK call below decides
+        pass
+    # The SDK handles MetaApi's 'authenticated' packet by first starting LatencyService.on_connected as a task of
+    # its own (it marks the instance connected, then measures the region's latency with one more socket) and then
+    # setting the flag above. Seen in the same turn of the event loop, the request below would find no connected
+    # instance and wait for that whole latency measurement (real-SDK rig: +0.6 s); one turn lets the task mark it.
+    await asyncio.sleep(0)
+    await conn.wait_synchronized(timeout_in_seconds=max(deadline - loop.time(), SYNC_POLL_SEC))
 
 
 def map_error(what: str, exc: BaseException) -> MetaApiError:
@@ -522,6 +598,7 @@ class MetaApiBroker(MetaTraderLegBroker):
         self._owns_conn = connection is None     # created by connect(): dropped on close so a retry starts clean
         self._api_factory = api_factory
         self._api: Any | None = None
+        self._domain_cache: dict[str, Any] | None = None     # server names a dropped SDK client knew (_reuse_domain)
         self._half_open: Any | None = None       # SDK connection of a connect() that did not finish
         self._lost: dict[tuple[str, str], tuple[OrderReplyLostError, str]] = {}   # (symbol, leg tag) -> unanswered
         self._refused: dict[tuple[str, str], MetaApiError] = {}      # (symbol, leg tag) -> refused, not executed
@@ -544,6 +621,7 @@ class MetaApiBroker(MetaTraderLegBroker):
         self._stale_at = 0.0                     # ... and when (loop time)
         self._answered_at = float("-inf")        # loop time of the latest answered request
         self._watch_task: asyncio.Task[None] | None = None     # the link watch (see _look_at_link)
+        self._link_wake: asyncio.Event | None = None             # ... looks at once when this is set
         self._link_down_since: float | None = None   # loop time the SDK started to report the link down
         self._link_reason = ""                       # ... and what it reported
         self._outage_since: float | None = None      # loop time the present outage began
@@ -591,10 +669,13 @@ class MetaApiBroker(MetaTraderLegBroker):
     def _sockets_down(self) -> bool | None:
         """What the SDK's own socket list says (private; best effort, no request): True = every socket of this
         client that the SDK keeps open has ended (the engine.io keep-alive abort, a closed or broken socket) and is
-        not back yet; False = at least one is connected; None = cannot tell (no real SDK client)."""
+        not back yet; False = at least one is connected; None = cannot tell (no real SDK client). A socket whose
+        engine.io connection ended counts as ended at once, although socket.io still calls it connected while the
+        SDK's own reconnect handler runs (see _pausing_socketio)."""
         try:
             by_region = self._api._metaapi_websocket_client._socket_instances     # type: ignore[union-attr]
-            states = [bool(inst["socket"].connected) for by_number in by_region.values()
+            states = [bool(inst["socket"].connected) and not getattr(inst["socket"], "copytrader_dropped", False)
+                      for by_number in by_region.values()
                       for insts in by_number.values() for inst in insts if inst.get("connected")]
         except Exception:  # noqa: BLE001 - another SDK layout, a test fake, or no client
             return None
@@ -664,6 +745,7 @@ class MetaApiBroker(MetaTraderLegBroker):
         finally:
             self._orders_in_flight -= 1
             self._note_order_in_outage()    # an order sent before the drop that ended during it
+            self._wake_if_put_off()
 
     def _note_order_in_outage(self) -> None:
         """A trade request (not a step of a rebuild) is waiting while the link is down: it may have executed, so
@@ -776,16 +858,22 @@ class MetaApiBroker(MetaTraderLegBroker):
                 self._api = factory(self.cfg.token, opts)
                 if hasattr(self._api, "_metaapi_websocket_client"):      # the real SDK object
                     _pause_socket_retries()
+                    self._reuse_domain(self._api)
                 account = await self._api.metatrader_account_api.get_account(self.cfg.account_id)
                 if account.state not in ("DEPLOYING", "DEPLOYED"):
                     logger.info("%s: deploying MetaApi account %s", self.name, self.cfg.account_id)
                     await account.deploy()
-                await account.wait_deployed()
-                await account.wait_connected()
+                # wait_deployed() / wait_connected() each read the account AGAIN first (one more REST call each,
+                # SDK 29.x opens a new HTTPS connection for every call) and then poll once a second. The account
+                # was read a moment ago: when that answer already says what they wait for, they are not called.
+                if account.state != "DEPLOYED":
+                    await account.wait_deployed()
+                if not _broker_connected(account):
+                    await account.wait_connected()
                 conn = account.get_rpc_connection()
                 self._half_open = conn            # close() must reach it even if we never get further
                 await conn.connect()
-                await conn.wait_synchronized()
+                await _wait_synchronized(conn)
             except BrokerError:
                 raise
             except asyncio.CancelledError as exc:
@@ -809,7 +897,9 @@ class MetaApiBroker(MetaTraderLegBroker):
             self.name, self._platform, info.get("broker"), info.get("currency"), self._netting,
         )
         if self._owns_conn and (self._watch_task is None or self._watch_task.done()):
+            self._link_wake = asyncio.Event()
             self._watch_task = asyncio.ensure_future(self._watch_link())
+            _LINK_WATCHERS.add(self)
 
     async def _close_connection(self, conn: Any, wait: float = CLOSE_WAIT_SEC) -> None:
         try:
@@ -828,8 +918,9 @@ class MetaApiBroker(MetaTraderLegBroker):
                 # MetaApi does not answer (unreachable): the api object is torn down anyway. The SDK's close task
                 # then fails on what that removes; nobody holds that task, so its error would only reach the log
                 # as "Task exception was never retrieved".
-                logger.warning("%s: MetaApi connection close did not finish in %.0f s; closing the client anyway",
-                               self.name, wait)
+                if wait > 0:                    # wait 0: every socket ended, nothing to wait for (see _teardown)
+                    logger.warning("%s: MetaApi connection close did not finish in %.0f s; closing the client "
+                                   "anyway", self.name, wait)
                 for task in asyncio.all_tasks():
                     frame = getattr(task.get_coro(), "cr_frame", None)
                     if frame is not None and frame.f_code.co_name == "close" and frame.f_locals.get("self") is inner:
@@ -850,6 +941,7 @@ class MetaApiBroker(MetaTraderLegBroker):
         # every socket of the client has ended (the link watch's case): an unsubscribe cannot reach MetaApi, so
         # waiting CLOSE_WAIT_SEC for it would only make the outage longer (measured: 10 of 11 s of a rebuild)
         wait = 0.0 if self._sockets_down() else CLOSE_WAIT_SEC
+        self._remember_domain(self._api)
         api, self._api = self._api, None
         try:
             if half_open is not None and half_open is not conn:
@@ -865,6 +957,27 @@ class MetaApiBroker(MetaTraderLegBroker):
                         api.close()
                     except Exception as exc:  # noqa: BLE001
                         logger.warning("%s: MetaApi close failed: %s", self.name, exc)
+
+    def _remember_domain(self, api: Any) -> None:
+        """What the SDK client being dropped knows about MetaApi's server names (DomainClient._url_cache: the
+        domain and host name every socket URL is built from, and when they were read)."""
+        with contextlib.suppress(Exception):    # private SDK attributes, a test double, or no client: nothing kept
+            cache = api._metaapi_websocket_client._domain_client._url_cache
+            if cache.get("domain") and cache.get("hostname") and cache.get("lastUpdated"):
+                self._domain_cache = {key: cache[key] for key in ("domain", "hostname", "lastUpdated")}
+
+    def _reuse_domain(self, api: Any) -> None:
+        """A new SDK client asks MetaApi for those server names before its first socket can connect: one more
+        REST call over a new HTTPS connection on the way back from a drop. It gets what the dropped client knew,
+        with its time, so the SDK's own rule still applies (read again when older than 10 minutes)."""
+        cache = self._domain_cache
+        if not cache:
+            return
+        with contextlib.suppress(Exception):    # another SDK layout: the SDK asks, as before
+            domain_client = api._metaapi_websocket_client._domain_client
+            current = domain_client._url_cache
+            if not current.get("domain") and current.get("requestPromise") is None:
+                domain_client._url_cache = {**cache, "requestPromise": None}
 
     async def _drop_client(self, api: Any) -> None:
         """SDK 29.x: MetaApi.close() only SCHEDULES the close of its sockets (one after the other, each waits up
@@ -993,6 +1106,16 @@ class MetaApiBroker(MetaTraderLegBroker):
             yield
         finally:
             self._flows -= 1
+            self._wake_if_put_off()
+
+    def _wake_link_watch(self) -> None:
+        if self._link_wake is not None:
+            self._link_wake.set()
+
+    def _wake_if_put_off(self) -> None:
+        """An order request or a flow just ended: a rebuild that the link watch put off for it starts at once."""
+        if self._link_down_since is not None and not self.busy:
+            self._wake_link_watch()
 
     def _begin_reconnect(self) -> None:
         """The checks and the flag in one step, without an await between them: from here on _require() refuses
@@ -1182,10 +1305,18 @@ class MetaApiBroker(MetaTraderLegBroker):
                           f"bağlantıyı yeniden kurdu, kesinti yaklaşık {took} sürdü. {during}{more}", Severity.INFO)
 
     async def _watch_link(self) -> None:
-        """Runs from the first connect() of a connection this adapter made itself until close()."""
+        """Runs from the first connect() of a connection this adapter made itself until close(). Looks every
+        LINK_WATCH_SEC, and at once when an SDK socket ended (_socket_dropped) or a request that put a rebuild off
+        ended (_wake_if_put_off)."""
         loop = asyncio.get_running_loop()
+        wake = self._link_wake
         while True:
-            await asyncio.sleep(LINK_WATCH_SEC)
+            if wake is None:
+                await asyncio.sleep(LINK_WATCH_SEC)
+            else:
+                with contextlib.suppress(asyncio.TimeoutError):
+                    await asyncio.wait_for(wake.wait(), LINK_WATCH_SEC)
+                wake.clear()
             if not self._wanted:
                 return
             try:
@@ -1229,9 +1360,11 @@ class MetaApiBroker(MetaTraderLegBroker):
             return
         if self._link_down_since is None:
             self._link_down_since, self._link_reason = now, reason
-            logger.warning("%s: MetaApi reports the link down (%s); rebuilt in %.0f s unless it comes back by itself",
-                           self.name, reason, LINK_CONFIRM_SEC)
-            return
+            if LINK_CONFIRM_SEC > 0:
+                logger.warning("%s: MetaApi reports the link down (%s); rebuilt in %.0f s unless it comes back by "
+                               "itself", self.name, reason, LINK_CONFIRM_SEC)
+            else:
+                logger.warning("%s: MetaApi reports the link down (%s)", self.name, reason)
         if now - self._link_down_since < LINK_CONFIRM_SEC:
             return
         events = self._policy.link_down(now)
@@ -1239,7 +1372,7 @@ class MetaApiBroker(MetaTraderLegBroker):
             self._outage_fast = True
             if self._outage_since is None or self._outage_since > self._link_down_since:
                 self._outage_since = self._link_down_since
-            logger.warning("%s: MetaApi link down for %.0f s (%s); rebuilding the connection now", self.name,
+            logger.warning("%s: MetaApi link down for %.1f s (%s); rebuilding the connection now", self.name,
                            now - self._link_down_since, reason)
         if _RECONNECT_FAILED in events:
             self._tell_reconnect_failed(reason, connected=True)
@@ -1247,6 +1380,7 @@ class MetaApiBroker(MetaTraderLegBroker):
             self._start_heal()
 
     async def _stop_healing(self) -> None:
+        _LINK_WATCHERS.discard(self)
         watch, self._watch_task = self._watch_task, None
         if watch is not None and not watch.done():
             watch.cancel()

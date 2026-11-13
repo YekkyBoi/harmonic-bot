@@ -5,8 +5,9 @@ Production (2026-11-12/13, owner's server log): both MetaApi websockets ended wi
 made one attempt and nothing more for hours. The adapter rebuilt the connection itself only after three failed
 60 s heartbeat checks: 3-4 minutes without tickmill per drop.
 
-W   link watch: when the SDK itself reports the link down (its sockets ended, or "not synchronized") and does not
-    heal it within LINK_CONFIRM_SEC, the connection is rebuilt at once, without waiting for heartbeat checks; an
+W   link watch: when the SDK itself reports the link down (its sockets ended) and does not heal it within
+    LINK_CONFIRM_SEC (0 in production since 2026-11-13: test_metaapi_fast_relink.py; the tests here run with a
+    short non-zero one), the connection is rebuilt at once, without waiting for heartbeat checks; an
     ambiguous slow answer keeps the old rule (three failed checks); never two rebuilds at once, never under an
     order request in flight, bounded back-off while MetaApi is really down
 N   owner notices: one per outage and one when it is back; a flapping link does not spam
@@ -108,7 +109,10 @@ async def back(world: World, b: MetaApiBroker, n: int, what: str = "the rebuild"
 # W  the link watch
 # --------------------------------------------------------------------------- #
 def test_w_defaults() -> None:
-    assert mb.LINK_WATCH_SEC == 2.0 and mb.LINK_CONFIRM_SEC == 20.0 and mb.LINK_SETTLE_SEC == 90.0
+    # changed on purpose (owner, 2026-11-13: "koptuğu gibi bağlasın"): was LINK_WATCH_SEC 2.0 and LINK_CONFIRM_SEC
+    # 20.0. Production showed MetaApi closing both sockets every 10-15 min and the SDK never bringing them back
+    # within those 20 s, so every drop cost 23-25 s; now the rebuild starts at once (test_metaapi_fast_relink.py)
+    assert mb.LINK_WATCH_SEC == 0.5 and mb.LINK_CONFIRM_SEC == 0.0 and mb.LINK_SETTLE_SEC == 90.0
     assert mb.LINK_NOTICE_QUIET_SEC == 1800.0 and mb.PING_MISSES_ALLOWED == 1
     from copytrader.engine import health
 
