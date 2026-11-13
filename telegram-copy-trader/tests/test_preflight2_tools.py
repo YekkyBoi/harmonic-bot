@@ -28,6 +28,7 @@ import zipfile
 from collections import Counter
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
+from types import SimpleNamespace
 from typing import Any
 
 import pytest
@@ -2214,6 +2215,9 @@ def paste(home: Path, bot: Path, *options: str, code: str | None = None, script:
     env = dict(os.environ, HOME=str(home), USERPROFILE=str(home), TMPDIR=str(home / "tmp"), TEMP=str(home / "tmp"),
                TMP=str(home / "tmp"), PYTHONDONTWRITEBYTECODE="1", PYTHONIOENCODING="utf-8")
     env.pop("PYTHONPATH", None)
+    for name in [k for k in env if k.upper().startswith("PIP_")]:
+        env.pop(name)            # the optional cryptg step: offline here, never into this interpreter
+    env.update(PIP_CONFIG_FILE=os.devnull, PIP_NO_INDEX="1", PIP_TARGET=str(home / "pip-target"))
     (home / "tmp").mkdir(exist_ok=True)
     command = [sys.executable, script, *options] if script else [sys.executable, "-c", code or documented_line(), *options]
     return subprocess.run(command, cwd=bot, env=env, capture_output=True, text=True, encoding="utf-8", timeout=300)
@@ -2287,3 +2291,90 @@ def test_the_documented_line_without_a_download_says_so(tmp_path: Path) -> None:
     result = paste(home, bot)
     assert result.returncode == 1 and "Zip bulunamadi: once 1. adimdaki dosyayi indirin" in result.stderr
     assert snapshot(bot) == before
+
+
+# ---- step 5b, optional: cryptg (the group copy's media); never a reason to stop or roll back an update ----------
+CRYPTG_PIP = ("-m pip install --disable-pip-version-check cryptg==0.6.1 --only-binary=:all: --timeout 10 "
+              "--retries 1")
+
+
+def update_with_cryptg(g: Any, bot: Path, runner: Runner, *options: str) -> tuple[int, list[tuple[Path, str]]]:
+    started: list[tuple[Path, str]] = []
+
+    def start(hedef: Path, python: str) -> int:
+        started.append((hedef, python))
+        return 130
+
+    code = g.main(["--hedef", str(bot), *options], calistir=runner, surecler=lambda: [], baslat=start,
+                  girdi=lambda prompt: "", yeni_agac=new_tree(), ek_paket=g.cryptg_adimi)
+    return code, started
+
+
+def test_update_cryptg_is_installed_when_missing_and_a_failure_is_only_a_warning(
+    g: Any, tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    bot = old_bot(tmp_path)
+    runner = Runner({"-c import cryptg": [(1, ["ModuleNotFoundError: No module named 'cryptg'"])],
+                     CRYPTG_PIP: [(1, ["ERROR: Could not find a version that satisfies the requirement cryptg==0.6.1"])]})
+    code, started = update_with_cryptg(g, bot, runner)
+    out = capsys.readouterr().out
+    assert runner.calls[1:3] == ["-c import cryptg", CRYPTG_PIP]          # right after step 5, before migrate
+    assert "UYARI: hızlı şifreleme paketi (cryptg) kurulamadı; güncelleme devam ediyor." in out
+    assert code == 130 and len(started) == 1 and "ESKİ SÜRÜM GERİ YÜKLENDİ" not in out
+    assert (bot / "copytrader" / "migrate.py").is_file()                  # the new version stays
+
+    bot2 = old_bot(tmp_path / "b")
+    runner = Runner({"-c import cryptg": [(1, [])], CRYPTG_PIP: [(0, ["Successfully installed cryptg-0.6.1"])]})
+    code, _ = update_with_cryptg(g, bot2, runner)
+    assert code == 130 and "Hızlı şifreleme paketi (cryptg) kuruldu." in capsys.readouterr().out
+
+
+def test_update_cryptg_already_there_runs_no_pip_and_the_way_back_never_touches_it(
+    g: Any, tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    bot = old_bot(tmp_path)
+    runner = Runner({"-c import cryptg": [(0, [])]})
+    code, _ = update_with_cryptg(g, bot, runner)
+    assert code == 130 and CRYPTG_PIP not in runner.calls and runner.calls.count("-c import cryptg") == 1
+    runner = Runner()                                                     # (any cryptg command would fail the test)
+    code, _ = update_with_cryptg(g, bot, runner, "--geri-al")
+    assert code == 130 and not any("cryptg" in c for c in runner.calls)
+
+
+def test_update_cryptg_with_a_hanging_package_index_is_cut_off_in_time(
+    g: Any, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    import socket
+
+    server = socket.socket()
+    server.bind(("127.0.0.1", 0))
+    server.listen(8)                                     # accepts connections and never answers
+    port = server.getsockname()[1]
+    monkeypatch.setattr(g, "CRYPTG_SURESI", 6.0)
+    for name in [k for k in os.environ if k.upper().startswith("PIP_")]:
+        monkeypatch.delenv(name)                         # hermetic: no pip config, no other index
+    monkeypatch.setenv("PIP_CONFIG_FILE", os.devnull)
+    monkeypatch.setenv("PIP_INDEX_URL", f"http://127.0.0.1:{port}/simple")
+    monkeypatch.setenv("PIP_NO_CACHE_DIR", "1")
+    monkeypatch.setenv("PIP_TARGET", str(tmp_path / "target"))      # never into this interpreter
+    for name in ("NO_PROXY", "no_proxy"):
+        monkeypatch.setenv(name, "127.0.0.1,localhost")
+    lines: list[str] = []
+    log = SimpleNamespace(yaz=lambda text="": lines.append(text), dosyaya=lambda text: lines.append(text))
+
+    def komut(*parts: str, sure: float = 900.0, ekranda: bool = True) -> tuple[int, list[str]]:
+        if parts == ("-c", "import cryptg"):
+            return 1, ["ModuleNotFoundError"]            # (not installed: whatever this machine has)
+        out: list[str] = []
+        return g.komut_calistir([sys.executable, *parts], tmp_path, sure, out.append), out   # the REAL pip
+
+    started = time.monotonic()
+    try:
+        ok = g.cryptg_adimi(komut, log)
+    finally:
+        server.close()
+    took = time.monotonic() - started
+    assert ok is False and 5.5 < took < 30, took             # stopped by the bound (pip itself would wait on)
+    assert "   | 6 saniye içinde bitmedi; durduruldu" in lines
+    assert not (tmp_path / "target").exists() or not any((tmp_path / "target").iterdir())
+    assert any("UYARI: hızlı şifreleme paketi (cryptg) kurulamadı" in line for line in lines)

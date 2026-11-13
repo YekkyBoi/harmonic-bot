@@ -88,6 +88,11 @@ BEKCI_BEKLEME = 30.0                    # seconds to wait for the test message o
 GOREV_TR_SINIRI = 261                   # longest /TR value schtasks accepts
 KONTROL_SURESI = 900.0          # seconds for check / selftest / migrate
 PIP_SURESI = 1800.0
+# Optional: cryptg, Telethon's native encryption (without it the group copy sends text only). Never a reason to stop
+# the update: bounded, binary wheels only, short network timeouts, a warning when it does not work.
+CRYPTG = "cryptg==0.6.1"
+CRYPTG_SURESI = 90.0            # seconds for its pip run (the bot is stopped meanwhile)
+CRYPTG_KONTROL_SURESI = 30.0    # seconds for "is it installed already?"
 BEKLEME = 15.0                  # seconds before the single retry of a failed check
 CIKIS_TAMAM, CIKIS_GERI_ALINDI, CIKIS_REDDEDILDI, CIKIS_KESILDI = 0, 1, 2, 130
 
@@ -884,6 +889,29 @@ def komut_calistir(komut: list[str], klasor: Path, sure: float, satir: Callable[
     return int(kod)
 
 
+def cryptg_adimi(komut: Callable[..., tuple[int, list[str]]], gunluk: Any) -> bool:
+    """Step 5b, optional: cryptg (fast native encryption for Telethon; without it the group copy sends text only).
+    Skipped when it imports already. Otherwise one pip run: binary wheels only, 10 s network timeout, one retry, the
+    whole run at most CRYPTG_SURESI. A failure is one warning line: the update goes on, nothing is rolled back.
+    True: cryptg is there now."""
+    kod, _ = komut("-c", "import cryptg", sure=CRYPTG_KONTROL_SURESI, ekranda=False)
+    if kod == 0:
+        gunluk.dosyaya("   hızlı şifreleme paketi (cryptg) zaten kurulu")
+        return True
+    gunluk.yaz(f"   Hızlı şifreleme paketi (cryptg) kuruluyor (en çok {CRYPTG_SURESI:.0f} saniye)...")
+    kod, satirlar = komut("-m", "pip", "install", "--disable-pip-version-check", CRYPTG, "--only-binary=:all:",
+                          "--timeout", "10", "--retries", "1", sure=CRYPTG_SURESI, ekranda=False)
+    if kod == 0:
+        gunluk.yaz("   Hızlı şifreleme paketi (cryptg) kuruldu.")
+        return True
+    for metin in [m for m in satirlar if m.strip()][-3:]:
+        gunluk.yaz(f"   | {metin}")
+    gunluk.yaz("   UYARI: hızlı şifreleme paketi (cryptg) kurulamadı; güncelleme devam ediyor. Grup kopyası "
+               "arkadaşınızın gruplarına yalnızca metinleri gönderir (resimler ve dosyalar gitmez). Sonra elle "
+               f"kurmak için: python -m pip install {CRYPTG}")
+    return False
+
+
 def botu_baslat(hedef: Path, python: str, komut: list[str] | None = None) -> int:
     """Step 9: the bot as a child in the same window; returns its exit code.
 
@@ -1164,11 +1192,16 @@ def main(
     girdi: Callable[[str], str] = input,
     yeni_agac: Path | None = None,
     gorev: Any = OTOMATIK,
+    ek_paket: Any = OTOMATIK,
 ) -> int:
     """Run the update. The keyword arguments replace the outside world in tests: ``calistir`` runs commands,
     ``surecler`` lists processes, ``baslat`` starts the bot, ``girdi`` asks the owner, ``yeni_agac`` is the
     new tree (default: the folder of this file), ``gorev`` runs schtasks for the watchman (default: the real
     one on Windows, None = nothing to register elsewhere)."""
+    if ek_paket is OTOMATIK:
+        # the real optional step with the real subprocess runner; a caller that replaces the runner (tests) passes
+        # its own step, or none
+        ek_paket = cryptg_adimi if calistir is komut_calistir else None
     if gorev is OTOMATIK:
         gorev = varsayilan_gorev()
     for akis in (sys.stdout, sys.stderr):
@@ -1304,6 +1337,11 @@ def main(
                 if kod != 0:
                     raise Hata(f"gerekli paketler kurulamadı (pip çıkış kodu {kod})")
                 gunluk.adim(5, "Gerekli paketler kuruldu")
+            if ek_paket is not None:
+                try:
+                    ek_paket(komut, gunluk)       # optional (cryptg): a warning at most, never a rollback
+                except Exception as exc:          # noqa: BLE001
+                    gunluk.yaz(f"   UYARI: isteğe bağlı paket adımı başarısız ({exc}); güncelleme devam ediyor.")
 
             adim = 6
             kod, satirlar = komut("-m", PAKET, "migrate")

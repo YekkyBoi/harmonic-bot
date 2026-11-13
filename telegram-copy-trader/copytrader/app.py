@@ -287,6 +287,7 @@ class App:
     engine: Engine
     listener: Any
     broker_errors: list[str] = field(default_factory=list)
+    mirror: Any = None               # the copy of the source group for the owner's friend (/grup), or None
 
 
 def build_app(
@@ -342,7 +343,15 @@ def build_app(
     set_notifier = getattr(listener, "set_notifier", None)
     if callable(set_notifier):
         set_notifier(notifier)           # the listener tells the owner about skipped messages, lost images...
-    return App(config, db, parser, brokers, notifier, engine, listener, errors)
+    mirror = None
+    if callable(getattr(listener, "set_group_mirror", None)) and callable(getattr(notifier, "set_group_mirror", None)):
+        from .telegram.group_mirror import GroupMirror
+
+        # /grup: every message of the source group, copied to the friend's groups (off until the owner turns it on)
+        mirror = GroupMirror(db, notifier, listener, str(data_dir), engine=engine)
+        listener.set_group_mirror(mirror)
+        notifier.set_group_mirror(mirror)
+    return App(config, db, parser, brokers, notifier, engine, listener, errors, mirror)
 
 
 SHUTDOWN_NOTICE_TR = "Kapanıyor, lütfen bekleyin (en çok 2 dakika). Tekrar Ctrl+C YAPMAYIN."
@@ -574,6 +583,11 @@ async def serve(app: App, stop: asyncio.Event | None = None, *, stop_file: Path 
             # (the owner's friend, /arkadas: known before the notifier's first message, so he gets that one too)
             with contextlib.suppress(Exception):
                 await load_friend()
+        if app.mirror is not None:
+            try:
+                await app.mirror.load()       # (/grup: the owner's setting; a failure leaves the copy off)
+            except Exception:
+                logger.exception("Group copy: could not load its setting; it stays off")
         await app.notifier.start(app.engine)
         for err in app.broker_errors:
             if err.split(":", 1)[0] in app.engine.optional_down:
@@ -626,7 +640,10 @@ async def serve(app: App, stop: asyncio.Event | None = None, *, stop_file: Path 
             if begin_shutdown is not None:
                 with contextlib.suppress(Exception):
                     begin_shutdown()
-            # 2. Stop the Telegram listener (waits for its running handlers).
+            # 2. Stop the group copy for the owner's friend (what still waits is dropped), then the Telegram listener
+            #    (waits for its running handlers).
+            if app.mirror is not None:
+                await _safe(app.mirror.stop())
             await _safe(app.listener.stop())
             if listen_task is not None:
                 await asyncio.gather(listen_task, return_exceptions=True)

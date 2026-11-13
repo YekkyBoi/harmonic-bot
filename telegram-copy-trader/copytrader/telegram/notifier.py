@@ -8,6 +8,11 @@ mirrored to the friend as read-only text (a message with buttons goes without th
 to the friend never delays, blocks or fails anything for the owner (a queue and a task of its own; see "the owner's
 friend" below). The friend's commands and messages are never executed, and his button presses count for catch-up
 questions only.
+With ``/grup ac`` every new message of the source group is also copied to the friend's own two groups, which he binds by
+writing ``/bagla@<bot> ana`` / ``/bagla@<bot> sohbet`` in them (see group_mirror.py; sent by
+:meth:`BotNotifier.send_group_copy`; the owner gets none of these). That ``/bagla``, from the owner or the friend and
+never in a source chat, is the only thing the bot ever acts on or answers in a group; every other group message is
+ignored, silently.
 Texts are Telegram HTML. Text passed to :meth:`BotNotifier.notify` and text
 returned by the engine is treated as HTML that our own code produced (use
 ``formatting.esc`` for anything untrusted inside it).
@@ -49,11 +54,11 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
 
-from telethon import Button, TelegramClient, errors, events, utils
+from telethon import Button, TelegramClient, errors, events, functions, types, utils
 from telethon.extensions import html as tl_html
 
 from .. import __version__
-from ..config import NotifierConfig, TelegramConfig
+from ..config import NotifierConfig, TelegramConfig, fold_ascii
 from ..interfaces import NO_CORRECTION_FRIEND_TEXT, SHUTDOWN_TEXT, STARTING_TEXT, EngineControl
 from ..models import ConfirmationStatus, PendingConfirmation, Severity
 from .formatting import (
@@ -118,6 +123,8 @@ HELP_TEXT = (
     "/arkadas sil: kaldır)\n"
     "/sonradan otomatik | sor — bağlantı yokken atlanan tickmill işlemi: şartlar uygunsa sormadan aç ya da sor "
     "(/sonradan: göster)\n"
+    "/grup ac · /grup kapat · /grup konular &lt;ad, ad&gt; — kaynak grubun kopyası arkadaşınızın gruplarına "
+    "(/grup: durum; grupları arkadaşınız o gruplarda /bagla ile bağlar)\n"
     "/yardim — bu mesaj\n\n"
     "Onay mesajlarında: ✅ Onayla · ✏️ Düzelt (doğrusunu yazarsınız) · ❌ İptal\n"
     "Bir onay mesajını yanıtlayarak da düzeltme yazabilirsiniz."
@@ -155,6 +162,48 @@ OWNER_REASKED = "♻️ Arkadaş ayarı değişti; bu soruyu artık siz cevaplı
 _FRIEND_UNREACHABLE_TR = ("Bot, kendisine hiç yazmamış (Start'a basmamış) ya da botu engellemiş bir kullanıcıya mesaj "
                           "gönderemez.")
 _USER_ID_RE = re.compile(r"^\d{1,20}$")       # a user's own id (a group or channel id is negative: refused)
+# ---- the copy of the source group for the friend's groups (``/grup``, ``/bagla``; see group_mirror.py) ----
+GROUP_GAP_SEC = 3.0               # at least this long between two requests to the same group (Telegram: 20 a minute)
+GROUP_YIELD_MAX_SEC = 60.0        # a copy waits at most this long for the friend's own messages to go first
+GROUP_UPLOAD_TIMEOUT_SEC = 300.0  # a photo / file (its upload pauses while the trading path is busy)
+GROUP_FLOOD_MAX_SEC = 300.0       # a longer FloodWait: that copy is given up (the next ones wait for it to pass)
+GROUP_FLOOD_TRIES = 3             # a copy is sent at most this often when Telegram answers with FloodWait
+GROUP_CAPTION_MAX = 1024          # Telegram's caption limit (longer: the text first, then the file)
+GROUP_POLL_SEC = 0.5
+GROUP_ALERT_EVERY_SEC = 3600.0    # failing group copies: the owner is told at most this often (a throttle of its own)
+FRIEND_FLOOD_MAX_SEC = 300.0      # the friend's own messages wait out a FloodWait up to this long (longer: as before)
+FRIEND_FLOOD_TRIES = 1            # an ordinary message is sent once more after a FloodWait (questions: until closed)
+ROLE_TR = {"ana": "ana grup", "sohbet": "sohbet grubu"}
+ROLE_ACC = {"ana": "ana grubu", "sohbet": "sohbet grubu"}
+ROLE_DATIVE = {"ana": "ana grubuna", "sohbet": "sohbet grubuna"}
+ROLE_TITLE = {"ana": "Ana grup", "sohbet": "Sohbet grubu"}
+ROLE_WHAT = {"ana": "sohbet dışındaki tüm konular: sinyaller, PnL, General...", "sohbet": "adında “sohbet” geçen konu"}
+BIND_DONE = {"ana": "✅ Bu grup bağlandı: kaynak grubun sohbet dışındaki tüm konuları buraya kopyalanacak.",
+             "sohbet": "✅ Bu grup bağlandı: kaynak grubun sohbet konusu buraya kopyalanacak."}
+GROUP_ON_FRIEND = "👥 Bot sahibi grup kopyasını açtı: kaynak gruptaki yeni mesajlar bağladığınız gruplara gelecek."
+GROUP_OFF_FRIEND = "👥 Bot sahibi grup kopyasını kapattı; kaynak gruptaki mesajlar artık gruplarınıza gelmeyecek."
+GROUP_NO_FRIEND = ("Arkadaş sohbeti ayarlı değil: kopyalar <code>/arkadas &lt;sohbet_id&gt;</code> ile arkadaşınızı "
+                   "ekleyip o gruplarını bağlayınca başlar.")
+GROUP_TOPICS_HINT = ("Yalnızca bazı konular için: <code>/grup konular &lt;ad, ad&gt;</code> (hepsi için: "
+                     "<code>/grup konular hepsi</code>)")
+GROUP_FRIEND_DROPPED = "\nGrup kopyası için bağlanan gruplar ve bekleyen kopyalar da kaldırıldı."
+GROUP_FRIEND_DROPPED_OLD = ("\nEski arkadaşınızın grup kopyası için bağladığı gruplar ve bekleyen kopyalar "
+                            "kaldırıldı.")
+GROUP_FRIEND_HELP_SENT = "\nGrup kopyası açık: arkadaşınıza gruplarını nasıl bağlayacağı yazıldı."
+GROUP_NOT_LOADED = ("❌ Grup kopyasının kayıtlı ayarı şu an okunamıyor; bu yüzden kopyalama kapalı ve değişiklik "
+                    "yapılamıyor. Lütfen biraz sonra <code>/grup</code> ile tekrar deneyin.")
+_BIND_RE = re.compile(r"^/(?:bagla|bağla)(?:@([A-Za-z0-9_]{3,64}))?(?:\s+(.*?))?\s*$", re.I | re.S)
+# The bot can no longer write to that group: the binding is marked broken (the owner is told; /bagla again).
+_GROUP_GONE: tuple[type[BaseException], ...] = (
+    errors.ChatWriteForbiddenError, errors.ChatForbiddenError, errors.ChannelPrivateError, errors.ChannelInvalidError,
+    errors.ChatIdInvalidError, errors.PeerIdInvalidError, errors.UserBannedInChannelError, errors.ChatRestrictedError,
+    errors.ChatGuestSendForbiddenError, errors.ChatSendPlainForbiddenError, errors.ChatAdminRequiredError,
+)
+GROUP_USAGE = ("Kullanım: <code>/grup</code> (durum), <code>/grup ac</code>, <code>/grup kapat</code>, "
+               "<code>/grup konular &lt;ad, ad&gt;</code> ya da <code>/grup konular hepsi</code>")
+_GROUP_ON_WORDS = ("ac", "acik", "on")               # compared without Turkish letters: "aç", "AÇIK"...
+_GROUP_OFF_WORDS = ("kapat", "kapa", "kapali", "off")
+_GROUP_ALL_WORDS = ("hepsi", "hepsini", "tumu", "tum")
 
 
 def _with_prefix(text: str, severity: Severity) -> str:
@@ -190,6 +239,8 @@ _COMMANDS = {
     "test": "test",
     "arkadas": "friend", "arkadaş": "friend",
     "sonradan": "catchup",
+    "grup": "group",
+    "bagla": "bind", "bağla": "bind",
 }
 _COMMAND_RE = re.compile(r"^/([^\s@]+)(?:@\S+)?\s*(.*)$", re.S)
 _SENT, _RETRY, _DROP = "sent", "retry", "drop"
@@ -206,6 +257,15 @@ def split_html(text: str, limit: int = MAX_CHUNK) -> list[str | tuple[str, list[
     return [(chunk, ents) for chunk, ents in utils.split_text(plain, entities, limit=limit)]
 
 
+def _utf16_len(html_text: str) -> int:
+    """Length of the text Telegram shows (UTF-16 units, markup removed); unparsable: counted as is."""
+    try:
+        plain = tl_html.parse(html_text)[0]
+    except Exception:
+        plain = html_text
+    return len(plain.encode("utf-16-le")) // 2
+
+
 def _outcome(text: str) -> str:
     return f"<b>Sonuç:</b> {text.strip()}" if text and text.strip() else "<b>Sonuç:</b> —"
 
@@ -218,6 +278,10 @@ def _abandoned(state: Any) -> bool:
     """A Telethon request state whose caller stopped waiting (its future is cancelled)."""
     future = getattr(state, "future", None)
     return future is not None and future.cancelled()
+
+
+class TransferAborted(Exception):
+    """A group copy's photo / file transfer was given up on purpose (the trading path stayed busy, or shutdown)."""
 
 
 @dataclass(eq=False)
@@ -233,6 +297,8 @@ class _FriendMessage:
     created: float = field(default_factory=time.time)
     task: asyncio.Task[Any] | None = None            # its send that got no answer in time (waited for, never resent)
     attempts: int = 0                                # sends of it started so far
+    floods: int = 0                                  # FloodWaits waited out for it
+    next_chunk: int = 0                              # a long message: its parts before this one were delivered
 
 
 @dataclass(eq=False)
@@ -323,6 +389,14 @@ class BotNotifier:
         self._former_friends: set[int] = set()                 # earlier friends: their taps get a short answer
         self._owner_reask: dict[str, int] = {}                 # conf id -> the owner's re-sent question (with buttons)
         self._friend_wake = asyncio.Event()                    # cuts a retry pause short (a question was closed...)
+        # ---- the copy of the source group for the friend (/grup) ----
+        self._group_mirror: Any = None                         # group_mirror.GroupMirror (set by the app)
+        self._group_next_at: dict[int, float] = {}             # group -> monotonic: its next request not before
+        self._group_hold_until = 0.0                           # monotonic: FloodWait of a group copy until then
+        self._group_alert_at: float | None = None              # monotonic: the owner was told about a failed copy then
+        self._group_peers: dict[int, Any] = {}                 # a supergroup a group was upgraded to -> its input peer
+        self._username: str | None = None                      # the bot's own username (for /bagla@...)
+        self._me_id: int | None = None                         # the bot's own user id (its posts are never copied)
 
     # ---- lifecycle -------------------------------------------------------
     def _make_client(self) -> Any:
@@ -367,6 +441,8 @@ class BotNotifier:
         if me.id == self._owner:
             raise RuntimeError("notifier.owner_user_id botun kendi ID'si olamaz; kendi kullanıcı ID'nizi yazın.")
         self._shut = False
+        self._username = getattr(me, "username", None) or None
+        self._me_id = getattr(me, "id", None)
         client.parse_mode = "html"
         self._no_hidden_flood_sleep()
         client.add_event_handler(self._on_message_event, events.NewMessage(incoming=True))
@@ -594,6 +670,13 @@ class BotNotifier:
     async def handle_message(self, event: Any) -> None:
         if getattr(event, "out", False):
             return
+        if not getattr(event, "is_private", True):
+            # In a group the bot answers nothing at all (also not the friend's chatter or his replies to copies), except
+            # a valid /bagla of the owner or the friend.
+            bind = self._bind_request(getattr(event, "raw_text", None) or "")
+            if bind is not None:
+                await self._handle_bind(event, bind)
+            return
         if self._is_friend(getattr(event, "sender_id", None)):
             self._friend_refuse()          # never executed, whatever it is
             return
@@ -672,6 +755,14 @@ class BotNotifier:
             return
         elif command == "catchup":
             reply = await engine.catch_up_command(args)
+        elif command == "group":
+            await self._group_command(args)
+            return
+        elif command == "bind":              # (written here, in the private chat: it belongs in the friend's group)
+            cmd = self._bind_cmd()
+            await self._send("ℹ️ <code>/bagla</code> arkadaşınızın grubunda yazılır: botu o gruba ekleyin, sonra o grupta "
+                             f"<code>{cmd} ana</code> ya da <code>{cmd} sohbet</code> gönderin.", mirror=False)
+            return
         else:                            # test
             if not args:
                 await self._send("Kullanım: <code>/test eth 1R long, giriş 2232, SL 2205, TP 2310</code>")
@@ -859,6 +950,11 @@ class BotNotifier:
     def friend_chat_id(self) -> int | None:
         return self._friend
 
+    @property
+    def bot_user_id(self) -> int | None:
+        """The bot's own user id (known once started): its posts are never copied by the group copy."""
+        return self._me_id
+
     def _is_friend(self, sender_id: int | None) -> bool:
         return self._friend is not None and sender_id is not None and sender_id == self._friend \
             and sender_id != self._owner
@@ -894,11 +990,30 @@ class BotNotifier:
             if chat is None:
                 self._friend_queue.clear()
                 return
+            # (A FloodWait of the group copies never holds his own messages: a catch-up question must not expire because
+            # of them. A FloodWait for his own chat is waited out below, and the message sent again.)
             try:
                 await self._friend_deliver(chat, message)
             except asyncio.CancelledError:
                 raise
             except Exception as exc:          # noqa: BLE001 - the friend's chat must never break anything
+                seconds = getattr(exc, "seconds", None)
+                if (isinstance(exc, errors.FloodError) and seconds and float(seconds) <= FRIEND_FLOOD_MAX_SEC
+                        and message.floods < FRIEND_FLOOD_TRIES and chat == self._friend
+                        and not self._friend_keep(message, chat)):
+                    # An ordinary message: the part that got the FloodWait was not sent; after the wait it is sent
+                    # again from that part on (the parts before it arrived and are never repeated).
+                    # Open questions waiting behind it go first: a catch-up question never waits for it.
+                    message.floods += 1
+                    log.warning("FloodWait %ss for the friend's chat; the message waits and is sent again", seconds)
+                    questions = [m for m in list(self._friend_queue)[1:] if self._open_question(m)]
+                    if questions:
+                        for question in questions:
+                            self._friend_queue.remove(question)
+                        self._friend_queue.extendleft(reversed(questions))
+                        continue
+                    await self._friend_pause(float(seconds) + FLOOD_MARGIN_SEC)
+                    continue
                 await self._friend_failed(chat, exc)
                 if self._friend_keep(message, chat):
                     seconds = getattr(exc, "seconds", None)
@@ -910,6 +1025,10 @@ class BotNotifier:
             delay = RETRY_BASE_SEC
             if self._friend_queue and self._friend_queue[0] is message:
                 self._friend_queue.popleft()
+
+    def _open_question(self, message: _FriendMessage) -> bool:
+        return (message.buttons is not None and message.conf_id is not None and not message.closing
+                and message.conf_id not in self._closed)
 
     def _friend_keep(self, message: _FriendMessage, chat: int) -> bool:
         """An open question with buttons for this very friend: never dropped."""
@@ -929,12 +1048,12 @@ class BotNotifier:
             sent = self._friend_msgs.pop(conf_id, None)
             if sent is not None and await self._friend_request(self._friend_edit(chat, sent[0], message.text)):
                 return                        # his question now shows the outcome, buttons removed
-            await self._friend_send(chat, message.text)
+            await self._friend_send(chat, message.text, message=message)
             return
         if message.buttons is not None and conf_id is not None:
             await self._friend_question(chat, message)
             return
-        await self._friend_send(chat, message.text)
+        await self._friend_send(chat, message.text, message=message)
 
     async def _friend_question(self, chat: int, message: _FriendMessage) -> None:
         """A question the friend answers (with its buttons). Closed before it got to him: not sent (its outcome
@@ -987,10 +1106,15 @@ class BotNotifier:
                 return
             self._remember(self._friend_msgs, conf_id, (msg_id, closed))     # (its text once the buttons are gone)
 
-    async def _friend_send(self, chat: int, text: str, *, buttons: Any = None) -> int | None:
+    async def _friend_send(self, chat: int, text: str, *, buttons: Any = None,
+                           message: _FriendMessage | None = None) -> int | None:
+        """``message``: its delivered parts are remembered, so a resend (after a FloodWait) goes on with the part that
+        failed and never repeats one that arrived."""
         msg_id: int | None = None
         chunks = self._chunks(text)
         for i, chunk in enumerate(chunks):
+            if message is not None and i < message.next_chunk:
+                continue
             kwargs: dict[str, Any] = {"buttons": buttons if i == len(chunks) - 1 else None, "link_preview": False}
             if isinstance(chunk, str):
                 request = self._client.send_message(chat, chunk, parse_mode="html", **kwargs)
@@ -998,6 +1122,8 @@ class BotNotifier:
                 request = self._client.send_message(chat, chunk[0], formatting_entities=chunk[1], **kwargs)
             result = await self._friend_request(request, raise_errors=True)
             msg_id = getattr(result, "id", None)
+            if message is not None:
+                message.next_chunk = i + 1
         return msg_id
 
     def _friend_edit(self, chat: int, msg_id: int, text: str) -> Coroutine[Any, Any, Any]:
@@ -1117,9 +1243,11 @@ class BotNotifier:
         if arg.lower() in ("sil", "kaldır", "kaldir"):
             old, questions = self._friend, dict(self._friend_msgs)
             await store(None)                 # (the engine gives the owner the questions the friend had)
+            dropped = await self._group_friend_changed(old, None)
             await self._friend_dropped(old, questions)
             await self._send("✅ Arkadaş sohbeti kaldırıldı; bildirimler artık yalnızca size gelir (<code>/sonradan "
-                             "sor</code> seçiliyse tickmill sorularını siz cevaplarsınız).", mirror=False)
+                             "sor</code> seçiliyse tickmill sorularını siz cevaplarsınız)."
+                             + (GROUP_FRIEND_DROPPED if dropped else ""), mirror=False)
             return
         if not _USER_ID_RE.match(arg) or int(arg) == 0:
             await self._send("Kullanım: <code>/arkadas &lt;sohbet_id&gt;</code> (arkadaşınızın kullanıcı kimliği: "
@@ -1141,10 +1269,463 @@ class BotNotifier:
             return
         old, questions = self._friend, dict(self._friend_msgs)
         await store(chat)
+        dropped = await self._group_friend_changed(old, chat)
         if old is not None and old != chat:
             await self._friend_dropped(old, questions)
+        extra = GROUP_FRIEND_DROPPED_OLD if dropped else ""
+        mirror = self._group_mirror
+        if mirror is not None and old != chat and self._send_bind_help(mirror):
+            extra += GROUP_FRIEND_HELP_SENT          # (the copy is on: the new friend is told how to bind his groups)
         await self._send(f"✅ Arkadaşınızın sohbeti kaydedildi (<code>{chat}</code>); deneme mesajı ulaştı. Bundan sonra "
-                         f"size gelen her bildirim ona da gider; {FRIEND_CATCH_UP_NOTE}", mirror=False)
+                         f"size gelen her bildirim ona da gider; {FRIEND_CATCH_UP_NOTE}" + extra, mirror=False)
+
+    async def _group_friend_changed(self, old: int | None, new: int | None) -> bool:
+        """The friend changed (or was removed): the group copy's bindings, waiting copies and edit memory were his and
+        are dropped. True when there was something to drop."""
+        mirror = self._group_mirror
+        if mirror is None or old == new:
+            return False
+        try:
+            return bool(await mirror.friend_changed(new))
+        except Exception:                     # noqa: BLE001 - never in the way of /arkadas
+            log.exception("Group copy: could not drop the earlier friend's bindings")
+            return False
+
+    # ---- the copy of the source group for the friend's groups (/grup, /bagla) ---------------------------
+    def set_group_mirror(self, mirror: Any) -> None:
+        """The app's GroupMirror: ``/grup`` switches it, ``/bagla`` binds its groups; it sends through
+        :meth:`send_group_copy`."""
+        self._group_mirror = mirror
+
+    def trading_busy(self) -> bool:
+        """An owner command or button press is being handled (it may be placing orders): the group copy moves no
+        media meanwhile."""
+        return any(not t.done() for t in self._tasks)
+
+    async def send_group_copy(
+        self,
+        chat: int,
+        header: str,
+        body: str = "",
+        *,
+        file: str | None = None,
+        document: bool = False,
+        note: str | None = None,
+        label: str = "Dosya",
+        name: str | None = None,
+        reply_to: int | None = None,
+        progress: Callable[[], Any] | None = None,
+        ready: Callable[[], Coroutine[Any, Any, bool]] | None = None,
+        valid: Callable[[], bool] | None = None,
+    ) -> int | None:
+        """One copy of a source-group message for one of the friend's groups (HTML; ``file``: a photo, or a document
+        named ``name`` when ``document``, with the text as its caption). Rules: Telegram's pace for a group, the
+        friend's own messages first, a FloodWait waited for, every request bounded and one without an answer never
+        cancelled nor sent again; right before EVERY request ``valid()`` must still be true (the copy is on, the group
+        is still the bound one), else nothing more is sent. For a file: ``ready()`` right before each upload attempt
+        and a fresh ``progress()`` callback for each attempt (both may stop it: the text then goes with a note).
+
+        Returns the message id in the group (None: nothing (more) sent: stopping, switched off, group changed). Raises
+        when it could not be delivered (see :meth:`group_chat_gone`; the caller counts it and tells the owner)."""
+        if self._client is None or self._shut:
+            return None
+        valid = valid or (lambda: True)
+        text = "\n".join(p for p in (header, body, note) if p)
+        if file is None:
+            return await self._group_text(chat, text, reply_to, valid)
+        caption, text_sent = text, False
+        if _utf16_len(caption) > GROUP_CAPTION_MAX:
+            if await self._group_text(chat, text, reply_to, valid) is None:     # too long for a caption: text first
+                return None
+            caption, text_sent = header, True
+        client = self._client
+
+        def upload(as_document: bool) -> Coroutine[Any, Any, Any]:
+            attributes = [types.DocumentAttributeFilename(name)] if as_document and name else None
+            return client.send_file(self._group_entity(chat), file, caption=caption, parse_mode="html",
+                                    force_document=as_document, attributes=attributes, reply_to=reply_to,
+                                    progress_callback=progress() if progress is not None else None)
+
+        try:
+            try:
+                result = await self._group_request(chat, lambda: upload(document), timeout=GROUP_UPLOAD_TIMEOUT_SEC,
+                                                   valid=valid, ready=ready)
+            except _PERMANENT as exc:
+                if document or self.group_chat_gone(exc) or self._is_unreachable(exc):
+                    raise
+                # (refused as a photo, e.g. its size: nothing was sent) the same picture once more, as a file
+                log.warning("Group copy: Telegram refused the photo %s (%s); sending it as a file", file, exc)
+                result = await self._group_request(chat, lambda: upload(True), timeout=GROUP_UPLOAD_TIMEOUT_SEC,
+                                                   valid=valid, ready=ready)
+        except TransferAborted as exc:
+            log.info("Group copy: the upload of %s was given up: %s", file, exc)
+        except Exception as exc:
+            if self.group_chat_gone(exc) or self._is_unreachable(exc) or not isinstance(exc, _PERMANENT):
+                raise
+            log.warning("Group copy: Telegram refused the file %s: %s", file, exc)
+        else:
+            return getattr(result, "id", None) if result is not None else None
+        why = f"📎 {esc(label)} kopyalanmadı."                     # (generic: the group may have other members)
+        return await self._group_text(chat, why if text_sent else "\n".join(p for p in (header, body, why) if p),
+                                      reply_to, valid)
+
+    def _group_entity(self, chat: int) -> Any:
+        return self._group_peers.get(chat, chat)
+
+    async def _group_text(self, chat: int, text: str, reply_to: int | None, valid: Callable[[], bool]) -> int | None:
+        client = self._client
+        msg_id: int | None = None
+        for i, chunk in enumerate(self._chunks(text)):
+            reply = reply_to if i == 0 else None
+
+            def make(chunk: Any = chunk, reply: int | None = reply) -> Coroutine[Any, Any, Any]:
+                entity = self._group_entity(chat)
+                if isinstance(chunk, str):
+                    return client.send_message(entity, chunk, parse_mode="html", link_preview=False, reply_to=reply)
+                return client.send_message(entity, chunk[0], formatting_entities=chunk[1], link_preview=False,
+                                           reply_to=reply)
+
+            try:
+                result = await self._group_request(chat, make, timeout=SEND_TIMEOUT_SEC, valid=valid)
+            except _PERMANENT as exc:
+                if reply is None or self.group_chat_gone(exc) or self._is_unreachable(exc):
+                    raise
+                log.warning("Group copy: reply to message %s refused (%s); sent without it", reply, exc)
+                result = await self._group_request(chat, lambda chunk=chunk: make(chunk, None),
+                                                   timeout=SEND_TIMEOUT_SEC, valid=valid)
+            if result is None:
+                return None
+            msg_id = getattr(result, "id", None)
+        return msg_id
+
+    async def _group_turn(self, chat: int) -> bool:
+        """Before a request of a group copy: no FloodWait running, GROUP_GAP_SEC since the last request to that group,
+        the bot's connection working, and the friend's own messages delivered first (waited for at most
+        GROUP_YIELD_MAX_SEC). False: stopping."""
+        yield_until = time.monotonic() + GROUP_YIELD_MAX_SEC
+        while not self._shut:
+            now = time.monotonic()
+            wait = max(self._group_hold_until, self._group_next_at.get(chat, 0.0)) - now
+            if wait > 0:
+                await asyncio.sleep(wait)
+            elif self._link_down() or (self._friend_queue and now < yield_until):
+                await asyncio.sleep(GROUP_POLL_SEC)
+            else:
+                return True
+        return False
+
+    async def _group_request(
+        self,
+        chat: int,
+        make: Callable[[], Coroutine[Any, Any, Any]],
+        *,
+        timeout: float,
+        valid: Callable[[], bool],
+        ready: Callable[[], Coroutine[Any, Any, bool]] | None = None,
+    ) -> Any:
+        """One request of a group copy, waited for at most ``timeout``. After every wait and right before the request:
+        ``ready()`` (an upload: the trading path is idle; False raises TransferAborted) and ``valid()`` (False: nothing
+        is sent, None is returned). No answer in time: left to Telethon (never cancelled, never sent a second time) and
+        raised as a timeout. FloodWait: nothing was sent; the same request again once the wait is over (at most
+        GROUP_FLOOD_TRIES sends, a wait of at most GROUP_FLOOD_MAX_SEC). None: stopping, or no longer valid."""
+        floods = 0
+        while True:
+            if not await self._group_turn(chat) or self._client is None:
+                return None
+            if ready is not None and not await ready():
+                raise TransferAborted("the trading path stayed busy, or the bot is stopping")
+            if not valid():
+                log.info("Group copy for %s: not sent, the copy was switched off or its group changed meanwhile", chat)
+                return None
+            task = self._track(asyncio.ensure_future(make()))
+            done, _ = await asyncio.wait({task}, timeout=timeout)
+            self._group_next_at[chat] = time.monotonic() + GROUP_GAP_SEC
+            if not done:
+                raise asyncio.TimeoutError("Telegram yanıt vermedi")
+            if task.cancelled():
+                raise asyncio.TimeoutError("istek yarıda kesildi")
+            exc = task.exception()
+            if exc is None:
+                return task.result()
+            seconds = getattr(exc, "seconds", None)
+            if isinstance(exc, errors.FloodError) and seconds:
+                wait = float(seconds) + FLOOD_MARGIN_SEC
+                self._group_hold_until = max(self._group_hold_until, time.monotonic() + wait)
+                floods += 1
+                log.warning("Group copy for %s: Telegram asks to wait %ss (FloodWait, send %d)", chat, seconds, floods)
+                if wait <= GROUP_FLOOD_MAX_SEC and floods < GROUP_FLOOD_TRIES:
+                    continue
+            raise exc
+
+    @staticmethod
+    def group_chat_gone(exc: BaseException) -> bool:
+        """The bot can no longer write to that group (removed, banned, group deleted, upgraded to a supergroup...)."""
+        return (isinstance(exc, _GROUP_GONE) or (isinstance(exc, ValueError) and "entity" in str(exc))
+                or getattr(exc, "migrate_to_chat_id", None) is not None)
+
+    async def group_migrated_to(self, chat: int, exc: BaseException) -> int | None:
+        """The id of the supergroup a group was upgraded to (the binding follows it), or None. A Bot-API style error
+        says it itself; otherwise the old (basic) group says it in ``migrated_to``."""
+        new = getattr(exc, "migrate_to_chat_id", None)
+        if isinstance(new, int) and not isinstance(new, bool):
+            return new
+        if not -10**12 < chat < 0 or self._client is None:
+            return None                       # only a basic group can be upgraded
+        try:
+            result = await asyncio.wait_for(self._client(functions.messages.GetChatsRequest(id=[-chat])),
+                                            SEND_TIMEOUT_SEC)
+        except Exception as error:            # noqa: BLE001
+            log.info("Group copy: could not look up group %s after a failed send: %s", chat, error)
+            return None
+        for found in getattr(result, "chats", None) or []:
+            moved = getattr(found, "migrated_to", None)
+            if getattr(found, "id", None) == -chat and isinstance(moved, types.InputChannel):
+                new_id = utils.get_peer_id(types.PeerChannel(moved.channel_id))
+                self._group_peers[new_id] = types.InputPeerChannel(moved.channel_id, moved.access_hash)
+                return new_id
+        return None
+
+    async def group_copy_failed(self, exc: BaseException, target: Any = None) -> None:
+        """A group copy was not delivered (the caller logged it): the owner is told at most once per
+        GROUP_ALERT_EVERY_SEC, with a throttle of its own (never hiding an alert about the friend's chat)."""
+        if self._shut:
+            return
+        now = time.monotonic()
+        if self._group_alert_at is not None and now - self._group_alert_at < GROUP_ALERT_EVERY_SEC:
+            return
+        self._group_alert_at = now
+        role = getattr(target, "role", "ana")
+        where = ROLE_DATIVE.get(role, "grubuna")
+        title = f" (<b>{esc(getattr(target, 'title', ''))}</b>)" if getattr(target, "title", None) else ""
+        await self._send(f"⚠️ Gruptan bir mesaj arkadaşınızın {where}{title} kopyalanamadı: {self._friend_why(exc)}. "
+                         "(Bu uyarı en fazla saatte bir gönderilir.)", mirror=False)
+
+    async def group_target_broken(self, target: Any, exc: BaseException) -> None:
+        """The bot can no longer write to one of the friend's groups: the owner is told (once per breakage)."""
+        if self._shut:
+            return
+        role = getattr(target, "role", "ana")
+        await self._send(
+            f"⚠️ Bot arkadaşınızın {ROLE_DATIVE.get(role, 'grubuna')} (<b>{esc(getattr(target, 'title', ''))}</b>) "
+            f"artık yazamıyor (<code>{esc(str(exc) or type(exc).__name__)}</code>): bot gruptan çıkarılmış ya da grup "
+            "silinmiş olabilir. Bu grubun kopyaları durdu; arkadaşınız botu gruba yeniden ekleyip orada "
+            f"<code>{self._bind_cmd()} {role}</code> yazmalı.", mirror=False)
+
+    # ---- /bagla: binding one of the friend's groups (written IN that group) ----------------------------------
+    def _bind_cmd(self) -> str:
+        return f"/bagla@{self._username}" if self._username else "/bagla"
+
+    def _bind_help(self, roles: list[str]) -> str:
+        """For the friend's private chat: the exact lines to paste in his groups."""
+        lines = ["🔗 Grup kopyası açık. Kopyaların gideceği gruplarınızı bağlamak için botu gruba ekleyin ve o grupta "
+                 "aşağıdaki satırı gönderin (kopyalayıp yapıştırabilirsiniz):"]
+        for role in roles:
+            lines.append(f"• {ROLE_TITLE[role]} ({ROLE_WHAT[role]}): <code>{self._bind_cmd()} {role}</code>")
+        lines.append("Bir grup bağlanana kadar o konuların mesajları kopyalanmaz.")
+        return "\n".join(lines)
+
+    def _send_bind_help(self, mirror: Any) -> bool:
+        """When the copy is on and a role has no working group: the instructions go to the friend's private chat."""
+        roles = mirror.unbound_roles() if mirror.enabled and self._friend is not None else []
+        if roles:
+            self._friend_put(_FriendMessage(text=self._bind_help(roles)))
+        return bool(roles)
+
+    def _bind_request(self, text: str) -> str | None:
+        """The argument of a ``/bagla`` (or ``/bagla@<this bot>``) command, or None when the text is something else
+        (also a /bagla for another bot): then the message is handled exactly as before."""
+        if self._group_mirror is None:
+            return None
+        match = _BIND_RE.match(text.strip())
+        if match is None:
+            return None
+        bot = match.group(1)
+        if bot is not None and (self._username is None or bot.lower() != self._username.lower()):
+            return None
+        return (match.group(2) or "").strip()
+
+    async def _group_reply(self, chat: int, text: str, reply_to: int | None) -> None:
+        """One short answer in the group the /bagla came from (bounded; a failure is only logged)."""
+        if self._client is None or self._shut:
+            return
+        task = self._track(asyncio.ensure_future(self._client.send_message(
+            chat, text, parse_mode="html", link_preview=False, reply_to=reply_to)))
+        done, _ = await asyncio.wait({task}, timeout=SEND_TIMEOUT_SEC)
+        if not done:
+            log.warning("The answer in group %s got no answer from Telegram in time", chat)
+        elif not task.cancelled() and task.exception() is not None:
+            log.warning("Could not answer in group %s: %s", chat, task.exception())
+
+    async def _chat_title(self, event: Any) -> str:
+        chat = getattr(event, "chat", None)
+        if chat is None and callable(getattr(event, "get_chat", None)):
+            try:
+                chat = await asyncio.wait_for(event.get_chat(), SEND_TIMEOUT_SEC)
+            except Exception as exc:          # noqa: BLE001 - the title is only shown
+                log.debug("Could not read the title of group %s: %s", getattr(event, "chat_id", None), exc)
+        return str(getattr(chat, "title", None) or "grup")[:128]
+
+    async def _handle_bind(self, event: Any, arg: str) -> None:
+        """``/bagla [ana|sohbet]`` written in a group by the owner or his current friend: that group gets the copies of
+        that role (no argument: "sohbet" when the group's title contains it, else "ana"). Anybody else: ignored,
+        silently. One short line in the group, a notice for the owner."""
+        mirror = self._group_mirror
+        sender = getattr(event, "sender_id", None)
+        chat = getattr(event, "chat_id", None)
+        by_owner = sender is not None and sender == self._owner
+        by_friend = not by_owner and self._is_friend(sender)
+        if mirror is None or chat is None or not (by_owner or by_friend) or not getattr(event, "is_group", True):
+            log.info("A /bagla in chat %s from %s was ignored (only the owner or his friend binds a group)", chat, sender)
+            return
+        msg_id = getattr(event, "id", None)
+        title = await self._chat_title(event)
+        if mirror.is_source(chat):
+            # The source group itself: never a target (the copies would loop back into it), and the bot says nothing
+            # there - only the owner is told.
+            log.warning("A /bagla in the source chat %s was refused", chat)
+            await self._send(f"❌ <b>{esc(title)}</b> kaynak grubun kendisi; grup kopyası oraya bağlanamaz. Arkadaşınızın "
+                             "kendi gruplarından birinde yazılmalı.", mirror=False)
+            return
+        word = fold_ascii(arg.split()[0]) if arg.split() else ""
+        if word and word not in mirror.ROLES:
+            cmd = self._bind_cmd()
+            await self._group_reply(chat, f"Kullanım: {cmd} ana ya da {cmd} sohbet", msg_id)
+            return
+        role = word or mirror.role_of(title)
+        try:
+            if not await mirror.ensure_loaded():
+                raise RuntimeError("the group copy setting cannot be read")
+            await mirror.bind(role, chat, title, sender)
+        except Exception as exc:              # noqa: BLE001 - told to both
+            log.exception("Could not bind group %s for the group copy", chat)
+            await self._group_reply(chat, "❌ Şu an bağlanamadı; lütfen biraz sonra tekrar deneyin.", msg_id)
+            await self._send(f"❌ <b>{esc(title)}</b> grubu grup kopyası için bağlanamadı "
+                             f"(<code>{esc(str(exc) or type(exc).__name__)}</code>).", mirror=False)
+            return
+        off = "" if mirror.enabled else " (Grup kopyası şu an kapalı.)"
+        await self._group_reply(chat, f"{BIND_DONE[role]}{off}", msg_id)
+        who = "arkadaşınız" if by_friend else "siz"
+        hint = "" if mirror.enabled else " Grup kopyası şu an kapalı; açmak için: <code>/grup ac</code>"
+        await self._send(f"🔗 <b>{esc(title)}</b> grubu grup kopyasının {ROLE_TR[role]} olarak bağlandı "
+                         f"({ROLE_WHAT[role]}; bağlayan: {who}).{hint}", mirror=False)
+
+    # ---- /grup ------------------------------------------------------------------------------------------------
+    @staticmethod
+    def _group_names(mirror: Any) -> str:
+        return ", ".join(f"'{esc(t)}'" for t in mirror.topics)
+
+    def _group_scope(self, mirror: Any) -> str:
+        return f"yalnızca adında {self._group_names(mirror)} geçen konular" if mirror.topics else "tüm konular"
+
+    def _group_state(self, mirror: Any) -> str:
+        lines = [f"👥 Grup kopyası {'açık' if mirror.enabled else 'kapalı'}."]
+        targets = mirror.targets
+        for role in mirror.ROLES:
+            target = targets.get(role)
+            if target is None:
+                where = "bağlı değil"
+            elif target.broken:
+                where = (f"<b>{esc(target.title)}</b> (bağlantı koptu: bot oraya yazamıyor; "
+                         f"<code>{self._bind_cmd()} {role}</code> ile yeniden bağlanmalı)")
+            else:
+                where = f"<b>{esc(target.title)}</b> (bağlı)"
+            lines.append(f"{ROLE_TITLE[role]} ({ROLE_WHAT[role]}): {where}")
+        routes = mirror.routes()
+        if routes:
+            parts = []
+            for role in mirror.ROLES:
+                names = [f"'{esc(t)}'" for t, r in routes if r == role]
+                if names:
+                    parts.append(", ".join(names) + f" → {ROLE_TR[role]}")
+            lines.append("Bilinen konular: " + "; ".join(parts) + ".")
+        if mirror.topics:
+            lines.append(f"Yalnızca adında {self._group_names(mirror)} geçen konular kopyalanıyor.")
+        if not mirror.media_possible:
+            lines.append("Resimler ve dosyalar kopyalanmıyor (yalnızca metinleri): bu bilgisayarda hızlı şifreleme "
+                         "paketi (cryptg) kurulu değil.")
+        if mirror.waiting:
+            lines.append(f"Sırada bekleyen: {mirror.waiting} mesaj.")
+        counts = [f"{ROLE_TR[r]} bağlı olmadığı için atlanan: {n}" for r, n in mirror.skipped.items() if n]
+        counts += [f"{label}: {n}" for label, n in (("sıra dolduğu ya da bot kapandığı için atlanan", mirror.dropped),
+                                                    ("gönderilemeyen", mirror.failed)) if n]
+        if counts:
+            lines.append("Bot başladığından beri " + "; ".join(counts) + " mesaj.")
+        if self._friend is None:
+            lines.append(GROUP_NO_FRIEND)
+        else:
+            cmd = self._bind_cmd()
+            lines.append(f"Arkadaşınız (<code>{self._friend}</code>) gruplarını, botu ekledikten sonra o grupta "
+                         f"<code>{cmd} ana</code> ya da <code>{cmd} sohbet</code> yazarak bağlar.")
+        toggle = "Kapatmak için: <code>/grup kapat</code>" if mirror.enabled else "Açmak için: <code>/grup ac</code>"
+        lines.append(f"{toggle} · {GROUP_TOPICS_HINT}")
+        return "\n".join(lines)
+
+    async def _group_command(self, args: str) -> None:
+        """/grup (state), /grup ac, /grup kapat, /grup konular &lt;ad, ad&gt; | hepsi. The owner's only (as every
+        command); the replies are not mirrored to the friend. While the stored setting cannot be read, nothing is
+        changed (each /grup tries to read it again)."""
+        mirror = self._group_mirror
+        if mirror is None:
+            await self._send("⏳ Sistem henüz hazır değil, biraz sonra tekrar deneyin.", mirror=False)
+            return
+        if not await mirror.ensure_loaded():
+            await self._send(GROUP_NOT_LOADED, mirror=False)
+            return
+        arg = " ".join(args.split())
+        word, _, rest = arg.partition(" ")
+        word = fold_ascii(word)
+        off_hint = "" if mirror.enabled else " (Grup kopyası şu an kapalı; açmak için: <code>/grup ac</code>)"
+        try:
+            if not arg or (word == "konular" and not rest):
+                await self._send(self._group_state(mirror), mirror=False)
+            elif word in _GROUP_ON_WORDS and not rest:
+                was_on = mirror.enabled
+                await mirror.set_enabled(True)
+                media = ("resimler dahil" if mirror.media_possible else
+                         "yalnızca metinler: bu bilgisayarda hızlı şifreleme paketi (cryptg) kurulu olmadığı için "
+                         "resimler ve dosyalar kopyalanmaz")
+                text = (f"✅ Grup kopyası açıldı: kaynak gruptaki her yeni mesaj ({self._group_scope(mirror)}, {media}) "
+                        "arkadaşınızın bağladığı gruplara gönderilecek; size gelmez. Kapatmak için: "
+                        "<code>/grup kapat</code>")
+                if self._friend is None:
+                    text += f"\n{GROUP_NO_FRIEND}"
+                else:
+                    if not was_on:
+                        self._friend_put(_FriendMessage(text=GROUP_ON_FRIEND))
+                    unbound = mirror.unbound_roles()
+                    if self._send_bind_help(mirror):
+                        which = "iki grubu da" if len(unbound) > 1 else ROLE_ACC[unbound[0]]
+                        text += (f"\nArkadaşınızın {which} henüz bağlı değil; nasıl bağlayacağı ona yazıldı. Bağlanana "
+                                 "kadar o konuların mesajları kopyalanmaz.")
+                await self._send(text, mirror=False)
+            elif word in _GROUP_OFF_WORDS and not rest:
+                was_on = mirror.enabled
+                await mirror.set_enabled(False)
+                text = "✅ Grup kopyası kapatıldı; kaynak gruptaki mesajlar artık arkadaşınızın gruplarına gönderilmiyor."
+                if self._friend is not None:
+                    text += " Size gelen bildirimlerin kopyası ona gitmeye devam eder."
+                await self._send(text, mirror=False)
+                if was_on:
+                    self._friend_put(_FriendMessage(text=GROUP_OFF_FRIEND))
+            elif word == "konular" and fold_ascii(rest) in _GROUP_ALL_WORDS:
+                await mirror.set_topics([])
+                await self._send(f"✅ Grup kopyası bundan sonra tüm konuların mesajlarını gönderecek.{off_hint}",
+                                 mirror=False)
+            elif word == "konular":
+                topics = mirror.parse_topics(rest)
+                if not topics:
+                    await self._send(GROUP_USAGE, mirror=False)
+                    return
+                await mirror.set_topics(topics)
+                await self._send(f"✅ Grup kopyası bundan sonra yalnızca adında {self._group_names(mirror)} geçen "
+                                 "konuların mesajlarını gönderecek. Tüm konular için: <code>/grup konular hepsi</code>"
+                                 f"{off_hint}", mirror=False)
+            else:
+                await self._send(GROUP_USAGE, mirror=False)
+        except Exception as exc:      # noqa: BLE001 - told to the owner
+            log.exception("Could not store the group copy setting")
+            await self._send(f"❌ Ayar kaydedilemedi (<code>{esc(str(exc) or type(exc).__name__)}</code>); grup "
+                             "kopyası değişmedi.", mirror=False)
 
     # ---- sending ------------------------------------------------------------
     async def _send(
