@@ -512,7 +512,13 @@ async def test_d2_a_hanging_leg_does_not_delay_the_other_legs_of_the_same_trade(
         assert binance.entered == closed_syncs                # a closed leg is not synced any more
         # Review 1 (engine_iso, I2): tickmill is optional: its sync runs under its own position lock, never under
         # the trade lock (which used to stay held for the whole hung call)
-        assert not monitor._trade_lock(trade).locked() and monitor.position_lock(trade, "tickmill").locked()
+        # (sampled: the fx leg's own short syncs still take the trade lock for a moment on every pass, so a single
+        # look can land inside one of them; what matters is that the lock is free between them while tickmill hangs)
+        end = time.monotonic() + 2
+        while monitor._trade_lock(trade).locked():
+            assert time.monotonic() < end, "trade lock held for the whole hung tickmill call"
+            await asyncio.sleep(0.001)
+        assert monitor.position_lock(trade, "tickmill").locked()
         tickmill.hang = False
         tickmill.release.set()                                # the hung call returns
         await wait_until(lambda: tickmill.finished >= 2, task=task, what="tickmill synced again afterwards")
