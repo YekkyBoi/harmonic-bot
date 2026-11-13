@@ -64,13 +64,16 @@ def esc(text: object) -> str:
 
 
 def fmt_price(price: float | None) -> str:
-    """2310.6 -> '2310.6', 1.2e-05 -> '0.000012' (no float noise, no exponent)."""
+    """2310.6 -> '2310.6', 1.2e-05 -> '0.000012', 1972 - 1.04 -> '1970.96' (no float noise, no exponent).
+
+    At most 15 significant digits: every decimal of up to 15 digits survives a float exactly, so a real price
+    is shown unchanged and only the arithmetic noise in the last digits (1970.9599999999998) is dropped."""
     if price is None:
         return "—"
     if isinstance(price, float) and not math.isfinite(price):
         return esc(price)
     try:
-        d = Decimal(repr(float(price))).normalize()
+        d = Decimal(format(float(price), ".15g")).normalize()
     except (InvalidOperation, ValueError, TypeError):
         return esc(price)
     text = format(d, "f")
