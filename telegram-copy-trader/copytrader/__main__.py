@@ -3,12 +3,16 @@
 login      - first Telegram login (prints the session string)
 chats      - list chats to find the source group id
 run        - run the bot (holds <data_dir>/bot.lock while it runs)
+stop       - ask the running bot to shut down as on Ctrl+C (writes <data_dir>/stop.request) and wait for it
 check      - check config + broker connections (never trades)
 parse      - show how a message would be understood (never trades)
 migrate    - bring config.yaml up to date for this version (writes a backup first)
 selftest   - read-only health report: accounts, symbols, prices, sizes, who may post in the source group
              (never trades, never posts)
 canli-test - the ONLY command that trades: smallest real round trip on one broker, after a typed "EVET"
+
+``stop`` waits (at most STOP_WAIT_SEC) until the bot has released bot.lock and its process has ended; exit code 0
+only then (or when no bot was running).
 
 login, chats, selftest and canli-test refuse to start while the bot is running (they would open the same
 Telegram session / broker links); check and parse stay usable.
@@ -367,7 +371,7 @@ async def cmd_chats(args: argparse.Namespace) -> int:
 
 
 async def cmd_run(args: argparse.Namespace) -> int:
-    from .app import run
+    from . import app as app_mod
 
     data_dir = load_config(args.config).data_dir
     lock: Path | None = None
@@ -378,12 +382,82 @@ async def cmd_run(args: argparse.Namespace) -> int:
         # (The watchman, bekci.py, reads the same file: without it a running bot looks stopped to it.)
         print(f"Uyarı: kilit dosyası yazılamadı ({exc}); bot yine de başlatılıyor. Bekçi kuruluysa botu kapalı "
               'sanıp "Bot çalışmıyor" uyarısı gönderebilir.')
+    # A stop request still there is from before this bot (no bot held the lock): it must never stop this one.
+    if app_mod.clear_stop_request(data_dir):
+        logging.getLogger(__name__).warning("An old stop request file was removed at start")
     try:
-        await run(args.config)
+        requested = await app_mod.run(args.config)
     finally:
         if lock is not None:
             release_lock(lock)
+    if requested is True:
+        print("\nDurduruldu.")                   # (stopped by `copytrader stop`: the same end as after Ctrl+C)
     return EXIT_OK
+
+
+STOP_WAIT_SEC = 240.0       # ``stop`` waits this long for the bot to end
+STOP_CHECK_SEC = 1.0        # ... looking this often
+STOP_PROGRESS_SEC = 15.0    # ... and says that it still waits this often
+
+
+def _bot_ended(data_dir: str, pid: int, token: Any) -> bool:
+    """The bot process ``pid`` has released the lock and is gone (a pid that belongs to another process now counts
+    as gone)."""
+    if lock_holder(data_dir) is not None:
+        return False
+    alive, now_token = _process_state(pid)
+    if alive is None:
+        return True                               # cannot be told: the released lock decides
+    return not alive or bool(token and now_token and str(token) != now_token)
+
+
+async def cmd_stop(args: argparse.Namespace) -> int:
+    from . import app as app_mod
+
+    data_dir = _data_dir(args.config)
+    holder = lock_holder(data_dir)
+    if holder is None:
+        app_mod.clear_stop_request(data_dir)      # nobody would read it: never left for a later bot
+        print("Çalışan bir bot bulunamadı (bot zaten kapalı); durdurulacak bir şey yok.")
+        return EXIT_OK
+    pid = int(holder["pid"])
+    path = app_mod.write_stop_request(data_dir, pid)
+    print(f"{running_text(holder)} Durdurma isteği gönderildi; bot Ctrl+C'deki gibi kendi kapanışını yapıyor "
+          f"(süren emir işlemlerini bitirip bağlantıları kapatır). En çok {STOP_WAIT_SEC / 60:g} dakika beklenir.",
+          flush=True)
+    loop = asyncio.get_running_loop()
+    began = loop.time()
+    say_at = began + STOP_PROGRESS_SEC
+    taken = False
+    try:
+        while True:
+            if not taken and not path.exists():
+                taken = True
+                print("Bot isteği aldı, kapanıyor...", flush=True)
+            if _bot_ended(data_dir, pid, holder.get("token")):
+                app_mod.clear_stop_request(data_dir)
+                print("Bot durduruldu.", flush=True)
+                return EXIT_OK
+            now = loop.time()
+            if now - began >= STOP_WAIT_SEC:
+                break
+            if now >= say_at:
+                say_at += STOP_PROGRESS_SEC
+                print(f"Bot hâlâ kapanıyor ({round(now - began)} sn)...", flush=True)
+            await asyncio.sleep(STOP_CHECK_SEC)
+    except BaseException:
+        if not taken and app_mod.clear_stop_request(data_dir):
+            print("Bekleme yarıda kesildi; bot isteği henüz almamıştı, istek geri alındı (bot çalışmaya devam ediyor).",
+                  flush=True)
+        raise
+    minutes = f"{STOP_WAIT_SEC / 60:g}"
+    if not taken and app_mod.clear_stop_request(data_dir):
+        print(f"Bot {minutes} dakika içinde durdurma isteğini almadı; istek geri alındı, bot çalışmaya devam ediyor. "
+              "Botun penceresine ve data/logs/copytrader.log dosyasına bakın. Botu zorla kapatmayın.")
+    else:
+        print(f"Bot kapanmaya başladı ama {minutes} dakika içinde bitmedi. Botun penceresine ve "
+              "data/logs/copytrader.log dosyasına bakın; botu zorla kapatmayın.")
+    return EXIT_PROBLEM
 
 
 async def cmd_check(args: argparse.Namespace) -> int:
@@ -546,6 +620,8 @@ def build_parser() -> argparse.ArgumentParser:
     chats = sub.add_parser("chats", parents=[common], help="sohbetleri listeler (kaynak grubun ID'sini bulmak için)")
     chats.add_argument("--limit", type=int, default=200, help="en fazla kaç sohbet listelensin (varsayılan: 200)")
     sub.add_parser("run", parents=[common], help="botu çalıştırır")
+    sub.add_parser("stop", parents=[common],
+                   help="çalışan botu Ctrl+C'deki gibi durdurur ve kapanmasını bekler (en çok 4 dakika)")
     sub.add_parser("check", parents=[common], help="ayarları ve broker bağlantılarını kontrol eder (işlem açmaz)")
     parse = sub.add_parser("parse", parents=[common], help="bir mesajın nasıl anlaşılacağını gösterir (işlem açmaz)")
     parse.add_argument("--text", default="", help='mesaj metni, ör. "eth 1R long"')
@@ -567,8 +643,8 @@ def build_parser() -> argparse.ArgumentParser:
     return p
 
 
-_COMMANDS = {"login": cmd_login, "chats": cmd_chats, "run": cmd_run, "check": cmd_check, "parse": cmd_parse,
-             "migrate": cmd_migrate, "selftest": cmd_selftest, "canli-test": cmd_canli_test}
+_COMMANDS = {"login": cmd_login, "chats": cmd_chats, "run": cmd_run, "stop": cmd_stop, "check": cmd_check,
+             "parse": cmd_parse, "migrate": cmd_migrate, "selftest": cmd_selftest, "canli-test": cmd_canli_test}
 # These would open the bot's Telegram session / broker links a second time: refused while the bot runs.
 _NEEDS_STOPPED_BOT = frozenset({"login", "chats", "selftest", "canli-test"})
 

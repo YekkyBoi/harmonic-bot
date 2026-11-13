@@ -32,6 +32,8 @@ HEADER_INCOMPLETE = "🧩 <b>Eksik sinyal — tamamlayabilir misin?</b>"
 # Under the one-line question of a confirmation that can be approved: what the two buttons do.
 BUTTON_HINT_MANAGE = "✅ Onayla = uygula · ❌ İptal = dokunma"
 BUTTON_HINT_OPEN = "✅ Onayla = aç · ❌ İptal = açma"
+# A catch-up question (kind "catch_up": open a signal an optional account missed, on that account, after all).
+CATCH_UP_YES, CATCH_UP_NO = "✅ Evet", "❌ Hayır"
 CORRECTION_HINT = (
     "✏️ Doğrusunu yazın, ör: <code>SL 2200, TP 2320</code> veya <code>short olacak</code>"
 )
@@ -366,6 +368,8 @@ def _manage_question(plan: ManagementPlan, issues: Iterable[ValidationIssue]) ->
 def confirmation_question(conf: PendingConfirmation) -> str | None:
     """The plain one-line question a confirmation asks ("#1 BTC SHORT pozisyonunu KAPATAYIM MI?"), as
     HTML-safe text. None when there is nothing to approve (no plan: the owner has to correct it first)."""
+    if conf.kind == "catch_up":
+        return str((conf.catch_up or {}).get("question") or "") or None
     if conf.kind == "incomplete":
         return None
     if isinstance(conf.plan, ManagementPlan):
@@ -383,6 +387,8 @@ def format_confirmation(conf: PendingConfirmation, *, with_expiry: bool = True) 
 
     A confirmation that can be approved starts with the question itself in one bold line and, while its
     buttons are live, a line that says what the buttons do; the details follow."""
+    if conf.kind == "catch_up":
+        return _format_catch_up(conf, with_expiry=with_expiry)
     action = conf.action
     parts: list[str] = []
     question = confirmation_question(conf)
@@ -421,6 +427,19 @@ def format_confirmation(conf: PendingConfirmation, *, with_expiry: bool = True) 
             parts.append("✏️ Onaylamak için önce <b>Düzelt</b> ile eksik bilgiyi yazın.")
         outcome = "bu değişiklik uygulanmaz" if conf.kind == "manage" else "işlem açılmaz"
         parts.append(f"⏳ {expiry_minutes(conf)} dk içinde yanıt gelmezse {outcome}.")
+    return "\n".join(parts)
+
+
+def _format_catch_up(conf: PendingConfirmation, *, with_expiry: bool) -> str:
+    """A catch-up question: the engine wrote its question and details (HTML) into ``conf.catch_up``."""
+    info = conf.catch_up or {}
+    broker = esc(info.get("broker") or "?")
+    parts = [f"❓ <b>{confirmation_question(conf) or '?'}</b>"]
+    if with_expiry:
+        parts.append(f"{CATCH_UP_YES} = {broker} hesabında aç · {CATCH_UP_NO} = açma")
+    parts += ["", str(info.get("details") or "")]
+    if with_expiry:
+        parts.append(f"⏳ {expiry_minutes(conf)} dk içinde yanıt gelmezse {broker} hesabında işlem açılmaz.")
     return "\n".join(parts)
 
 

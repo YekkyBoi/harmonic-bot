@@ -42,6 +42,13 @@ class BrokerError(Exception):
     """A broker operation failed. ``str(err)`` is shown to the owner."""
 
 
+class BrokerUnavailableError(BrokerError):
+    """The adapter refused a call itself, BEFORE sending any request of it, because the account is not connected or
+    its link is known to be down (MetaApi: not connected, rebuilding its connection, or health checks found the link
+    dead). Never raised once a request of that call went out. The engine may offer the owner to open a signal that
+    was skipped this way on that account once it is healthy again (Engine catch-up)."""
+
+
 class OrderOutcomeUnknownError(BrokerError):
     """An order request was SENT and its answer was lost (no answer in time, the link broke under it): the order may
     or may not exist at the broker. It is never sent again; the owner must be told that its outcome is unknown, never

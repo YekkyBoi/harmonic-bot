@@ -233,7 +233,8 @@ class PendingConfirmation(BaseModel):
     """Something the bot was unsure about and asked the owner to confirm."""
 
     id: str                               # short id used in button callback data
-    kind: Literal["open", "manage", "incomplete"]
+    # "catch_up": open a trade that an optional broker missed (it was not connected) on that broker after all
+    kind: Literal["open", "manage", "incomplete", "catch_up"]
     action: ParsedAction                  # what was understood
     plan: TradePlan | ManagementPlan | None = None  # executable on approval; None => needs correction
     issues: list[ValidationIssue] = Field(default_factory=list)
@@ -245,6 +246,8 @@ class PendingConfirmation(BaseModel):
     status: ConfirmationStatus = ConfirmationStatus.PENDING
     bot_message_id: int | None = None     # id of the bot message carrying the buttons
     awaiting_correction: bool = False     # owner pressed "Düzelt" and we wait for their text
+    # kind "catch_up": {"trade_id": int, "broker": str, "text": the question (HTML), ...} (Engine._ask_catch_up)
+    catch_up: dict[str, Any] | None = None
 
 
 # --------------------------------------------------------------------------- #

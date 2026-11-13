@@ -18,7 +18,7 @@ from typing import Any
 
 from ..config import MetaApiBrokerConfig
 from ..models import BrokerPosition, MarketType, OpenRequest, Quote, Severity, Side, SymbolInfo, TakeProfit
-from .base import BrokerError
+from .base import BrokerError, BrokerUnavailableError
 from .mt5_broker import (
     MT5,
     RETCODE_TR,
@@ -683,14 +683,16 @@ class MetaApiBroker(MetaTraderLegBroker):
         return await self._call(what, timeout, fn, *args, **kwargs)
 
     def _require(self) -> Any:
+        """The connection for a call that is about to be made; refused (BrokerUnavailableError: nothing is sent)
+        while there is none."""
         if self._reconnecting:
-            raise BrokerError("MetaApi bağlantısı şu an yenileniyor (hesap yanıt vermediği için bot bağlantıyı "
-                              "sıfırdan kuruyor); bu işlem yapılamadı.")
+            raise BrokerUnavailableError("MetaApi bağlantısı şu an yenileniyor (hesap yanıt vermediği için bot "
+                                         "bağlantıyı sıfırdan kuruyor); bu işlem yapılamadı.")
         if not self._connected or self._conn is None:
             if self._wanted:
-                raise BrokerError("MetaApi bağlantısı yok (yeniden bağlanma denemesi sonuç vermedi; bot aralıklarla "
-                                  "tekrar deniyor).")
-            raise BrokerError(f"{self.name}: MetaApi bağlı değil (connect çağrılmadı).")
+                raise BrokerUnavailableError("MetaApi bağlantısı yok (yeniden bağlanma denemesi sonuç vermedi; bot "
+                                             "aralıklarla tekrar deniyor).")
+            raise BrokerUnavailableError(f"{self.name}: MetaApi bağlı değil (connect çağrılmadı).")
         return self._conn
 
     def _refuse_while_unhealthy(self) -> None:
@@ -726,8 +728,8 @@ class MetaApiBroker(MetaTraderLegBroker):
         else:
             then = (f"Bağlantı kontrolü üst üste {RECONNECT_AFTER_PROBLEMS} kez yanıtsız kalırsa bot bağlantıyı "
                     "sıfırdan kurar.")
-        raise BrokerError(f"MetaApi bağlantısı sorunlu: {known}; bu hesapta yeni işlem açılmadı. {then} Bağlantı "
-                          "kontrolü yeniden yanıt alınca yeni sinyaller bu hesapta yine açılır.")
+        raise BrokerUnavailableError(f"MetaApi bağlantısı sorunlu: {known}; bu hesapta yeni işlem açılmadı. {then} "
+                                     "Bağlantı kontrolü yeniden yanıt alınca yeni sinyaller bu hesapta yine açılır.")
 
     async def _before_management(self, not_done: str) -> None:
         """A management call (stop / TP move, close, cancel) while the link is degraded: make sure the account

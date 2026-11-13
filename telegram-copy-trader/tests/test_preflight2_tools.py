@@ -1659,7 +1659,8 @@ def test_update_failure_before_the_check_restores_the_old_installation(
         assert after[name] == content, name
     assert sorted(set(after) - set(before) - {"guncelle.py", "bekci.py", "config.example.yaml",
                                               "config.tickmill.example.yaml", "pyproject.toml", "docs/GUNCELLEME.md",
-                                              "docs/ARKADAS_METAAPI.md", "docs/OWNER_TICKMILL_EKLE.md"}
+                                              "docs/ARKADAS_METAAPI.md", "docs/OWNER_TICKMILL_EKLE.md",
+                                              "docs/SUNUCU_CLAUDE.md"}
                   ) == sorted(p.name for p in bot.glob("guncelleme_*.log"))     # nothing else: no lock file left either
 
 

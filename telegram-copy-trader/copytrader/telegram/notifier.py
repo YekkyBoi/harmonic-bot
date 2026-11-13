@@ -50,6 +50,8 @@ from ..config import NotifierConfig, TelegramConfig
 from ..interfaces import SHUTDOWN_TEXT, STARTING_TEXT, EngineControl
 from ..models import ConfirmationStatus, PendingConfirmation, Severity
 from .formatting import (
+    CATCH_UP_NO,
+    CATCH_UP_YES,
     CORRECTION_HINT,
     UNDELIVERED_QUESTION,
     esc,
@@ -374,10 +376,14 @@ class BotNotifier:
             text = format_confirmation(conf)
             closed_html = format_confirmation(conf, with_expiry=False)
             row = []
-            if conf.plan is not None:      # blocking issues -> only correction / cancel
-                row.append(Button.inline("✅ Onayla", f"ok:{conf.id}".encode()))
-            row.append(Button.inline("✏️ Düzelt", f"fix:{conf.id}".encode()))
-            row.append(Button.inline("❌ İptal", f"no:{conf.id}".encode()))
+            if conf.kind == "catch_up":    # yes / no: nothing to correct
+                row.append(Button.inline(CATCH_UP_YES, f"ok:{conf.id}".encode()))
+                row.append(Button.inline(CATCH_UP_NO, f"no:{conf.id}".encode()))
+            else:
+                if conf.plan is not None:      # blocking issues -> only correction / cancel
+                    row.append(Button.inline("✅ Onayla", f"ok:{conf.id}".encode()))
+                row.append(Button.inline("✏️ Düzelt", f"fix:{conf.id}".encode()))
+                row.append(Button.inline("❌ İptal", f"no:{conf.id}".encode()))
         except Exception:
             log.exception("Could not build confirmation %s", conf.id)
             return None

@@ -285,6 +285,7 @@ class Monitor:
         self._sync_locks: dict[str, asyncio.Lock] = {}             # broker -> one venue sync at a time
         self._sync_since: dict[str, float] = {}                    # broker -> monotonic start of its running sync
         self._served_at: dict[tuple[int, str], float] = {}         # when each position last got its broker's turn
+        self._venue_read_at: dict[tuple[int, str], float] = {}     # when a venue sync of it last ended well (stored)
         #                                                            (before its first turn: when it was first due)
         self._pass_errors = 0                                      # loop passes that failed in a row
         self._pass_alerted = False                                 # the owner was told that the passes keep failing
@@ -329,6 +330,12 @@ class Monitor:
     @property
     def stopping(self) -> bool:
         return self._stop.is_set()
+
+    def synced_since(self, trade_id: int, broker: str, since: float) -> bool:
+        """A venue sync of this position ended well, and its result was stored, at or after ``since`` (monotonic
+        time). A sync that did not get its broker's turn, failed, or whose broker is not connected does not count."""
+        at = self._venue_read_at.get((trade_id, broker))
+        return at is not None and at >= since
 
     def _own_lock(self, trade_id: int) -> asyncio.Lock:
         return self._locks.setdefault(trade_id, asyncio.Lock())
@@ -707,7 +714,7 @@ class Monitor:
             for trade in await self.db.active_trades():   # also trades whose positions are all terminal
                 if trade.id not in trade_ids and (mode == "all" or trade.id not in busy):
                     trade_ids.append(trade.id)
-        for state in (self._synced_at, self._sync_counted_at, self._served_at):
+        for state in (self._synced_at, self._sync_counted_at, self._served_at, self._venue_read_at):
             for key in [k for k in state if k not in active]:
                 del state[key]
         # (self._pos_locks is never pruned: a lock handed from one holder to the next looks free for a moment, and a
@@ -1068,6 +1075,7 @@ class Monitor:
                 {"trade_id": trade.id, "broker": pos.broker, "status": new.status.value,
                  "remaining": new.remaining_quantity, "realized_pnl": new.realized_pnl},
             )
+        self._venue_read_at[key] = time.monotonic()      # (read from the venue and stored: see synced_since)
         if new.status is PositionStatus.FAILED and before is not PositionStatus.FAILED:
             await self.notifier.notify(
                 f"{esc(pos.broker)}: #{trade.id} {esc(trade.plan.base_asset)} pozisyonu hata durumunda: "

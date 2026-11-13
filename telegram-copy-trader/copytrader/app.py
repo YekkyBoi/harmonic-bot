@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import asyncio
 import contextlib
+import json
 import logging
 import os
 import re
@@ -349,6 +350,86 @@ SHUTDOWN_REMINDER_TR = "Kapanış sürüyor (açık emir işlemleri bitiriliyor)
 SHUTDOWN_FORCED_TR = ("Kapanış 3 dakikadır bitmedi; bot şimdi zorla durduruluyor. Yeniden başlatınca açık "
                       "pozisyonları ve stopları kontrol edin.")
 HARD_INTERRUPT_AFTER_SEC = 180.0   # a shutdown still running this long after the first Ctrl+C may be interrupted hard
+# ``python -m copytrader stop`` writes this file into data_dir; the running bot (``run``) looks for it every
+# STOP_POLL_SEC and then shuts down exactly as after the first Ctrl+C. Only a request that names the bot's own process
+# id counts; ``run`` removes a file left from before it started (it can never stop a later bot).
+STOP_REQUEST_FILE = "stop.request"
+STOP_POLL_SEC = 2.0
+STOP_REQUEST_TR = "Durdurma isteği alındı (python -m copytrader stop). " + SHUTDOWN_NOTICE_TR
+
+
+def stop_request_path(data_dir: str | os.PathLike[str]) -> Path:
+    return Path(data_dir).expanduser() / STOP_REQUEST_FILE
+
+
+def write_stop_request(data_dir: str | os.PathLike[str], pid: int) -> Path:
+    """Ask the bot process ``pid`` to stop (written at once and whole: a temporary file renamed over it)."""
+    path = stop_request_path(data_dir)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    tmp = path.with_name(path.name + f".{os.getpid()}.tmp")
+    tmp.write_text(json.dumps({"pid": int(pid), "by": os.getpid(),
+                               "requested": time.strftime("%Y-%m-%dT%H:%M:%S%z")}), encoding="utf-8")
+    os.replace(tmp, path)
+    return path
+
+
+def clear_stop_request(data_dir: str | os.PathLike[str]) -> bool:
+    """Remove a stop request (True if there was one). Never raises."""
+    try:
+        stop_request_path(data_dir).unlink()
+        return True
+    except FileNotFoundError:
+        return False
+    except OSError as exc:
+        logger.warning("Could not remove the stop request file: %s", exc)
+        return False
+
+
+def read_stop_request(path: Path) -> dict[str, Any] | None:
+    """The request in ``path`` ({"pid": ..., ...}), None when there is none or it cannot be read right now (the next
+    poll reads it again); a file whose content is not a request counts as one for no process (``{"pid": None}``)."""
+    try:
+        raw = path.read_text(encoding="utf-8")
+    except FileNotFoundError:
+        return None
+    except OSError:
+        return None         # (e.g. a Windows sharing violation while it is being written: the next poll reads it)
+    try:
+        info = json.loads(raw)
+        return info if isinstance(info, dict) else {"pid": None}
+    except ValueError:
+        return {"pid": None}
+
+
+async def watch_stop_request(path: Path, on_request: Callable[[], None], *, poll_sec: float = STOP_POLL_SEC) -> None:
+    """Look for a stop request every ``poll_sec`` until one for THIS process comes: remove it, call ``on_request`` and
+    end. A request for another process (left by an earlier bot) is removed and never counts. Runs until cancelled;
+    nothing it meets ends it otherwise."""
+    me = os.getpid()
+    while True:
+        await asyncio.sleep(poll_sec)
+        try:
+            info = read_stop_request(path)
+            if info is None:
+                continue
+            try:
+                path.unlink()
+            except FileNotFoundError:
+                pass
+            try:
+                pid = int(info.get("pid"))         # type: ignore[arg-type]
+            except (TypeError, ValueError):
+                pid = None
+            if pid != me:
+                logger.warning("Stop request file for another process (pid %s, this bot is %s) removed; ignored",
+                               info.get("pid"), me)
+                continue
+            logger.warning("Stop requested (%s by `python -m copytrader stop`, pid %s): shutting down", path.name,
+                           info.get("by"))
+            on_request()
+            return
+        except Exception:                       # noqa: BLE001 - the watch must never end the bot
+            logger.exception("Stop request watch failed; it goes on")
 
 
 class _Interrupts:
@@ -371,6 +452,7 @@ class _Interrupts:
         self._loop_signals: list[int] = []
         self._previous: Any = None
         self._wrapped = False
+        self.requested = False           # the shutdown was asked for by a stop request (request_stop)
 
     def install(self) -> None:
         for sig in (signal.SIGINT, signal.SIGTERM):
@@ -385,6 +467,15 @@ class _Interrupts:
     def restore(self) -> None:
         self._remove_loop_handlers()
         self._unwrap_sigint()
+
+    def request_stop(self) -> None:
+        """A stop request from outside (``python -m copytrader stop``): the same as the first Ctrl+C on a system with
+        loop signal handlers - the graceful shutdown starts; a Ctrl+C during it is swallowed like a second one."""
+        if self._again():
+            return                       # a Ctrl+C came first: that shutdown is running already
+        self.requested = True
+        self._say(STOP_REQUEST_TR)
+        self.stop.set()
 
     # ---- loop signal handlers (POSIX) ----
     def _on_loop_signal(self, signum: int) -> None:
@@ -459,14 +550,19 @@ class _Interrupts:
             print(text, flush=True)
 
 
-async def serve(app: App, stop: asyncio.Event | None = None) -> None:
-    """Start everything, run until the listener ends or ``stop`` is set, then shut down in order."""
+async def serve(app: App, stop: asyncio.Event | None = None, *, stop_file: Path | None = None) -> bool:
+    """Start everything, run until the listener ends or ``stop`` is set, then shut down in order. ``stop_file``: a
+    stop request written there (:data:`STOP_REQUEST_FILE`) shuts down like the first Ctrl+C. Returns True when the
+    shutdown came from such a request."""
     stop = stop or asyncio.Event()
     interrupts = _Interrupts(stop)
     interrupts.install()
     watchdog = asyncio.get_running_loop().create_task(
         watch_event_loop(tick_sec=LOOP_WATCH_TICK_SEC, warn_after_sec=LOOP_STALL_WARN_SEC,
                          every_sec=LOOP_STALL_LOG_EVERY_SEC), name="copytrader-loop-watchdog")
+    stop_watch = (asyncio.get_running_loop().create_task(
+        watch_stop_request(stop_file, interrupts.request_stop, poll_sec=STOP_POLL_SEC), name="copytrader-stop-request")
+        if stop_file is not None else None)
     listen_task: asyncio.Task[Any] | None = None
     stop_task: asyncio.Task[Any] | None = None
     early_start: asyncio.Task[Any] | None = None
@@ -514,7 +610,7 @@ async def serve(app: App, stop: asyncio.Event | None = None) -> None:
             await _safe(app.notifier.notify(f"Bot durdu: <code>{_esc(exc)}</code>", Severity.ERROR))
     finally:
         try:
-            for task in (stop_task, listen_task, early_start):
+            for task in (stop_watch, stop_task, listen_task, early_start):
                 if task is not None and not task.done():
                     task.cancel()
             if early_start is not None:
@@ -549,6 +645,7 @@ async def serve(app: App, stop: asyncio.Event | None = None) -> None:
                 logger.info("Shutdown complete")
     if failure is not None:
         raise failure
+    return interrupts.requested
 
 
 def _withdraw_cancel_requests() -> None:
@@ -599,16 +696,17 @@ def _esc(x: object) -> str:
     return esc(x)
 
 
-async def run(config_path: str | os.PathLike[str] = "config.yaml") -> None:
-    """Entry point of ``python -m copytrader run``."""
+async def run(config_path: str | os.PathLike[str] = "config.yaml") -> bool:
+    """Entry point of ``python -m copytrader run``. True: it was stopped by ``python -m copytrader stop``."""
     config = load_config(config_path)
     log_path = setup_logging(config.log_level, config.data_dir, secrets=config_secrets(config))
     logger.info("Config %s loaded; mode %s; log file %s", config_path,
                 "DRY-RUN" if config.dry_run else "LIVE", log_path)
     if not config.dry_run:
         logger.warning("LIVE MODE: real orders will be sent to %s", [b.name for b in config.enabled_brokers])
-    await serve(build_app(config))
+    return await serve(build_app(config), stop_file=stop_request_path(config.data_dir))
 
 
-__all__ = ["App", "build_app", "config_secrets", "make_parser", "mask_secrets", "parser_deadline_sec", "run",
-           "serve", "setup_logging", "watch_event_loop"]
+__all__ = ["App", "STOP_REQUEST_FILE", "build_app", "clear_stop_request", "config_secrets", "make_parser",
+           "mask_secrets", "parser_deadline_sec", "read_stop_request", "run", "serve", "setup_logging",
+           "stop_request_path", "watch_event_loop", "watch_stop_request", "write_stop_request"]

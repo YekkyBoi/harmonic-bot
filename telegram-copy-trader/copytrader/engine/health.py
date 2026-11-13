@@ -62,6 +62,9 @@ class BrokerHeartbeat:
         self._count: dict[str, int] = {}       # broker -> problems in a row
         self._reason: dict[str, str] = {}      # broker -> its latest problem
         self._alerted: dict[str, str] = {}     # broker -> kind of the alert the owner got for this outage
+        # Called with the broker's name after every check it passed (the engine looks then whether that account
+        # missed a signal while it was not connected). Must not block; whatever it raises is logged only.
+        self.on_healthy: Callable[[str], Any] | None = None
 
     @staticmethod
     def watched(broker: Any) -> bool:
@@ -140,8 +143,18 @@ class BrokerHeartbeat:
             return _SILENT, _short(str(exc) or f"{HEARTBEAT_READ_TIMEOUT_SEC:g} sn içinde yanıt gelmedi")
         return None
 
+    def _healthy(self, name: str) -> None:
+        hook = self.on_healthy
+        if hook is None:
+            return
+        try:
+            hook(name)
+        except Exception:
+            logger.exception("Heartbeat: the hook for a healthy %s failed", name)
+
     async def _record(self, name: str, problem: tuple[str, str] | None) -> None:
         if problem is None:
+            self._healthy(name)
             failed = self._count.pop(name, 0)
             self._reason.pop(name, None)
             kind = self._alerted.get(name)
