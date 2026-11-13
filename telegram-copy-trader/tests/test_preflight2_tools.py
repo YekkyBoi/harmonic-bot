@@ -2346,6 +2346,7 @@ def test_update_cryptg_with_a_hanging_package_index_is_cut_off_in_time(
 ) -> None:
     import socket
 
+    pytest.importorskip("pip", reason="this interpreter has no pip (the server's venv has; guncelle uses it)")
     server = socket.socket()
     server.bind(("127.0.0.1", 0))
     server.listen(8)                                     # accepts connections and never answers
