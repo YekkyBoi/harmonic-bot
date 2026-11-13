@@ -51,6 +51,14 @@ OWNER, FRIEND = 777, 555
 CHAT = -1001234567890
 
 
+@pytest.fixture(autouse=True)
+def _ask_mode(monkeypatch: pytest.MonkeyPatch) -> None:
+    """These tests are about the Evet / Hayır question: mode "sor" (the default is "otomatik", tests/test_catch_up_auto.py)."""
+    from copytrader.engine import orchestrator as orch
+    monkeypatch.setattr(orch, "CATCH_UP_DEFAULT_MODE", "sor")
+
+
+
 class Client(FakeBotClient):
     """Telegram, per chat: ``fail_for`` raises for that chat, ``hang_for`` never answers it."""
 
@@ -212,7 +220,8 @@ async def test_f2_arkadas_stores_the_chat_after_a_test_message_reaches_it(tmp_pa
                                      "tarafından eklendi.")
         assert world.client.to(OWNER)[-1].text == (
             f"✅ Arkadaşınızın sohbeti kaydedildi (<code>{FRIEND}</code>); deneme mesajı ulaştı. Bundan sonra size "
-            "gelen her bildirim ona da gider; tickmill 'sonradan açılsın mı?' sorularını o cevaplar.")
+            "gelen her bildirim ona da gider; bağlantı yokken atlanan tickmill işlemleri <code>/sonradan</code> ayarına "
+            "göre ya kendiliğinden açılır ya da ona sorulur.")
         assert await world.db.get_state("friend_chat_id") == FRIEND
         await world.owner_says("/arkadas")
         assert world.client.to(OWNER)[-1].text.startswith(f"👤 Arkadaşınızın sohbeti: <code>{FRIEND}</code>.")
@@ -227,7 +236,8 @@ async def test_f2_arkadas_stores_the_chat_after_a_test_message_reaches_it(tmp_pa
         assert [m.text for m in again.client.to(FRIEND)] == ["ℹ️ yeniden başladı"]
         await again.owner_says("/arkadas sil")
         assert again.client.to(OWNER)[-1].text == ("✅ Arkadaş sohbeti kaldırıldı; bildirimler artık yalnızca size "
-                                                   "gelir, tickmill sorularını siz cevaplarsınız.")
+                                                   "gelir (<code>/sonradan sor</code> seçiliyse tickmill sorularını siz "
+                                                   "cevaplarsınız).")
         assert again.client.to(FRIEND)[-1].text == ("ℹ️ Bot sahibi bu sohbeti bildirim listesinden çıkardı; buraya "
                                                     "artık mesaj gelmeyecek.")
         assert await again.db.get_state("friend_chat_id") is None

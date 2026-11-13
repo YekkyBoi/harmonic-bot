@@ -2,10 +2,12 @@
 
 Talks to ``notifier.owner_user_id``; everybody else is ignored - except the owner's friend (the owner of the
 optional tickmill account), when the owner has set his chat with ``/arkadas <id>``: every message the owner gets is
-mirrored to the friend as read-only text (a message with buttons goes without them), and the friend answers the
-tickmill catch-up question ("... hesabında da açılsın mı?"). Delivery to the friend never delays, blocks or fails
-anything for the owner (a queue and a task of its own; see "the owner's friend" below). The friend's commands and
-messages are never executed, and his button presses count for catch-up questions only.
+mirrored to the friend as read-only text (a message with buttons goes without them); when the owner chose
+``/sonradan sor`` the friend answers the tickmill catch-up question ("... hesabında da açılsın mı?"), in the default
+``/sonradan otomatik`` no question is asked (the bot opens it when the conditions hold, and both are told). Delivery
+to the friend never delays, blocks or fails anything for the owner (a queue and a task of its own; see "the owner's
+friend" below). The friend's commands and messages are never executed, and his button presses count for catch-up
+questions only.
 Texts are Telegram HTML. Text passed to :meth:`BotNotifier.notify` and text
 returned by the engine is treated as HTML that our own code produced (use
 ``formatting.esc`` for anything untrusted inside it).
@@ -114,6 +116,8 @@ HELP_TEXT = (
     "/test &lt;metin&gt; — bir mesajın nasıl anlaşılacağını dene (işlem açmaz)\n"
     "/arkadas &lt;sohbet_id&gt; — tickmill hesabının sahibine bildirimlerin kopyası (/arkadas: göster, "
     "/arkadas sil: kaldır)\n"
+    "/sonradan otomatik | sor — bağlantı yokken atlanan tickmill işlemi: şartlar uygunsa sormadan aç ya da sor "
+    "(/sonradan: göster)\n"
     "/yardim — bu mesaj\n\n"
     "Onay mesajlarında: ✅ Onayla · ✏️ Düzelt (doğrusunu yazarsınız) · ❌ İptal\n"
     "Bir onay mesajını yanıtlayarak da düzeltme yazabilirsiniz."
@@ -138,9 +142,12 @@ FRIEND_REFUSED = "Bu bot komutlarını yalnızca sahibi kullanabilir."
 FRIEND_BUTTON_REFUSED = "Bu düğme yalnızca bot sahibi içindir."
 FRIEND_HELLO = (
     "👋 Merhaba! Bu sohbet, kopya-trade botunun bildirimlerini almak için bot sahibi tarafından eklendi. Bundan sonra "
-    "bot sahibine giden her bildirim buraya da gelir; tickmill hesabında \"sonradan açılsın mı?\" sorularını siz "
-    "cevaplarsınız (✅ Evet / ❌ Hayır). Bu sohbetten bot komutları çalıştırılamaz."
+    "bot sahibine giden her bildirim buraya da gelir. tickmill bağlı değilken gelen bir işlem, bağlantı gelince "
+    "şartlar uygunsa bot sahibinin ayarına göre ya kendiliğinden açılır ya da size \"sonradan açılsın mı?\" diye "
+    "sorulur (✅ Evet / ❌ Hayır). Bu sohbetten bot komutları çalıştırılamaz."
 )
+FRIEND_CATCH_UP_NOTE = ("bağlantı yokken atlanan tickmill işlemleri <code>/sonradan</code> ayarına göre ya kendiliğinden "
+                        "açılır ya da ona sorulur.")
 FRIEND_REMOVED = "ℹ️ Bot sahibi bu sohbeti bildirim listesinden çıkardı; buraya artık mesaj gelmeyecek."
 FRIEND_NOT_YOURS = "Bu soru artık size ait değil; bot sahibi cevaplayacak."
 FRIEND_NOT_YOURS_TAP = "Bu soru artık size ait değil."
@@ -182,6 +189,7 @@ _COMMANDS = {
     "hepsini_kapat": "closeall", "closeall": "closeall",
     "test": "test",
     "arkadas": "friend", "arkadaş": "friend",
+    "sonradan": "catchup",
 }
 _COMMAND_RE = re.compile(r"^/([^\s@]+)(?:@\S+)?\s*(.*)$", re.S)
 _SENT, _RETRY, _DROP = "sent", "retry", "drop"
@@ -662,6 +670,8 @@ class BotNotifier:
         elif command == "friend":
             await self._friend_command(args)
             return
+        elif command == "catchup":
+            reply = await engine.catch_up_command(args)
         else:                            # test
             if not args:
                 await self._send("Kullanım: <code>/test eth 1R long, giriş 2232, SL 2205, TP 2310</code>")
@@ -1098,8 +1108,8 @@ class BotNotifier:
                                  "(arkadaşınız önce botu Telegram'da açıp Start'a basmalı).", mirror=False)
             else:
                 await self._send(f"👤 Arkadaşınızın sohbeti: <code>{self._friend}</code>. Size gelen her bildirim ona "
-                                 "da gider; tickmill 'sonradan açılsın mı?' sorularını o cevaplar. Kaldırmak için: "
-                                 "<code>/arkadas sil</code>", mirror=False)
+                                 f"da gider; {FRIEND_CATCH_UP_NOTE} Kaldırmak için: <code>/arkadas sil</code>",
+                                 mirror=False)
             return
         if store is None:
             await self._send("⏳ Sistem henüz hazır değil, biraz sonra tekrar deneyin.", mirror=False)
@@ -1108,8 +1118,8 @@ class BotNotifier:
             old, questions = self._friend, dict(self._friend_msgs)
             await store(None)                 # (the engine gives the owner the questions the friend had)
             await self._friend_dropped(old, questions)
-            await self._send("✅ Arkadaş sohbeti kaldırıldı; bildirimler artık yalnızca size gelir, tickmill sorularını "
-                             "siz cevaplarsınız.", mirror=False)
+            await self._send("✅ Arkadaş sohbeti kaldırıldı; bildirimler artık yalnızca size gelir (<code>/sonradan "
+                             "sor</code> seçiliyse tickmill sorularını siz cevaplarsınız).", mirror=False)
             return
         if not _USER_ID_RE.match(arg) or int(arg) == 0:
             await self._send("Kullanım: <code>/arkadas &lt;sohbet_id&gt;</code> (arkadaşınızın kullanıcı kimliği: "
@@ -1134,8 +1144,7 @@ class BotNotifier:
         if old is not None and old != chat:
             await self._friend_dropped(old, questions)
         await self._send(f"✅ Arkadaşınızın sohbeti kaydedildi (<code>{chat}</code>); deneme mesajı ulaştı. Bundan sonra "
-                         "size gelen her bildirim ona da gider; tickmill 'sonradan açılsın mı?' sorularını o cevaplar.",
-                         mirror=False)
+                         f"size gelen her bildirim ona da gider; {FRIEND_CATCH_UP_NOTE}", mirror=False)
 
     # ---- sending ------------------------------------------------------------
     async def _send(
