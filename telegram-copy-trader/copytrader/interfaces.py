@@ -28,6 +28,10 @@ from .models import (
 # Returned by the engine for an owner action refused because the bot is shutting down. Nothing was decided:
 # the confirmation stays pending (restored after the restart), so the notifier keeps its buttons.
 SHUTDOWN_TEXT = "⏳ Bot kapanıyor; şu an işlem yapılamıyor. Bot yeniden başlayınca tekrar deneyin."
+# Returned by the engine for an owner action that would trade (approval, correction, close-all) while it is still
+# connecting the owner's brokers at start-up. Nothing was decided: the confirmation stays pending, so the notifier
+# keeps its buttons (as with SHUTDOWN_TEXT) and the owner taps again a few seconds later.
+STARTING_TEXT = "⏳ Bot başlıyor; birkaç saniye sonra tekrar deneyin."
 
 
 @runtime_checkable

@@ -56,7 +56,7 @@ async def test_open_sends_bold_quantity_with_levels(tmp_path: Path) -> None:
     [(text, severity)] = [(t, s) for t, s in notifier.notifications]
     assert severity is Severity.INFO
     first_line = text.split("\n")[0]
-    assert first_line.startswith("<b>🔢 ") and "KONTRAT — ETH SHORT" in first_line and first_line.endswith("</b>")
+    assert first_line.startswith("<b>🔢 ") and " ETH — ETH SHORT" in first_line and first_line.endswith("</b>")  # (final: the instruction names the unit and the USD value; 'KONTRAT' was typed as USD on 2026-11-12)
     assert "2250.6" in text and "2205.11" in text and "2239.2" in text and "50 USD" in text
     assert pos.data["manual_qty"] == size.quantity
 
@@ -83,7 +83,7 @@ async def test_qty_decimals_rounds_down(tmp_path: Path) -> None:
     pos = await broker.open_position(OpenRequest(plan=plan, symbol=info, quantity=2.876, entry_type=EntryType.MARKET,
                                                  stop_loss=2250.60, take_profits=plan.take_profits, client_tag="c"))
     assert pos.data["manual_qty"] == 2.8
-    assert "2.8 KONTRAT" in notifier.notifications[0][0]
+    assert "2.8 ETH — ETH SHORT" in notifier.notifications[0][0]  # (final: the instruction names the unit and the USD value; 'KONTRAT' was typed as USD on 2026-11-12)
 
 
 def test_registry_builds_manual_and_never_wraps_in_dry_run(tmp_path: Path) -> None:

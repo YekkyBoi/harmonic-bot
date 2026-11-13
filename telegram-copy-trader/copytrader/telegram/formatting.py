@@ -272,12 +272,15 @@ def format_trade_line(trade: TradeRecord) -> str:
     )
 
 
-def format_management(plan: ManagementPlan, trade: TradeRecord | None) -> str:
-    """An instruction for an existing trade."""
+def format_management(plan: ManagementPlan, trade: TradeRecord | None, *, before: TradeRecord | None = None) -> str:
+    """An instruction for an existing trade. ``before``: the trade as it was before the plan was applied, when
+    ``trade`` is the trade afterwards (an execution report): the old stop / targets shown as "old → new" are taken
+    from it (from ``trade`` otherwise, e.g. before the plan is applied)."""
     target = format_trade_line(trade) if trade else f"#{plan.trade_id}"
+    old = before or trade
     lines = [f"🔗 İşlem: {target}"]
     if plan.action is ActionType.MOVE_SL:
-        current = f"{fmt_price(trade.current_stop_loss)} → " if trade else ""
+        current = f"{fmt_price(old.current_stop_loss)} → " if old else ""
         if plan.move_sl_to_entry:
             entry = trade.plan.entry_price if trade else None
             new = "girişe (başabaş)" + (f" <b>{fmt_price(entry)}</b>" if entry is not None else "")
@@ -289,9 +292,8 @@ def format_management(plan: ManagementPlan, trade: TradeRecord | None) -> str:
         lines.append(f"🛑 Stop: {current}{new}")
     elif plan.action is ActionType.MOVE_TP:
         lines.insert(0, "🎯 <b>TP güncelle</b>")
-        if trade and trade.current_take_profits:
-            old = ", ".join(fmt_price(tp.price) for tp in trade.current_take_profits)
-            lines.append(f"Eski TP: {old}")
+        if old and old.current_take_profits:
+            lines.append("Eski TP: " + ", ".join(fmt_price(tp.price) for tp in old.current_take_profits))
         entry = trade.plan.entry_price if trade else None
         stop = trade.current_stop_loss if trade else None
         lines += _tp_lines(plan.take_profits, entry, stop)

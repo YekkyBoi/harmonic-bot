@@ -51,9 +51,16 @@ from ..models import (
     TakeProfit,
 )
 from ..risk.sizing import SizingError, choose_leverage, compute_linear_size, floor_to_step, round_to_tick
-from .base import Broker, BrokerError
+from .base import OUTCOME_UNKNOWN_MARK, Broker, BrokerError, OrderOutcomeUnknownError
 
 logger = logging.getLogger(__name__)
+
+# Public contract with the monitor (Monitor._retry_close, which does not import adapters and reads the same key):
+# ``pos.data[FLAT_SEEN]`` = how many venue reads in a row found no position in the trade's direction (0 after a read
+# that shows it; two in a row close the trade, see CcxtBroker._gone_on_venue). While it is above 0 a retried
+# reduce-only close is not sent: the earlier close may have gone through. Renaming it breaks that guard; it is pinned
+# by tests/test_review1_glue_engine.py::test_g4_*.
+FLAT_SEEN = "flat_seen"
 
 T = TypeVar("T")
 
@@ -89,9 +96,19 @@ _LEVERAGE_STEPS = (125, 100, 75, 50, 40, 25, 20, 15, 10, 8, 5, 4, 3, 2, 1)
 _LEVERAGE_INFO_TTL_MS = 6 * 3600 * 1000     # leverage brackets / limits learned from refusals are re-read after this
 _CLOCK_RESYNC_MS = 30 * 60 * 1000           # the offset to the exchange clock is measured again after this
 _LOST_ORDER_MISSES = 3                      # "not found" this many passes in a row: the order never reached the venue
+_LOST_ORDER_MIN_AGE_MS = 60_000             # ... and at least this long after it was sent (it may still execute late;
+                                            # meanwhile the engine sends no new partial close for it)
 _SHRUNK_NOTE_TTL_MS = 2 * 60 * 1000         # a size cut for margin by size_position is "the same order" this long
 _HEALTH_TIMEOUT_SEC = 20.0
 _TP_PLACE_ATTEMPTS = 3
+# An entry / close request that ended without a clear answer (see _unclear) is looked up by its client id up to
+# _LOOKUP_ATTEMPTS times, ``retry_delay`` (1 s) apart, and never longer than _LOOKUP_WINDOW_SEC in all: an order whose
+# answer was lost can take a moment to show up (binance -1007 "execution status unknown"). An entry runs inside the
+# engine's deadline for a leg (orchestrator.LEG_DEADLINE_SEC = 30 s); the lost request itself may already have used
+# ccxt's whole request timeout (10 s by default) and the reads before it a few seconds more, and an entry that is
+# found still needs its stop and targets (about 1-3 s): 8 s of looking keeps the whole leg inside the deadline.
+_LOOKUP_ATTEMPTS = 6
+_LOOKUP_WINDOW_SEC = 8.0
 # pos.error is a " | "-joined list of notes; these markers find the notes that clear themselves.
 _ERR_SEP = " | "
 _STALE_MARK = "eski stop emri"
@@ -317,6 +334,29 @@ def _fmt(x: float | None) -> str:
     if x is None:
         return "-"
     return format(Decimal(f"{x:.10g}").normalize(), "f")
+
+
+def _unclear(err: BaseException | None) -> bool:
+    """True when an order request that failed with ``err`` may still have reached the venue and been executed: no
+    clear answer came back. That is every ccxt NetworkError (timeout, broken connection, HTTP 5xx; binance -1007 "send
+    status unknown; execution status unknown"), a plain OperationFailed (binance -1000 / -1001 / -1006 / -1008: unknown
+    error, internal error, "execution status unknown", server busy) and an answer that an order with our client id
+    exists already (DuplicateOrderId). Not the two NetworkErrors that are the venue's clear refusal, given before any
+    order is processed (ccxt classes them as network trouble because they can be retried): a request stamped outside
+    the venue's time window (InvalidNonce: binance -1021) and a rate limit or ban answered with HTTP 418 / 429
+    (DDoSProtection: ccxt 4.5.92's binance raises it for those two statuses, whatever the code in the body, e.g.
+    -1003 / -1015). A RateLimitExceeded (ccxt's class for binance -1003 / -1015 when they come with another HTTP status;
+    NOT a DDoSProtection subclass) stays unclear on purpose: it is looked up by client id like a lost answer, the
+    cautious side (never sent twice). The engine's no_answer() agrees (orchestrator._REFUSAL_TYPES)."""
+    if err is None or isinstance(err, (cx.InvalidNonce, cx.DDoSProtection)):
+        return False
+    return isinstance(err, (cx.OperationFailed, cx.DuplicateOrderId))
+
+
+def _why(err: BaseException | None, limit: int = 180) -> str:
+    """Short reason for an owner text: an unclear answer (see _unclear) says that the answer was not received."""
+    text = _short(err or Exception(), limit)
+    return f"yanıt alınamadı ({text})" if _unclear(err) else text
 
 
 def _venue_code(err: BaseException) -> str | None:
@@ -1092,33 +1132,59 @@ class CcxtBroker(Broker):
                 return False
             except cx.BaseError as e:
                 last = e
+        if _unclear(last):
+            # (sending the cancel again is harmless: one for an order that is gone is answered "unknown order")
+            raise BrokerError(f"{self.name}: emir iptal isteğine yanıt alınamadı ({order_id}): {_short(last)}; emir "
+                              f"iptal edilmiş de olabilir, hâlâ açık da.") from last
         raise BrokerError(f"{self.name}: emir iptal edilemedi ({order_id}): {_short(last or Exception())}")
 
-    async def _find_by_client_id(self, symbol: str, client_id: str, since: int) -> dict[str, Any] | None:
-        """Look for an order we may have placed although the request failed (timeout / duplicate)."""
+    async def _lookup_client_id(self, symbol: str, client_id: str, since: int) -> dict[str, Any] | None:
+        """One look-up of an order of ours by its client id: the order, or None when the venue answered that it has
+        none. Raises the ccxt error when a read got no answer."""
         ex, fam = self.exchange, self._family
-        for attempt in range(3):
-            if attempt:
-                await self._sleep(self.retry_delay)
+        if fam in ("binance", "okx", "bitget"):
             try:
-                if fam in ("binance", "okx", "bitget"):
-                    try:
-                        return await ex.fetch_order("", symbol, {"clientOrderId": client_id})
-                    except cx.OrderNotFound:
-                        pass
-                lists = [await ex.fetch_open_orders(symbol)]
-                try:
-                    lists.append(await ex.fetch_closed_orders(symbol, since))
-                except cx.BaseError:
-                    pass
-                for orders in lists:
-                    for o in orders or []:
-                        if o.get("clientOrderId") == client_id:
-                            return o
-                return None
-            except cx.NetworkError as e:
-                logger.warning("%s: lookup by client id %s failed: %s", self.name, client_id, e)
+                return await ex.fetch_order("", symbol, {"clientOrderId": client_id})
+            except cx.OrderNotFound:
+                pass
+        lists = [await ex.fetch_open_orders(symbol)]
+        try:
+            lists.append(await ex.fetch_closed_orders(symbol, since))
+        except cx.BaseError:
+            pass
+        for orders in lists:
+            for o in orders or []:
+                if o.get("clientOrderId") == client_id:
+                    return o
         return None
+
+    async def _find_by_client_id(self, symbol: str, client_id: str, since: int, *,
+                                 attempts: int = _LOOKUP_ATTEMPTS) -> tuple[dict[str, Any] | None, bool]:
+        """Look for an order of ours whose request failed without a clear answer (see _unclear): it may exist all the
+        same. Asks up to ``attempts`` times, ``retry_delay`` apart and never longer than _LOOKUP_WINDOW_SEC in all
+        (each read is cut off when the window ends). Returns (the order, True) as soon as it is found; (None, True)
+        when the venue answered that it has no such order (it can still show up later: the answer was lost); (None,
+        False) when no read got an answer at all: the bot could not look."""
+        loop = asyncio.get_running_loop()
+        end = loop.time() + _LOOKUP_WINDOW_SEC
+        looked = False
+        for attempt in range(max(1, attempts)):
+            if attempt:
+                if loop.time() + self.retry_delay >= end:
+                    break
+                await self._sleep(self.retry_delay)
+            left = end - loop.time()
+            if left <= 0:
+                break
+            try:
+                found = await asyncio.wait_for(self._lookup_client_id(symbol, client_id, since), left)
+            except Exception as e:      # (ccxt's errors, the window's timeout, an answer ccxt could not parse)
+                logger.warning("%s: lookup by client id %s got no answer: %r", self.name, client_id, e)
+                continue
+            looked = True
+            if found is not None:
+                return found, True
+        return None, looked
 
     # ------------------------------------------------------------------ trading
     async def open_position(self, req: OpenRequest) -> BrokerPosition:
@@ -1334,19 +1400,38 @@ class CcxtBroker(Broker):
         self, symbol: str, entry_type: EntryType, side: str, qty: float, price: float | None,
         params: dict[str, Any], client_id: str, since: int,
     ) -> dict[str, Any]:
+        """Send the entry order; it is never sent twice. When the request ends without a clear answer (see _unclear)
+        the order may exist: it is looked up by its client id for a short while (_find_by_client_id) and adopted when
+        found; otherwise OrderOutcomeUnknownError says that whether it exists is not known (the engine then reports
+        "açılıp açılmadığı bilinmiyor", never "açılmadı")."""
         try:
             return await self.exchange.create_order(symbol, entry_type.value, side, qty, price, params)
-        except (cx.NetworkError, cx.DuplicateOrderId) as e:
-            found = await self._find_by_client_id(symbol, client_id, since - 60_000)
+        except cx.InsufficientFunds as e:
+            raise BrokerError(f"{self.name}: giriş emri reddedildi: yetersiz bakiye ({_short(e)})") from e
+        except (cx.OperationFailed, cx.DuplicateOrderId) as e:
+            unclear = _unclear(e)
+            # (a clear refusal among these - binance -1021, a rate limit - is looked up once, as before)
+            found, looked = await self._find_by_client_id(symbol, client_id, since - 60_000,
+                                                          attempts=_LOOKUP_ATTEMPTS if unclear else 1)
             if found:
                 logger.warning("%s: entry request failed (%s) but order %s exists; adopting it", self.name, e, found.get("id"))
                 return found
-            raise BrokerError(
-                f"{self.name}: giriş emri gönderilemedi ({_short(e)}). Bu etiketle ({client_id}) emir bulunamadı; "
-                f"yine de borsayı kontrol edin."
+            if not unclear:
+                raise BrokerError(f"{self.name}: giriş emri reddedildi: {_short(e)}") from e
+            where = (f"bu etiketle ({client_id}) borsada henüz görünmüyor, ama yanıt kaybolduğu için kesin değil"
+                     if looked else f"borsaya ulaşılamadığı için bu etiketle ({client_id}) aranamadı")
+            if entry_type is EntryType.MARKET:
+                check = (f"Borsada {symbol} pozisyonuna elle bakın; emir gerçekleşmişse bot o pozisyonu takip ETMİYOR "
+                         f"ve stopu YOK: stop koyun ya da kapatın.")
+            else:
+                check = (f"Borsada {symbol} bekleyen emirlerine ve pozisyonuna elle bakın; emir borsadaysa bot onu "
+                         f"takip ETMİYOR ve dolarsa stopu OLMAYACAK: iptal edin ya da stop koyun.")
+            logger.error("%s: entry %s on %s sent, its answer lost (%s) and not found by its client id (looked: %s)",
+                         self.name, client_id, symbol, e, looked)
+            raise OrderOutcomeUnknownError(
+                f"{self.name}: giriş emri gönderildi ama yanıtı alınamadı ({_short(e)}); emir {OUTCOME_UNKNOWN_MARK} "
+                f"{where}. Aynı emir ikinci kez GÖNDERİLMEDİ. {check}"
             ) from e
-        except cx.InsufficientFunds as e:
-            raise BrokerError(f"{self.name}: giriş emri reddedildi: yetersiz bakiye ({_short(e)})") from e
         except cx.BaseError as e:
             hint = ""
             if "-4061" in str(e):       # binance: the ACCOUNT is in the other position mode than position_mode says
@@ -1557,19 +1642,33 @@ class CcxtBroker(Broker):
         return executed
 
     async def _emergency_close(self, pos: BrokerPosition, qty: float) -> tuple[bool, float | None]:
-        """Reduce-only market close. Returns (sent, executed size; None = unknown)."""
+        """Reduce-only market close. Returns (sent, executed size; None = unknown). A request without a clear answer
+        (see _unclear) counts as sent: the order is looked up by its client id once and booked when found, else kept
+        in ``unconfirmed_closes`` by that id (the next sync looks it up first, before anything is sent again)."""
         d = pos.data
         if qty <= 0:
             return True, 0.0
         d["close_seq"] = int(d.get("close_seq", 0)) + 1
         cid = self._client_id(d.get("client_tag", "ct"), f"x{d['close_seq']}")
+        sent_ms = self._now_ms()
         try:
             order = await self.exchange.create_order(
                 pos.broker_symbol, "market", self._close_side(pos.side), qty, None, self._close_params(cid)
             )
         except cx.BaseError as e:
-            logger.critical("%s: EMERGENCY CLOSE FAILED for %s: %s", self.name, pos.broker_symbol, e)
-            return False, None
+            if not _unclear(e):
+                logger.critical("%s: EMERGENCY CLOSE FAILED for %s: %s", self.name, pos.broker_symbol, e)
+                return False, None
+            found, _looked = await self._find_by_client_id(pos.broker_symbol, cid, sent_ms - 60_000, attempts=1)
+            if found is None:
+                logger.critical("%s: EMERGENCY CLOSE of %s sent but its answer was lost (%s); looked up on the next "
+                                "sync", self.name, pos.broker_symbol, e)
+                d.setdefault("unconfirmed_closes", []).append(
+                    {"order_id": None, "client_id": cid, "qty": qty, "kind": "emergency", "since": sent_ms,
+                     "misses": 0})
+                return True, None
+            logger.warning("%s: emergency close %s exists although its answer was lost; booking it", self.name, cid)
+            order = found
         executed = await self._book_exit_order(pos, order, qty, "emergency")
         if pos.remaining_quantity > 0:
             logger.critical("%s: EMERGENCY CLOSE of %s incomplete (executed %s of %s)",
@@ -1600,7 +1699,7 @@ class CcxtBroker(Broker):
             entry_ok = await self._stop_entry(pos)
             requested = pos.remaining_quantity
             sent, executed = await self._emergency_close(pos, requested)
-            why = _short(err or Exception())
+            why = _why(err)
             if pos.remaining_quantity > 0:
                 # Part (or all) of it is still open without a stop: keep OPEN so every sync retries.
                 d["unprotected"] = True
@@ -1652,7 +1751,9 @@ class CcxtBroker(Broker):
                     logger.error("%s: %s", self.name, e)
                     kept.append(tp)
                     total_qty = max(0.0, _dec_sub(total_qty, float(tp["qty"])))
-                    pos.error = f"{self.name}: eski kâr al emri iptal edilemedi ({tp['id']}); tekrar denenecek."
+                    pos.error = (f"{self.name}: eski kâr al emrinin ({tp['id']}) iptal isteğine yanıt alınamadı; hâlâ "
+                                 f"açık olabilir, tekrar denenecek." if _unclear(e.__cause__) else
+                                 f"{self.name}: eski kâr al emri iptal edilemedi ({tp['id']}); tekrar denenecek.")
                     continue
                 self._remember(d, tp["id"])
                 if not cancelled:
@@ -1683,7 +1784,7 @@ class CcxtBroker(Broker):
         oid, err = await self._place_trigger(pos, "tp", entry["qty"], float(entry["price"]), attempts=1)
         if oid is None:
             entry["status"] = "failed"
-            return f"TP {_fmt(entry['price'])}: {_short(err or Exception(), 120)}"
+            return f"TP {_fmt(entry['price'])}: {_why(err, 120)}"
         entry.update(id=oid, status="open")
         return None
 
@@ -1830,11 +1931,11 @@ class CcxtBroker(Broker):
         new_id, err = await self._place_sl(pos, pos.remaining_quantity, float(d["sl_price"]))
         if new_id is None:
             if d.get("sl_order_id") and not d.get("unprotected"):   # unprotected: that id is a stop that is gone
-                pos.error = f"{self.name}: stop miktarı güncellenemedi (eski stop aktif): {_short(err or Exception())}"
+                pos.error = f"{self.name}: stop miktarı güncellenemedi (eski stop aktif): {_why(err)}"
             else:
                 d["unprotected"] = True     # nothing protects the open size: next sync retries / closes
                 pos.error = (f"{_CRITICAL_MARK} {self.name}: {pos.broker_symbol} için stop emri yerleştirilemedi; "
-                             f"{_fmt(pos.remaining_quantity)} STOPSUZ açık. ({_short(err or Exception())})")
+                             f"{_fmt(pos.remaining_quantity)} STOPSUZ açık. ({_why(err)})")
             return
         old = d.get("sl_order_id")
         old_qty = float(d.get("protected_qty") or 0.0)
@@ -1930,8 +2031,10 @@ class CcxtBroker(Broker):
             sent, executed = await self._emergency_close(pos, requested)
             if pos.remaining_quantity > 0:
                 d.update(closing=False, unprotected=True)
+                what = ("kapatma emri gönderildi ama sonucu okunamadı" if sent and executed is None
+                        else f"kapatılamadı ({_fmt(executed or 0.0)} kapatıldı)")
                 pos.error = (f"{_CRITICAL_MARK} {self.name}: işlem kapanırken giriş emri {_fmt(requested)} daha doldu "
-                             f"ve kapatılamadı ({_fmt(executed or 0.0)} kapatıldı); {_fmt(pos.remaining_quantity)} "
+                             f"ve {what}; {_fmt(pos.remaining_quantity)} "
                              f"STOPSUZ açık olabilir. {pos.broker_symbol} pozisyonunu borsada hemen kontrol edin.")
                 return
         if not (await self._cancel_protection(pos, include_sl=reason != "stop") and entry_ok):
@@ -1996,6 +2099,7 @@ class CcxtBroker(Broker):
     # ------------------------------------------------------------------ management
     async def update_stop_loss(self, pos: BrokerPosition, new_stop_loss: float) -> BrokerPosition:
         self._require_real(pos)
+        caller = pos
         pos = pos.model_copy(deep=True)
         self._register(pos)
         d = pos.data
@@ -2009,7 +2113,18 @@ class CcxtBroker(Broker):
             raise BrokerError(f"{self.name}: pozisyon açık değil ({pos.status.value}); stop taşınamadı.")
         new_id, err = await self._place_sl(pos, pos.remaining_quantity, price)
         if new_id is None:
-            raise BrokerError(f"{self.name}: yeni stop ({_fmt(price)}) yerleştirilemedi, eski stop aktif: {_short(err or Exception())}")
+            # A stop request whose answer was lost is in ``lost_orders`` (with the client-id sequence): it must not
+            # be lost with this error, or a stop of ours could stay on the venue untracked (see _hand_back).
+            self._hand_back(caller, pos)
+            has_stop = bool(d.get("sl_order_id")) and not d.get("unprotected")
+            if _unclear(err):
+                old = "eski stop yerinde ve aktif" if has_stop else "pozisyonun çalışan bir stopu YOK"
+                raise BrokerError(f"{self.name}: yeni stop ({_fmt(price)}) emrine yanıt alınamadı ({_short(err)}); "
+                                  f"{old}. Yeni stop emri borsaya ulaştıysa bot sonraki kontrolde onu bulup iptal "
+                                  f"edecek.") from err
+            old = "eski stop aktif" if has_stop else "pozisyonun çalışan bir stopu YOK"
+            raise BrokerError(f"{self.name}: yeni stop ({_fmt(price)}) yerleştirilemedi, {old}: "
+                              f"{_short(err or Exception())}")
         old = d.get("sl_order_id")
         old_qty = float(d.get("protected_qty") or 0.0)
         d.update(sl_order_id=new_id, sl_price=price, protected_qty=pos.remaining_quantity, unprotected=False)
@@ -2055,8 +2170,24 @@ class CcxtBroker(Broker):
         return pos
 
     async def close_position(self, pos: BrokerPosition, fraction: float = 1.0) -> BrokerPosition:
+        """See Broker.close_position. A close request without a clear answer (see _unclear) is never sent again by
+        the adapter: it is looked up by its client id (_find_by_client_id) and booked like any close when it exists
+        (size, P/L, stop and targets re-sized). When it is not found, or cannot be looked for, it is kept in
+        ``unconfirmed_closes`` by its client id and OrderOutcomeUnknownError is raised ("gerçekleşip gerçekleşmediği
+        bilinmiyor"); the next syncs look it up first and book it once it shows up (_settle_unconfirmed). That
+        record and the advanced ``close_seq`` (so no later close reuses the lost order's client id) are handed back
+        into ``pos`` itself before the error is raised (see _hand_back): the caller stores it when it books the
+        failed close."""
         self._require_real(pos)
-        pos = pos.model_copy(deep=True)
+        work = pos.model_copy(deep=True)
+        try:
+            return await self._close_position(work, fraction)
+        except OrderOutcomeUnknownError:
+            self._hand_back(pos, work)
+            raise
+
+    async def _close_position(self, pos: BrokerPosition, fraction: float) -> BrokerPosition:
+        """close_position on the adapter's own copy ``pos``."""
         self._register(pos)
         d = pos.data
         if pos.status is PositionStatus.PENDING and pos.filled_quantity <= 0:
@@ -2066,11 +2197,20 @@ class CcxtBroker(Broker):
         if d.get("closing"):                 # already flat; only leftover orders remain
             await self._finalize_closed(pos, d.get("closed_reason") or "manual_close")
             return pos
+        step, min_qty, _, _ = self._market_rules(pos)
         if d.get("unconfirmed_closes"):      # an earlier exit's result first (it may have closed it)
-            await self._settle_unconfirmed(pos)
+            before = pos.remaining_quantity
+            await self._settle_unconfirmed(pos, count_misses=False)
             if self._done(pos):
                 return pos
-        step, min_qty, _, _ = self._market_rules(pos)
+            if fraction < 0.999 and before - pos.remaining_quantity > step / 2:
+                # An earlier close of ours turned out to have gone through just now. The fraction asked for was
+                # worked out from the size before it: closing it now could close the same part twice. Nothing new
+                # is sent; the caller sees the size that is left.
+                pos.error = _join_error(pos.error, f"{self.name}: önceki kapatma emri borsada gerçekleşmiş "
+                                                   f"({_fmt(_dec_sub(before, pos.remaining_quantity))} kapandı, kalan "
+                                                   f"{_fmt(pos.remaining_quantity)}); yeni kapatma emri gönderilmedi.")
+                return pos
         full = fraction >= 0.999
         if full:
             await self._stop_entry(pos)      # if it may still be live, _finalize_closed retries it
@@ -2082,10 +2222,7 @@ class CcxtBroker(Broker):
             raise BrokerError(f"{self.name}: kapatılacak miktar ({_fmt(qty)}) minimum emir miktarının altında.")
         d["close_seq"] = int(d.get("close_seq", 0)) + 1
         cid = self._client_id(d.get("client_tag", "ct"), f"c{d['close_seq']}")
-        order = await self._ccxt(
-            "kapatma emri reddedildi",
-            self.exchange.create_order(pos.broker_symbol, "market", self._close_side(pos.side), qty, None, self._close_params(cid)),
-        )
+        order = await self._send_close(pos, qty, cid)
         executed = await self._book_exit_order(pos, order, qty, "close")
         if executed is None:
             pos.error = _join_error(pos.error, f"{self.name}: kapatma emri gönderildi ama {_UNCONFIRMED_MARK}; stop "
@@ -2109,9 +2246,62 @@ class CcxtBroker(Broker):
                                                f"borsayı kontrol edin.")
         return pos
 
+    async def _send_close(self, pos: BrokerPosition, qty: float, cid: str) -> dict[str, Any]:
+        """Send the reduce-only market close of ``qty`` tagged ``cid`` and return the order. A clear refusal raises
+        BrokerError ("reddedildi"). A request without a clear answer is looked up by its client id: the order is
+        returned when it exists; otherwise it is kept in ``unconfirmed_closes`` and OrderOutcomeUnknownError raised."""
+        sent_ms = self._now_ms()
+        try:
+            return await self.exchange.create_order(pos.broker_symbol, "market", self._close_side(pos.side), qty, None,
+                                                    self._close_params(cid))
+        except cx.InsufficientFunds as e:
+            raise BrokerError(f"{self.name}: kapatma emri reddedildi: yetersiz bakiye ({_short(e)})") from e
+        except cx.BaseError as e:
+            if not _unclear(e):
+                raise BrokerError(f"{self.name}: kapatma emri reddedildi: {_short(e)}") from e
+            found, looked = await self._find_by_client_id(pos.broker_symbol, cid, sent_ms - 60_000)
+            if found is not None:
+                logger.warning("%s: close request failed (%s) but order %s (client id %s) exists; booking it",
+                               self.name, e, found.get("id"), cid)
+                return found
+            where = (f"bu etiketle ({cid}) borsada henüz görünmüyor" if looked
+                     else f"borsaya ulaşılamadığı için bu etiketle ({cid}) aranamadı")
+            pos.data.setdefault("unconfirmed_closes", []).append(
+                {"order_id": None, "client_id": cid, "qty": qty, "kind": "close", "since": sent_ms, "misses": 0})
+            pos.error = _join_error(pos.error, f"{self.name}: {_fmt(qty)} kapatma emri gönderildi ama "
+                                               f"{_UNCONFIRMED_MARK} ({where}); stop yerinde bırakıldı, sonraki "
+                                               f"kontrollerde aranacak.")
+            logger.error("%s: close %s of %s on %s sent, its answer lost (%s) and not found (looked: %s)",
+                         self.name, cid, _fmt(qty), pos.broker_symbol, e, looked)
+            raise OrderOutcomeUnknownError(
+                f"{self.name}: kapatma emri ({_fmt(qty)} {pos.broker_symbol}) gönderildi ama yanıtı alınamadı "
+                f"({_short(e)}); emir {OUTCOME_UNKNOWN_MARK} {where}, gerçekleşip gerçekleşmediği bilinmiyor. Bot "
+                f"sonraki kontrollerde bu emri borsada arayacak ve bulursa kayda geçirecek."
+            ) from e
+
+    @staticmethod
+    def _hand_back(caller: BrokerPosition, pos: BrokerPosition) -> None:
+        """Before an error is raised after an order request went out without a clear answer: the caller's own
+        position object takes this call's state (``pos``, the adapter's working copy). Every caller of the engine and
+        the monitor stores the object it passed in when it books the failed change, so the record of such an order
+        (``unconfirmed_closes`` / ``lost_orders``) and the advanced client-id sequence are not lost with the error:
+        the next sync looks the order up and books (or cancels) it, and no later order reuses its client id. Other
+        failures leave the caller's object as it was."""
+        state = pos.model_copy(deep=True)
+        for name in type(pos).model_fields:
+            setattr(caller, name, getattr(state, name))
+
     async def cancel_entry(self, pos: BrokerPosition) -> BrokerPosition:
         self._require_real(pos)
-        pos = pos.model_copy(deep=True)
+        work = pos.model_copy(deep=True)
+        try:
+            return await self._cancel_entry(work)
+        except OrderOutcomeUnknownError:
+            self._hand_back(pos, work)      # (the close of a fill found now went out without a clear answer)
+            raise
+
+    async def _cancel_entry(self, pos: BrokerPosition) -> BrokerPosition:
+        """cancel_entry on the adapter's own copy ``pos``."""
         self._register(pos)
         d = pos.data
         if pos.status not in (PositionStatus.PENDING, PositionStatus.OPEN):
@@ -2259,13 +2449,42 @@ class CcxtBroker(Broker):
                 await self._sync_clock(force=True)      # -1021: our offset to the exchange clock is stale
             return None
 
-    async def _settle_unconfirmed(self, pos: BrokerPosition) -> None:
-        """Book exit orders whose result could not be read when they were sent."""
+    async def _settle_unconfirmed(self, pos: BrokerPosition, *, count_misses: bool = True) -> None:
+        """Book exit orders whose result could not be read when they were sent. One whose request got no answer at
+        all is kept by its client id (``order_id`` None): it is looked up by that id and, once found, settled like
+        the others. When the venue has answered on _LOST_ORDER_MISSES syncs (``count_misses``: this call is a sync;
+        a sync whose look-up got no answer does not count) that it has no order with that id, and at least
+        _LOST_ORDER_MIN_AGE_MS have passed since it was sent, the request never reached it: nothing was closed by it
+        (its client id is remembered in ``dropped_closes``, see _flat_note). One found and booked by a sync leaves a
+        note for the owner in ``pos.error``."""
         d, symbol = pos.data, pos.broker_symbol
         keep: list[dict[str, Any]] = []
         kinds: set[str] = set()
+        found_late: list[tuple[str, float]] = []      # (client id, size closed): lost closes a sync found executed
         for u in list(d.get("unconfirmed_closes") or []):
-            st = await self._try_state(str(u["order_id"]), symbol, "close", d.get("opened_at"))
+            late = False
+            if not u.get("order_id"):
+                since = int(u.get("since") or d.get("opened_at") or 0) - 60_000
+                found, looked = await self._find_by_client_id(symbol, str(u.get("client_id")), since, attempts=1)
+                if found is None:
+                    if looked and count_misses:
+                        u = {**u, "misses": int(u.get("misses") or 0) + 1}
+                    if (int(u.get("misses") or 0) >= _LOST_ORDER_MISSES
+                            and self._now_ms() - int(u.get("since") or 0) >= _LOST_ORDER_MIN_AGE_MS):
+                        logger.warning("%s: exit order %s (client id) never reached the venue; nothing closed by it",
+                                       self.name, u.get("client_id"))
+                        d["dropped_closes"] = [*(d.get("dropped_closes") or []), str(u.get("client_id"))][-5:]
+                        continue
+                    keep.append(u)
+                    continue
+                u = {**u, "order_id": str(found.get("id"))}
+                self._remember(d, u["order_id"])
+                logger.warning("%s: exit order %s (client id %s) whose answer was lost exists; settling it", self.name,
+                               u["order_id"], u.get("client_id"))
+                st: OrderState | None = parse_order_state(found, trigger=False)
+                late = count_misses
+            else:
+                st = await self._try_state(str(u["order_id"]), symbol, "close", d.get("opened_at"))
             if st is None:
                 keep.append(u)
                 continue
@@ -2282,6 +2501,8 @@ class CcxtBroker(Broker):
             if executed > 0:
                 self._record_exit(pos, str(u["order_id"]), executed, st.average, u.get("kind") or "close")
                 kinds.add(u.get("kind") or "close")
+                if late:
+                    found_late.append((str(u.get("client_id")), executed))
         d["unconfirmed_closes"] = keep
         if not keep:
             pos.error = _drop_error(pos.error, _UNCONFIRMED_MARK)
@@ -2297,6 +2518,12 @@ class CcxtBroker(Broker):
             levels = [TakeProfit(**lv) for lv in self._unfilled_levels(pos)]
             if levels and not self._done(pos):
                 await self._replace_take_profits(pos, levels, pos.remaining_quantity)
+        for cid, executed in found_late:
+            # Booked by this sync, not by a call that reports it: the owner is told here (once: the monitor sends
+            # a changed pos.error; the note is not written again by a later sync).
+            pos.error = _join_error(pos.error, f"{self.name}: yanıtı alınamayan önceki kapatma emri ({cid}) borsada "
+                                               f"gerçekleşmiş bulundu: {_fmt(executed)} kapandı, kalan "
+                                               f"{_fmt(pos.remaining_quantity)}.")
 
     async def _sync_open(self, pos: BrokerPosition) -> None:
         d, symbol = pos.data, pos.broker_symbol
@@ -2424,15 +2651,17 @@ class CcxtBroker(Broker):
 
     async def _gone_on_venue(self, pos: BrokerPosition) -> bool:
         """True when the venue holds nothing in our direction (the caller must not place protection for it).
-        After two consecutive flat reads (position APIs can lag behind fills) the trade is closed."""
+        After two consecutive flat reads (position APIs can lag behind fills) the trade is closed.
+        ``pos.data[FLAT_SEEN]`` counts those flat reads (0 after a read that shows the position): part of this
+        adapter's contract, read by the monitor before it retries a close (see FLAT_SEEN)."""
         d = pos.data
         size = await self._venue_position_size(pos.broker_symbol, pos.side)
         step = self._market_rules(pos)[0]
         if size is None or size >= step / 2:
-            d["flat_seen"] = 0
+            d[FLAT_SEEN] = 0
             return False
-        d["flat_seen"] = int(d.get("flat_seen", 0)) + 1
-        if d["flat_seen"] >= 2:
+        d[FLAT_SEEN] = int(d.get(FLAT_SEEN, 0)) + 1
+        if d[FLAT_SEEN] >= 2:
             outside = pos.remaining_quantity  # gone on the venue (closed there by hand, liquidated, netted...)
             pos.remaining_quantity = 0.0
             d["unprotected"] = False
@@ -2446,7 +2675,14 @@ class CcxtBroker(Broker):
         d = pos.data
         note = f"{self.name}: pozisyon borsada kapalı bulundu; kalan emirler iptal edildi."
         outside = float(d.get("closed_outside") or 0.0)
-        if outside > 0:                       # no order of ours closed that size: its result is not known to us
+        dropped = [str(c) for c in d.get("dropped_closes") or []]
+        if outside > 0 and dropped:
+            # A close of ours whose answer was lost and that was not found (so given up) may have executed late.
+            note += (f" {_fmt(outside)} botun kayda geçirdiği emirler dışında kapandı; bu, yanıtı alınamayan ve "
+                     f"borsada bulunamayan önceki kapatma emrinin ({', '.join(dropped)}) sonradan gerçekleşmesi de "
+                     f"olabilir. " + ("Kâr/zarar bilinmiyor." if pos.realized_pnl is None else
+                                      "Kâr/zarar yalnızca botun kayda geçirdiği emirleri içerir."))
+        elif outside > 0:                     # no order of ours closed that size: its result is not known to us
             note += (" Kapanış botun emirleriyle olmadığı için kâr/zarar bilinmiyor." if pos.realized_pnl is None else
                      f" {_fmt(outside)} botun emirleri dışında kapandı; kâr/zarar yalnızca botun kendi "
                      f"emirlerini içerir.")
@@ -2674,6 +2910,13 @@ class CcxtBroker(Broker):
         if len(plain) + len(conditional) > 12:
             out.append(f"DİKKAT   ... ve {len(plain) + len(conditional) - 12} emir daha.")
         return out
+
+    async def venue_position_size(self, symbol: str, side: Side) -> float | None:
+        """Public contract (the monitor's close retry, ``Monitor._shared_venue_doubt``): the position size the venue
+        holds on ``symbol`` in ``side``'s direction, in contracts (one-way mode: the signed net, positive = that
+        side; hedge mode: that side's leg). None = unknown (the venue cannot tell, or the read failed). One
+        ``fetch_positions`` call; nothing is changed."""
+        return await self._venue_position_size(symbol, side)
 
     async def _venue_position_size(self, symbol: str, side: Side) -> float | None:
         """Size on the venue in our direction (one-way: signed net, positive = ours). None = unknown."""

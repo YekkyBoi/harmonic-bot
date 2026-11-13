@@ -783,17 +783,21 @@ def build_management_plan(
                 issues.block("invalid_price", f"Geçersiz yeni stop fiyatı ({action.new_stop_loss}).")
         else:
             issues.block("missing_new_stop", "Yeni stop seviyesi belirtilmedi.")
+        # "Stop girişe" while the entries are still resting: the trader is at break-even, so the engine cancels the
+        # resting entries instead of moving their stop (a fill at the entry later would be a fresh full-risk trade
+        # he no longer has). No stop is placed anywhere: neither the market nor the entry side applies to it.
+        be_cancel = pending and action.move_sl_to_entry
         if new_sl is not None:
             below = "altında" if side is Side.LONG else "üstünde"
-            if market is None:
+            if market is None and not be_cancel:
                 issues.warn("market_price_unknown", "Piyasa fiyatı alınamadı; yeni stop piyasaya göre kontrol edilemedi.")
-            elif not _loss_side(side, new_sl, market):
+            elif market is not None and not be_cancel and not _loss_side(side, new_sl, market):
                 issues.block(
                     "sl_wrong_side",
                     f"{_side_word(side)} işlemde yeni stop piyasa fiyatının {below} olmalı "
                     f"(piyasa {_fmt(market)}, yeni stop {_fmt(new_sl)}).",
                 )
-            if pending and plan_entry is not None and not _loss_side(side, new_sl, plan_entry):
+            if pending and plan_entry is not None and not _loss_side(side, new_sl, plan_entry) and not be_cancel:
                 issues.block(
                     "sl_wrong_side",
                     f"Bekleyen {_side_word(side).lower()} işlemde stop girişin {below} olmalı "
@@ -806,6 +810,8 @@ def build_management_plan(
                 )
             to_entry = " (giriş)" if action.move_sl_to_entry else ""
             summary = f"{label}: stop {_fmt(new_sl)}{to_entry} seviyesine çekilecek"
+            if be_cancel:
+                summary = f"{label}: stop girişe çekildi (başa baş); dolmamış girişler iptal edilecek"
 
     elif action.action is ActionType.MOVE_TP:
         valid = [tp for tp in action.take_profits if _positive(tp.price)]

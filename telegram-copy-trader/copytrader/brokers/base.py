@@ -42,6 +42,33 @@ class BrokerError(Exception):
     """A broker operation failed. ``str(err)`` is shown to the owner."""
 
 
+class OrderOutcomeUnknownError(BrokerError):
+    """An order request was SENT and its answer was lost (no answer in time, the link broke under it): the order may
+    or may not exist at the broker. It is never sent again; the owner must be told that its outcome is unknown, never
+    that it "could not be opened"."""
+
+
+# The words with which the MetaTrader adapters report, inside a plain BrokerError, an order leg whose answer was lost
+# after looking it up by its tag ("Emir durumu belirsiz: ..." / "2/3. bacak durumu belirsiz: ...":
+# MetaTraderLegBroker._open_position, MetaApiBroker._unsure_not_failed). tests/test_review2_repair.py pins that both
+# adapters still say so.
+OUTCOME_UNKNOWN_MARK = "durumu belirsiz:"
+
+
+def outcome_unknown(exc: BaseException | None) -> bool:
+    """True when ``exc`` (the failure of a broker call that sent an order) says that the order request went out and
+    its answer was lost: an :class:`OrderOutcomeUnknownError`, raised directly or wrapped (its ``__cause__`` /
+    ``__context__``), or a BrokerError carrying OUTCOME_UNKNOWN_MARK."""
+    seen: set[int] = set()
+    cur = exc
+    while cur is not None and id(cur) not in seen:
+        if isinstance(cur, OrderOutcomeUnknownError):
+            return True
+        seen.add(id(cur))
+        cur = cur.__cause__ or cur.__context__
+    return isinstance(exc, BrokerError) and OUTCOME_UNKNOWN_MARK in str(exc)
+
+
 # Contract multiplier an exchange puts before a low-priced coin: "1000PEPE" = 1000 PEPE, "1MBABYDOGE" =
 # 1000000 BABYDOGE. The same prefixes as ccxt_broker._PREFIX_RE plus the "1M" spelling, and only before a
 # letter, so a coin whose real name starts with a digit ("1INCH") is left alone.
@@ -51,6 +78,18 @@ _MULTIPLIER_PREFIX_RE = re.compile(r"^(?:1000000|100000|10000|1000|1M)(?=[A-Z])"
 def _asset_key(asset: str) -> str:
     """Upper-case asset name without a contract multiplier prefix: "1000pepe" -> "PEPE", "1INCH" -> "1INCH"."""
     return _MULTIPLIER_PREFIX_RE.sub("", asset.upper(), count=1)
+
+
+def contract_multiplier(asset: str) -> tuple[float, str] | None:
+    """(coins per contract unit, the single coin) for a bundled contract name, by the same prefixes as
+    :func:`_asset_key`: "1000PEPE" -> (1000.0, "PEPE"), "1MBABYDOGE" -> (1000000.0, "BABYDOGE"). None for any
+    other name ("1INCH", "2Z", "ADA")."""
+    name = (asset or "").upper()
+    found = _MULTIPLIER_PREFIX_RE.match(name)
+    if found is None:
+        return None
+    prefix = found.group(0)
+    return (1_000_000.0 if prefix == "1M" else float(prefix)), name[len(prefix):]
 
 
 class Broker(ABC):

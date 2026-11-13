@@ -897,7 +897,9 @@ async def test_capped_market_signal_end_to_end_after_the_owner_approves(env: Env
     assert env.binance.opened[0].quantity == pytest.approx(10.0 / 350.0, abs=0.001)
     assert env.binance.opened[0].entry_type is EntryType.MARKET and env.binance.opened[0].stop_loss == 73300.0
     line = next(x for x in result.splitlines() if x.startswith("• binance:"))
-    assert CAP_WARNING in line and "gerçek risk ~5.74 USDT (hedefin altında)" in line
+    # Review 1 (glue_engine, G8): the figure of the quantity really sent (0.028 BTC x 201 = 5.63), no longer that of the
+    # unrounded size 10 / 350 BTC (10 x 201 / 350 = 5.74).
+    assert CAP_WARNING in line and "gerçek risk ~5.63 USDT (hedefin altında)" in line
 
 
 async def test_automatic_crypto_market_signal_within_tolerance_is_capped(env: Env) -> None:

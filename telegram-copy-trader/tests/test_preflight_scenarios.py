@@ -15,11 +15,19 @@ Scenarios (each asserts what every broker of the route received):
   (c) fx, EURUSD explicit market 4 pips away  (d) fx, USDJPY with market_type None
   (e) fx, no_hedge: other pair / same pair    (f) fx, live price 2.5 pips above the stop: size cap
   (g) crypto, 1000PEPE and the manual broker's allowed_assets entry "PEPE"
+
+Two replicas of the owner's config.yaml (REPLICAS): "prod" (PROD_YAML, the default of the ``prod`` fixture and
+of Prod.create, used by the other test files) and "live" (LIVE_YAML: the config on the server since the
+62e0719 update; execution reports on, binance no_hedge, crypto drift "follow", min-size round-up, fx daily loss
+with open risk). Scenarios a-g run on both (``@both_replicas``); where the live settings change the outcome
+(an execution report for the owner, no question on the crypto drift) the test says so. The live-only settings
+have their own scenarios at the end: (h) min-size round-up, (k) fx daily loss with open risk.
 """
 
 from __future__ import annotations
 
 import os
+import re
 from datetime import UTC, datetime
 from pathlib import Path
 from types import SimpleNamespace
@@ -134,6 +142,84 @@ brokers:
     no_hedge: true
     daily_loss_limit_pct: 0
 """
+# The owner's config.yaml as it is on the server now (release 62e0719, after its config update), with the same
+# ${VAR} placeholders. Against PROD_YAML it adds: kripto explicit_market_drift "follow"; notifier
+# notify_on_execution + notify_on_ignored; binance daily_loss_limit_pct 0 + no_hedge; fx
+# daily_loss_include_open_risk; risk max_open_trades 25 + allow_min_qty_round_up
+# (test_live_replica_is_the_server_config pins that list).
+LIVE_YAML = """\
+dry_run: false
+data_dir: data
+timezone: Europe/Istanbul
+telegram:
+  api_id: ${TG_API_ID}
+  api_hash: ${TG_API_HASH}
+  source_chats: [-1003782294463]
+  topics:
+    - name: kripto
+      title_contains: ["Kripto İşlemleri"]
+      brokers: [binance, breakout, tickmill]
+      kind: crypto
+      explicit_market_drift: follow
+    - name: fx
+      title_contains: ["Fx İşlemleri"]
+      brokers: [fx, tickmill]
+      kind: fx
+notifier:
+  bot_token: ${TG_BOT_TOKEN}
+  owner_user_id: ${TG_OWNER_ID}
+  notify_on_execution: true
+  notify_on_ignored: true
+llm:
+  api_key: ${ANTHROPIC_API_KEY}
+brokers:
+  - name: binance
+    type: ccxt
+    exchange: binanceusdm
+    api_key: ${BINANCE_API_KEY}
+    secret: ${BINANCE_API_SECRET}
+    risk_usd: 10
+    margin_mode: cross
+    leverage: 125
+    max_leverage: 125
+    daily_loss_limit_pct: 0
+    no_hedge: true
+  - name: breakout
+    type: manual
+    risk_usd: 50
+    allowed_assets: [BTC, ETH, SOL, XRP, DOGE, ADA, AVAX, LINK, BNB, LTC, SUI, TON, DOT, NEAR, APT, ARB, OP, PEPE, WIF, HYPE]
+  - name: fx
+    type: mt5
+    login: ${MT5_LOGIN}
+    password: ${MT5_PASSWORD}
+    server: ${MT5_SERVER}
+    risk_usd: 100
+    no_hedge: true
+    daily_loss_limit_pct: 3
+    daily_loss_include_open_risk: true
+  - name: tickmill
+    type: metaapi
+    enabled: true
+    optional: true
+    token: ${METAAPI_TOKEN:-}
+    account_id: ${METAAPI_ACCOUNT_ID:-}
+    risk_usd: 45
+    reference_exchange: binanceusdm
+    offset_mode: additive
+    max_offset_pct: 1.0
+    entry_trigger: reference_touch
+    virtual_trigger_max_hours: 48
+    symbol_map:
+      BTC: BTCUSD
+      ETH: ETHUSD
+    allowed_assets: [EUR, GBP, USD, AUD, NZD, BTC, ETH, XAU, XAG]
+    no_hedge: true
+    daily_loss_limit_pct: 0
+risk:
+  max_open_trades: 25
+  allow_min_qty_round_up: true
+"""
+REPLICAS = ("prod", "live")
 DUMMY_ENV = {
     "TG_API_ID": "12345", "TG_API_HASH": "0123456789abcdef", "TG_BOT_TOKEN": "123456:dummy", "TG_OWNER_ID": "42",
     "ANTHROPIC_API_KEY": "sk-ant-dummy", "BINANCE_API_KEY": "dummy-key", "BINANCE_API_SECRET": "dummy-secret",
@@ -142,13 +228,22 @@ DUMMY_ENV = {
 }
 
 
-def load_prod_config(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> AppConfig:
+def replica_yaml(replica: str = "prod") -> str:
+    """The config text of a replica: "prod" = PROD_YAML (read when called), "live" = LIVE_YAML."""
+    if replica == "prod":
+        return PROD_YAML
+    if replica == "live":
+        return LIVE_YAML
+    raise ValueError(f"unknown replica {replica!r}; one of {REPLICAS}")
+
+
+def load_prod_config(tmp_path: Path, monkeypatch: pytest.MonkeyPatch, replica: str = "prod") -> AppConfig:
     """The replica as the bot would load it: YAML file + environment variables (dummy secrets)."""
     for name, value in DUMMY_ENV.items():
         monkeypatch.setenv(name, value)
     monkeypatch.chdir(tmp_path)                    # load_config also reads a ".env" of the current directory
     path = tmp_path / "config.yaml"
-    path.write_text(PROD_YAML, encoding="utf-8")
+    path.write_text(replica_yaml(replica), encoding="utf-8")
     cfg = load_config(path)
     cfg.data_dir = str(tmp_path / "data")
     cfg.monitor_interval_sec = 3600.0
@@ -358,16 +453,19 @@ class Prod:
         self.tickmill: Tickmill
         self.ref: Reference
         self.brokers: dict[str, Any] = {}
+        self.replica = "prod"
         self._mid = 7000
 
     @classmethod
     async def create(cls, tmp_path: Path, monkeypatch: pytest.MonkeyPatch, *,
                      tickmill_symbols: tuple[str, ...] = TICKMILL_LISTED, edit: Any = None,
-                     model: ScriptedModel | None = None) -> "Prod":
+                     model: ScriptedModel | None = None, replica: str = "prod") -> "Prod":
         """``edit(cfg)``: change the loaded config before the engine is built. ``model``: read the messages with
-        the real ClaudeSignalParser on this scripted model instead of the FakeParser."""
+        the real ClaudeSignalParser on this scripted model instead of the FakeParser. ``replica``: which config
+        (REPLICAS: "prod" = PROD_YAML, "live" = LIVE_YAML)."""
         p = cls()
-        p.cfg = load_prod_config(tmp_path, monkeypatch)
+        p.replica = replica
+        p.cfg = load_prod_config(tmp_path, monkeypatch, replica)
         if edit is not None:
             edit(p.cfg)
         if model is not None:
@@ -434,6 +532,20 @@ class Prod:
     def texts(self, severity: Severity | None = None) -> list[str]:
         return self.notifier.texts(severity)
 
+    def reports(self) -> list[str]:
+        """The owner's execution reports: "✅ <b>#1 BTC LONG açıldı</b>" (or ⚠️), the plan, one line per broker."""
+        return [t for t in self.texts(Severity.INFO) if re.match(r"(?:✅|⚠️) <b>#\d+ ", t)]
+
+    def assert_reported(self, *lines: str, always: bool = False) -> None:
+        """With notify_on_execution (the live config) the owner gets ONE execution report and it holds every
+        line given; without it none, unless a broker of the route left the trade out (``always``)."""
+        if always or self.cfg.notifier.notify_on_execution:
+            (report,) = self.reports()
+            for line in lines:
+                assert line in report, (line, report)
+        else:
+            assert self.reports() == []
+
     def fx_orders(self) -> list[tuple[str, str, float, float, float, float]]:
         """Orders sent to the fx terminal: (kind, symbol, lots, price, sl, tp)."""
         kinds = {(MT5.TRADE_ACTION_DEAL, MT5.ORDER_TYPE_BUY): "BUY", (MT5.TRADE_ACTION_DEAL, MT5.ORDER_TYPE_SELL): "SELL",
@@ -459,10 +571,14 @@ def _isolate(monkeypatch: pytest.MonkeyPatch) -> None:
 
 
 @pytest.fixture
-async def prod(tmp_path: Path, monkeypatch: pytest.MonkeyPatch):
-    p = await Prod.create(tmp_path, monkeypatch)
+async def prod(tmp_path: Path, monkeypatch: pytest.MonkeyPatch, request: pytest.FixtureRequest):
+    """The "prod" replica; a test marked ``@both_replicas`` gets each of REPLICAS (indirect parametrization)."""
+    p = await Prod.create(tmp_path, monkeypatch, replica=getattr(request, "param", "prod"))
     yield p
     await p.close()
+
+
+both_replicas = pytest.mark.parametrize("prod", REPLICAS, indirect=True)
 
 
 # --------------------------------------------------------------------------- #
@@ -524,9 +640,51 @@ def test_replica_loads_like_production(tmp_path: Path, monkeypatch: pytest.Monke
         assert yaml.safe_load(PROD_YAML) == yaml.safe_load(theirs.read_text(encoding="utf-8"))
 
 
+def _flat(node: Any, prefix: str = "") -> dict[str, Any]:
+    """A YAML document as {"brokers[binance].no_hedge": True, ...}; list items with a "name" are named by it."""
+    out: dict[str, Any] = {}
+    if isinstance(node, dict):
+        for key, value in node.items():
+            out.update(_flat(value, f"{prefix}.{key}" if prefix else str(key)))
+    elif isinstance(node, list) and node and all(isinstance(x, dict) and "name" in x for x in node):
+        for item in node:
+            out.update(_flat({k: v for k, v in item.items() if k != "name"}, f"{prefix}[{item['name']}]"))
+    else:
+        out[prefix] = node
+    return out
+
+
+def test_live_replica_is_the_server_config(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    old, live = _flat(yaml.safe_load(PROD_YAML)), _flat(yaml.safe_load(LIVE_YAML))
+    assert set(old) <= set(live)                                    # nothing of the first replica is left out
+    assert {k: v for k, v in live.items() if old.get(k, "<unset>") != v} == {
+        "telegram.topics[kripto].explicit_market_drift": "follow",
+        "notifier.notify_on_execution": True, "notifier.notify_on_ignored": True,
+        "brokers[binance].daily_loss_limit_pct": 0, "brokers[binance].no_hedge": True,
+        "brokers[fx].daily_loss_include_open_risk": True,
+        "risk.max_open_trades": 25, "risk.allow_min_qty_round_up": True,
+    }
+    cfg = load_prod_config(tmp_path, monkeypatch, "live")
+    by = {b.name: b for b in cfg.brokers}
+    assert [(b.name, b.type, b.risk_usd, b.no_hedge) for b in cfg.brokers] == [
+        ("binance", "ccxt", 10.0, True), ("breakout", "manual", 50.0, False),
+        ("fx", "mt5", 100.0, True), ("tickmill", "metaapi", 45.0, True)]
+    assert (by["binance"].daily_loss_limit_pct, by["fx"].daily_loss_limit_pct, by["tickmill"].daily_loss_limit_pct) == (
+        0.0, 3.0, 0.0)
+    assert by["fx"].daily_loss_include_open_risk is True and by["tickmill"].optional is True
+    assert (cfg.notifier.notify_on_execution, cfg.notifier.notify_on_ignored) == (True, True)
+    assert (cfg.risk.max_open_trades, cfg.risk.allow_min_qty_round_up) == (25, True)
+    assert {r.name: r.explicit_market_drift for r in cfg.telegram.topics} == {"kripto": "follow", "fx": None}
+    # Optional: COPYTRADER_LIVE_REPLICA=<folder with the server's config.yaml, secrets as ${VAR}> checks LIVE_YAML.
+    theirs = Path(os.environ.get("COPYTRADER_LIVE_REPLICA") or tmp_path / "none") / "config.yaml"
+    if theirs.is_file():
+        assert yaml.safe_load(LIVE_YAML) == yaml.safe_load(theirs.read_text(encoding="utf-8"))
+
+
 # =========================================================================== #
 # (a) crypto route, BTC market long with SL / TP
 # =========================================================================== #
+@both_replicas
 async def test_a_crypto_btc_market_long_opens_on_all_three_and_tickmill_gets_shifted_levels(prod: Prod) -> None:
     # Binance 73999 / 74001, tickmill's CFD 73949 / 73951: 50 USD lower.
     await prod.say(btc(EntryType.MARKET, 74000.0, 73300.0, 75500.0), KRIPTO, "btc 1R long")
@@ -549,7 +707,7 @@ async def test_a_crypto_btc_market_long_opens_on_all_three_and_tickmill_gets_shi
 
     # breakout (manual): a message with the quantity for 50 USD of risk, tracked as an open position
     (note,) = [t for t in prod.texts() if "Elle işlem (breakout)" in t]
-    assert "0.071 KONTRAT — BTC LONG" in note and "Stop: 73300" in note and "TP: 75500" in note
+    assert "0.071 BTC — BTC LONG" in note and "Stop: 73300" in note and "TP: 75500" in note  # (final: the instruction names the unit and the USD value; 'KONTRAT' was typed as USD on 2026-11-12)
     assert pos["breakout"].status is PositionStatus.OPEN and pos["breakout"].quantity == 0.071
 
     # tickmill: the same trade on the CFD, every level moved by (73950 - 74000) = -50
@@ -560,11 +718,16 @@ async def test_a_crypto_btc_market_long_opens_on_all_three_and_tickmill_gets_shi
 
     assert prod.terminal.sent == []                                          # the fx account is not on this route
     assert prod.texts(Severity.ERROR) == [] and prod.texts(Severity.WARNING) == []
+    # live config (notify_on_execution): one report says what every account did
+    prod.assert_reported("✅ <b>#1 BTC LONG açıldı</b>", "• binance: 0.012 BTC/USDT:USDT (açık)",
+                         "• breakout: 0.071 BTC/USDT:USDT (açık)", "• tickmill: 0.06 BTCUSD (açık)",
+                         "(fark -50.0 uygulandı)")
 
 
 # =========================================================================== #
 # (b) crypto route, BTC limit long below the market
 # =========================================================================== #
+@both_replicas
 async def test_b_crypto_btc_limit_long_rests_on_binance_and_waits_as_a_virtual_trigger_on_tickmill(prod: Prod) -> None:
     await prod.say(btc(EntryType.LIMIT, 73000.0, 72300.0, 75000.0), KRIPTO, "btc 1R long limit emir")
 
@@ -589,6 +752,9 @@ async def test_b_crypto_btc_limit_long_rests_on_binance_and_waits_as_a_virtual_t
     assert (virtual.stop_loss, [tp.price for tp in virtual.take_profits]) == (72300.0, [75000.0])
     assert any("tickmill: sanal tetik kuruldu: Binance fiyatı 73000" in t for t in prod.texts())
     assert prod.ref.calls == []                                              # nothing measured before the touch
+    prod.assert_reported("#1 BTC LONG", "• binance: 0.012 BTC/USDT:USDT (bekleyen emir)",
+                         "• breakout: 0.071 BTC/USDT:USDT (bekleyen emir)",
+                         "• tickmill: sanal tetik kuruldu: Binance fiyatı 73000")
 
     # Binance not there yet: nothing happens
     await prod.engine.monitor.run_virtual_once()
@@ -607,6 +773,7 @@ async def test_b_crypto_btc_limit_long_rests_on_binance_and_waits_as_a_virtual_t
 # =========================================================================== #
 # (c) fx route, EURUSD explicit market, live price 4 pips from the entry
 # =========================================================================== #
+@both_replicas
 @pytest.mark.parametrize("bid,ask,fx_lots,tickmill_lots", [
     (1.16235, 1.16245, 0.40, 0.18),          # 4 pips above the entry: 24.5 pips to the stop
     (1.16155, 1.16165, 0.60, 0.27),          # 4 pips below the entry: 16.5 pips to the stop
@@ -629,7 +796,10 @@ async def test_c_fx_eurusd_explicit_market_four_pips_away_opens_on_both_without_
     assert "price_offset" not in pos["tickmill"].data and pos["tickmill"].stop_loss == 1.16
     assert prod.ref.calls == []
     assert [c for c in prod.binance.calls if c[0] in ("fetch_ticker", "fetch_order_book", "create_order")] == []
-    assert prod.texts() == []                                                # nothing to report
+    # nothing to report on the old replica; the live config sends the execution report and nothing else
+    prod.assert_reported("✅ <b>#1 EUR LONG açıldı</b>", f"• fx: {fx_lots:g} EURUSD (açık)",
+                         f"• tickmill: {tickmill_lots:g} EURUSD (açık)")
+    assert prod.texts() == prod.reports()
 
 
 # =========================================================================== #
@@ -640,6 +810,7 @@ def usdjpy_untyped(entry_type: EntryType | None, entry: float, sl: float, tp: fl
     return signal(None, "USD", "JPY", None, Side.LONG, entry, sl, tp, entry_type=entry_type)
 
 
+@both_replicas
 @pytest.mark.parametrize("entry_type", [EntryType.MARKET, None])
 async def test_d_fx_usdjpy_without_a_market_type_opens_on_both_and_never_asks_the_reference(
     prod: Prod, entry_type: EntryType | None
@@ -656,14 +827,16 @@ async def test_d_fx_usdjpy_without_a_market_type_opens_on_both_and_never_asks_th
     assert "price_offset" not in pos["tickmill"].data
     assert prod.ref.calls == [] and not any("referans" in t for t in prod.texts())
     assert [c for c in prod.binance.calls if c[0] == "create_order"] == []
+    prod.assert_reported("açıldı</b>", "• fx: 0.75 USDJPY (açık)", "• tickmill: 0.33 USDJPY (açık)")
 
 
+@pytest.mark.parametrize("replica", REPLICAS)
 async def test_d_fx_usdjpy_read_by_the_real_parser_is_typed_forex_by_the_topic_and_opens_on_both(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, replica: str
 ) -> None:
     # The same signal through the real ClaudeSignalParser: the model leaves the market type and the symbol null.
     model = ScriptedModel()
-    prod = await Prod.create(tmp_path, monkeypatch, model=model)
+    prod = await Prod.create(tmp_path, monkeypatch, model=model, replica=replica)
     try:
         model.queue.append([wire_action(
             action="open", base_asset="USD", quote_asset="JPY", side="long", entry_type="market",
@@ -679,10 +852,12 @@ async def test_d_fx_usdjpy_read_by_the_real_parser_is_typed_forex_by_the_topic_a
         assert prod.fx_orders() == [("BUY", "USDJPY", 0.75, 154.205, 154.0, 154.6)]
         assert prod.tickmill_orders() == [("market_buy", "USDJPY", 0.33, 154.0, 154.6)]
         assert prod.ref.calls == []
+        prod.assert_reported("• fx: 0.75 USDJPY (açık)", "• tickmill: 0.33 USDJPY (açık)")
     finally:
         await prod.close()
 
 
+@both_replicas
 async def test_d_fx_usdjpy_limit_without_a_market_type_is_a_broker_limit_not_a_virtual_trigger(prod: Prod) -> None:
     await prod.say(usdjpy_untyped(EntryType.LIMIT, 154.05, 153.85, 154.45), FX, "USDJPY LONG 1R Limit Emir")
 
@@ -692,6 +867,8 @@ async def test_d_fx_usdjpy_limit_without_a_market_type_is_a_broker_limit_not_a_v
     (trade,) = await prod.trades()
     pos = await prod.positions(trade.id)
     assert pos["tickmill"].status is PositionStatus.PENDING and not is_virtual_pending(pos["tickmill"])
+    prod.assert_reported("limit emri yerleştirildi</b>", "• fx: 0.77 USDJPY (bekleyen emir)",
+                         "• tickmill: 0.34 USDJPY (bekleyen emir)")
     await prod.engine.monitor.run_virtual_once()                             # nothing waits for Binance "USD"
     assert prod.ref.calls == [] and not any("sanal tetik" in t for t in prod.texts())
 
@@ -699,11 +876,12 @@ async def test_d_fx_usdjpy_limit_without_a_market_type_is_a_broker_limit_not_a_v
 # =========================================================================== #
 # (e) fx route, no_hedge: another pair of the same currency opens, the same pair is refused
 # =========================================================================== #
+@pytest.mark.parametrize("replica", REPLICAS)
 async def test_e_fx_other_pair_of_the_same_currency_opens_and_the_same_pair_opposite_is_refused(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, replica: str
 ) -> None:
     # (EURJPY is not among the eleven symbols known on the Tickmill account: listed here for this scenario.)
-    prod = await Prod.create(tmp_path, monkeypatch, tickmill_symbols=TICKMILL_LISTED + ("EURJPY",))
+    prod = await Prod.create(tmp_path, monkeypatch, tickmill_symbols=TICKMILL_LISTED + ("EURJPY",), replica=replica)
     try:
         await prod.say(fx_pair(*EURUSD_LONG), FX, "EUR LONG 1R")
         assert prod.fx_orders() == [("BUY", "EURUSD", 0.48, 1.16205, 1.16, 1.166)]
@@ -725,10 +903,13 @@ async def test_e_fx_other_pair_of_the_same_currency_opens_and_the_same_pair_oppo
             "• fx: EUR: açık LONG var; ters yönlü SHORT sinyali hedging yasağı nedeniyle açılmadı\n"
             "• tickmill: EUR: açık LONG var; ters yönlü SHORT sinyali hedging yasağı nedeniyle açılmadı")
         assert [t.status for t in await prod.trades()] == [TradeStatus.OPEN, TradeStatus.OPEN, TradeStatus.FAILED]
+        # live config: the two opened trades were reported as well (the refused one only by the notice above)
+        assert len(prod.reports()) == (2 if prod.cfg.notifier.notify_on_execution else 0)
     finally:
         await prod.close()
 
 
+@both_replicas
 async def test_e_fx_pair_that_tickmill_does_not_list_opens_on_fx_only_never_as_another_pair(prod: Prod) -> None:
     # The Tickmill symbol list has no EURJPY: tickmill sits this trade out. It is never placed on EURUSD.
     await prod.say(fx_pair(*EURJPY_SHORT), FX, "EURJPY SHORT 1R")
@@ -738,11 +919,14 @@ async def test_e_fx_pair_that_tickmill_does_not_list_opens_on_fx_only_never_as_a
     (trade,) = await prod.trades()
     assert trade.status is TradeStatus.OPEN and trade.note == "tickmill: unsupported"
     assert prod.asked() == [] and prod.texts(Severity.ERROR) == []
+    # a broker of the route that left the trade out is reported on both replicas
+    prod.assert_reported("• fx: 0.73 EURJPY (açık)", "• tickmill: ", always=True)
 
 
 # =========================================================================== #
 # (f) the live price is 2.5 pips above the stop: never more than twice the planned size
 # =========================================================================== #
+@both_replicas
 @pytest.mark.parametrize("entry_type", [None, EntryType.MARKET, EntryType.LIMIT])
 async def test_f_fx_eurusd_price_close_to_the_stop_is_sized_at_most_twice_the_planned_size(
     prod: Prod, entry_type: EntryType | None
@@ -779,13 +963,24 @@ async def test_f_fx_eurusd_price_close_to_the_stop_is_sized_at_most_twice_the_pl
         assert pos.status is PositionStatus.OPEN and pos.stop_loss == 1.16, name
         if entry_type is not EntryType.MARKET:              # limited by the adapter: noted on the position
             assert any("sınırlandı; gerçek risk hedefin altında" in w for w in pos.data["warnings"]), name
-    if entry_type is EntryType.MARKET:                      # limited by the engine: the owner is told at once
+    if entry_type is EntryType.MARKET and not prod.cfg.notifier.notify_on_execution:
+        # limited by the engine: the owner is told at once
         (notice,) = prod.texts(Severity.WARNING)
         assert notice.startswith("⚠️ <b>#1 EUR LONG açıldı</b>: miktar sınırlandı, gerçek risk hedefin altında")
         assert "• fx: 1 EURUSD" in notice and "gerçek risk ~25.00 USD (hedefin altında)" in notice
         assert "• tickmill: 0.45 EURUSD" in notice and "gerçek risk ~11.25 USD (hedefin altında)" in notice
+    elif entry_type is EntryType.MARKET:
+        # live config: the same lines are in the execution report instead (no separate warning)
+        assert prod.texts(Severity.WARNING) == []
+        prod.assert_reported("• fx: 1 EURUSD (açık)", "gerçek risk ~25.00 USD (hedefin altında)",
+                             "• tickmill: 0.45 EURUSD (açık)", "gerçek risk ~11.25 USD (hedefin altında)")
+    else:
+        # limited by the adapter; the live config's report carries the adapter's note on each line
+        prod.assert_reported("• fx: 1 EURUSD (açık)", "• tickmill: 0.44 EURUSD (açık)",
+                             "sınırlandı; gerçek risk hedefin altında")
 
 
+@both_replicas
 async def test_f_crypto_market_order_approved_close_to_the_stop_is_sized_at_most_twice_the_planned_size(
     prod: Prod
 ) -> None:
@@ -801,10 +996,15 @@ async def test_f_crypto_market_order_approved_close_to_the_stop_is_sized_at_most
     prod.binance.set_price("BTC", 73499.0, 73501.0)
     prod.tickmill.set_price("BTCUSD", 73449.0, 73451.0)
     await prod.say(btc(EntryType.MARKET, 74000.0, 73300.0, 75500.0), KRIPTO, "btc 1R long")
-    assert prod.asked() == [["market_far_from_entry"]]                       # crypto route: still a question
-    assert prod.binance.created() == [] and prod.tickmill_orders() == []
-
-    result = await prod.engine.handle_confirmation(prod.notifier.confirmations[0].id, True)
+    (kripto,) = [r for r in prod.cfg.telegram.topics if r.name == "kripto"]
+    if kripto.explicit_market_drift == "follow":
+        # live config: the crypto route follows the market without a question; the report says what was limited
+        assert prod.asked() == []
+        (result,) = prod.reports()
+    else:
+        assert prod.asked() == [["market_far_from_entry"]]                   # crypto route: still a question
+        assert prod.binance.created() == [] and prod.tickmill_orders() == []
+        result = await prod.engine.handle_confirmation(prod.notifier.confirmations[0].id, True)
 
     (entry,) = prod.binance.entry_orders()
     assert entry["type"] == "market" and 0 < entry["amount"] <= 2 * planned["binance"]
@@ -821,6 +1021,7 @@ async def test_f_crypto_market_order_approved_close_to_the_stop_is_sized_at_most
 # =========================================================================== #
 # (g) crypto route, base 1000PEPE: the manual broker lists "PEPE"
 # =========================================================================== #
+@both_replicas
 async def test_g_crypto_1000pepe_is_taken_by_the_manual_broker_that_lists_pepe(prod: Prod) -> None:
     by = {b.name: b for b in prod.cfg.brokers}
     assert "PEPE" in by["breakout"].allowed_assets and "1000PEPE" not in by["breakout"].allowed_assets
@@ -835,8 +1036,84 @@ async def test_g_crypto_1000pepe_is_taken_by_the_manual_broker_that_lists_pepe(p
     # breakout: 50 USD over a 0.0003 stop distance = 166666 contracts of 1000PEPE
     assert pos["breakout"].status is PositionStatus.OPEN and pos["breakout"].quantity == 166666.0
     (note,) = [t for t in prod.texts() if "Elle işlem (breakout)" in t]
-    assert "166666 KONTRAT — 1000PEPE LONG" in note and "Stop: 0.0117" in note
+    assert "166666 1000PEPE — 1000PEPE LONG" in note and "Stop: 0.0117" in note  # (final: the instruction names the unit and the USD value; 'KONTRAT' was typed as USD on 2026-11-12)
     (entry,) = prod.binance.entry_orders()
     assert (entry["symbol"], entry["type"], entry["side"]) == ("1000PEPE/USDT:USDT", "market", "buy")
     assert 0 < entry["amount"] * (0.012 - 0.0117) <= 10.0
     assert prod.tickmill_orders() == [] and prod.terminal.sent == []
+    # tickmill does not list PEPE: the report that names it goes out on both replicas
+    prod.assert_reported("• breakout: 166666 1000PEPE/USDT:USDT (açık)", "• binance: ", "• tickmill: ", always=True)
+
+
+# =========================================================================== #
+# (h) live config, risk.allow_min_qty_round_up: a stop so wide that 1R is below the minimum order size
+# =========================================================================== #
+@pytest.mark.parametrize("replica", REPLICAS)
+async def test_h_crypto_wide_stop_below_the_minimum_size_is_rounded_up_on_the_live_config(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, replica: str
+) -> None:
+    """BTC long, stop 10.8% away: binance's 10 USDT of risk is 0.001 BTC = 74 USDT, below its 100 USDT minimum;
+    tickmill's 45 USD is below its 0.01 lot. The old replica leaves both out (an error each); the live config opens
+    the minimum size when the loss at the stop stays within 2R, and says so in the report."""
+    prod = await Prod.create(tmp_path, monkeypatch, replica=replica)
+    try:
+        await prod.say(btc(EntryType.MARKET, 74000.0, 66000.0, 90000.0), KRIPTO, "btc 1R long")
+        assert prod.asked() == []
+        (trade,) = await prod.trades()
+        pos = await prod.positions(trade.id)
+        assert pos["breakout"].status is PositionStatus.OPEN and pos["breakout"].quantity == 0.006
+        if not prod.cfg.risk.allow_min_qty_round_up:
+            assert prod.binance.created() == [] and prod.tickmill_orders() == [] and sorted(pos) == ["breakout"]
+            errors = prod.texts(Severity.ERROR)
+            assert len(errors) == 2 and "minimum emir tutarının (100) altında" in errors[0], errors
+            return
+        (entry,) = prod.binance.entry_orders()
+        assert entry["amount"] == 0.002                                      # 148 USDT: Binance's minimum
+        assert prod.tickmill_orders() == [("market_buy", "BTCUSD", 0.01, 65950.0, 89950.0)]   # the minimum lot
+        assert pos["binance"].stop_loss == 66000.0 and pos["tickmill"].stop_loss == 65950.0
+        (report,) = prod.reports()
+        binance_line = next(x for x in report.splitlines() if x.startswith("• binance:"))
+        tickmill_line = next(x for x in report.splitlines() if x.startswith("• tickmill:"))
+        loss = re.search(r"Miktar minimum emir büyüklüğüne yükseltildi \(0\.001 → 0\.002\); stopta kayıp ~(\d+\.\d\d) "
+                         r"\(hedef 10\.00\)", binance_line)
+        assert loss is not None and 10.0 < float(loss.group(1)) <= 20.0, binance_line      # above 1R, within 2R
+        loss = re.search(r"Lot minimum lota yükseltildi; stopta kayıp ~(\d+\.\d\d) \(hedef 45\.00\)", tickmill_line)
+        assert loss is not None and 45.0 < float(loss.group(1)) <= 90.0, tickmill_line
+    finally:
+        await prod.close()
+
+
+# =========================================================================== #
+# (k) live config, fx daily_loss_include_open_risk: what is still at risk counts toward the prop account's 3%
+# =========================================================================== #
+@pytest.mark.parametrize("replica", REPLICAS)
+async def test_k_fx_fourth_open_trade_stays_off_the_prop_account_on_the_live_config(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, replica: str
+) -> None:
+    """Four fx signals on four pairs, all open at once. The live config counts the risk still at the stops on fx
+    (3% of 10,000 = 300 USD a day): three 1R trades fill it, the 4th (300 + 100 = 400) is not opened on fx and
+    the owner is told; tickmill (no daily limit) takes all four. The old replica opens all four on fx."""
+    prod = await Prod.create(tmp_path, monkeypatch, replica=replica)
+    try:
+        for pair, entry, sl, tp in (("EURUSD", 1.1620, 1.1600, 1.1660), ("GBPUSD", 1.3150, 1.3130, 1.3190),
+                                    ("AUDUSD", 0.6520, 0.6500, 0.6560), ("NZDUSD", 0.5650, 0.5630, 0.5690)):
+            await prod.say(fx_pair(pair, Side.LONG, entry, sl, tp), FX, f"{pair} LONG 1R")
+        assert prod.asked() == []
+        assert [o[1] for o in prod.tickmill_orders()] == ["EURUSD", "GBPUSD", "AUDUSD", "NZDUSD"]
+        trades = await prod.trades()
+        assert [t.status for t in trades] == [TradeStatus.OPEN] * 4
+        if not next(b for b in prod.cfg.brokers if b.name == "fx").daily_loss_include_open_risk:
+            assert [o[1] for o in prod.fx_orders()] == ["EURUSD", "GBPUSD", "AUDUSD", "NZDUSD"]
+            return
+        assert [o[1] for o in prod.fx_orders()] == ["EURUSD", "GBPUSD", "AUDUSD"]
+        assert trades[3].note == "fx: skipped" and sorted(await prod.positions(trades[3].id)) == ["tickmill"]
+        # Review 1 (engine_mgmt, M4): the refusal also names the excess (it never reads as two equal numbers).
+        expected = ("fx: günlük zarar sınırı (%3 = 300.00 USD) aşılırdı: bugün gerçekleşen zarar 0.00 + açık ve "
+                    "bekleyen pozisyonların stoptaki riski 300.00 + bu işlemin riski 100.00 = 400.00 USD, yani "
+                    "sınırı 100.00 USD aşardı; yeni işlem açılmadı")
+        # Review 1 (glue_engine, G6): one message, the open report "kısmen açıldı" with the refusal as fx's line (it
+        # was also sent as a separate warning with the same text).
+        (told,) = [t for t in prod.texts(Severity.WARNING) if "günlük zarar" in t]
+        assert told.startswith("⚠️ <b>#4 NZD LONG kısmen açıldı</b>") and f"• {expected}" in told.splitlines()
+    finally:
+        await prod.close()

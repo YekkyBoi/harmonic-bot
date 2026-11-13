@@ -567,7 +567,13 @@ def test_move_sl_widening_asks():
 
 def test_move_sl_on_pending_trade_checked_against_entry():
     t = trade(status=TradeStatus.PENDING)
+    # Review 1 (engine_mgmt, M7, finding YONETIM-6): "stop girişe" while the entries still rest is no stop on the
+    # wrong side of the entry: the trader is at break-even and the engine cancels the resting entries (a plan, no
+    # block). A stop PRICE beyond the entry of a pending trade is still refused.
     plan, issues = manage(mact(ActionType.MOVE_SL, move_sl_to_entry=True), t, market=2260.0)
+    assert plan is not None and "sl_wrong_side" not in codes(issues)
+    assert "dolmamış girişler iptal edilecek" in plan.summary_tr
+    plan, issues = manage(mact(ActionType.MOVE_SL, new_stop_loss=2240.0), t, market=2260.0)
     assert plan is None and "sl_wrong_side" in codes(issues)
     plan, issues = manage(mact(ActionType.MOVE_SL, new_stop_loss=2215.0), t, market=2260.0)
     assert plan is not None and issues == []

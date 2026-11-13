@@ -16,7 +16,13 @@ stop loss. ``BrokerPosition.data["legs"]`` holds one dict per leg:
     realized      realized PnL incl. commission + swap, account currency (None = unknown)
     reason        exit reason: "tp" | "sl" | "stop_out" | "manual" | "unknown" | None
     unconfirmed   True while a filled leg has not been seen on the venue yet (its look-up failed right after the
-                  fill: tracked by the order ticket, adopted by ticket or comment on the next refresh)
+                  fill, or a pending order's history said FILLED before its position could be read: tracked by
+                  the position / order ticket, adopted by ticket or comment on a later refresh, closed only when
+                  the deals show it fully closed or after _MAX_MISSES refreshes that find nothing)
+    rest_order    a partly filled pending order: the leg is the filled part (an open position under the order's
+                  ticket) and ``rest_order`` / ``rest_volume`` / ``rest_price`` the rest that still rests; stop and
+                  TP moves go to both, a full close cancels the rest first, and a rest left when the filled part
+                  has closed is cancelled
 
 ``MetaTraderLegBroker`` implements open/modify/close/sync on top of a small set
 of venue primitives; ``Mt5Broker`` (here) and ``MetaApiBroker``
@@ -59,7 +65,7 @@ from ..models import (
 )
 from ..parsing.symbols import CFD_QUOTES, FIAT_CURRENCIES
 from ..risk.sizing import SizingError, compute_lot_size, floor_to_step, round_to_tick
-from .base import Broker, BrokerError
+from .base import Broker, BrokerError, OrderOutcomeUnknownError
 
 logger = logging.getLogger(__name__)
 
@@ -70,6 +76,7 @@ LIVE_STATES = ("pending", "open")
 TERMINAL_STATES = ("closed", "cancelled", "failed")
 _MAX_PNL_TRIES = 5          # re-query history this many syncs for a closed leg with unknown PnL
 _MAX_MISSES = 3             # an open leg missing from the venue AND its history this many syncs -> closed
+_VOL_TOL = 1e-6             # lots: sums of deal volumes vs. a leg's volume (lots have at most 8 decimals)
 _DEFAULT_MAX_SIZE_MULTIPLE = 2.0    # RiskConfig.max_size_multiple when the risk config does not carry it
 
 
@@ -386,6 +393,16 @@ def tag_matches(value: str | None, tag: str) -> bool:
     return bool(value) and (value == tag or value.startswith(tag + "-"))  # type: ignore[union-attr]
 
 
+def closed_by_deals(s: dict[str, Any] | None) -> bool:
+    """The deal summary of a position shows it fully closed: closing deals cover every lot it opened. A summary
+    with an opening deal only (just filled), or with fewer closed lots than opened (partly closed, or the newest
+    closing deal not in the history yet), is NOT closed."""
+    if not s:
+        return False
+    out = float(s.get("out_volume") or 0.0)
+    return out > _EPS and out + _VOL_TOL >= float(s.get("in_volume") or 0.0)
+
+
 def leg_tag(tag: str, index: int, count: int, limit: int = 31) -> str:
     suffix = f"-{index + 1}" if count > 1 else ""
     return tag[: limit - len(suffix)] + suffix
@@ -431,6 +448,70 @@ def _tp_sort_key(side: Side) -> Callable[[dict[str, Any]], float]:
             return math.inf
         return tp if side is Side.LONG else -tp
     return key
+
+
+# --------------------------------------------------------------------------- #
+# Leg failures of a management call (stop / TP move, close, cancel)
+# --------------------------------------------------------------------------- #
+# A leg whose stop move got no answer (update_stop_loss): the stop it is to carry; sync_position sends it again when
+# the account shows another one there (MetaTraderLegBroker._resend_wanted_stops).
+SL_WANTED = "sl_wanted"
+# Netting accounts: an emulated TP whose partial close got no answer: {"from": the open volume then, "at": epoch s}.
+# It is done once the account shows the volume drop; after TP_LOST_WAIT_SEC without it, it did not execute.
+TP_LOST = "lost"
+TP_LOST_WAIT_SEC = 60.0
+
+
+def answer_lost(exc: BaseException) -> bool:
+    """A leg request that went out and whose answer was lost, so it may have been executed: an
+    OrderOutcomeUnknownError (Mt5Broker: OrderReplyLostError) or a MetaApi error carrying ``no_answer`` (timeout,
+    link cut while the request was under way)."""
+    return isinstance(exc, OrderOutcomeUnknownError) or bool(getattr(exc, "no_answer", False))
+
+
+class _LegErrors(list):  # type: ignore[type-arg]
+    """The owner-facing error texts of the legs of one management call (a plain list of str, as before), with the
+    leg exceptions behind them in ``failures`` (see _leg_failed), so that the call's own error can tell a lost answer
+    from a refusal (_fold)."""
+
+    def __init__(self) -> None:
+        super().__init__()
+        self.failures: list[BaseException] = []
+        self.whole_closes: list[tuple[str, BaseException, dict[str, Any]]] = []   # (text, error, leg): leg closed in full
+
+
+def _leg_failed(errors: list[str], text: str, exc: BaseException) -> None:
+    """Record a failed leg request: ``text`` in ``errors`` and, when ``errors`` keeps them (_LegErrors), ``exc``."""
+    errors.append(text)
+    failures = getattr(errors, "failures", None)
+    if failures is not None:
+        failures.append(exc)
+
+
+def _lost_answer(errors: list[str]) -> BaseException | None:
+    """The first recorded leg failure whose answer was lost (see answer_lost), or None."""
+    return next((e for e in getattr(errors, "failures", ()) if answer_lost(e)), None)
+
+
+def _fold(failed: str, unknown: str, errors: list[str]) -> BrokerError:
+    """The error of a management call none of whose leg requests worked: BrokerError(``failed`` + the leg texts).
+    When one of those requests went out and its answer was lost (it may have worked): OrderOutcomeUnknownError
+    (``unknown`` + the leg texts) whose cause is that leg's error, so that the engine and the monitor treat the
+    outcome as unknown (base.outcome_unknown): never "could not be closed" or "refused", and the account is read
+    before anything is sent again."""
+    text = "; ".join(errors)
+    lost = _lost_answer(errors)
+    if lost is None:
+        return BrokerError(failed + text)
+    err = OrderOutcomeUnknownError(unknown + text)
+    err.__cause__ = lost
+    return err
+
+
+def _some_failed(failed: str, unknown: str, errors: list[str]) -> str:
+    """The note (pos.error) of a management call that worked on some legs only: ``unknown`` when one of the failed
+    requests got no answer (it may have worked there too), else ``failed``; then the leg texts."""
+    return (unknown if _lost_answer(errors) is not None else failed) + "; ".join(errors)
 
 
 # --------------------------------------------------------------------------- #
@@ -498,6 +579,12 @@ class MetaTraderLegBroker(Broker, ABC):
     @abstractmethod
     async def _deal_summary(self, position_id: Any) -> dict[str, Any] | None:
         """From the position's deals: realized, in_volume, out_volume, entry, reason. None if no history."""
+
+    async def _position_now(self, symbol: str, ticket: Any) -> dict[str, Any] | None:
+        """One position read afresh (same dict as in _snapshot), None if the venue does not list it. Subclasses
+        may read just that position; this default reads the whole snapshot again."""
+        positions, _ = await self._snapshot(symbol)
+        return positions.get(str(ticket))
 
     # ---- sizing ------------------------------------------------------------
     def _fee_per_lot(self, loss_per_lot: float, entry: float, stop: float) -> float:
@@ -875,6 +962,10 @@ class MetaTraderLegBroker(Broker, ABC):
                 legs.append(leg)
         for o in orders.values():
             if tag_matches(o.get("tag"), tag):
+                part = next((leg for leg in legs if str(leg["ticket"]) == str(o["ticket"])), None)
+                if part is not None:        # partly filled: the position above is its filled part
+                    part.update(rest_order=o["ticket"], rest_volume=o["volume"], rest_price=o.get("price"))
+                    continue
                 legs.append(new_leg(ticket=o["ticket"], order_ticket=o["ticket"], state="pending",
                                     volume=o["volume"], entry=o.get("price"), sl=o.get("sl"), tp=o.get("tp"),
                                     tag=o["tag"]))
@@ -893,6 +984,27 @@ class MetaTraderLegBroker(Broker, ABC):
         leg.pop("unconfirmed", None)    # seen on the venue
         if leg["sl"]:
             leg.pop("naked", None)      # the venue shows a stop on it again
+
+    @staticmethod
+    def _take_realized(leg: dict[str, Any], s: dict[str, Any]) -> bool:
+        """Realized PnL of a leg from its deal summary, once the closing deals cover every lot closed so far
+        (filled - open_volume). Until then (the newest closing deal is not in the history yet) realized stays
+        None and a later refresh reads again; after _MAX_PNL_TRIES reads the last number read stands. True when
+        it was taken."""
+        closed = float(leg.get("filled") or 0.0) - float(leg.get("open_volume") or 0.0)
+        if float(s.get("out_volume") or 0.0) + _VOL_TOL >= closed or leg.get("pnl_tries", 0) >= _MAX_PNL_TRIES:
+            leg["realized"] = s.get("realized")
+            return True
+        leg["realized"] = None
+        return False
+
+    @staticmethod
+    def _mark_closed_lots(leg: dict[str, Any], closed: float) -> None:
+        """The bot closed ``closed`` lots of the leg: its realized PnL changed on the venue and must be read again
+        (a number read after an earlier partial close would otherwise stand for good)."""
+        if closed > _EPS:
+            leg["realized"] = None
+            leg["pnl_tries"] = 0
 
     @staticmethod
     def _close_from_summary(leg: dict[str, Any], s: dict[str, Any]) -> None:
@@ -915,19 +1027,26 @@ class MetaTraderLegBroker(Broker, ABC):
         positions, orders = await self._snapshot(pos.broker_symbol)
         for leg in todo:
             if leg["state"] == "pending":
-                await self._refresh_pending(leg, positions, orders)
+                await self._refresh_pending(leg, positions, orders, symbol=pos.broker_symbol)
             elif leg["state"] == "open":
                 await self._refresh_open(leg, positions)
             else:
                 leg["pnl_tries"] = leg.get("pnl_tries", 0) + 1
                 s = await self._deal_summary(leg["ticket"])
-                if s and s.get("out_volume", 0) > _EPS:
-                    leg["realized"] = s.get("realized")
+                if s and s.get("out_volume", 0) > _EPS and self._take_realized(leg, s):
                     if leg["state"] == "closed" and leg.get("reason") in (None, "manual", "unknown"):
                         leg["reason"] = s.get("reason") or leg.get("reason")
+            if leg.get("rest_order") is not None:
+                o = orders.get(str(leg["rest_order"]))
+                if o is None:
+                    self._drop_rest(leg)    # filled into the position (it shows the lots), or cancelled / expired
+                else:
+                    leg["rest_volume"] = float(o.get("volume") or 0.0)
+                    leg["rest_price"] = o.get("price") or leg.get("rest_price")
 
     async def _refresh_pending(
-        self, leg: dict[str, Any], positions: dict[str, dict[str, Any]], orders: dict[str, dict[str, Any]]
+        self, leg: dict[str, Any], positions: dict[str, dict[str, Any]], orders: dict[str, dict[str, Any]],
+        *, symbol: str | None = None,
     ) -> None:
         oid = leg["order_ticket"]
         o = orders.get(str(oid))
@@ -935,6 +1054,14 @@ class MetaTraderLegBroker(Broker, ABC):
             leg["sl"] = o.get("sl") or None
             leg["venue_tp"] = o.get("tp") or None
             leg["entry"] = o.get("price") or leg.get("entry")
+            p = positions.get(str(oid))
+            if p is not None:
+                # Partly filled: the filled part is a position under the order's ticket while the rest still rests.
+                # The leg becomes that position (managed like any open leg); the resting rest goes with it.
+                self._apply_position(leg, p)
+                leg.update(rest_order=oid, rest_volume=float(o.get("volume") or 0.0), rest_price=o.get("price"))
+                logger.warning("%s: pending order %s partly filled: %s lots open, %s lots still resting", self.name,
+                               oid, _num(leg["open_volume"]), _num(leg["rest_volume"]))
             return
         pid: Any = oid
         hist = None
@@ -952,14 +1079,89 @@ class MetaTraderLegBroker(Broker, ABC):
             return
         if hist["state"] == "filled":
             leg["ticket"] = pid
+            # The snapshot can be older than the fill: positions are read before orders (an order that fills
+            # between the two reads is in neither), and the terminal does not promise to show the position
+            # before the order's history. One stale read must never book a live position closed or cancelled.
+            p = await self._position_now(symbol, pid) if symbol else None
+            if p is not None:
+                self._apply_position(leg, p)
+                logger.info("%s: pending order %s filled -> position %s (read again)", self.name, oid, p["ticket"])
+                return
             s = await self._deal_summary(pid)
-            if s:
-                self._close_from_summary(leg, s)
-            else:
-                leg.update(state="closed", open_volume=0.0, reason="unknown")
+            if closed_by_deals(s):
+                self._close_from_summary(leg, s)        # filled and closed again (stop / target) between two looks
+                return
+            self._filled_not_seen(leg, pid, s)
         elif hist["state"] == "cancelled":
+            # A part may have filled before the rest was cancelled / expired (MetaTrader keeps a partly filled
+            # order resting with the rest): that part is a position, never "cancelled".
+            s = await self._deal_summary(pid)
+            if s and float(s.get("in_volume") or 0.0) > _EPS:
+                leg["ticket"] = pid
+                if closed_by_deals(s):
+                    self._close_from_summary(leg, s)
+                    return
+                p = await self._position_now(symbol, pid) if symbol else None
+                if p is not None:
+                    self._apply_position(leg, p)
+                else:
+                    self._filled_not_seen(leg, pid, s)
+                logger.warning("%s: pending order %s was cancelled after a partial fill; tracking the filled part",
+                               self.name, oid)
+                return
             leg["state"] = "cancelled"
             leg["reason"] = hist.get("reason") or "cancelled"
+
+    @staticmethod
+    def _rest_view(leg: dict[str, Any]) -> dict[str, Any]:
+        """The still resting rest of a partly filled order as a pending leg of its own (for _modify_leg /
+        _cancel_leg)."""
+        return {**leg, "state": "pending", "ticket": leg["rest_order"], "order_ticket": leg["rest_order"],
+                "entry": leg.get("rest_price") or leg.get("entry")}
+
+    @staticmethod
+    def _drop_rest(leg: dict[str, Any]) -> None:
+        for key in ("rest_order", "rest_volume", "rest_price"):
+            leg.pop(key, None)
+
+    async def _cancel_rest(self, symbol: str, leg: dict[str, Any], errors: list[str]) -> str | None:
+        """Remove the resting rest of a partly filled order: "removed" (by this call), "gone" (the venue no longer
+        lists it: it filled into the position meanwhile, or the venue cancelled it), or None (it still rests;
+        the reason is in ``errors``)."""
+        rest = leg["rest_order"]
+        try:
+            await self._cancel_leg(symbol, self._rest_view(leg))
+        except BrokerError as exc:
+            try:
+                _, orders = await self._snapshot(symbol)
+                resting = str(rest) in orders
+            except BrokerError:
+                resting = True              # cannot look: as far as is known it still rests
+            if resting:
+                what = "iptal isteğine yanıt alınamadı" if answer_lost(exc) else "iptal edilemedi"
+                _leg_failed(errors, f"#{rest}: emrin dolmamış kalan kısmı {what} ({exc})", exc)
+                return None
+            self._drop_rest(leg)
+            return "gone"
+        self._drop_rest(leg)
+        return "removed"
+
+    def _filled_not_seen(self, leg: dict[str, Any], pid: Any, s: dict[str, Any] | None) -> None:
+        """A pending order filled (history) but its position is not listed (yet): an open leg, tracked by the
+        position ticket and the order comment until a refresh sees it (_refresh_open), closed only when the deals
+        show it fully closed or after _MAX_MISSES refreshes that find nothing. Size from the opening deals, else
+        the order's; its stop and target stay those of the order (they moved to the position with the fill), so
+        the stop repair of sync_position does not act on a position it cannot see yet."""
+        in_vol = float((s or {}).get("in_volume") or 0.0)
+        out_vol = float((s or {}).get("out_volume") or 0.0)
+        filled = in_vol if in_vol > _EPS else float(leg.get("volume") or 0.0)
+        leg.update(state="open", ticket=pid, unconfirmed=True, misses=0)
+        leg["filled"] = max(float(leg.get("filled") or 0.0), filled)
+        leg["open_volume"] = max(0.0, filled - out_vol)
+        if (s or {}).get("entry"):
+            leg["entry"] = s["entry"]       # type: ignore[index]
+        logger.warning("%s: pending order %s filled but position %s is not listed yet; tracking it as open",
+                       self.name, leg.get("order_ticket"), pid)
 
     async def _refresh_open(self, leg: dict[str, Any], positions: dict[str, dict[str, Any]]) -> None:
         p = positions.get(str(leg["ticket"]))
@@ -974,15 +1176,17 @@ class MetaTraderLegBroker(Broker, ABC):
                 if p.get("realized") is not None:
                     leg["realized"] = p["realized"]
                 else:
+                    leg["pnl_tries"] = leg.get("pnl_tries", 0) + 1
                     s = await self._deal_summary(leg["ticket"])
                     if s:
-                        leg["realized"] = s.get("realized")
+                        self._take_realized(leg, s)
             return
         s = await self._deal_summary(leg["ticket"])
-        if s and s.get("out_volume", 0) > _EPS:
+        if closed_by_deals(s):
             self._close_from_summary(leg, s)
             return
-        # Missing from positions and history: do not conclude on one glitch.
+        # Missing from positions, and its deals do not show it fully closed (none yet, or the newest closing
+        # deal not in the history yet): do not conclude on one glitch.
         leg["misses"] = leg.get("misses", 0) + 1
         if leg["misses"] >= _MAX_MISSES:
             logger.warning("%s: position %s vanished without history; marking closed", self.name, leg["ticket"])
@@ -1019,6 +1223,10 @@ class MetaTraderLegBroker(Broker, ABC):
             pos.status = PositionStatus.CANCELLED
         reasons = [leg["reason"] for leg in legs if leg.get("reason")]
         pos.data["exit_reasons"] = reasons
+        if any(leg.get("rest_order") is not None and leg["state"] in LIVE_STATES for leg in legs):
+            pos.data["entry_done"] = False      # the rest of a partly filled entry still rests (monitor: its expiry)
+        else:
+            pos.data.pop("entry_done", None)
 
     # ---- management ----------------------------------------------------------
     def _copy(self, pos: BrokerPosition) -> tuple[BrokerPosition, list[dict[str, Any]]]:
@@ -1046,20 +1254,42 @@ class MetaTraderLegBroker(Broker, ABC):
             if leg["state"] == "pending" and leg.get("entry") and sign * (float(leg["entry"]) - sl) <= 0:
                 raise BrokerError(f"Yeni stop ({_num(sl)}) bekleyen giriş fiyatının ({_num(leg['entry'])}) {side_word} olmalı.")
 
-        errors, changed = [], 0
+        errors, changed = _LegErrors(), 0
+        notes: list[str] = []
         for leg in live:
+            leg.pop(SL_WANTED, None)        # (a newer stop move replaces an older one still being checked)
             try:
                 await self._modify_leg(p.broker_symbol, p.side, leg, sl, leg.get("tp"))
                 leg["sl"] = sl
                 changed += 1
             except BrokerError as exc:
-                errors.append(f"#{leg['ticket']}: {exc}")
+                _leg_failed(errors, f"#{leg['ticket']}: {exc}", exc)
+                if answer_lost(exc) and leg["state"] == "open":
+                    # It may or may not have been set: the next sync reads the leg's stop and sends it again when
+                    # the venue still shows another one (_resend_wanted_stops).
+                    leg[SL_WANTED] = sl
         if not changed:
-            raise BrokerError("Stop güncellenemedi: " + "; ".join(errors))
+            raise _fold("Stop güncellenemedi: ", "Stop değişikliğinin sonucu alınamadı: ", errors)
+        for leg in live:
+            if leg.get("rest_order") is None or leg["state"] != "open":
+                continue
+            # The rest of a partly filled order gets the same stop; one at or beyond its price is impossible
+            # there (stop to entry, a trailed stop): that rest is cancelled instead.
+            rest, lots = self._rest_view(leg), _num(float(leg.get("rest_volume") or 0.0))
+            if rest.get("entry") and sign * (float(rest["entry"]) - sl) <= 0:
+                if await self._cancel_rest(p.broker_symbol, leg, errors) == "removed":
+                    notes.append(f"Emrin dolmamış kalan kısmı ({lots} lot) yeni stopla bekleyemeyeceği için iptal edildi.")
+                continue
+            try:
+                await self._modify_leg(p.broker_symbol, p.side, rest, sl, leg.get("tp"))
+            except BrokerError as exc:
+                _leg_failed(errors, f"#{leg['rest_order']} (emrin dolmamış kalan kısmı): {exc}", exc)
         self._aggregate(p)
         if not errors:
             p.stop_loss = sl
-        p.error = ("Stop bazı bacaklarda güncellenemedi: " + "; ".join(errors)) if errors else None
+        p.error = " ".join(([_some_failed("Stop bazı bacaklarda güncellenemedi: ",
+                                          "Stop bazı bacaklarda güncellenemedi ya da sonucu alınamadı: ", errors)]
+                            if errors else []) + notes) or None
         return p
 
     async def update_take_profits(self, pos: BrokerPosition, take_profits: list[TakeProfit]) -> BrokerPosition:
@@ -1086,11 +1316,18 @@ class MetaTraderLegBroker(Broker, ABC):
             last = max(i for i, h in enumerate(hit) if not h)     # venue TP: the last level not hit yet
             targets = [(live[0], tps[last].price)]
             s = sum(max(0.0, t.close_fraction) for t in tps)
+            # A level whose partial close got no answer and is still being checked keeps that mark (TP_LOST): it is
+            # not sent again before the account shows whether it went through.
+            lost = [e for e in p.data.get("emulated_tps") or [] if isinstance(e.get(TP_LOST), dict) and not e.get("done")]
             p.data["emulated_tps"] = [
                 {"index": i, "price": t.price, "fraction": (max(0.0, t.close_fraction) / s) if s > 0 else 1 / len(tps),
                  "done": hit[i]}
                 for i, t in enumerate(tps) if i != last
             ]
+            for e in p.data["emulated_tps"]:
+                was = next((x for x in lost if abs(float(x["price"]) - e["price"]) <= tol), None)
+                if was is not None and not e["done"]:
+                    e[TP_LOST] = dict(was[TP_LOST])
             if any(hit):
                 logger.info("%s: filled emulated TP level(s) kept done: %s", self.name,
                             [t.price for t, h in zip(tps, hit) if h])
@@ -1114,7 +1351,7 @@ class MetaTraderLegBroker(Broker, ABC):
             if base is not None and sign * (tp - float(base)) <= 0:
                 raise BrokerError(f"Yeni TP ({_num(tp)}) fiyatın ({_num(base)}) yanlış tarafında; TP'ler değiştirilmedi.")
 
-        errors, changed = [], 0
+        errors, changed = _LegErrors(), 0
         for leg, tp in targets:
             keep_sl = leg.get("sl") or p.stop_loss
             if not keep_sl:   # never send sl=0 (would remove the stop)
@@ -1125,12 +1362,20 @@ class MetaTraderLegBroker(Broker, ABC):
                 leg["tp"] = tp
                 changed += 1
             except BrokerError as exc:
-                errors.append(f"#{leg['ticket']}: {exc}")
+                _leg_failed(errors, f"#{leg['ticket']}: {exc}", exc)
+                continue
+            if leg.get("rest_order") is not None and leg["state"] == "open":
+                try:                        # the rest of a partly filled order gets the same target
+                    await self._modify_leg(p.broker_symbol, p.side, self._rest_view(leg), float(keep_sl), tp)
+                except BrokerError as exc:
+                    _leg_failed(errors, f"#{leg['rest_order']} (emrin dolmamış kalan kısmı): {exc}", exc)
         if not changed:
-            raise BrokerError("TP güncellenemedi: " + "; ".join(errors))
+            raise _fold("TP güncellenemedi: ", "TP değişikliğinin sonucu alınamadı: ", errors)
         p.take_profits = tps
         self._aggregate(p)
-        msgs = ([warning] if warning else []) + (["TP bazı bacaklarda güncellenemedi: " + "; ".join(errors)] if errors else [])
+        msgs = ([warning] if warning else []) + ([_some_failed(
+            "TP bazı bacaklarda güncellenemedi: ", "TP bazı bacaklarda güncellenemedi ya da sonucu alınamadı: ",
+            errors)] if errors else [])
         p.error = " ".join(msgs) or None
         return p
 
@@ -1142,19 +1387,32 @@ class MetaTraderLegBroker(Broker, ABC):
         step = float(p.data.get("volume_step") or 0.0)
         vmin = float(p.data.get("volume_min") or 0.0)
         open_legs = sorted((leg for leg in legs if leg["state"] == "open"), key=_tp_sort_key(p.side))
-        errors: list[str] = []
+        errors = _LegErrors()
+        notes: list[str] = []           # what the owner must know although nothing failed (a filled part closed)
         closed_any = False
 
         if fraction >= 1 - 1e-9:
+            rests = [leg for leg in open_legs if leg.get("rest_order") is not None]
+            if rests:
+                # The rest of a partly filled order is cancelled first: it must not fill after the close. A part
+                # that filled meanwhile shows in the position, read again before it is closed.
+                for leg in rests:
+                    closed_any |= await self._cancel_rest(p.broker_symbol, leg, errors) is not None
+                try:
+                    await self._refresh_legs(p, legs)
+                except BrokerError as exc:
+                    logger.warning("%s: refresh before close failed: %s", self.name, exc)
+                open_legs = sorted((leg for leg in legs if leg["state"] == "open"), key=_tp_sort_key(p.side))
             for leg in open_legs:
                 try:
                     await self._close_leg(p.broker_symbol, p.side, leg, None)
                     closed_any = True
                 except BrokerError as exc:
-                    errors.append(f"#{leg['ticket']}: {exc}")
+                    _leg_failed(errors, f"#{leg['ticket']}: {exc}", exc)
+                    errors.whole_closes.append((f"#{leg['ticket']}: {exc}", exc, leg))
             for leg in legs:
                 if leg["state"] == "pending":
-                    closed_any |= await self._cancel_or_close(p, leg, errors)
+                    closed_any |= await self._cancel_or_close(p, leg, errors, notes)
         else:
             if not open_legs:
                 raise BrokerError("Açık pozisyon yok; kısmi kapatma yapılamadı.")
@@ -1165,6 +1423,8 @@ class MetaTraderLegBroker(Broker, ABC):
                 raise BrokerError(
                     f"Kapatılacak miktar ({_num(target)}) minimum lotun ({_num(vmin)}) altında; işlem yapılmadı."
                 )
+            closed_lots = 0.0
+            lost_leg: tuple[dict[str, Any], BaseException] | None = None
             for leg in open_legs:  # nearest TP first
                 if target <= _EPS:
                     break
@@ -1179,61 +1439,156 @@ class MetaTraderLegBroker(Broker, ABC):
                 try:
                     done = await self._close_leg(p.broker_symbol, p.side, leg, vol)
                     target = _snap(target - done, step)
+                    closed_lots = _snap(closed_lots + done, step)
                     closed_any = True
                 except BrokerError as exc:
-                    errors.append(f"#{leg['ticket']}: {exc}")
+                    _leg_failed(errors, f"#{leg['ticket']}: {exc}", exc)
+                    if answer_lost(exc):
+                        # That close may have executed: no further leg is closed while its outcome is unknown
+                        # (closing the next leg too would close about twice what was asked).
+                        lost_leg = (leg, exc)
+                        break
+            if lost_leg is not None and closed_any:
+                # Some legs closed, then one close's answer was lost: how much of the partial close is done is not
+                # known. Never reported as done: an unknown outcome (the engine owes the change and reads the
+                # account before anything is sent again), with what is known handed back in ``position``.
+                try:
+                    await self._refresh_legs(p, legs)
+                except BrokerError as exc:
+                    logger.warning("%s: refresh after close failed: %s", self.name, exc)
+                self._aggregate(p)
+                leg, exc = lost_leg
+                err = OrderOutcomeUnknownError(
+                    f"Kısmi kapatmanın bir kısmı yapıldı ({_num(closed_lots)} lot kapatıldı), ardından "
+                    f"#{leg['ticket']} için gönderilen kapatma emrinin sonucu alınamadı: {exc} "
+                    f"Kısmi kapatmanın tamamlanıp tamamlanmadığı bilinmiyor.")
+                err.__cause__ = exc
+                err.position = p  # type: ignore[attr-defined]  # (what is known after the legs that did close)
+                raise err
 
         if not closed_any and errors:
-            raise BrokerError("Pozisyon kapatılamadı: " + "; ".join(errors))
+            whole = fraction >= 1 - 1e-9
+            raise _fold("Pozisyon kapatılamadı: ", "Kapatma emrinin sonucu alınamadı: " if whole
+                        else "Kısmi kapatma emrinin sonucu alınamadı: ", errors)
         try:
             await self._refresh_legs(p, legs)   # pick up realized PnL
+            for text, exc, leg in errors.whole_closes:
+                if answer_lost(exc) and leg["state"] in TERMINAL_STATES and text in errors:
+                    # Its answer was lost, but the account shows the leg closed now: that close went through.
+                    errors.remove(text)
+                    errors.failures.remove(exc)
+                    logger.info("%s: close of leg %s had no answer but the account shows it closed", self.name,
+                                leg.get("ticket"))
         except BrokerError as exc:
             logger.warning("%s: refresh after close failed: %s", self.name, exc)
         self._aggregate(p)
-        if fraction >= 1 - 1e-9 and not errors and p.remaining_quantity > _EPS:
+        if fraction >= 1 - 1e-9 and not errors and not notes and p.remaining_quantity > _EPS:
             # A close deal can execute less than asked: the rest stays open (its stop stays on the venue).
             errors.append(f"{_num(p.remaining_quantity)} lot hâlâ açık (kapatma emri kısmen gerçekleşti; stop yerinde)")
-        p.error = ("Bazı bacaklar kapatılamadı: " + "; ".join(errors)) if errors else None
+        p.error = " ".join(([_some_failed("Bazı bacaklar kapatılamadı: ",
+                                          "Bazı bacaklar kapatılamadı ya da kapatma sonucu alınamadı: ", errors)]
+                            if errors else []) + notes) or None
         return p
 
-    async def _cancel_or_close(self, p: BrokerPosition, leg: dict[str, Any], errors: list[str]) -> bool:
+    async def _cancel_or_close(
+        self, p: BrokerPosition, leg: dict[str, Any], errors: list[str], notes: list[str] | None = None
+    ) -> bool:
         try:
             await self._cancel_leg(p.broker_symbol, leg)
-            leg["state"] = "cancelled"
-            leg["reason"] = "cancelled"
-            return True
         except BrokerError as exc:
-            await self._refresh_legs(p, [leg])   # maybe it just filled
+            try:
+                await self._refresh_legs(p, [leg])   # maybe it just filled
+            except BrokerError as exc_read:
+                if not answer_lost(exc):
+                    raise
+                # The removal went out, its answer was lost, and the account cannot be read now: whether the order
+                # is still there is not known (never "could not be cancelled").
+                raise OrderOutcomeUnknownError(
+                    f"#{leg['order_ticket']}: {exc} Ardından hesap da okunamadı ({exc_read}); emrin iptal edilip "
+                    f"edilmediği bilinmiyor.") from exc
             if leg["state"] == "open":
                 try:
                     await self._close_leg(p.broker_symbol, p.side, leg, None)
                     return True
                 except BrokerError as exc2:
-                    errors.append(f"#{leg['ticket']}: {exc2}")
+                    _leg_failed(errors, f"#{leg['ticket']}: {exc2}", exc2)
                     return False
             if leg["state"] in TERMINAL_STATES:
                 return True
-            errors.append(f"#{leg['order_ticket']}: {exc}")
+            _leg_failed(errors, f"#{leg['order_ticket']}: {exc}", exc)
             return False
+        await self._after_cancel(p, leg, errors if notes is None else notes)
+        return True
+
+    async def _after_cancel(self, p: BrokerPosition, leg: dict[str, Any], notes: list[str]) -> None:
+        """The pending order is removed. A part of it may have filled before (MetaTrader keeps a partly filled
+        order resting with the rest, under the same ticket): the leg is booked cancelled only when the account
+        shows no filled part. A filled part is closed at market (the trader closed or cancelled the trade); when
+        that fails it stays an open leg the bot keeps managing. ``notes`` gets what the owner must know."""
+        tag = leg.get("tag") or ""
+        try:
+            await self._refresh_legs(p, [leg])          # the order is gone now: a filled part shows as a position
+            self._drop_rest(leg)                        # (a read that still lists the removed order: no rest left)
+        except BrokerError as exc:
+            leg["state"], leg["reason"] = "cancelled", "cancelled"
+            notes.append(f"Bekleyen emir #{leg['order_ticket']} iptal edildi ama emrin dolmuş bir kısmı olup "
+                         f"olmadığı okunamadı ({exc}); MetaTrader'da '{tag}' etiketli pozisyon var mı bakın.")
+            return
+        if leg["state"] == "pending":                   # not in the venue's history yet: the removal stands
+            leg["state"], leg["reason"] = "cancelled", "cancelled"
+            return
+        if leg["state"] != "open":
+            return                                      # cancelled; or filled and closed again (result booked)
+        lots = _num(float(leg.get("open_volume") or 0.0))
+        if leg.get("unconfirmed"):
+            notes.append(f"Bekleyen emrin {lots} lotluk kısmı dolmuş ama pozisyonu henüz görünmüyor; açık pozisyon "
+                         f"olarak takip ediliyor. MetaTrader'da '{tag}' etiketli pozisyona bakın.")
+            return
+        try:
+            await self._close_leg(p.broker_symbol, p.side, leg, None)
+        except BrokerError as exc:
+            stop = ", stopu yerinde" if leg.get("sl") else ""
+            what = "kapatma emrine yanıt alınamadı" if answer_lost(exc) else "kapatılamadı"
+            notes.append(f"Bekleyen emrin {lots} lotluk kısmı dolmuştu ve {what} ({exc}); o kısım açık "
+                         f"pozisyon olarak takip ediliyor{stop}.")
+            return
+        notes.append(f"Bekleyen emrin {lots} lotluk kısmı dolmuştu; o kısım piyasa fiyatından kapatıldı.")
+
+    async def cancel_entry_remainder(self, pos: BrokerPosition) -> BrokerPosition:
+        """Cancel only the still resting rest of a partly filled entry (the monitor does this once
+        pending_entry_expiry_min has passed); the filled part stays open with its stop."""
+        p, legs = self._copy(pos)
+        await self._refresh_legs(p, legs)
+        errors: list[str] = []
+        for leg in legs:
+            if leg.get("rest_order") is not None and leg["state"] in LIVE_STATES:
+                await self._cancel_rest(p.broker_symbol, leg, errors)
+        self._aggregate(p)
+        if errors:
+            p.error = "; ".join(errors)
+        return p
 
     async def cancel_entry(self, pos: BrokerPosition) -> BrokerPosition:
         p, legs = self._copy(pos)
         await self._refresh_legs(p, legs)
         if any(leg["state"] == "open" for leg in legs):
             return await self.close_position(p, 1.0)
-        errors: list[str] = []
+        errors = _LegErrors()
+        notes: list[str] = []
         changed = False
         for leg in legs:
             if leg["state"] == "pending":
-                changed |= await self._cancel_or_close(p, leg, errors)
+                changed |= await self._cancel_or_close(p, leg, errors, notes)
         if not changed and errors:
-            raise BrokerError("Bekleyen emir iptal edilemedi: " + "; ".join(errors))
+            raise _fold("Bekleyen emir iptal edilemedi: ", "Bekleyen emrin iptal isteğinin sonucu alınamadı: ", errors)
         try:
             await self._refresh_legs(p, legs)
         except BrokerError as exc:
             logger.warning("%s: refresh after cancel failed: %s", self.name, exc)
         self._aggregate(p)
-        p.error = ("Bazı emirler iptal edilemedi: " + "; ".join(errors)) if errors else None
+        p.error = " ".join(([_some_failed("Bazı emirler iptal edilemedi: ",
+                                          "Bazı emirler iptal edilemedi ya da iptal sonucu alınamadı: ", errors)]
+                            if errors else []) + notes) or None
         return p
 
     async def sync_position(self, pos: BrokerPosition) -> BrokerPosition:
@@ -1245,12 +1600,20 @@ class MetaTraderLegBroker(Broker, ABC):
             return p
         await self._refresh_legs(p, legs)
         errors: list[str] = []
+        for leg in legs:
+            if leg.get("rest_order") is not None and leg["state"] not in LIVE_STATES:
+                # The filled part of a partly filled order has closed (stop / target) while the rest still rests:
+                # it would open a new position after the trade ended. Cancelled.
+                lots = _num(float(leg.get("rest_volume") or 0.0))
+                if await self._cancel_rest(p.broker_symbol, leg, errors) == "removed":
+                    errors.append(f"Emrin dolmuş kısmı kapandı; dolmamış kalan kısmı ({lots} lot) iptal edildi.")
         # Rule 1: a filled leg must always carry a stop.
         for leg in legs:
             if leg["state"] == "open" and leg.get("sl") is None and p.stop_loss:
                 err = await self._protect_or_close(p.broker_symbol, p.side, leg, float(p.stop_loss), leg.get("tp"))
                 if err:
                     errors.append(err)
+        await self._resend_wanted_stops(p, legs, errors)
         if p.data.get("emulated_tps"):
             await self._run_emulated_tps(p, legs, errors)
         self._aggregate(p)
@@ -1262,12 +1625,49 @@ class MetaTraderLegBroker(Broker, ABC):
             p.error = None              # every filled leg carries its stop again
         return p
 
+    async def _resend_wanted_stops(self, p: BrokerPosition, legs: list[dict[str, Any]], errors: list[str]) -> None:
+        """A stop move whose answer was lost on a leg (SL_WANTED, set by update_stop_loss): the account has just been
+        read. When the leg shows that stop it went through; otherwise it is sent again (the leg kept its old stop).
+        A refusal now is reported and not tried again; another lost answer is looked at at the next sync."""
+        tick = float(p.data.get("price_tick") or 0.0)
+        tol = tick / 2 if tick > 0 else 1e-9
+        for leg in legs:
+            want = leg.get(SL_WANTED)
+            if want is None:
+                continue
+            if leg["state"] != "open":
+                leg.pop(SL_WANTED, None)
+                continue
+            if leg.get("sl") is not None and abs(float(leg["sl"]) - float(want)) <= tol:
+                leg.pop(SL_WANTED, None)
+                logger.info("%s: stop move of leg %s had no answer; the account shows it set", self.name,
+                            leg.get("ticket"))
+                continue
+            try:
+                await self._modify_leg(p.broker_symbol, p.side, leg, float(want), leg.get("tp"))
+            except BrokerError as exc:
+                if answer_lost(exc):
+                    errors.append(f"#{leg['ticket']}: stop {_num(float(want))} yeniden gönderildi, yine yanıt "
+                                  f"alınamadı ({exc}); bot sonraki kontrolde yeniden bakacak.")
+                    continue
+                leg.pop(SL_WANTED, None)
+                errors.append(f"#{leg['ticket']}: stop {_num(float(want))} bu bacakta yeniden gönderildi ama "
+                              f"uygulanamadı ({exc}); bu bacağın stopu {_num(leg.get('sl'))} olarak kaldı.")
+                continue
+            leg["sl"] = float(want)
+            leg.pop(SL_WANTED, None)
+            logger.info("%s: stop %s sent again to leg %s (its earlier answer was lost) and set", self.name, want,
+                        leg.get("ticket"))
+
     async def _run_emulated_tps(self, p: BrokerPosition, legs: list[dict[str, Any]], errors: list[str]) -> None:
         """Netting accounts: partial-close at intermediate TPs the venue cannot hold."""
         todo = [e for e in p.data.get("emulated_tps", []) if not e.get("done")]
         leg = next((x for x in legs if x["state"] == "open"), None)
         if not todo or leg is None:
             return
+        if self._settle_lost_tps(todo, leg, errors):
+            return          # (one TP's partial close is still unknown: nothing else is sent meanwhile)
+        todo = [e for e in todo if not e.get("done")]
         px = (await self._quote(p.broker_symbol)).exit_price_for(p.side)
         sign = 1.0 if p.side is Side.LONG else -1.0
         step = float(p.data.get("volume_step") or 0.0)
@@ -1288,8 +1688,53 @@ class MetaTraderLegBroker(Broker, ABC):
                 e["done"] = True
                 logger.info("%s: emulated TP%d hit at %s, closed %s", self.name, e["index"] + 1, px, vol)
             except BrokerError as exc:
+                if answer_lost(exc):
+                    # It may have been executed: not sent again while the account does not show whether it was
+                    # (a second one would close another slice). Done once the open volume shows the drop
+                    # (_settle_lost_tps); nothing else is sent meanwhile.
+                    e[TP_LOST] = {"from": ov, "at": self._wall_clock()}
+                    errors.append(f"TP{e['index'] + 1} ({_num(e['price'])}) kısmi kapatma emrine yanıt alınamadı "
+                                  f"({exc}); tekrar gönderilmedi, bot hesabı okuyup gerçekleşip gerçekleşmediğine "
+                                  f"bakacak.")
+                    break
                 errors.append(f"TP{e['index'] + 1} kısmi kapatma başarısız: {exc}")
-        await self._refresh_legs(p, legs)
+        try:
+            await self._refresh_legs(p, legs)
+        except BrokerError as exc:
+            # The TPs done above must reach the database with this sync (else the next one would close them again).
+            logger.warning("%s: refresh after the emulated take profits failed: %s", self.name, exc)
+            return
+        lost = [e for e in todo if e.get(TP_LOST) and not e.get("done")]
+        if lost and leg["state"] == "open":
+            self._settle_lost_tps(lost, leg, errors, quiet=True)
+
+    def _wall_clock(self) -> float:
+        """Seconds since the epoch (stored with the position: it must hold across a restart)."""
+        return time.time()
+
+    def _settle_lost_tps(self, todo: list[dict[str, Any]], leg: dict[str, Any], errors: list[str], *,
+                         quiet: bool = False) -> bool:
+        """Emulated TPs whose partial close got no answer (TP_LOST): done once the leg's open volume has dropped
+        below what it was when that close was sent; after TP_LOST_WAIT_SEC without the drop it did not execute and
+        it may be sent again. True while one is still unknown (nothing else is sent meanwhile)."""
+        waiting = False
+        for e in todo:
+            lost = e.get(TP_LOST)
+            if not isinstance(lost, dict) or e.get("done"):
+                continue
+            if float(leg["open_volume"]) + _EPS < float(lost.get("from") or 0.0):
+                e["done"] = True
+                e.pop(TP_LOST, None)
+                logger.info("%s: emulated TP%d had no answer; the account shows it executed", self.name,
+                            e["index"] + 1)
+            elif self._wall_clock() - float(lost.get("at") or 0.0) >= TP_LOST_WAIT_SEC:
+                e.pop(TP_LOST, None)
+                if not quiet:
+                    errors.append(f"TP{e['index'] + 1} ({_num(e['price'])}) kısmi kapatma emri hesapta "
+                                  f"gerçekleşmemiş görünüyor; fiyat hâlâ hedefteyse yeniden gönderilecek.")
+            else:
+                waiting = True
+        return waiting
 
 
 # --------------------------------------------------------------------------- #
@@ -1306,9 +1751,10 @@ def _last_error(mt5: Any) -> tuple[int, str]:
         return -1, "unknown"
 
 
-class OrderReplyLostError(BrokerError):
+class OrderReplyLostError(OrderOutcomeUnknownError):
     """The reply to an order request was lost (IPC loss, or the terminal did not answer in time): the order may or
-    may not exist on the venue. Never re-sent; the caller looks it up by its tag."""
+    may not exist on the venue. Never re-sent; the caller looks it up by its tag. (An OrderOutcomeUnknownError, and
+    so still a BrokerError.)"""
 
 
 _LOOK_AT_TERMINAL_TR = (
@@ -2332,12 +2778,18 @@ class Mt5Broker(MetaTraderLegBroker):
         if res.retcode == MT5.TRADE_RETCODE_PLACED:
             # Accepted, executed a moment later (like an entry answered with 10008): wait for the venue to show it.
             closed = await self._await_closed(symbol, int(leg["ticket"]), ov, vol)
+        elif res.retcode == MT5.TRADE_RETCODE_TIMEOUT:
+            # "Request cancelled by timeout": the server may have executed it anyway (so _retry_transient never
+            # repeats a close for it). Its outcome is unknown: never "could not be closed".
+            raise OrderReplyLostError(
+                self._lost_reply_text(retcode_text(res.retcode, getattr(res, "comment", "")), request))
         elif res.retcode not in _DEAL_OK:
             raise BrokerError(f"#{leg['ticket']} kapatılamadı: {retcode_text(res.retcode, getattr(res, 'comment', ''))}")
         else:
             closed = _f(getattr(res, "volume", 0.0)) or vol
         step = float(info.volume_step or 0.0)
         leg["open_volume"] = _snap(ov - closed, step)
+        self._mark_closed_lots(leg, closed)
         if leg["open_volume"] <= _EPS:
             leg["state"] = "closed"
             leg["reason"] = "manual"
@@ -2377,18 +2829,26 @@ class Mt5Broker(MetaTraderLegBroker):
             raise BrokerError(f"Emir #{leg['order_ticket']} iptal edilemedi: {retcode_text(res.retcode, getattr(res, 'comment', ''))}")
 
     # ---- state primitives ---------------------------------------------------------------
+    def _position_dict(self, p: Any) -> dict[str, Any]:
+        magic = int(getattr(p, "magic", 0) or 0)
+        return {
+            "ticket": int(p.ticket), "volume": _f(p.volume), "entry": _f(p.price_open) or None,
+            "sl": _f(p.sl) or None, "tp": _f(p.tp) or None,
+            # Only our own orders count for tag matching / idempotency.
+            "tag": str(getattr(p, "comment", "") or "") if magic == int(self.cfg.magic) else "",
+            "magic": magic, "realized": None,
+        }
+
+    async def _position_now(self, symbol: str, ticket: Any) -> dict[str, Any] | None:
+        self._require()
+        ps = await self._get_list("positions_get", ticket=int(ticket), what="pozisyon")
+        return next((self._position_dict(p) for p in ps if int(p.ticket) == int(ticket)), None)
+
     async def _snapshot(self, symbol: str) -> tuple[dict[str, dict[str, Any]], dict[str, dict[str, Any]]]:
         self._require()
         ps = await self._get_list("positions_get", symbol=symbol, what="pozisyonlar")
         os_ = await self._get_list("orders_get", symbol=symbol, what="bekleyen emirler")
-        positions = {
-            str(p.ticket): {
-                "ticket": int(p.ticket), "volume": _f(p.volume), "entry": _f(p.price_open) or None,
-                "sl": _f(p.sl) or None, "tp": _f(p.tp) or None, "tag": str(getattr(p, "comment", "") or ""),
-                "magic": int(getattr(p, "magic", 0) or 0), "realized": None,
-            }
-            for p in ps
-        }
+        positions = {str(p.ticket): self._position_dict(p) for p in ps}
         orders = {
             str(o.ticket): {
                 "ticket": int(o.ticket), "volume": _f(getattr(o, "volume_current", 0.0) or getattr(o, "volume_initial", 0.0)),
@@ -2399,10 +2859,9 @@ class Mt5Broker(MetaTraderLegBroker):
             if int(getattr(o, "type", 0)) >= MT5.ORDER_TYPE_BUY_LIMIT
         }
         # Only our own orders count for tag matching / idempotency.
-        for d in (positions, orders):
-            for v in d.values():
-                if v["magic"] != int(self.cfg.magic):
-                    v["tag"] = ""
+        for v in orders.values():
+            if v["magic"] != int(self.cfg.magic):
+                v["tag"] = ""
         return positions, orders
 
     async def _history_order(self, order_ticket: Any) -> dict[str, Any] | None:

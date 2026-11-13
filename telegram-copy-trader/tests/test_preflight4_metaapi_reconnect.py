@@ -721,14 +721,19 @@ async def test_f_after_a_failed_check_a_new_signal_is_refused_at_once(world: Wor
     pos = await broker.open_position(make_req(sym, 0.05, make_plan()))
     line = world.line
     line.dead = True
-    assert await broker.health_problem() is not None            # one failed check is enough
+    # Review 1 (ILETISIM-6) changed this on purpose: ONE late check no longer refuses (the friend's account missed
+    # signals while its link worked); two failed checks in a row do, and the text says only what is known (it
+    # said "Bot bağlantıyı kendisi yeniliyor" although no rebuild starts before the third failed check).
+    assert await broker.health_problem() is not None
+    assert await broker.health_problem() is not None            # two failed checks in a row
     before = len(line.seen)
 
     for call in (broker.resolve_symbol("BTC"), broker.get_equity(), broker.get_free_margin(),
                  broker.account_currency(), broker.open_position(make_req(sym, 0.05, make_plan(), tag="ctnew00001"))):
         text = await raises_fast(call)
-        assert text.startswith("MetaApi şu an yanıt vermiyor (") and "yanıt gelmedi" in text
-        assert "bu hesapta yeni işlem açılmadı" in text and "Bot bağlantıyı kendisi yeniliyor" in text
+        assert text.startswith("MetaApi bağlantısı sorunlu: son 2 bağlantı kontrolü yanıt almadı (")
+        assert "yanıt gelmedi" in text and "bu hesapta yeni işlem açılmadı" in text
+        assert "üst üste 3 kez yanıtsız kalırsa bot bağlantıyı sıfırdan kurar" in text
     assert line.seen[before:] == []                             # nothing was sent to the dead connection
 
     task = asyncio.ensure_future(broker.sync_position(pos))     # an EXISTING position is still looked after
@@ -747,7 +752,8 @@ async def test_f_link_reported_back_by_the_sdk_lets_a_new_signal_try(world: Worl
     inner = world.line._meta_api_connection
     inner.synchronized = False                                  # the SDK itself says: no terminal connected
     assert await broker.health_problem() == "MetaApi bağlantısı kopuk; yeniden bağlanması bekleniyor."
-    assert "yanıt vermiyor" in await raises_fast(broker.get_equity())
+    # one such check is enough (the SDK itself reports it); Review 1 reworded the refusal (ILETISIM-6)
+    assert "bağlantısının koptuğunu bildiriyor" in await raises_fast(broker.get_equity())
     inner.synchronized = True                                   # the SDK reconnected by itself, before the next check
     assert await broker.get_equity() == 10_000.0
 
@@ -760,7 +766,8 @@ async def test_f_the_refusal_expires_when_no_health_check_follows(world: World, 
     line = world.line
     line.dead = True
     assert await broker.health_problem() is not None
-    assert "yanıt vermiyor" in await raises_fast(broker.get_equity())
+    assert await broker.health_problem() is not None            # Review 1 (ILETISIM-6): two checks before refusing
+    assert "yeni işlem açılmadı" in await raises_fast(broker.get_equity())
     line.dead = False                                           # it answers again, but nobody checks
     await asyncio.sleep(0.06)
     assert await broker.get_equity() == 10_000.0

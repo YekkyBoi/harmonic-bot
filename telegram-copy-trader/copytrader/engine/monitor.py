@@ -12,6 +12,16 @@ at the same time, and the loop never waits for a sync beyond its own tick.
 A broker still gets one sync at a time (:meth:`Monitor._turn`): a broker that
 hangs holds up one trade at a time, never every trade that has a position on
 it, and its adapter never sees two syncs of the monitor at once.
+A position of an OPTIONAL broker (config ``optional: true``, e.g. a friend's
+account) is synced outside its trade's lock, under a lock of its own
+(:meth:`Monitor.position_lock`, shared with the engine's management of it): a
+friend's broker that does not answer never holds a trade lock, so the
+owner's positions of that trade are managed meanwhile. The same holds for its
+waiting virtual entry, whose market order is sent from such a sync when the
+reference price touches the level. While an open flow
+still waits for a slow broker it lends the trade lock to the fast check
+(:meth:`Monitor.lend`): a resting exchange entry whose leg has answered gets
+its stop when it fills, without waiting for the flow.
 Only :meth:`Monitor.request_stop` and a real cancellation of its task end
 :meth:`Monitor.run`; a ``CancelledError`` that a broker SDK raises on its own
 is an ordinary sync error, and when the passes themselves keep failing (the
@@ -27,12 +37,13 @@ from __future__ import annotations
 import asyncio
 import contextlib
 import logging
+import math
 import time
 from collections.abc import AsyncIterator, Awaitable, Callable, Sequence
 from datetime import datetime, timedelta, timezone
 from typing import Any
 
-from ..brokers.base import Broker
+from ..brokers.base import Broker, outcome_unknown
 from ..config import AppConfig
 from ..interfaces import Notifier, Storage
 from ..models import BrokerPosition, PositionStatus, Severity, TradeRecord, TradeStatus
@@ -61,11 +72,92 @@ PASS_ERROR_ALERT_AFTER = 5        # loop passes that failed in a row (e.g. the d
 # while another trade's call to that account takes long or hangs.
 TURN_WAIT_SEC = 2.0
 STARVED_AFTER_INTERVALS = 2.0     # a position that has waited this many monitor intervals for its broker goes first
+# ``data[CLOSE_WANTED]`` of a position: the bot wants it closed (its pending entry cancelled) because the trader's
+# trade is over - written before the close / cancel is sent and kept while it has not worked (the broker refused,
+# did not answer, was not connected, or closed only a part). The monitor tries it again after every successful
+# venue sync of the position (:meth:`Monitor._retry_close`), never while the venue read says it is gone already.
+CLOSE_WANTED = "close_wanted"
+# Waits after a failed try before the next one: the next pass, then these (the last one repeats until it works or
+# the position is gone).
+CLOSE_RETRY_BACKOFF_SEC: tuple[float, ...] = (0.0, 30.0, 60.0, 120.0, 300.0)
+# ``data[MANAGE_WANTED]`` of a position: a change of the trader's that the bot still owes this position because it
+# could not be applied when it came (the broker was not connected yet, its link was down, it refused or did not
+# answer): "sl" (the latest stop instruction: a price in the signal's scale, or "to the entry"), "tp" (the latest
+# targets) and / or "reduce" (a partial close: the size that is to stay open). The latest instruction of each kind
+# replaces an older one; one that was applied later drops it. The engine applies what is owed after a successful venue
+# sync of the position, when it is due (CLOSE_RETRY_BACKOFF_SEC after failed tries), through :attr:`Monitor.owed_hook`;
+# a position that has ended, or must be closed (CLOSE_WANTED), drops it.
+MANAGE_WANTED = "manage_wanted"
+# The exchange (ccxt) adapter's contract (copytrader.brokers.ccxt_broker.FLAT_SEEN, CcxtBroker.venue_position_size):
+# ``pos.data[VENUE_FLAT_SEEN]`` counts the venue reads in a row that found no position in the trade's direction, and
+# ``venue_position_size(symbol, side)`` reads the size the venue holds. The monitor imports no adapter, so the key is
+# repeated here; tests/test_review1_glue_engine.py::test_g4_* fails when the two drift apart.
+VENUE_FLAT_SEEN = "flat_seen"
+# ``data[VENUE_BELOW_RECORD]`` of a position on an exchange account: the engine's note that a venue read showed less
+# open there than the bot's record (see orchestrator.py, which writes and reads it). A sync whose booking brings the
+# record down to what the venue showed then makes it say nothing any more: _sync_position drops it.
+VENUE_BELOW_RECORD = "venue_below_record"
+
+
+def venue_note_settled(pos: BrokerPosition) -> bool:
+    """The VENUE_BELOW_RECORD note of ``pos`` is out of date: the record holds no more than the venue showed then
+    (a later booking - e.g. of the earlier close whose answer was lost - has caught up), within half the smallest
+    close size (the tolerance of the engine's venue reads). False when there is no note."""
+    note = (pos.data or {}).get(VENUE_BELOW_RECORD)
+    if not isinstance(note, dict):
+        return False
+    try:
+        venue = float(note.get("venue"))
+    except (TypeError, ValueError):
+        return False
+    if not math.isfinite(venue):
+        return False
+    sizes: list[float] = []
+    for key in ("volume_step", "volume_min", "qty_step", "min_qty"):      # (as Engine._min_close)
+        try:
+            size = float((pos.data or {}).get(key) or 0.0)
+        except (TypeError, ValueError):
+            continue
+        if math.isfinite(size) and size > 0:
+            sizes.append(size)
+    step = max(sizes) * (1.0 - 1e-9) if sizes else 1e-9
+    tol = max(step / 2, abs(pos.remaining_quantity) * 1e-6)
+    return pos.remaining_quantity <= venue + tol
 
 
 def is_virtual_pending(pos: BrokerPosition) -> bool:
     """A virtual entry waiting for its reference-exchange trigger: no order exists on the broker yet."""
     return pos.status is PositionStatus.PENDING and bool((pos.data or {}).get("virtual_trigger"))
+
+
+def close_wanted(pos: BrokerPosition) -> dict[str, Any] | None:
+    """The bot's wish to close / cancel this still active position (see CLOSE_WANTED), else None."""
+    if pos.status not in ACTIVE_POSITION:
+        return None
+    wish = (pos.data or {}).get(CLOSE_WANTED)
+    return wish if isinstance(wish, dict) else None
+
+
+def manage_wanted(pos: BrokerPosition) -> dict[str, Any] | None:
+    """The changes the bot still owes this active position (see MANAGE_WANTED), else None."""
+    if pos.status not in ACTIVE_POSITION:
+        return None
+    wish = (pos.data or {}).get(MANAGE_WANTED)
+    return wish if isinstance(wish, dict) else None
+
+
+def trade_closing(positions: Sequence[BrokerPosition]) -> bool:
+    """Every active position of the trade waits for the bot's own close / cancel: the trader's trade is over (the
+    bot only still has to get rid of what is left). False when nothing is active."""
+    active = [p for p in positions if p.status in ACTIVE_POSITION]
+    return bool(active) and all(close_wanted(p) is not None for p in active)
+
+
+def close_retry_delay(failures: int) -> float:
+    """Seconds to wait before the next try of a wanted close after ``failures`` failed tries."""
+    if failures <= 0:
+        return 0.0
+    return CLOSE_RETRY_BACKOFF_SEC[min(failures, len(CLOSE_RETRY_BACKOFF_SEC)) - 1]
 
 
 def is_live_ccxt(broker: Broker | None) -> bool:
@@ -201,10 +293,31 @@ class Monitor:
         self._unprotected: dict[tuple[int, str], int] = {}       # passes since the last "no stop" alert
         self._error_alerts: dict[tuple[int, str], list[tuple[int, str]]] = {}   # (pass no, text) of recent alerts
         self._remainder_warned: set[tuple[int, str]] = set()
+        # Positions of optional brokers: one call at a time per position (the monitor's sync, the engine's
+        # management of it), outside the trade lock. (trade id, broker) -> lock / monotonic start of its holder.
+        self._pos_locks: dict[tuple[int, str], asyncio.Lock] = {}
+        self._pos_since: dict[tuple[int, str], float] = {}
+        self._detached: dict[tuple[int, str], asyncio.Task[None]] = {}   # their running syncs
+        # Trades whose open flow holds the trade lock and lets the fast check protect what its legs saved (lend()).
+        self._lent: set[int] = set()
+        self._protecting: dict[int, asyncio.Task[None]] = {}
+        self._protected: set[int] = set()        # lent trades that had such a check
         self._passes = 0
         self._stop = asyncio.Event()
         # Engine hook for virtual entries: (trade, position, now) -> new position. Called under the trade lock.
         self.virtual_hook: Callable[[TradeRecord, BrokerPosition, datetime], Awaitable[BrokerPosition]] | None = None
+        # Engine hook: True while an OPENING trade still has a broker leg in flight (a "late" leg). Its status is
+        # then left alone (no roll-up to FAILED, no "stuck opening"): the late leg decides it.
+        self.settling: Callable[[int], bool] | None = None
+        # Engine hook: (trade id, broker) -> True while a management leg of the engine waits to be applied to that
+        # optional broker's position (it waited for this monitor's sync of it, e.g. a virtual entry's order). That
+        # leg rolls the trade up when it is booked, after telling the owner what it did: the sync leaves it to it.
+        self.rollup_deferred: Callable[[int, str], bool] | None = None
+        # Engine hook: (broker, trade, position, now) -> position. Called right after a successful venue sync of a
+        # position that carries MANAGE_WANTED (under the same lock as the sync: the trade lock, or an optional
+        # broker's position lock): applies what is owed when it is due, or drops it. Never raises.
+        self.owed_hook: (Callable[[Broker, TradeRecord, BrokerPosition, datetime], Awaitable[BrokerPosition]]
+                         | None) = None
         # Started and stopped inside run(): tells the owner when a connected broker stops answering.
         self.heartbeat = BrokerHeartbeat(self._connected, notifier)
 
@@ -232,6 +345,189 @@ class Monitor:
 
     def _now(self) -> datetime:
         return utc(self._clock())
+
+    # ---- positions of optional brokers -----------------------------------------
+    def _detachable(self, pos: BrokerPosition) -> bool:
+        """A position of a connected OPTIONAL broker (config ``optional: true``): its venue sync runs outside the
+        trade lock, under :meth:`position_lock` (see :meth:`_detached_sync`). That includes a waiting virtual
+        entry: the engine's hook (:attr:`virtual_hook`) may send its market order when the reference price touches
+        the level, and a broker that does not answer that order must not hold the trade lock (the owner's
+        positions of the trade are managed meanwhile; the engine manages the entry under the same position lock).
+        A waiting virtual entry of any other broker stays with the trade lock."""
+        broker = self._broker(pos.broker)
+        return broker is not None and bool(getattr(getattr(broker, "config", None), "optional", False))
+
+    def position_lock(self, trade_id: int, broker: str) -> asyncio.Lock:
+        """The lock of one position of an optional broker: held by whoever talks to the broker about that
+        position (this monitor's sync, the engine's management of it) and writes it. Never held while waiting for
+        a trade lock: lock order is trade lock -> position lock."""
+        return self._pos_locks.setdefault((trade_id, broker), asyncio.Lock())
+
+    def position_busy_sec(self, trade_id: int, broker: str) -> float:
+        """For how long the position's lock has been held by the call that holds it now (0: free)."""
+        lock = self._pos_locks.get((trade_id, broker))
+        since = self._pos_since.get((trade_id, broker))
+        if lock is None or not lock.locked() or since is None:
+            return 0.0
+        return time.monotonic() - since
+
+    def position_stuck(self, trade_id: int, broker: str) -> bool:
+        """The position's lock has been held for TURN_WAIT_SEC already: the call that holds it is not answered."""
+        return self.position_busy_sec(trade_id, broker) >= TURN_WAIT_SEC
+
+    @contextlib.asynccontextmanager
+    async def position_turn(self, trade_id: int, broker: str) -> AsyncIterator[bool]:
+        """Hold :meth:`position_lock`. Yields True when another call had it first (the stored position may have
+        changed meanwhile: read it again)."""
+        key = (trade_id, broker)
+        lock = self.position_lock(trade_id, broker)
+        waited = lock.locked()
+        await lock.acquire()
+        self._pos_since[key] = time.monotonic()
+        try:
+            yield waited
+        finally:
+            self._pos_since.pop(key, None)
+            lock.release()
+
+    def _detach(self, trade: TradeRecord, pos: BrokerPosition, spaced: bool) -> asyncio.Task[None] | None:
+        """Start the sync of an optional broker's position outside the trade lock (None: one is running, or
+        shutdown began)."""
+        key = (trade.id, pos.broker)
+        running = self._detached.get(key)
+        if (running is not None and not running.done()) or self._stop.is_set():
+            return None
+        task = asyncio.ensure_future(self._detached_sync(trade, pos.broker, spaced))
+        task.set_name(f"monitor-sync-{trade.id}-{pos.broker}-own-lock")
+        self._detached[key] = task
+
+        def done(t: asyncio.Task[None], key: tuple[int, str] = key) -> None:
+            if self._detached.get(key) is t:
+                del self._detached[key]
+
+        task.add_done_callback(done)
+        return task
+
+    async def _detached_sync(self, trade: TradeRecord, broker: str, spaced: bool) -> None:
+        """Sync one position of an optional broker under its own lock (never the trade lock: the owner's
+        positions of the trade are managed meanwhile), then roll the trade up under the trade lock. Never raises
+        (a real cancellation excepted).
+        A waiting virtual entry is looked at every fast interval, also while a slow call of another position holds
+        the trade lock (see :meth:`_resync_due`): its look never waits for that lock to roll the trade up (it would
+        stay running, and the entry would not be looked at again until the lock is free). The holder of the lock or
+        the next pass rolls the trade up from the stored positions then."""
+        try:
+            async with self.position_turn(trade.id, broker):
+                if self._stop.is_set():
+                    return
+                pos = next((p for p in await self.db.broker_positions(trade.id) if p.broker == broker), None)
+                if pos is None or pos.status not in ACTIVE_POSITION or not self._detachable(pos):
+                    return
+                waiting_entry = is_virtual_pending(pos)
+                await self._sync_guarded(trade, pos, spaced)
+            if waiting_entry and self._trade_lock(trade.id).locked():
+                return
+            async with self._trade_lock(trade.id):
+                fresh = await self.db.get_trade(trade.id)
+                deferred = self.rollup_deferred is not None and bool(self.rollup_deferred(trade.id, broker))
+                if fresh is not None and fresh.status in ACTIVE_TRADE and not self._settling(fresh) and not deferred:
+                    await self._rollup(fresh, await self.db.broker_positions(trade.id))
+        except asyncio.CancelledError:
+            if not stray_cancel():
+                raise
+            logger.error("Monitor: %s trade #%s sync ended by a CancelledError nobody requested", broker, trade.id)
+        except Exception:
+            logger.exception("Monitor: %s trade #%s sync failed", broker, trade.id)
+
+    async def settle_optional(self, trade_id: int) -> None:
+        """Wait until every sync of this trade's optional positions that runs outside the trade lock has ended or
+        is stuck (:meth:`position_stuck`: at it for TURN_WAIT_SEC, counted from its start). One whose broker is
+        known to fail (its last sync of that position failed, or its latest heartbeat check) is not waited for."""
+        failing = self.heartbeat.problems()
+        while True:
+            pending = [(key, task) for key, task in self._detached.items()
+                       if key[0] == trade_id and not task.done() and key[1] not in failing
+                       and not self._sync_errors.get(key) and not self.position_stuck(*key)]
+            if not pending:
+                return
+            now = time.monotonic()
+            left = max(self._pos_since.get(key, now) + TURN_WAIT_SEC - now for key, _task in pending)
+            await asyncio.wait([task for _key, task in pending], timeout=max(0.01, left + 0.01))
+
+    async def _wait_detached(self, timeout: float | None = None) -> None:
+        running = [t for t in self._detached.values() if not t.done()]
+        if running:
+            await asyncio.wait(running, timeout=timeout)
+
+    def _settling(self, trade: TradeRecord) -> bool:
+        return trade.status is TradeStatus.OPENING and self.settling is not None and bool(self.settling(trade.id))
+
+    # ---- an open flow lends its trade lock to the fast check ---------------------
+    def lend(self, trade_id: int) -> None:
+        """The caller (an open flow) holds this trade's lock while it waits for its slower broker legs. Until
+        :meth:`unlend` the fast check may sync, without taking the lock, the positions it is there for (resting
+        LIMIT entries on an exchange of the owner, which get their stop when the fill is seen) that the legs have
+        already saved: nothing else of the trade is touched (no roll-up)."""
+        self._lent.add(trade_id)
+
+    async def unlend(self, trade_id: int, timeout: float | None = None) -> bool:
+        """End :meth:`lend`: waits for such a check that is running (at most ``timeout`` seconds; then it is
+        cancelled, as SYNC_TIMEOUT_SEC would cancel it later: nothing may write the trade's positions without its
+        lock once the lender goes on). True if one ran during the lend (the stored positions may then be newer
+        than what the legs returned)."""
+        self._lent.discard(trade_id)
+        task = self._protecting.get(trade_id)
+        if task is not None and not task.done():
+            done, _pending = await asyncio.wait({task}, timeout=timeout)
+            if not done:
+                logger.error("Monitor: the fast check of opening trade %s did not end within %.0fs; cancelled",
+                             trade_id, timeout or 0.0)
+                await self._cancel_tasks([task])
+        ran = trade_id in self._protected
+        self._protected.discard(trade_id)
+        return ran
+
+    def _protectable(self, pos: BrokerPosition) -> bool:
+        broker = self._broker(pos.broker)
+        return (self._fast_position(pos) and not is_virtual_pending(pos) and broker is not None
+                and not getattr(getattr(broker, "config", None), "optional", False))
+
+    def _start_protect(self, trade_id: int) -> asyncio.Task[None] | None:
+        running = self._protecting.get(trade_id)
+        if (running is not None and not running.done()) or self._stop.is_set():
+            return None
+        task = asyncio.ensure_future(self._protect(trade_id))
+        task.set_name(f"monitor-protect-{trade_id}")
+        self._protecting[trade_id] = task
+
+        def done(t: asyncio.Task[None], trade_id: int = trade_id) -> None:
+            if self._protecting.get(trade_id) is t:
+                del self._protecting[trade_id]
+
+        task.add_done_callback(done)
+        return task
+
+    async def _protect(self, trade_id: int) -> None:
+        """The fast check of a lent trade (see :meth:`lend`). Never raises (a real cancellation excepted)."""
+        try:
+            if trade_id not in self._lent:
+                return
+            trade = await self.db.get_trade(trade_id)
+            if trade is None:
+                return
+            mono = time.monotonic()
+            due = [pos for pos in await self.db.broker_positions(trade_id)
+                   if self._protectable(pos) and self._due(trade_id, pos, mono)]
+            if not due:
+                return
+            self._protected.add(trade_id)
+            await asyncio.gather(*(self._sync_guarded(trade, pos, True) for pos in due))
+        except asyncio.CancelledError:
+            if not stray_cancel():
+                raise
+            logger.error("Monitor: fast check of opening trade %s ended by a CancelledError nobody requested", trade_id)
+        except Exception:
+            logger.exception("Monitor: fast check of opening trade %s failed", trade_id)
 
     # ---- schedule --------------------------------------------------------------
     def _periods(self) -> tuple[float, float, float]:
@@ -320,7 +616,7 @@ class Monitor:
             await self._finish_running()
             await self._finish_notes()
         except asyncio.CancelledError:
-            await self._cancel_tasks(list(self._running.values()))
+            await self._cancel_tasks([*self._running.values(), *self._detached.values(), *self._protecting.values()])
             raise
         finally:
             await self._cancel_tasks([*self._notes, *([heartbeat] if heartbeat is not None else [])])
@@ -414,6 +710,9 @@ class Monitor:
         for state in (self._synced_at, self._sync_counted_at, self._served_at):
             for key in [k for k in state if k not in active]:
                 del state[key]
+        # (self._pos_locks is never pruned: a lock handed from one holder to the next looks free for a moment, and a
+        # second lock object for the same position would break the one-call-at-a-time rule. One small lock per
+        # position of an optional broker.)
         for trade_id in [t for t, task in self._running.items() if task.done()]:
             del self._running[trade_id]         # (a task cancelled before it started never removed itself)
         started: list[asyncio.Task[None]] = []
@@ -425,6 +724,8 @@ class Monitor:
                 continue        # its previous sync is still running (a slow broker): the others do not wait
             lock = self._trade_lock(trade_id)
             if lock.locked():
+                if trade_id in self._lent and mode in ("due", "fast"):
+                    self._start_protect(trade_id)       # an open flow waits for a slow broker: protect what is saved
                 continue        # being executed / managed right now; next pass
             task = asyncio.ensure_future(self._sync_task(trade_id, lock, mode))
             task.set_name(f"monitor-sync-{trade_id}")
@@ -452,19 +753,21 @@ class Monitor:
                 del self._running[trade_id]
 
     async def _finish(self, tasks: list[asyncio.Task[None]]) -> None:
-        """Wait for a directly called pass. A cancelled caller takes its syncs with it (they used to run
-        inside it)."""
+        """Wait for a directly called pass, the syncs of optional brokers' positions it started outside the
+        trade locks included. A cancelled caller takes its syncs with it (they used to run inside it)."""
         if not tasks:
             return
         try:
             await asyncio.wait(tasks)
+            await self._wait_detached()
         except asyncio.CancelledError:
-            await self._cancel_tasks(tasks)
+            await self._cancel_tasks([*tasks, *self._detached.values()])
             raise
 
     async def _finish_running(self) -> None:
         """Graceful stop: the syncs that are running finish (one of them may be placing a stop)."""
-        running = [t for t in self._running.values() if not t.done()]
+        running = [t for t in (*self._running.values(), *self._detached.values(), *self._protecting.values())
+                   if not t.done()]
         if running:
             logger.info("Monitor: stopping; waiting for %d running position sync(s)", len(running))
             await asyncio.wait(running)
@@ -482,35 +785,52 @@ class Monitor:
                              CANCEL_WAIT_SEC, sorted(t.get_name() for t in left))
 
     # ---- one trade -----------------------------------------------------------
-    async def sync_trade(self, trade_id: int, *, virtual_only: bool = False) -> None:
+    async def sync_trade(self, trade_id: int, *, virtual_only: bool = False) -> list[asyncio.Task[None]]:
         """Sync all active positions of one trade at the same time (``virtual_only``: just its waiting virtual
         entries), then roll the trade status up once. Caller holds the trade lock. A position whose broker is
-        busy with another trade for longer than TURN_WAIT_SEC is not waited for: it keeps its stored state."""
-        await self._sync_trade(trade_id, "virtual" if virtual_only else "all")
+        busy with another trade for longer than TURN_WAIT_SEC is not waited for: it keeps its stored state.
+        The positions of optional brokers are synced outside the trade lock (:meth:`_detached_sync`): returned
+        are those of their syncs started now that are worth waiting for (no failed sync and no failed heartbeat
+        of that broker), which the caller may wait for after releasing the lock."""
+        return await self._sync_trade(trade_id, "virtual" if virtual_only else "all")
 
-    async def _sync_trade(self, trade_id: int, mode: str) -> None:
+    async def _sync_trade(self, trade_id: int, mode: str) -> list[asyncio.Task[None]]:
         trade = await self.db.get_trade(trade_id)
         positions = await self.db.broker_positions(trade_id)   # fresh copies (the engine may have changed them)
         if trade is None:
-            return
+            return []
         now = self._now()
+        settling = self._settling(trade)
         if trade.status is TradeStatus.OPENING and not positions:
-            if (now - utc(trade.created_at)).total_seconds() > STUCK_OPENING_SEC:
+            if not settling and (now - utc(trade.created_at)).total_seconds() > STUCK_OPENING_SEC:
                 await self.db.update_trade(trade_id, status=TradeStatus.FAILED, note="yarım kalan açılış")
                 await self.notifier.notify(
                     f"#{trade_id} {esc(trade.plan.base_asset)} işlemi açılırken yarım kaldı. "
                     "Lütfen borsada/brokerda elle kontrol edin.",
                     Severity.WARNING,
                 )
-            return
+            return []
 
         mono = time.monotonic()
-        first = [i for i, pos in enumerate(positions) if self._wanted(mode, trade_id, pos, mono)]
-        updated = await self._sync_positions(trade, positions, first, spaced=mode == "due")
-        await self._rollup(trade, updated)
+        wanted = [i for i, pos in enumerate(positions) if self._wanted(mode, trade_id, pos, mono)]
+        # Optional brokers' positions: synced outside this trade lock, never waited for here.
+        aside = {i for i, pos in enumerate(positions) if pos.status in ACTIVE_POSITION and self._detachable(pos)}
+        failing = self.heartbeat.problems()
+        started: list[asyncio.Task[None]] = []
+        for i in sorted(aside & set(wanted)):
+            task = self._detach(trade, positions[i], spaced=mode == "due")
+            key = (trade_id, positions[i].broker)
+            if task is not None and not self._sync_errors.get(key) and positions[i].broker not in failing:
+                started.append(task)
+        first = [i for i in wanted if i not in aside]
+        updated = await self._sync_positions(trade, positions, first, spaced=mode == "due", aside=aside)
+        if not settling:
+            await self._rollup(trade, updated)
+        return started
 
     async def _sync_positions(
-        self, trade: TradeRecord, positions: list[BrokerPosition], first: list[int], *, spaced: bool
+        self, trade: TradeRecord, positions: list[BrokerPosition], first: list[int], *, spaced: bool,
+        aside: set[int] | None = None,
     ) -> list[BrokerPosition]:
         """Sync the positions ``first`` (indexes) at the same time - they are on different brokers - and return
         the trade's positions as they are afterwards.
@@ -529,13 +849,16 @@ class Monitor:
         began = time.monotonic()
         tasks = {i: self._spawn_sync(trade, states[i], spaced) for i in first}
         slow = list(tasks.values())         # this call's own syncs: others are re-synced only while one of them runs
-        failed: set[int] = set()            # ended unexpectedly: left to the next pass (it reads the database)
+        # ended unexpectedly (left to the next pass, it reads the database), and the optional brokers' positions
+        # (synced outside the trade lock): never re-synced here (a waiting virtual entry of theirs excepted: its own
+        # sync outside the trade lock is started again when due, see _resync_due)
+        failed: set[int] = set(aside or ())
         try:
             while tasks:
                 wait: float | None = None
                 if not self._stop.is_set() and any(not t.done() for t in slow):
                     try:
-                        wait = await self._resync_due(trade, states, tasks, failed, began)
+                        wait = await self._resync_due(trade, states, tasks, failed, began, aside=aside)
                     except asyncio.CancelledError:
                         if not stray_cancel():
                             raise
@@ -561,14 +884,19 @@ class Monitor:
     async def _resync_due(
         self, trade: TradeRecord, states: list[BrokerPosition],
         tasks: dict[int, asyncio.Task[tuple[BrokerPosition, bool]]], failed: set[int], began: float,
+        *, aside: set[int] | None = None,
     ) -> float | None:
         """While a sync of the trade is slow: start the sync of every other active position whose own period has
         passed (not before the slow one has taken one fast interval), from what the database holds now.
+        ``aside``: the positions of optional brokers, synced outside the trade lock (:meth:`_detached_sync`); of
+        those only a waiting virtual entry is looked at again here (its trigger level must be watched every fast
+        interval while the trade lock is held by the slow sync), by starting its own sync outside the lock.
         Returns the seconds until the next one is due (None: nothing to wait for)."""
         interval, fast, _tolerance = self._periods()
         wait: float | None = None
         for i, pos in enumerate(states):
-            if i in tasks or i in failed or pos.status not in ACTIVE_POSITION:
+            entry_aside = aside is not None and i in aside and is_virtual_pending(pos)
+            if i in tasks or (i in failed and not entry_aside) or pos.status not in ACTIVE_POSITION:
                 continue
             period = fast if self._fast_position(pos) else interval
             due_in = max(began + fast, self._synced_at.get((trade.id, pos.broker), began) + period) - time.monotonic()
@@ -585,6 +913,11 @@ class Monitor:
             except Exception:
                 logger.exception("Monitor: re-reading %s trade #%s failed", pos.broker, trade.id)
                 failed.add(i)
+                continue
+            if entry_aside:
+                if is_virtual_pending(states[i]) and self._detachable(states[i]) and not self._stop.is_set():
+                    self._detach(trade, states[i], True)        # (None: its previous look still runs)
+                    wait = fast if wait is None else min(wait, fast)    # look again one fast interval later
                 continue
             if states[i].status in ACTIVE_POSITION and not self._stop.is_set():
                 tasks[i] = self._spawn_sync(trade, states[i], True)
@@ -718,6 +1051,16 @@ class Monitor:
             return await self._sync_failed(trade, pos, failure, spaced)
         self._sync_errors.pop(key, None)
         self._sync_counted_at.pop(key, None)
+        wish = close_wanted(pos)
+        if wish is not None and new.status in ACTIVE_POSITION and not isinstance(new.data.get(CLOSE_WANTED), dict):
+            new.data[CLOSE_WANTED] = dict(wish)       # (an adapter that rebuilt its data: the wish is the bot's)
+        owed = manage_wanted(pos)
+        if owed is not None and not isinstance(new.data.get(MANAGE_WANTED), dict):
+            new.data[MANAGE_WANTED] = dict(owed)      # (the same; the engine drops it when the position has ended)
+        if venue_note_settled(new):
+            # (the engine's note that the venue held less than the record: this sync has booked what was behind)
+            new = new.model_copy(deep=True)
+            new.data.pop(VENUE_BELOW_RECORD, None)
         if new.model_dump() != pos.model_dump():
             await self.db.save_broker_position(trade.id, new)
             await self.db.log_event(
@@ -736,11 +1079,194 @@ class Monitor:
         elif new.error and new.error != pos.error and protection_problem(new) is None:
             await self._error_changed(trade, new)
         await self.check_protection(trade, new)
+        await self._tell_fill(broker, trade, pos, new)
 
+        if wish is not None:
+            # The bot wants this position closed (the trader's trade is over). The venue has just been read: what
+            # is gone there is not closed a second time; what is still there is closed again when it is due.
+            if new.status not in ACTIVE_POSITION:
+                return await self._close_wish_done(trade, new, retried=False)
+            return await self._retry_close(broker, trade, new, self._now())
         if new.status is PositionStatus.PENDING:
             new = await self._expire_pending(broker, trade, new, now)
         elif entry_remainder_resting(new):
             new = await self._expire_remainder(broker, trade, new, now)
+        if owed is not None and self.owed_hook is not None and not self._stop.is_set():
+            # A change the bot could not apply when it came: the venue has just been read, so it is applied now
+            # (when due), or dropped when the position has ended meanwhile.
+            try:
+                new = await self.owed_hook(broker, trade, new, self._now())
+            except asyncio.CancelledError:
+                if not stray_cancel():
+                    raise
+                logger.error("Monitor: owed change of %s trade #%s cut off (no cancel request)", pos.broker, trade.id)
+            except Exception:
+                logger.exception("Monitor: owed change of %s trade #%s failed", pos.broker, trade.id)
+        return new
+
+    async def _tell_fill(self, broker: Broker, trade: TradeRecord, before: BrokerPosition,
+                         after: BrokerPosition) -> None:
+        """Tell the owner when a RESTING entry of an automatic broker fills (with notify_on_execution): once at the
+        first fill (wholly or partly) and once more when the unfilled rest of a partly filled entry has filled too.
+        Market entries are reported by the open flow; a manual broker's entries are the owner's own; a virtual
+        entry has its own notice when it fires. Read from the venue sync that saw the fill, so it is said once."""
+        if not self.config.notifier.notify_on_execution or getattr(broker, "kind", "") == "manual":
+            return
+        if after.status is not PositionStatus.OPEN:
+            return          # (filled and already closed in the same read: the closing summary tells it)
+        if before.status is not PositionStatus.PENDING and not entry_remainder_resting(before):
+            return
+        prev, cur = float(before.filled_quantity or 0.0), float(after.filled_quantity or 0.0)
+        if cur <= prev + 1e-12:
+            return
+        rest = entry_remainder_resting(after)
+        if prev > 0 and rest:
+            return          # one more piece of a partly filled entry: told when its rest has filled too
+        label = f"#{trade.id} {esc(trade.plan.base_asset)} {trade.plan.side.value.upper()} {esc(after.broker)}"
+        at = f" @ {fmt_price(after.avg_entry_price)}" if after.avg_entry_price else ""
+        partial = rest or cur < float(after.quantity or 0.0) - 1e-9
+        if prev > 0:
+            head = f"✅ {label}: limit girişinin kalan kısmı da doldu — toplam {fmt_price(cur)}"
+        elif partial:
+            head = f"⏳ {label}: limit girişi kısmen doldu — {fmt_price(cur)}/{fmt_price(after.quantity)}"
+        else:
+            head = f"✅ {label}: limit girişi doldu — {fmt_price(cur)}"
+        head += f" {esc(after.broker_symbol)}{at}"
+        if rest:
+            head += "; dolmayan kısmı bekliyor"
+        if protection_problem(after) is None and after.stop_loss:
+            tail = f"; stop {fmt_price(after.stop_loss)} hesapta kurulu."
+        else:
+            tail = "; stop henüz kurulmadı, bot kuruyor (kurulamazsa ayrıca haber verilecek)."
+        await self.db.log_event("entry_filled", {"trade_id": trade.id, "broker": after.broker, "filled": cur,
+                                                 "rest_waiting": rest})
+        await self.notifier.notify(head + tail, Severity.INFO)
+
+    # ---- closes the bot still owes ------------------------------------------------
+    async def _retry_close(
+        self, broker: Broker, trade: TradeRecord, pos: BrokerPosition, now: datetime
+    ) -> BrokerPosition:
+        """Try a wanted close (CLOSE_WANTED) again when it is due: a PENDING entry is cancelled (a fill since then
+        is closed by the adapter), an OPEN position closed in full. Called right after a successful venue sync of
+        ``pos``; never raises (a real cancellation excepted). The owner was told when the close first failed; the
+        next notice is the one when it has worked (:meth:`_close_wish_done`)."""
+        wish = dict(close_wanted(pos) or {})
+        due = _parse_time(wish.get("next_at"))
+        if self._stop.is_set() or (due is not None and now < due):
+            return pos
+        if int((pos.data or {}).get(VENUE_FLAT_SEEN) or 0) > 0:
+            # (exchange adapter) The venue showed no position in our direction at this read: the earlier close may
+            # have gone through after all. The next read settles it (closed there, or still open: then it is sent).
+            return pos
+        doubt = await self._shared_venue_doubt(broker, trade, pos)
+        if doubt is not None:
+            if not wish.get("held"):
+                wish["held"] = doubt
+                held = pos.model_copy(deep=True)
+                held.data[CLOSE_WANTED] = wish
+                await self.db.save_broker_position(trade.id, held)
+                await self.db.log_event("close_retry_held", {"trade_id": trade.id, "broker": pos.broker,
+                                                             "why": doubt})
+                await self.notifier.notify(
+                    f"⚠️ #{trade.id} {esc(trade.plan.base_asset)} {trade.plan.side.value.upper()} {esc(pos.broker)}: "
+                    f"kapatılması beklenen pozisyon için bot yeni kapatma emri GÖNDERMEDİ: {esc(doubt)}. Borsada "
+                    "kontrol edin; pozisyon hâlâ açıksa elle kapatın.",
+                    Severity.WARNING,
+                )
+                return held
+            return pos
+        failures = int(wish.get("attempts") or 0)
+        failure: BaseException | None = None
+        new: BrokerPosition | None = None
+        try:
+            call = broker.cancel_entry(pos) if pos.status is PositionStatus.PENDING else broker.close_position(pos, 1.0)
+            new = await asyncio.wait_for(call, SYNC_TIMEOUT_SEC)
+        except asyncio.CancelledError as exc:
+            if not stray_cancel():
+                raise
+            failure = exc
+        except Exception as exc:
+            failure = exc
+        if new is not None and new.status not in ACTIVE_POSITION:
+            return await self._close_wish_done(trade, new, retried=True)
+        failures += 1
+        reason = sync_error_text(failure) if failure is not None else (
+            (new.error if new is not None and new.error else None) or "pozisyon hâlâ açık")
+        kept = (new if new is not None else pos).model_copy(deep=True)
+        wish.update(attempts=failures, last_error=reason[:500], last_try=now.isoformat(),
+                    next_at=(now + timedelta(seconds=close_retry_delay(failures))).isoformat())
+        if failure is not None and (outcome_unknown(failure) or isinstance(failure, asyncio.CancelledError)):
+            wish["unknown"] = True      # (sent - or maybe - and its answer lost: it may have worked)
+        wish.pop("held", None)
+        kept.data[CLOSE_WANTED] = wish
+        await self.db.save_broker_position(trade.id, kept)
+        await self.db.log_event("close_retry_failed", {"trade_id": trade.id, "broker": pos.broker,
+                                                       "attempts": failures, "error": reason[:500]})
+        logger.warning("Monitor: wanted close of %s trade #%s failed again (%d tries): %s", pos.broker, trade.id,
+                       failures, reason)
+        return kept
+
+    async def _shared_venue_doubt(self, broker: Broker, trade: TradeRecord, pos: BrokerPosition) -> str | None:
+        """An exchange account closes a position with a reduce-only order of its size, not by a ticket: when another
+        active position of the bot holds the same symbol in the same direction there, the venue's size must still
+        cover all of them - otherwise the earlier close may have gone through after all, and a second one would
+        close the OTHER trade. Turkish reason not to send, else None (also for every account that closes by ticket)."""
+        if pos.status is not PositionStatus.OPEN or not is_live_ccxt(broker):
+            return None
+        symbol = (pos.broker_symbol or "").strip().upper()
+        others = [(tid, p) for tid, p in await self.db.active_broker_positions()
+                  if tid != trade.id and p.broker == pos.broker and p.side is pos.side and not is_virtual_pending(p)
+                  and (p.broker_symbol or "").strip().upper() == symbol]
+        if not others:
+            return None
+        need = pos.remaining_quantity + sum(p.remaining_quantity for _tid, p in others)
+        size: float | None = None
+        read = getattr(broker, "venue_position_size", None)        # (the exchange adapter's public read)
+        if read is not None:
+            try:
+                size = await asyncio.wait_for(read(pos.broker_symbol, pos.side), SYNC_TIMEOUT_SEC)
+            except asyncio.CancelledError:
+                if not stray_cancel():
+                    raise
+            except Exception:
+                logger.exception("Monitor: venue size of %s %s could not be read", pos.broker, pos.broker_symbol)
+        if size is not None and size >= need - max(1e-9, abs(need) * 1e-6):
+            return None
+        ids = ", ".join(f"#{tid}" for tid in sorted({tid for tid, _p in others}))
+        return (f"aynı hesapta aynı yönde {pos.broker_symbol} taşıyan başka bir işlem var ({ids}) ve borsadaki "
+                f"miktar {'okunamadı' if size is None else 'botun kayıtlarındakinden az'}; önceki kapatma emri "
+                "gerçekleşmiş olabilir, yeni bir emir diğer işlemi kapatabilirdi")
+
+    async def _close_wish_done(self, trade: TradeRecord, pos: BrokerPosition, *, retried: bool) -> BrokerPosition:
+        """The position the bot wanted closed is no longer active: the wish is dropped and the owner told once."""
+        new = pos.model_copy(deep=True)
+        wish = new.data.pop(CLOSE_WANTED, None)
+        await self.db.save_broker_position(trade.id, new)
+        await self.db.log_event("close_wish_done", {"trade_id": trade.id, "broker": pos.broker,
+                                                    "status": new.status.value, "retried": retried,
+                                                    "attempts": (wish or {}).get("attempts")})
+        if new.status is PositionStatus.FAILED:
+            return new                      # (the owner was told about the error state by the sync)
+        failed_before = int((wish or {}).get("attempts") or 0) > 0
+        if (wish or {}).get("unknown"):
+            # A try went out and its answer was lost (CLOSE_WANTED "unknown"): it may have been that try that worked.
+            # Never "could not be closed / cancelled before"; only what is known now.
+            if new.status is PositionStatus.CANCELLED:
+                what, done = "iptal isteğinin sonucu alınamamıştı;", "bekleyen giriş artık iptal edilmiş durumda"
+            else:
+                what, done = "kapatma emrinin sonucu alınamamıştı;", "pozisyon artık kapalı"
+        elif new.status is PositionStatus.CANCELLED:
+            what = "daha önce iptal edilemeyen bekleyen giriş" if failed_before else "iptali yarıda kalan bekleyen giriş"
+            done = "yeniden denemede iptal edildi" if retried else "artık iptal edilmiş durumda"
+        else:
+            what = "daha önce kapatılamayan pozisyon" if failed_before else "kapatılması yarıda kalan pozisyon"
+            done = "yeniden denemede kapatıldı" if retried else "artık kapalı"
+        pnl = f" (K/Z {new.realized_pnl:+.2f})" if new.realized_pnl is not None else ""
+        await self.notifier.notify(
+            f"✅ #{trade.id} {esc(trade.plan.base_asset)} {trade.plan.side.value.upper()} {esc(pos.broker)}: "
+            f"{what} {done}{pnl}.",
+            Severity.INFO,
+        )
         return new
 
     async def _sync_failed(
@@ -824,6 +1350,7 @@ class Monitor:
         max_age = timedelta(minutes=self.config.risk.pending_entry_expiry_min)
         if self.config.risk.pending_entry_expiry_min <= 0 or now - position_opened_at(pos, trade.created_at) < max_age:
             return pos
+        before = pos.model_dump()
         try:
             new = await broker.cancel_entry(pos)
         except asyncio.CancelledError as exc:
@@ -834,6 +1361,14 @@ class Monitor:
             return pos
         except Exception as exc:
             logger.warning("Monitor: cancelling stale entry %s #%s failed: %s", pos.broker, trade.id, exc)
+            if pos.model_dump() != before:
+                # The adapter handed its state back into ``pos`` before raising: an order of this call (the close
+                # of a fill found now) went out without a clear answer (CcxtBroker._hand_back). Keep that record,
+                # so the next sync looks the order up first and no later order reuses its client id, and tell the
+                # owner what the adapter noted (once).
+                await self.db.save_broker_position(trade.id, pos)
+                if pos.error:
+                    await self._error_changed(trade, pos)
             return pos
         await self.db.save_broker_position(trade.id, new)
         await self.db.log_event("pending_expired", {"trade_id": trade.id, "broker": pos.broker})
@@ -902,17 +1437,50 @@ class Monitor:
         logger.info("Trade #%s %s -> %s", trade.id, trade.status.value, status.value)
         if status in ACTIVE_TRADE or not self.config.notifier.notify_on_execution:
             return
-        pnl = [(p.broker, p.realized_pnl) for p in positions if p.realized_pnl is not None]
-        pnl_text = ", ".join(f"{esc(b)} {v:+.2f}" for b, v in pnl) or "bilinmiyor"
-        word = "kapandı" if status is TradeStatus.CLOSED else (
-            "iptal edildi" if status is TradeStatus.CANCELLED else "başarısız")
-        entry = fmt_price(trade.plan.entry_price) if trade.plan.entry_price is not None else "?"
-        topic = f" · 📁 {esc(trade.plan.route)}" if trade.plan.route else ""     # forum topic route
-        await self.notifier.notify(
-            f"🏁 #{trade.id} {esc(trade.plan.base_asset)} {trade.plan.side.value.upper()} (giriş {entry}) {word}. "
-            f"Gerçekleşen K/Z: {pnl_text}{topic}",
-            Severity.INFO,
-        )
+        await self.notifier.notify(closing_summary_text(trade, positions, status), Severity.INFO)
+
+
+def note_unknown(note: str | None) -> tuple[list[str], list[str]]:
+    """From a trade's note (written by the engine at the open, "binance: unknown; fx: ok"): (brokers whose open
+    outcome is unknown - the order went out and its answer was lost, "unknown", or it may have gone out, "maybe" -,
+    those of them that may not have sent it)."""
+    parts = [p.rsplit(": ", 1) for p in (note or "").split("; ") if ": " in p]
+    unknown = [p[0] for p in parts if p[1] in ("unknown", "maybe")]
+    return unknown, [p[0] for p in parts if p[1] == "maybe"]
+
+
+def unknown_open_brokers(trade: TradeRecord, positions: Sequence[BrokerPosition]) -> tuple[list[str], list[str]]:
+    """(brokers of ``trade`` whose open outcome is unknown and that have no position of it - the bot does not manage
+    an order there that may exist -, those of them where the order may not even have been sent)."""
+    unknown, maybe = note_unknown(trade.note)
+    held = {p.broker for p in positions}
+    names = [b for b in dict.fromkeys(unknown) if b not in held]
+    return names, [b for b in names if b in maybe]
+
+
+def closing_summary_text(trade: TradeRecord, positions: Sequence[BrokerPosition], status: TradeStatus) -> str:
+    """The owner's notice that a trade has ended (``status``: CLOSED / CANCELLED / FAILED), with the realized result
+    of every position of it that has one - also those that ended at their venue earlier. One text for the monitor
+    and for the engine's management that ends a trade, so that the two never drift apart. A broker whose open
+    outcome was unknown (see :func:`unknown_open_brokers`) gets a line of its own: the bot never managed an order
+    that may be there."""
+    pnl = [(p.broker, p.realized_pnl) for p in positions if p.realized_pnl is not None]
+    ever_filled = any(p.status is PositionStatus.CLOSED or p.filled_quantity > 0 for p in positions)
+    pnl_text = ", ".join(f"{esc(b)} {v:+.2f}" for b, v in pnl) or (
+        "bilinmiyor" if ever_filled else "yok (giriş hiçbir hesapta dolmadı)")
+    word = "kapandı" if status is TradeStatus.CLOSED else (
+        "iptal edildi" if status is TradeStatus.CANCELLED else "başarısız")
+    entry = fmt_price(trade.plan.entry_price) if trade.plan.entry_price is not None else "?"
+    topic = f" · 📁 {esc(trade.plan.route)}" if trade.plan.route else ""     # forum topic route
+    text = (f"🏁 #{trade.id} {esc(trade.plan.base_asset)} {trade.plan.side.value.upper()} (giriş {entry}) {word}. "
+            f"Gerçekleşen K/Z: {pnl_text}{topic}")
+    unknown, maybe = unknown_open_brokers(trade, positions)
+    for name in unknown:
+        how = "açılış emri gönderilmiş olabilir, sonucu bilinmiyordu" if name in maybe else (
+            "açılış emrinin sonucu bilinmiyordu")
+        text += (f"\n⚠️ {esc(name)}: {how}; emir açıldıysa pozisyonu elle kapatın (bekleyen emir olarak duruyorsa "
+                 "iptal edin).")
+    return text
 
 
 _STATUS_TR = {
@@ -939,5 +1507,7 @@ __all__ = [
     "Monitor", "rollup_status", "position_opened_at", "entry_placed_at", "entry_remainder_resting",
     "protection_problem", "unprotected_alert_text", "is_virtual_pending", "VIRTUAL_POLL_SEC", "utc", "ACTIVE_POSITION", "ACTIVE_TRADE",
     "is_live_ccxt", "sync_error_text", "SYNC_TIMEOUT_SEC", "PASS_ERROR_ALERT_AFTER", "TURN_WAIT_SEC",
-    "STARVED_AFTER_INTERVALS",
+    "STARVED_AFTER_INTERVALS", "CLOSE_WANTED", "CLOSE_RETRY_BACKOFF_SEC", "close_wanted", "close_retry_delay",
+    "trade_closing", "closing_summary_text", "VENUE_FLAT_SEEN", "MANAGE_WANTED", "manage_wanted", "note_unknown",
+    "unknown_open_brokers",
 ]

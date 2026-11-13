@@ -510,7 +510,9 @@ async def test_d2_a_hanging_leg_does_not_delay_the_other_legs_of_the_same_trade(
         closed_syncs = binance.entered
         await asyncio.sleep(0.2)
         assert binance.entered == closed_syncs                # a closed leg is not synced any more
-        assert monitor._trade_lock(trade).locked()            # still one sync of this trade: the lock is held
+        # Review 1 (engine_iso, I2): tickmill is optional: its sync runs under its own position lock, never under
+        # the trade lock (which used to stay held for the whole hung call)
+        assert not monitor._trade_lock(trade).locked() and monitor.position_lock(trade, "tickmill").locked()
         tickmill.hang = False
         tickmill.release.set()                                # the hung call returns
         await wait_until(lambda: tickmill.finished >= 2, task=task, what="tickmill synced again afterwards")
@@ -528,7 +530,10 @@ async def test_d2_positions_of_one_trade_are_synced_concurrently_and_rolled_up_o
     tickmill.sync_fn = binance.sync_fn = closed
     t0 = time.monotonic()
     async with monitor._trade_lock(trade):                    # the way the engine calls it before managing a trade
-        await monitor.sync_trade(trade)
+        optional = await monitor.sync_trade(trade)
+    # Review 1 (engine_iso, I2): the optional tickmill's sync goes on outside the trade lock; the engine waits for
+    # it (bounded) after releasing the lock
+    await asyncio.wait(optional)
     assert binance.stamps[0] - t0 < 0.25                      # base: binance waited for tickmill (>= 0.3 s)
     assert tickmill.entered == binance.entered == 1
     assert status_of(await db.get_trade(trade)) is TradeStatus.CLOSED
@@ -822,7 +827,8 @@ async def test_d2_a_broker_that_hangs_keeps_one_trade_busy_and_not_every_trade_t
             samples.append({t for t in trades if monitor._trade_lock(t).locked()})
             await asyncio.sleep(0.013)
         stuck = set.intersection(*samples)                    # locked the whole time
-        assert len(stuck) == 1, samples                       # before: all three
+        # Review 1 (engine_iso, I2): tickmill is optional, its syncs never hold a trade lock (it was one trade)
+        assert stuck == set(), samples                        # before: all three
         for trade in trades:
             if trade not in stuck:
                 assert await engine_gets_the_lock(trade) < 0.3
@@ -863,7 +869,10 @@ async def test_d2_engine_closes_a_trade_at_once_while_a_broker_hangs_in_the_sync
         for _ in range(12):
             samples.append({t for t in trades if engine.trade_lock(t).locked()})
             await asyncio.sleep(0.013)
-        (stuck,) = set.intersection(*samples)                 # one trade is held up by the call that hangs
+        # Review 1 (engine_iso, I2): tickmill is optional, so the call that hangs holds no trade lock (it held one);
+        # the trade whose tickmill position it is busy with is told by the position lock
+        assert set.intersection(*samples) == set(), samples
+        (stuck,) = {t for t in trades if engine.monitor.position_busy_sec(t, "tickmill") > 0}
         (free,) = set(trades) - {stuck}
         close = ManagementPlan(plan_id="m1", action=ActionType.CLOSE, trade_id=free, close_fraction=1.0,
                                source_chat_id=CHAT, summary_tr="kapat", created_at=datetime.now(timezone.utc))

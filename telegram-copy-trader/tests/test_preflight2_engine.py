@@ -601,9 +601,15 @@ async def test_c1_stray_cancellation_while_managing_leaves_the_other_brokers_man
 
     assert await env.brokers_of(trade.id) == {"binance": "closed", "breakout": "closed", "tickmill": "open"}
     assert len(env.binance.calls_of("close_position")) == 1
-    assert [t for t in env.texts(Severity.ERROR) if "değişikliğin" in t] == [
-        f"#{trade.id} tickmill: broker bağlantısı yanıt vermeden kesildi; değişikliğin uygulanıp uygulanmadığını "
-        "brokerda elle kontrol edin"]
+    # Review 1 (engine_mgmt, M1): a close that ends the trade and fails is remembered on the position and tried
+    # again by the monitor after it has read the venue (so a close that went through is not sent twice): the owner
+    # is told that, instead of "check by hand whether it was applied".
+    # Review 3b (F2): a close cut off inside the broker library may have reached the broker: its outcome is unknown,
+    # so it is no longer called "pozisyon kapatılamadı" (the retry and the venue read before it are unchanged).
+    assert [t for t in env.texts(Severity.ERROR) if "yanıt vermeden kesildi" in t] == [
+        f"#{trade.id} tickmill: kapatma emrinin sonucu alınamadı; pozisyonun kapanıp kapanmadığı bilinmiyor "
+        "(<code>broker bağlantısı yanıt vermeden kesildi</code>); bot tickmill hesabını her kontrolde okuyup "
+        "gerekirse yeniden deneyecek ve kapanınca haber verecek"]
     assert (await env.trade(trade.id)).status is TradeStatus.OPEN       # the tickmill leg is still there
     assert (await env.db.get_message(CHAT, env.mid)).consumed           # type: ignore[union-attr]
     assert not env.engine.trade_lock(trade.id).locked()
@@ -697,7 +703,8 @@ async def test_c1_unreadable_reference_skips_only_the_offset_broker(env: Env) ->
     await env.say(btc(), KRIPTO, "btc 1R long")
     (trade,) = await env.trades()
     assert await env.brokers_of(trade.id) == {"binance": "open", "breakout": "open"}
-    assert any("tickmill: referans fiyat (binanceusdm) alınamadı" in t for t in env.texts(Severity.WARNING))
+    # Review 1 (glue_engine, G6): the refusal is one line of the open report, no longer also a separate warning.
+    assert sum("tickmill: referans fiyat (binanceusdm) alınamadı" in t for t in env.texts()) == 1
 
 
 async def test_c1_monitor_task_that_dies_is_restarted_and_the_owner_is_told_once(
@@ -773,7 +780,10 @@ async def test_c2_slow_broker_the_report_comes_at_the_deadline_and_its_result_la
     second = (await env.trades())[1]
     assert await env.brokers_of(second.id) == {"binance": "open", "breakout": "open"}
     assert len(env.binance.opened) == 2 and len(env.tickmill.opened) == 1 and env.tickmill.most_running == 1
-    assert "tickmill önceki emrine hâlâ yanıt vermedi; bu işlem tickmill'da açılmadı" in env.texts(Severity.ERROR)
+    # Review 1 (engine_iso, I1): tickmill is optional, so its busy wait goes on inside its own leg task, not in the
+    # flow: the "not opened" result comes in its own report once that wait gives up (it used to be in the flow).
+    await env.until(lambda: any("tickmill önceki emrine hâlâ yanıt vermedi; bu işlem tickmill'da açılmadı" in t
+                                for t in env.texts(Severity.ERROR)), "the busy leg's report")
 
     # tickmill answers: booked under the trade lock, rolled up and reported (notify_on_execution is off).
     answer.set()
@@ -797,6 +807,10 @@ async def test_c2_next_signal_waits_for_the_busy_broker_and_opens_after_it(
     assert len(env.tickmill.opened) == 1 and len(env.binance.opened) == 2
     answer.set()                                         # the first order is answered within the wait
     await second
+    # Review 1 (engine_iso, I1): the optional broker's leg waits for its busy account inside its own task (the
+    # flow no longer waits for it), so its order follows in the background, still one after the other.
+    await env.until(lambda: len(env.tickmill.opened) == 2, "the second tickmill order")
+    await env.until(lambda: not env.engine._busy(), "the late leg to be booked")
     assert len(env.tickmill.opened) == 2 and env.tickmill.most_running == 1     # one after the other
     assert (await env.brokers_of(2))["tickmill"] == "open"
     assert not any("önceki emrine" in t for t in env.texts())
@@ -843,7 +857,10 @@ async def test_c2_late_leg_that_cannot_be_closed_is_reported_with_broker_symbol_
     size = orch._qty(env.tickmill.opened[0].quantity)
     assert late.startswith("🚨") and env.notifier.notifications[-1][1] is Severity.ERROR
     assert f"tickmill hesabındaki {size} BTCUSD LONG pozisyonu KAPATILAMADI" in late
-    assert "piyasa kapalı" in late and "tickmill hesabında ELLE kapatın" in late
+    # Review 1 (engine_mgmt, M1): the failed close is remembered and the monitor tries it again, so the owner is told
+    # that (closing it by hand is offered, no longer the only way out).
+    assert "piyasa kapalı" in late and "bot her kontrolde yeniden deneyecek" in late
+    assert "tickmill hesabında elle de kapatabilirsiniz" in late
     # It is on record and the trade is active again: monitored, and the next instruction can manage it.
     assert (await env.brokers_of(trade.id))["tickmill"] == "open"
     assert (await env.trade(trade.id)).status is TradeStatus.OPEN
@@ -1125,10 +1142,13 @@ async def test_c2_change_made_while_the_leg_was_in_flight_is_reported_as_not_app
     answer.set()
     await env.until(lambda: late_reports(env) != [], "the late report")
     (late,) = late_reports(env)
-    assert "değişiklikler bu pozisyona UYGULANMADI" in late and "tickmill hesabında elle kontrol edin" in late
-    assert env.notifier.notifications[-1][1] is Severity.ERROR
+    # Review 2 (R2, tests/test_review2_repair.py): a change the trade got while this leg was unanswered is no longer
+    # only reported as "UYGULANMADI ... elle kontrol edin": it is applied to the position the late answer brings
+    # (the stop 73500 with tickmill's offset of -50).
+    assert "değişiklikler bu pozisyona şimdi uygulandı: stop 73450" in late and "UYGULANMADI" not in late
+    assert env.notifier.notifications[-1][1] is Severity.INFO
     pos = await env.position(trade.id, "tickmill")
-    assert pos.status is PositionStatus.OPEN and pos.stop_loss == pytest.approx(73250.0)   # 73300 shifted by -50
+    assert pos.status is PositionStatus.OPEN and pos.stop_loss == pytest.approx(73450.0)   # 73500 shifted by -50
 
 
 async def test_c2_late_leg_writes_its_position_under_the_trade_lock(
@@ -1462,9 +1482,12 @@ async def test_c4_open_risk_counts_towards_the_daily_limit_when_the_option_is_on
 
     await env.say(fx_pair("AUDUSD"), FX, "AUDUSD LONG 1R")          # 0 + 300 + 100 = 400 > 300
     assert len(env.fx.opened) == 3 and len(env.tickmill.opened) == 4     # tickmill (limit 0 = off) still opens
-    assert [t for t in env.texts(Severity.WARNING) if "günlük zarar" in t] == [
-        "fx: günlük zarar sınırı (%3 = 300.00 USD) aşılırdı: bugün gerçekleşen zarar 0.00 + açık ve bekleyen "
-        "pozisyonların stoptaki riski 300.00 + bu işlemin riski 100.00 = 400.00 USD; yeni işlem açılmadı"]
+    # Review 1 (engine_mgmt, M4): the refusal also names the excess (it never reads as two equal numbers).
+    # Review 1 (glue_engine, G6): it is one line of the open report ("kısmen açıldı"), no longer a separate warning.
+    (told,) = [t for t in env.texts(Severity.WARNING) if "günlük zarar" in t]
+    assert ("• fx: günlük zarar sınırı (%3 = 300.00 USD) aşılırdı: bugün gerçekleşen zarar 0.00 + açık ve bekleyen "
+            "pozisyonların stoptaki riski 300.00 + bu işlemin riski 100.00 = 400.00 USD, yani sınırı 100.00 USD aşardı; "
+            "yeni işlem açılmadı") in told.splitlines()
 
     # GBPUSD goes to break-even (stop at the entry): it has nothing left to lose -> 0 + 200 + 100 = 300.
     env.fx.quotes["GBPUSD"] = env.tickmill.quotes["GBPUSD"] = q(1.3190, 1.3191)
@@ -1483,9 +1506,10 @@ async def test_c4_open_risk_counts_towards_the_daily_limit_when_the_option_is_on
     env.notifier.notifications.clear()
     await env.say(fx_pair("XAUUSD"), FX, "XAUUSD LONG 1R")
     assert len(env.fx.opened) == 4
-    assert [t for t in env.texts(Severity.WARNING) if "günlük zarar" in t] == [
-        "fx: günlük zarar sınırı (%3 = 297.00 USD) aşılırdı: bugün gerçekleşen zarar 100.00 + açık ve bekleyen "
-        "pozisyonların stoptaki riski 200.00 + bu işlemin riski 100.00 = 400.00 USD; yeni işlem açılmadı"]
+    (told,) = [t for t in env.texts(Severity.WARNING) if "günlük zarar" in t]  # (M4: the excess is named; G6: a line)
+    assert ("• fx: günlük zarar sınırı (%3 = 297.00 USD) aşılırdı: bugün gerçekleşen zarar 100.00 + açık ve bekleyen "
+            "pozisyonların stoptaki riski 200.00 + bu işlemin riski 100.00 = 400.00 USD, yani sınırı 103.00 USD aşardı; "
+            "yeni işlem açılmadı") in told.splitlines()
 
 
 async def test_c4_size_raised_to_the_minimum_lot_counts_with_what_it_really_loses(env: Env) -> None:
@@ -1548,7 +1572,7 @@ async def test_c5_a_routed_broker_that_did_not_open_is_reported_whatever_notify_
         env: Env, why: str) -> None:
     if why == "unsupported":
         env.tickmill.unsupported.add("EUR")              # the symbol is not on that account
-        line = "• tickmill: EUR bu hesapta işlem görmüyor"
+        line = "• tickmill: EURUSD bu hesapta işlem görmüyor"   # Review 1 (glue_engine, G5): names the pair
     elif why == "hedge":
         other = await env.db.create_trade(plan_of("EUR", "USD", Side.SHORT, route="fx", brokers=["tickmill"],
                                                   entry=1.17, sl=1.18, market_type=MarketType.FOREX))
@@ -1851,7 +1875,12 @@ async def test_c6c_entry_keeps_waiting_while_no_other_account_ever_filled(timed:
     e.clock.at(9, 40, 0)
     at_price(e, 73900.0)
     await look(e)
-    assert is_virtual_pending(await e.position(trade.id, "tickmill")) and e.texts() == []
+    # Review 1 (engine_mgmt, M3, finding ACILIS-4): every real entry of the trade ended without a fill, so the
+    # waiting virtual entry ends too (one notice) instead of opening the trade on the friend's account alone later.
+    pos = await e.position(trade.id, "tickmill")
+    assert pos.status is PositionStatus.CANCELLED and pos.data["virtual_end"] == "diğer hesaplardaki girişler dolmadı"
+    (told,) = e.texts()
+    assert "girişleri dolmadan sona erdi" in told and "AÇILMADI" in told
 
 
 async def test_c6c_stop_to_entry_cancels_the_waiting_entry(timed: Env) -> None:

@@ -51,7 +51,20 @@ _CONNECT_FAILURE_LOGGERS = ("engineio.client", "socketio.client")
 _CONNECT_FAILURE = re.compile(r"failed with error|[Cc]onnection failed|[Cc]onnection refused|was rejected|"
                               r"attempts reached|upgrade failed|connection dropped|Unexpected status code")
 CONNECT_FAILURE_LOG_EVERY_SEC = 60.0   # at most one such line per kind in this time (a failing connect loops fast)
+# ... and the moment an ESTABLISHED websocket was lost (engineio logs these at INFO, each once per socket and drop):
+# the keep-alive answer did not come, the socket's loops ended. Anchored at the start of the message, so the text of
+# a received packet can never match.
+_CONNECTION_LOST = re.compile(r"^(?:PONG response has not been received|Exiting ping task|"
+                              r"(?:Read|Write) loop: WebSocket connection was closed|"
+                              r"Unexpected error (?:receiving|decoding) packet)")
+CONNECTION_LOST_BURST = 4              # lines per kind in that time: a drop takes down both main sockets at once
 _FILTER_TAG = "_copytrader_filter"
+
+# ---- event-loop stall watchdog (diagnostics): while the loop is held, no websocket keep-alive, timer or order flow
+# of the bot can run ----
+LOOP_WATCH_TICK_SEC = 1.0          # the watchdog sleeps this long in a loop ...
+LOOP_STALL_WARN_SEC = 5.0          # ... and logs a WARNING when it wakes up more than this late
+LOOP_STALL_LOG_EVERY_SEC = 60.0    # at most one such line in this time; the stalls in between are counted
 
 
 def mask_secrets(text: str, secrets: Iterable[str] = ()) -> str:
@@ -124,13 +137,17 @@ class SecretMaskFilter(logging.Filter):
 class ConnectFailureFilter(logging.Filter):
     """On the 'engineio.client' / 'socketio.client' loggers (the MetaApi websocket): these libraries log
     WHY a connection failed at INFO, among hundreds of harmless lines. Records that report a failed
-    connection pass as WARNING (at most one per kind in ``every_sec``, with the number left out);
-    everything else below WARNING stays quiet. Secrets are masked by the handlers' SecretMaskFilter."""
+    connection pass as WARNING (at most one per kind in ``every_sec``, with the number left out), and so
+    do those that report the loss of an established one ("PONG response has not been received", "Exiting
+    ping task", ...: up to CONNECTION_LOST_BURST per kind in ``every_sec``, so the drop's exact time and
+    every socket it took down are in the log); everything else below WARNING stays quiet. Secrets are
+    masked by the handlers' SecretMaskFilter."""
 
     def __init__(self, every_sec: float = CONNECT_FAILURE_LOG_EVERY_SEC) -> None:
         super().__init__()
         self._every = every_sec
-        self._last: dict[str, float] = {}
+        self._last: dict[str, float] = {}       # kind -> start of its present window
+        self._passed: dict[str, int] = {}       # kind -> lines let through in that window
         self._hidden: dict[str, int] = {}
 
     def filter(self, record: logging.LogRecord) -> bool:
@@ -140,16 +157,21 @@ class ConnectFailureFilter(logging.Filter):
             message = record.getMessage()
         except Exception:
             return False
-        if not _CONNECT_FAILURE.search(message):
+        lost = _CONNECTION_LOST.search(message) is not None
+        if not lost and not _CONNECT_FAILURE.search(message):
             return False
         kind = f"{record.name}:{str(record.msg)[:40]}"
         now = time.monotonic()
         last = self._last.get(kind)
         if last is not None and now - last < self._every:
-            self._hidden[kind] = self._hidden.get(kind, 0) + 1
-            return False
+            if self._passed.get(kind, 1) >= (CONNECTION_LOST_BURST if lost else 1):
+                self._hidden[kind] = self._hidden.get(kind, 0) + 1
+                return False
+            self._passed[kind] = self._passed.get(kind, 1) + 1
+        else:
+            self._last[kind] = now
+            self._passed[kind] = 1
         hidden = self._hidden.pop(kind, 0)
-        self._last[kind] = now
         record.levelno, record.levelname = logging.WARNING, "WARNING"
         if hidden:
             record.msg, record.args = f"{message} (+{hidden} similar line(s) not logged)", ()
@@ -201,6 +223,38 @@ def setup_logging(level: str = "INFO", data_dir: str | os.PathLike[str] | None =
         noisy.addFilter(gate)
         noisy.setLevel(logging.INFO)     # the filter decides: failed-connection lines only
     return log_path
+
+
+async def watch_event_loop(*, tick_sec: float = LOOP_WATCH_TICK_SEC, warn_after_sec: float = LOOP_STALL_WARN_SEC,
+                           every_sec: float = LOOP_STALL_LOG_EVERY_SEC) -> None:
+    """Runs until cancelled (serve() starts it): sleeps ``tick_sec`` in a loop and logs the WARNING
+    "Olay döngüsü <n> sn gecikti" when it wakes up more than ``warn_after_sec`` late, i.e. when the event loop
+    was held (a blocking call, a starved process, a paused machine) and nothing of the bot could run, the
+    MetaApi websockets' keep-alive answers included. At most one line per ``every_sec``: a stall in between is
+    counted and the count (with the longest delay) is added to the next line, at the latest when that time is
+    over. Costs one timer per ``tick_sec``."""
+    loop = asyncio.get_running_loop()
+    last_line: float | None = None
+    hidden, worst = 0, 0.0
+    while True:
+        due = loop.time() + tick_sec
+        await asyncio.sleep(tick_sec)
+        now = loop.time()
+        late = now - due
+        stalled = late > warn_after_sec
+        window_open = last_line is None or now - last_line >= every_sec
+        if stalled and not window_open:
+            hidden, worst = hidden + 1, max(worst, late)
+            continue
+        if stalled:
+            more = f" (son uyarıdan beri {hidden} gecikme daha oldu, en uzunu {worst:.1f} sn)" if hidden else ""
+            logger.warning("Olay döngüsü %.1f sn gecikti%s", late, more)
+        elif hidden and window_open:
+            logger.warning("Olay döngüsü son uyarıdan beri %d kez daha %g sn'den uzun gecikti (en uzunu %.1f sn)",
+                           hidden, warn_after_sec, worst)
+        else:
+            continue
+        last_line, hidden, worst = now, 0, 0.0
 
 
 def parser_deadline_sec(config: AppConfig) -> float:
@@ -410,6 +464,9 @@ async def serve(app: App, stop: asyncio.Event | None = None) -> None:
     stop = stop or asyncio.Event()
     interrupts = _Interrupts(stop)
     interrupts.install()
+    watchdog = asyncio.get_running_loop().create_task(
+        watch_event_loop(tick_sec=LOOP_WATCH_TICK_SEC, warn_after_sec=LOOP_STALL_WARN_SEC,
+                         every_sec=LOOP_STALL_LOG_EVERY_SEC), name="copytrader-loop-watchdog")
     listen_task: asyncio.Task[Any] | None = None
     stop_task: asyncio.Task[Any] | None = None
     early_start: asyncio.Task[Any] | None = None
@@ -450,6 +507,8 @@ async def serve(app: App, stop: asyncio.Event | None = None) -> None:
                                             Severity.ERROR))
     except BaseException as exc:
         failure = exc
+        if isinstance(exc, asyncio.CancelledError):
+            _withdraw_cancel_requests()
         if not isinstance(exc, (asyncio.CancelledError, KeyboardInterrupt)):
             logger.exception("Startup/run failed")
             await _safe(app.notifier.notify(f"Bot durdu: <code>{_esc(exc)}</code>", Severity.ERROR))
@@ -485,10 +544,33 @@ async def serve(app: App, stop: asyncio.Event | None = None) -> None:
             try:
                 await _close_db(app.db)
             finally:
+                watchdog.cancel()
                 interrupts.restore()
                 logger.info("Shutdown complete")
     if failure is not None:
         raise failure
+
+
+def _withdraw_cancel_requests() -> None:
+    """serve() was cancelled and answers by shutting down: on Windows that is how the first Ctrl+C arrives
+    (asyncio.run() cancels the main task). The shutdown runs in this same task, and code in it tells a real
+    cancellation from a library's stray CancelledError by ``Task.cancelling()`` (engine.prices.stray_cancel and
+    its users, the MetaApi adapter's close): with the request still counted, an SDK's stray CancelledError
+    would pass for a new cancellation and end the shutdown half-way (no "durduruldu" notice, the notifier's
+    queue not sent, brokers after that one not closed). The request is therefore withdrawn here, as when the
+    shutdown starts from the stop event; serve() still re-raises the CancelledError at the end, and a new
+    cancellation during the shutdown is counted again and goes on."""
+    task = asyncio.current_task()
+    cancelling = getattr(task, "cancelling", None)
+    uncancel = getattr(task, "uncancel", None)
+    if cancelling is None or uncancel is None:
+        return
+    withdrawn = 0
+    while cancelling() > 0:
+        uncancel()
+        withdrawn += 1
+    if withdrawn:
+        logger.info("Cancelled (Ctrl+C on Windows or a cancelled main task): shutting down")
 
 
 async def _close_db(db: Any) -> None:
@@ -529,4 +611,4 @@ async def run(config_path: str | os.PathLike[str] = "config.yaml") -> None:
 
 
 __all__ = ["App", "build_app", "config_secrets", "make_parser", "mask_secrets", "parser_deadline_sec", "run",
-           "serve", "setup_logging"]
+           "serve", "setup_logging", "watch_event_loop"]

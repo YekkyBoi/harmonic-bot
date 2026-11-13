@@ -277,6 +277,9 @@ async def test_move_sl_and_tp_update_stored_levels_then_fire_uses_them(db: Datab
 async def test_expires_after_max_hours(db: Database) -> None:
     clock = {"t": now()}
     env = await make_env(db, clock=lambda: clock["t"], max_hours=48.0)
+    # Review 1 (engine_mgmt, M3): a virtual entry never waits longer than risk.pending_entry_expiry_min (default
+    # 1440 min = 24 h, which would end it first); with a longer limit max_hours is what ends it, as tested here.
+    env.cfg.risk.pending_entry_expiry_min = 72 * 60
     env.parser.push(result(btc()))
     await env.signal()
     clock["t"] += timedelta(hours=47)

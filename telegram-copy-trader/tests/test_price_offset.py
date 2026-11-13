@@ -163,8 +163,11 @@ async def test_reference_outage_fails_closed_with_warning(db: Database) -> None:
     env.parser.push(result(btc_short()))
     await env.signal()
     assert env.broker.opened == [] and env.broker.sized == []
-    warns = env.notifier.texts(Severity.WARNING)
-    assert len(warns) == 1 and "referans fiyat" in warns[0] and "tickmill" in warns[0]
+    # Review 1 (glue_engine, G6): the refusal is told once, as a line of the open report (here "hiçbir brokerda
+    # açılamadı"); it is no longer also sent as a separate warning with the same text.
+    assert env.notifier.texts(Severity.WARNING) == []
+    (told,) = [t for t in env.notifier.texts() if "referans fiyat" in t]
+    assert "tickmill" in told and "hiçbir brokerda açılamadı" in told
     assert not env.notifier.texts(Severity.INFO)
 
 
@@ -173,8 +176,10 @@ async def test_offset_above_max_pct_skips(db: Database) -> None:
     env.parser.push(result(btc_short()))
     await env.signal()
     assert env.broker.opened == []
-    warns = env.notifier.texts(Severity.WARNING)
-    assert len(warns) == 1 and "fark" in warns[0] and "işlem açılmadı" in warns[0]
+    # Review 1 (glue_engine, G6): told once, as a line of the open report, no longer also as a separate warning.
+    assert env.notifier.texts(Severity.WARNING) == []
+    (told,) = [t for t in env.notifier.texts() if "fark" in t]
+    assert "işlem açılmadı" in told and "hiçbir brokerda açılamadı" in told
 
 
 async def test_offset_within_custom_limit_trades(db: Database) -> None:

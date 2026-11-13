@@ -7,7 +7,11 @@ returned by the engine is treated as HTML that our own code produced (use
 
 Delivery rules (Telegram trouble must never stop the engine, and nothing may get lost silently):
 
-* No call into this class waits for Telegram longer than ``SEND_TIMEOUT_SEC``.
+* No call into this class waits for Telegram longer than ``SEND_TIMEOUT_SEC``, and a message (notice, question,
+  outcome of a question) keeps its caller waiting at most ``CALLER_WAIT_SEC``: the engine awaits them while it
+  holds its locks, so a silent Telegram link must not hold up the next signal. A message that got no answer by
+  then stays in the queue, in its place, with its request still running; the connection is taken for down only
+  when ``SEND_TIMEOUT_SEC`` pass without an answer.
 * A message that cannot be sent now is kept in a bounded in-memory queue and a background task
   delivers the queue in order, with back-off. While something is waiting, or the connection is known
   to be down, callers do not wait at all: the message is queued and the call returns.
@@ -43,7 +47,7 @@ from telethon.extensions import html as tl_html
 
 from .. import __version__
 from ..config import NotifierConfig, TelegramConfig
-from ..interfaces import SHUTDOWN_TEXT, EngineControl
+from ..interfaces import SHUTDOWN_TEXT, STARTING_TEXT, EngineControl
 from ..models import ConfirmationStatus, PendingConfirmation, Severity
 from .formatting import (
     CORRECTION_HINT,
@@ -64,6 +68,9 @@ STOP_GRACE_SEC = 30.0
 _CACHE_SIZE = 500
 
 SEND_TIMEOUT_SEC = 20.0           # nobody waits longer than this for an answer from Telegram
+# A message keeps its caller (the engine, a broker, a handler) waiting at most this long for Telegram (never longer
+# than SEND_TIMEOUT_SEC); then it is left to the queue with its request still running (see the module docstring).
+CALLER_WAIT_SEC = 2.5
 QUEUE_MAX = 200                   # messages kept while they cannot be sent (least important, oldest dropped first)
 RETRY_BASE_SEC = 2.0              # back-off of the delivery task after a failed attempt
 RETRY_MAX_SEC = 60.0
@@ -111,6 +118,15 @@ START_FAILED_TEXT = (
     "İnternet bağlantısını kontrol edip botu yeniden başlatın."
 )
 _PREFIX = {Severity.INFO: "ℹ️", Severity.WARNING: "⚠️", Severity.ERROR: "🚨"}
+
+
+def _with_prefix(text: str, severity: Severity) -> str:
+    """The severity icon in front of a notice, unless the text already starts with that same icon."""
+    icon = _PREFIX.get(severity, "ℹ️")
+    bare = icon.replace("\ufe0f", "")
+    if text.lstrip().replace("\ufe0f", "").startswith(bare):
+        return text
+    return f"{icon} {text}"
 _IMPORTANCE = {Severity.INFO: 0, Severity.WARNING: 1, Severity.ERROR: 2}
 _STATUS_OUTCOME = {
     ConfirmationStatus.APPROVED: "✅ Onaylandı",
@@ -138,6 +154,9 @@ _COMMANDS = {
 }
 _COMMAND_RE = re.compile(r"^/([^\s@]+)(?:@\S+)?\s*(.*)$", re.S)
 _SENT, _RETRY, _DROP = "sent", "retry", "drop"
+# Engine answers that refuse an owner action for now (shutting down / still starting): nothing was decided, so the
+# question keeps its buttons and stays usable; the owner only gets the text.
+_NOT_NOW = (SHUTDOWN_TEXT, STARTING_TEXT)
 
 
 def split_html(text: str, limit: int = MAX_CHUNK) -> list[str | tuple[str, list[Any]]]:
@@ -186,6 +205,13 @@ class _Outgoing:
     # and delivers it itself once the connection is back.
     task: asyncio.Task[Any] | None = None
     task_started: float = 0.0
+    # An edit of an earlier bot message (msg id, html; its buttons are removed) that the caller did not wait for:
+    # the delivery task does it in its turn, or waits for its request when that is on its way already
+    # (``edit_task``). Done: nothing else is sent. Not possible: the item goes on as an ordinary message (``text``,
+    # with ``edit_first``), as when the caller's own edit fails.
+    edit: tuple[int, str] | None = None
+    edit_task: asyncio.Task[Any] | None = None
+    edit_started: float = 0.0
     failures: int = 0
     queued: bool = False                             # went through the queue (not delivered at the first try)
     cancelled: bool = False                          # question closed meanwhile: do not ask it any more
@@ -329,20 +355,21 @@ class BotNotifier:
 
     # ---- Notifier API ----------------------------------------------------
     async def notify(self, text: str, severity: Severity = Severity.INFO) -> None:
-        """Tell the owner. Returns when the notice is delivered, or at the latest after SEND_TIMEOUT_SEC;
-        while notices are already waiting or the connection is down it is queued and this returns at once."""
+        """Tell the owner. Returns when the notice is delivered, or at the latest after CALLER_WAIT_SEC (it then
+        stays queued, in order, and is delivered later); while notices are already waiting or the connection is
+        down it is queued and this returns at once."""
         try:
-            await self._send(
-                f"{_PREFIX.get(severity, 'ℹ️')} {text}", backlog=True, importance=_IMPORTANCE.get(severity, 0)
-            )
+            await self._send(_with_prefix(text, severity), backlog=True, importance=_IMPORTANCE.get(severity, 0))
         except Exception:
             log.exception("notify() failed")
 
     async def ask_confirmation(self, conf: PendingConfirmation) -> int | None:
         """Send the 'I understood X, is that right?' message with buttons. Returns bot message id.
 
-        None: it could not be delivered now. It is then asked as soon as Telegram answers again, as
-        long as it is still valid (see ``close_confirmation`` for a question that never went out)."""
+        None: it was not delivered within CALLER_WAIT_SEC. It is then asked as soon as Telegram answers
+        (its request may already be on its way), as long as it is still valid; once delivered, the bot
+        knows its message id, so its buttons, replies to it and ``close_confirmation`` work as usual
+        (see ``close_confirmation`` for a question that never went out)."""
         try:
             text = format_confirmation(conf)
             closed_html = format_confirmation(conf, with_expiry=False)
@@ -392,9 +419,9 @@ class BotNotifier:
             if msg_id is None:
                 await self._send(f"{UNDELIVERED_QUESTION}\n\n{closed_html}\n\n{outcome}", importance=2)
                 return
-            body = closed_html + "\n\n" + outcome
-            if not await self._edit(msg_id, body):
-                await self._send(outcome, reply_to=msg_id, importance=2, edit_first=(msg_id, body))
+            # The question's message shows the outcome (buttons removed); if that cannot be done, the outcome goes
+            # out as a reply that edits the question first. The caller waits at most CALLER_WAIT_SEC.
+            await self._edit_or_send(msg_id, closed_html + "\n\n" + outcome, outcome)
         except Exception:
             log.exception("close_confirmation failed for %s", conf.id)
 
@@ -477,7 +504,12 @@ class BotNotifier:
             return
         conf_id = self._by_msg.get(reply_to) if reply_to is not None else None
         if conf_id is not None and conf_id not in self._closed:
-            await engine.request_correction(conf_id)     # reply to a confirmation = correction
+            refused = await engine.request_correction(conf_id)     # reply to a confirmation = correction
+            if refused in _NOT_NOW:
+                # Shutting down / still starting: nothing was taken (no "correction received"); the question
+                # stays as it is and the owner sends the correction again later.
+                await self._send(refused)
+                return
         else:
             conf_id = await engine.awaiting_correction_id()
         if conf_id is None:
@@ -524,21 +556,25 @@ class BotNotifier:
             reply = await engine.test_parse(args)
         await self._send(reply or "✔️")
 
+    @staticmethod
+    def _close_all_prompt() -> tuple[str, list[list[Any]]]:
+        """The /hepsini_kapat question (HTML) and its buttons."""
+        return (
+            "⚠️ <b>Tüm açık pozisyonlar kapatılsın ve bekleyen emirler iptal edilsin mi?</b>\n"
+            f"Bu işlem geri alınamaz. ({int(CLOSEALL_TTL_SEC // 60)} dk içinde onaylayın.)",
+            [[
+                Button.inline("✅ Evet, hepsini kapat", b"closeall:yes"),
+                Button.inline("❌ Vazgeç", b"closeall:no"),
+            ]],
+        )
+
     async def _ask_close_all(self) -> None:
-        buttons = [[
-            Button.inline("✅ Evet, hepsini kapat", b"closeall:yes"),
-            Button.inline("❌ Vazgeç", b"closeall:no"),
-        ]]
+        text, buttons = self._close_all_prompt()
 
         def prompt_sent(msg_id: int) -> None:    # also when it goes out late: its time starts at delivery
             self._closeall_prompt = (msg_id, time.monotonic())
 
-        await self._send(
-            "⚠️ <b>Tüm açık pozisyonlar kapatılsın ve bekleyen emirler iptal edilsin mi?</b>\n"
-            f"Bu işlem geri alınamaz. ({int(CLOSEALL_TTL_SEC // 60)} dk içinde onaylayın.)",
-            buttons=buttons,
-            on_sent=prompt_sent,
-        )
+        await self._send(text, buttons=buttons, on_sent=prompt_sent)
 
     # ---- button presses (testable) ------------------------------------------
     async def handle_callback(self, event: Any) -> None:
@@ -564,17 +600,18 @@ class BotNotifier:
             if kind == "fix":
                 await self._answer(event, "✏️ Doğrusunu yazın")
                 reply = await engine.request_correction(conf_id)
-                if reply == SHUTDOWN_TEXT:
-                    await self._send(reply)
+                if reply in _NOT_NOW:
+                    await self._send(reply)          # (no "write the correction" hint: nothing waits for it)
                     return
                 await self._send(f"{reply.strip()}\n\n{CORRECTION_HINT}" if reply and reply.strip() else CORRECTION_HINT)
             else:
                 approved = kind == "ok"
                 await self._answer(event, "⏳ Onaylandı, işleniyor…" if approved else "❌ İptal ediliyor…")
                 result = await engine.handle_confirmation(conf_id, approved)
-                if result == SHUTDOWN_TEXT:
-                    # Nothing was decided: the confirmation stays pending and is restored after the restart,
-                    # so its buttons stay on the message (the owner can approve it again then).
+                if result in _NOT_NOW:
+                    # Nothing was decided: the confirmation stays pending (shutting down: restored after the
+                    # restart; starting: usable in a few seconds), so its buttons stay on the message and the
+                    # owner can tap them again then.
                     await self._send(result)
                     return
                 await self._after_decision(conf_id, getattr(event, "message_id", None), result)
@@ -641,6 +678,17 @@ class BotNotifier:
         except Exception as exc:
             log.exception("close_all failed")
             result = f"🚨 Hepsini kapatma sırasında hata: <code>{esc(exc)}</code>"
+        if result == STARTING_TEXT:
+            # Nothing was done (the owner's brokers are still being connected): the question gets its buttons back
+            # and stays valid for the rest of its time, so "Evet" can be tapped again in a few seconds. (Shutting
+            # down: as before the message shows the text; the question lives in memory only and could not be
+            # confirmed after the restart.)
+            if self._closeall_prompt is None:    # (unless a newer /hepsini_kapat question has been sent meanwhile)
+                self._closeall_prompt = prompt
+            text, buttons = self._close_all_prompt()
+            await self._edit(msg_id, text, buttons=buttons)
+            await self._send(result)
+            return
         final = result or "✔️ Tamamlandı."
         if not await self._edit(msg_id, final):
             await self._send(final, importance=2, edit_first=(msg_id, final) if msg_id is not None else None)
@@ -685,15 +733,22 @@ class BotNotifier:
             log.exception("Sending to the owner failed unexpectedly: %.200s", text)
             return None
 
+    @staticmethod
+    def _caller_wait() -> float:
+        """How long a caller waits for Telegram before its message is left to the queue."""
+        return min(CALLER_WAIT_SEC, SEND_TIMEOUT_SEC)
+
     async def _submit(self, item: _Outgoing) -> int | None:
-        """Deliver now if nothing is in the way, else queue. Bounded by SEND_TIMEOUT_SEC per chunk."""
+        """Deliver now if nothing is in the way, else queue. The caller waits at most CALLER_WAIT_SEC for the
+        whole message: a request without an answer by then stays with the item, which is queued in its place,
+        and the delivery task gives it the rest of SEND_TIMEOUT_SEC before it takes the connection for down."""
         if not self._client_connected():
             self._mark_down("the client is disconnected")
         if self._queue or self._down_since is not None:
             self._enqueue(item)          # keep the order; the caller does not wait
             return None
         try:
-            outcome = await self._attempt(item, deadline=time.monotonic() + SEND_TIMEOUT_SEC)
+            outcome = await self._attempt(item, deadline=time.monotonic() + self._caller_wait())
         except asyncio.CancelledError:
             if item.task is not None:    # the caller was cancelled mid-send: the queue finishes the job
                 self._enqueue(item)
@@ -848,24 +903,26 @@ class BotNotifier:
         if not task.cancelled():
             task.exception()             # looked at: a late failure of an abandoned request is not an error
 
-    async def _edit(self, msg_id: int, text: str) -> bool:
-        """Replace a bot message (buttons removed). False if it could not be edited (bounded wait)."""
+    def _edit_request(self, msg_id: int, text: str, buttons: Any = None) -> Coroutine[Any, Any, Any]:
+        """The Telethon request that replaces bot message ``msg_id`` by ``text`` (buttons removed, or ``buttons``)."""
+        chunk = split_html(text, limit=4096)[-1]   # too long: keep the tail (it holds the outcome)
+        if isinstance(chunk, str):
+            return self._client.edit_message(
+                self._owner, msg_id, chunk, parse_mode="html", buttons=buttons, link_preview=False
+            )
+        return self._client.edit_message(
+            self._owner, msg_id, chunk[0], formatting_entities=chunk[1], buttons=buttons, link_preview=False
+        )
+
+    async def _edit(self, msg_id: int, text: str, *, buttons: Any = None) -> bool:
+        """Replace a bot message (buttons removed, or ``buttons``). False if it could not be edited (bounded wait)."""
         if self._client is None:
             return False
         if self._link_down():
             return False                 # it would only time out; callers fall back to a (queued) message
         started = time.monotonic()
         try:
-            chunk = split_html(text, limit=4096)[-1]   # too long: keep the tail (it holds the outcome)
-            if isinstance(chunk, str):
-                edit = self._client.edit_message(
-                    self._owner, msg_id, chunk, parse_mode="html", buttons=None, link_preview=False
-                )
-            else:
-                edit = self._client.edit_message(
-                    self._owner, msg_id, chunk[0], formatting_entities=chunk[1], buttons=None, link_preview=False
-                )
-            await asyncio.wait_for(edit, SEND_TIMEOUT_SEC)
+            await asyncio.wait_for(self._edit_request(msg_id, text, buttons), SEND_TIMEOUT_SEC)
             return True
         except errors.MessageNotModifiedError:
             return True
@@ -879,6 +936,111 @@ class BotNotifier:
                 self._mark_down(f"edit failed: {type(exc).__name__}: {exc}")
             log.warning("Could not edit bot message %s: %s", msg_id, exc)
             return False
+
+    async def _edit_or_send(self, msg_id: int, body: str, fallback: str) -> None:
+        """``_edit(msg_id, body)``, and when that cannot be done ``fallback`` as a reply to that message which edits
+        it first if it goes out late (as close_confirmation always did). The caller waits at most CALLER_WAIT_SEC:
+        while messages are waiting the edit waits its turn in the queue, and an edit that got no answer in time is
+        left to the delivery task with its request still running (see ``_Outgoing.edit``)."""
+        if self._client is None or self._shut or self._link_down():
+            # No edit is tried (it would only time out): the fallback is queued until Telegram answers, as before.
+            await self._send(fallback, reply_to=msg_id, importance=2, edit_first=(msg_id, body))
+            return
+        item = _Outgoing(text=fallback, importance=2, reply_to=msg_id, edit_first=(msg_id, body), edit=(msg_id, body))
+        if self._queue:
+            self._enqueue(item)          # in order behind what is waiting; the caller does not wait
+            return
+        try:
+            task = self._track(asyncio.ensure_future(self._edit_request(msg_id, body)))
+        except Exception as exc:
+            log.warning("Could not edit bot message %s: %s", msg_id, exc)
+            await self._send(fallback, reply_to=msg_id, importance=2, edit_first=(msg_id, body))
+            return
+        started = time.monotonic()
+        try:
+            done, _ = await asyncio.wait({task}, timeout=self._caller_wait())
+        except asyncio.CancelledError:
+            item.edit_task, item.edit_started = task, started
+            self._enqueue(item)          # the caller was cancelled meanwhile: the delivery task finishes the job
+            raise
+        if not done:
+            item.edit_task, item.edit_started = task, started
+            self._enqueue(item)          # no answer yet: the delivery task waits for it, in order
+            return
+        if not self._edit_answered(task, msg_id):
+            await self._send(fallback, reply_to=msg_id, importance=2, edit_first=(msg_id, body))
+
+    def _edit_answered(self, task: asyncio.Task[Any], msg_id: int) -> bool:
+        """A finished edit request: True when the message shows the new text (also when it did so already)."""
+        if task.cancelled():
+            return False
+        exc = task.exception()
+        if exc is None or isinstance(exc, errors.MessageNotModifiedError):
+            self._round_trip_ok()
+            return True
+        if isinstance(exc, (ConnectionError, OSError)):
+            self._mark_down(f"edit failed: {type(exc).__name__}: {exc}")
+        seconds = getattr(exc, "seconds", None)
+        if isinstance(exc, errors.FloodError) and seconds:
+            self._hold(float(seconds) + FLOOD_MARGIN_SEC)   # Telegram asks us to wait: the fallback goes after it
+        log.warning("Could not edit bot message %s: %s", msg_id, exc)
+        return False
+
+    async def _queued_edit(self, item: _Outgoing) -> None:
+        """One step of the delivery task for a queued edit (``_Outgoing.edit``): start it in its turn, or wait for
+        its request (like for a message: SEND_TIMEOUT_SEC without an answer and the connection is taken for down);
+        then the item is done, or goes on as its fallback message."""
+        assert item.edit is not None
+        task = item.edit_task
+        if task is None:
+            if self._link_down():
+                if self._down_since is None:
+                    self._mark_down("the client is disconnected")
+                await self._pause(IDLE_RECHECK_SEC)    # the supervisor wakes us when Telegram answers again
+                return
+            wait = self._hold_until - time.monotonic()
+            if wait > 0:
+                await self._pause(wait)
+                return
+            try:
+                item.edit_task = self._track(asyncio.ensure_future(self._edit_request(*item.edit)))
+            except Exception as exc:
+                log.warning("Could not edit bot message %s: %s", item.edit[0], exc)
+                self._edit_fallback(item)
+                return
+            item.edit_started = time.monotonic()
+            return
+        if not task.done():
+            left = item.edit_started + SEND_TIMEOUT_SEC - time.monotonic()
+            if left > 0:
+                await self._pause(left, task)
+                return
+            # No answer in time: given up as _edit() does (taken out of Telethon's hands, or it would be applied
+            # after some later reconnect); the fallback edits the message again first once Telegram answers.
+            task.cancel()
+            item.edit_task = None
+            self._forget_abandoned_requests()
+            log.warning("Could not edit bot message %s: no answer from Telegram", item.edit[0])
+            self._mark_down(f"no answer to an edit within {SEND_TIMEOUT_SEC:.0f}s", since=item.edit_started)
+            self._edit_fallback(item)
+            return
+        item.edit_task = None
+        if self._edit_answered(task, item.edit[0]):
+            item.edit = None
+            if time.time() - item.created < LATE_MARK_SEC:
+                self._discard(item)      # edited: nothing else to send, as when the caller's own edit works
+            else:
+                # Edited only long after the outcome was known (an outage): the owner also gets the outcome as a
+                # message of its own, marked as late, as after an edit that timed out; the edit itself is done.
+                item.edit_first = None
+        else:
+            self._edit_fallback(item)
+
+    def _edit_fallback(self, item: _Outgoing) -> None:
+        """A queued edit that could not be done goes on as its message (one without a text is dropped)."""
+        item.edit = None
+        if not item.text.strip():
+            self._discard(item)
 
     async def _flush_backlog(self) -> None:
         """The owner just wrote, so messages reach them: deliver what is waiting first (bounded wait)."""
@@ -909,8 +1071,10 @@ class BotNotifier:
         (INFO notices and plain replies, then warnings, then the rest), and write it to the log."""
         victim = min(self._queue, key=lambda it: (it.importance, it.created))
         self._queue.remove(victim)
-        if victim.task is not None:
-            victim.task.cancel()
+        running = [t for t in (victim.task, victim.edit_task) if t is not None]
+        for task in running:
+            task.cancel()
+        if running:
             self._forget_abandoned_requests()
         self._forget_question(victim)
         self._dropped += 1
@@ -964,6 +1128,20 @@ class BotNotifier:
                 self._queue.append(report)
                 continue
             item = self._queue[0]
+            if item.edit is not None:    # an edit nobody waits for: done (or given up) in its turn
+                try:
+                    await self._queued_edit(item)
+                except asyncio.CancelledError:
+                    raise
+                except Exception:
+                    # Never block the queue for ever: the item goes on as its message (the outcome as a reply).
+                    log.exception("A queued edit of bot message %s failed; its message is sent instead", item.edit)
+                    if item.edit_task is not None:
+                        item.edit_task.cancel()
+                        item.edit_task = None
+                        self._forget_abandoned_requests()
+                    self._edit_fallback(item)
+                continue
             task = item.task
             if task is not None and not task.done():
                 # Asked earlier, no answer so far: Telethon still holds the request and sends it once the
