@@ -423,10 +423,12 @@ async def test_open_market_one_leg_per_tp(conn: FakeConn, broker: MetaApiBroker)
     sym = await broker.resolve_symbol("ETH")
     pos = await broker.open_position(make_req(sym, 0.10, make_plan(tps=THREE_TPS)))
     calls = conn.called("create_market_buy_order")
+    # clientId in MetaApi's ${strategyId}_${positionId}_${orderId} format: the live service refused the bare tag
+    # "ct12ab34cd-1" (2026-11-12, test_review1_clientid.py); the adapter reads it back as that tag.
     assert [(a[1], k["stop_loss"], k["take_profit"], k["options"]["clientId"]) for a, k in calls] == [
-        (0.03, 2205.11, 2260.0, "ct12ab34cd-1"),
-        (0.03, 2205.11, 2290.0, "ct12ab34cd-2"),
-        (0.04, 2205.11, 2310.6, "ct12ab34cd-3"),
+        (0.03, 2205.11, 2260.0, "CT_12ab34cdL1_0"),
+        (0.03, 2205.11, 2290.0, "CT_12ab34cdL2_0"),
+        (0.04, 2205.11, 2310.6, "CT_12ab34cdL3_0"),
     ]
     for _, k in calls:
         opts = k["options"]

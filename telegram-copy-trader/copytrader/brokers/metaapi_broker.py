@@ -49,6 +49,24 @@ _TRADE_MODES = {
 }
 _DEAL_REASONS = {"DEAL_REASON_SL": "sl", "DEAL_REASON_TP": "tp", "DEAL_REASON_SO": "stop_out"}
 _MAX_TAG_PLUS_COMMENT = 26      # SDK: len(comment) + len(clientId) <= 26
+# clientId as MetaApi requires it (https://metaapi.cloud/docs/client/clientIdUsage/, linked from the SDK's
+# TradeOptions): ${strategyId}_${positionId}_${orderId}, e.g. "RF_EURUSD_GjCy5lk" there and "TE_GBPUSD_7hyINWqAl" in
+# MetaApi's own SDK examples. The live service refused the bare internal tag ("ctd7c454ab04": "Value must match
+# required pattern"). This bot writes the tag "ct<body>[-<leg>]" as "CT_<body>[L<leg>]_0": ASCII letters and digits
+# only inside each part. The third part may be replaced by MetaApi (trades from a stop loss / take profit), so it
+# is a fixed "0" and is ignored when read back.
+_CID_STRATEGY = "CT"
+_CID_ORDER = "0"
+_CID_RE = re.compile(r"([A-Za-z0-9]+)_([A-Za-z0-9]+)_([A-Za-z0-9]+)")
+_CID_POSITION_RE = re.compile(r"([A-Za-z0-9]+?)(?:L([1-9][0-9]*))?")
+_TAG_RE = re.compile(r"ct([A-Za-z0-9]+)(?:-([1-9][0-9]*))?")       # internal tag: "ct" + body [+ "-<leg>"]
+_LABEL_FIELDS = ("clientId", "comment")      # trade request fields that only label the order
+# SDK exceptions (clients/error_handler.py) that MetaApi raises BEFORE a request reaches the terminal: the request
+# was refused as such (400 invalid input, 401 / 403 not allowed, 429 rate limit), so nothing was executed. Every
+# other error of an order request (timeout, not connected / synchronized, internal, not found) leaves its outcome
+# unknown and stays a lost reply.
+_REFUSED_ERRORS = ("ValidationException", "UnauthorizedException", "ForbiddenException", "TooManyRequestsException")
+_REASON_MAX = 160                # characters of MetaApi's own words in a refusal reason
 RPC_TIMEOUT_SEC = 120.0          # trade requests + connect chain. SDK calls have their own timeouts; last resort
 READ_TIMEOUT_SEC = 30.0          # pure reads (account, price, specification, positions, orders, history): one
                                  # that is never answered must not hold the shared loops for two minutes
@@ -88,6 +106,83 @@ class MetaApiError(BrokerError):
         super().__init__(message)
         self.code = code
         self.string_code = string_code
+        self.refused = False            # MetaApi refused the request before executing it (see _REFUSED_ERRORS)
+        self.reason = ""                # ... why, in a few words for the owner
+        self.fields: tuple[str, ...] = ()     # ... the request fields its ValidationException names
+
+
+def encode_client_id(tag: str) -> str | None:
+    """The clientId for an internal order tag: "ctd7c454ab04" -> "CT_d7c454ab04_0", "ctd7c454ab04-2" ->
+    "CT_d7c454ab04L2_0". None when the tag cannot be written so that :func:`decode_client_id` gives it back
+    exactly (the order then goes without a clientId; its comment carries the tag)."""
+    m = _TAG_RE.fullmatch(tag or "")
+    if m is None:
+        return None
+    body, leg = m.groups()
+    cid = f"{_CID_STRATEGY}_{body}{'L' + leg if leg else ''}_{_CID_ORDER}"
+    return cid if decode_client_id(cid) == tag else None
+
+
+def decode_client_id(value: Any) -> str:
+    """The internal tag a clientId of this bot carries ("CT_d7c454ab04L2_<anything>" -> "ctd7c454ab04-2"; the
+    third part is ignored). A value that is itself an internal tag (the form 62e0719 sent) counts as that tag.
+    "" for anything else: a foreign clientId."""
+    text = str(value or "")
+    m = _CID_RE.fullmatch(text)
+    if m is not None:
+        strategy, position, _order = m.groups()
+        p = _CID_POSITION_RE.fullmatch(position)
+        if strategy != _CID_STRATEGY or p is None:
+            return ""
+        body, leg = p.groups()
+        return f"ct{body}" + (f"-{leg}" if leg else "")
+    return text if _TAG_RE.fullmatch(text) else ""
+
+
+def _is_sdk_error(exc: BaseException, name: str) -> bool:
+    return any(cls.__name__ == name for cls in type(exc).__mro__)
+
+
+def _refused_fields(exc: BaseException) -> tuple[str, ...]:
+    """The request fields a ValidationException names (details: [{"parameter": ..., "message": ...}, ...])."""
+    if not _is_sdk_error(exc, "ValidationException"):
+        return ()
+    try:
+        details = getattr(exc, "details", None)
+    except Exception:  # noqa: BLE001 - a property of a foreign exception class
+        return ()
+    names: list[str] = []
+    for item in details if isinstance(details, (list, tuple)) else ():
+        name = item.get("parameter") if isinstance(item, dict) else None
+        if isinstance(name, str) and name and name not in names:
+            names.append(name)
+    if not names:       # no structured details: a label field named in the text still counts
+        text = f"{exc} {details or ''}"
+        names = [f for f in _LABEL_FIELDS if f in text]
+    return tuple(names)
+
+
+def _short(text: Any) -> str:
+    text = _TOKEN_RE.sub(r"\1***", " ".join(str(text or "").split()))     # never a token in an owner's text
+    return text if len(text) <= _REASON_MAX else text[: _REASON_MAX - 1] + "…"
+
+
+def _refusal_reason(exc: BaseException, fields: tuple[str, ...]) -> str:
+    """Why MetaApi refused a request, in a few words for the owner (MetaApi's own words where they help)."""
+    if _is_sdk_error(exc, "ValidationException"):
+        said = ""
+        details = getattr(exc, "details", None)
+        for item in details if isinstance(details, (list, tuple)) else ():
+            if isinstance(item, dict) and item.get("message"):
+                said = str(item["message"])
+                break
+        what = f"geçersiz alan: {', '.join(fields)}" if fields else "geçersiz istek"
+        return _short(f"{what} – {said}" if said else f"{what} – {exc}")
+    if _is_sdk_error(exc, "TooManyRequestsException"):
+        return "MetaApi istek sınırı aşıldı, kısa sürede çok fazla istek gönderildi"
+    if _is_sdk_error(exc, "UnauthorizedException"):
+        return _short(f"MetaApi erişim anahtarı (METAAPI_TOKEN) kabul edilmedi – {exc}")
+    return _short(f"MetaApi bu hesapta bu işleme izin vermiyor – {exc}")
 
 
 def _error_detail(exc: BaseException) -> str:
@@ -165,7 +260,12 @@ def map_error(what: str, exc: BaseException) -> MetaApiError:
         text = f"MetaApi {what} başarısız: {retcode_text(code, msg)}"
     else:
         text = f"MetaApi {what} başarısız: {msg}" + (f" [{scode}]" if scode else "")
-    return MetaApiError(text, code if isinstance(code, int) else None, scode)
+    err = MetaApiError(text, code if isinstance(code, int) else None, scode)
+    if any(_is_sdk_error(exc, name) for name in _REFUSED_ERRORS):
+        err.refused = True
+        err.fields = _refused_fields(exc)
+        err.reason = _refusal_reason(exc, err.fields)
+    return err
 
 
 def _f(x: Any) -> float:
@@ -287,7 +387,7 @@ class MetaApiBroker(MetaTraderLegBroker):
     outside (tests)."""
 
     kind = "metaapi"
-    tag_limit = 16      # clientId length; leaves room for a short comment
+    tag_limit = 16      # internal tag length; its clientId is 3 longer (encode_client_id): room for a short comment
 
     def __init__(
         self,
@@ -304,6 +404,7 @@ class MetaApiBroker(MetaTraderLegBroker):
         self._api: Any | None = None
         self._half_open: Any | None = None       # SDK connection of a connect() that did not finish
         self._lost: dict[tuple[str, str], tuple[OrderReplyLostError, str]] = {}   # (symbol, leg tag) -> unanswered
+        self._refused: dict[tuple[str, str], MetaApiError] = {}      # (symbol, leg tag) -> refused, not executed
         self._snapshot_failures = 0
         self._connected = False
         self._platform = "mt5"
@@ -1047,14 +1148,32 @@ class MetaApiBroker(MetaTraderLegBroker):
     # ---- order primitives -------------------------------------------------------------
     def _options(self, tag: str) -> dict[str, Any]:
         opts: dict[str, Any] = {
-            "clientId": tag,
             "magic": int(self.cfg.magic),
             "slippage": int(self.cfg.slippage_points),
         }
-        room = _MAX_TAG_PLUS_COMMENT - len(tag)
+        cid = encode_client_id(tag)
+        if cid is None:
+            # Not writable in MetaApi's clientId format (never for the engine's "ct" + hex tags): the comment
+            # carries the tag (see _own_tag).
+            if len(tag) <= _MAX_TAG_PLUS_COMMENT:
+                opts["comment"] = tag
+            return opts
+        opts["clientId"] = cid
+        room = _MAX_TAG_PLUS_COMMENT - len(cid)
         if room >= 2:
             opts["comment"] = "copytrader"[:room]
         return opts
+
+    @staticmethod
+    def _without_labels(opts: dict[str, Any], tag: str, fields: Sequence[str]) -> None:
+        """``opts`` (in place) for the one repeat of an order whose label MetaApi refused: without the refused
+        label field(s). Without a clientId the comment carries the internal tag, unless the comment was refused."""
+        if "clientId" in fields:
+            opts.pop("clientId", None)
+            if "comment" not in fields and len(tag) <= _MAX_TAG_PLUS_COMMENT:
+                opts["comment"] = tag
+        if "comment" in fields:
+            opts.pop("comment", None)
 
     async def _find_tagged_position(self, symbol: str, tag: str) -> str | None:
         positions, _ = await self._snapshot(symbol)
@@ -1083,15 +1202,33 @@ class MetaApiBroker(MetaTraderLegBroker):
         requote_retries: int = 0, **kwargs: Any,
     ) -> Any:
         """A request that CREATES an order. An answer with a trade return code is final (MetaApiError; a requote
-        of a market order is sent again, the price is the market's at that moment). Anything else (timeout,
-        connection closed, an answer without a return code) means the order MAY have been executed:
-        OrderReplyLostError, never sent again. So does the one return code that says the trade server did not
-        answer in time (10012, "request cancelled by timeout"; Mt5Broker treats it the same way)."""
+        of a market order is sent again, the price is the market's at that moment). So is a refusal MetaApi gives
+        before executing anything (map_error: ``refused``): nothing was executed, never a lost reply. When that
+        refusal names a label field (clientId, comment), the order is sent ONCE more without it (safe: the first
+        request was not executed; ``options`` is changed in place, so the caller sees how the order went out).
+        Anything else (timeout, connection closed, an answer without a return code) means the order MAY have been
+        executed: OrderReplyLostError, never sent again. So does the one return code that says the trade server
+        did not answer in time (10012, "request cancelled by timeout"; Mt5Broker treats it the same way)."""
         attempt = 0
+        relabelled = False
         while True:
             try:
                 return await self._rpc(what, fn, *args, **kwargs)
             except MetaApiError as exc:
+                if exc.refused:
+                    opts = kwargs.get("options")
+                    labels = [f for f in exc.fields if f in _LABEL_FIELDS and isinstance(opts, dict) and f in opts]
+                    if labels and not relabelled:
+                        relabelled = True
+                        self._without_labels(opts, tag, labels)      # type: ignore[arg-type]
+                        logger.warning("%s: MetaApi refused the %s of the %s order tagged %s (%s); nothing was "
+                                       "executed, sending it once more without it", self.name, "/".join(labels),
+                                       symbol, tag, exc.reason)
+                        continue
+                    err = MetaApiError(f"MetaApi emri reddetti ({exc.reason})", exc.code, exc.string_code)
+                    err.refused, err.reason, err.fields = True, exc.reason, exc.fields
+                    self._refused[(symbol, tag)] = err
+                    raise err from exc
                 if (exc.code is None and exc.string_code is None) or exc.code == MT5.TRADE_RETCODE_TIMEOUT:
                     raise self._reply_lost(symbol, tag, str(exc)) from exc
                 if exc.code not in _REQUOTE_RETCODES or attempt >= requote_retries:
@@ -1130,15 +1267,29 @@ class MetaApiBroker(MetaTraderLegBroker):
             pos = await super()._open_position(req)
         except BrokerError as exc:
             text = self._unsure_not_failed(symbol, str(exc))
+            for key, err in self._refused.items():
+                # Nothing was opened and MetaApi refused the order before executing it: say exactly that.
+                if key[0] == symbol and re.fullmatch(rf"(?:Emir|\d+/\d+\. bacak) açılamadı: {re.escape(str(err))}",
+                                                     text):
+                    text = f"{err}; bu hesapta işlem açılmadı."
             if text != str(exc):
                 raise BrokerError(text) from exc
             raise
         finally:
             lost = [self._lost.pop(key)[0] for key in list(self._lost) if key[0] == symbol]
+            for key in [k for k in self._refused if k[0] == symbol]:
+                del self._refused[key]
         if pos.error:
             pos.error = self._unsure_not_failed(symbol, pos.error, lost)
         legs = pos.data.get("legs") or []
         notes = pos.data.setdefault("warnings", [])
+        unlabelled = [f"#{leg['ticket']}" for leg in legs if leg.get("unlabelled")]
+        if unlabelled:
+            one = len(unlabelled) == 1
+            what = "emir etiketsiz gönderildi" if one else f"{len(unlabelled)} emir etiketsiz gönderildi"
+            how = "bu emri MetaApi'nin verdiği bu numarayla" if one else "bu emirleri MetaApi'nin verdiği bu numaralarla"
+            notes.append(f"MetaApi emir etiketini (clientId) kabul etmedi; {what} ({', '.join(unlabelled)}). Bot "
+                         f"{how} takip ediyor.")
         for leg in legs:
             label = f"#{leg['ticket']}" if len(legs) > 1 else "Emir"
             if leg.get("unfilled"):
@@ -1185,6 +1336,7 @@ class MetaApiBroker(MetaTraderLegBroker):
         name = symbol.broker_symbol
         fn = conn.create_market_buy_order if side is Side.LONG else conn.create_market_sell_order
         opts = self._options(tag)
+        labelled = "clientId" in opts
         naked = False
         try:
             res = await self._send_order("piyasa emri", name, tag, fn, name, float(volume), stop_loss=float(sl),
@@ -1211,6 +1363,8 @@ class MetaApiBroker(MetaTraderLegBroker):
                       sl=None if naked else float(sl), tp=tp, tag=tag)
         if _partly_done(res):
             leg["partial_fill"] = True        # the real volume is read from the position (_refresh_open)
+        if labelled and "clientId" not in opts:
+            leg["unlabelled"] = True          # MetaApi refused its clientId: sent without (_send_order)
         return leg
 
     async def _open_pending_leg(
@@ -1230,6 +1384,7 @@ class MetaApiBroker(MetaTraderLegBroker):
         if allowed and need not in allowed:
             raise BrokerError(f"{name} için {'limit' if limit else 'stop'} emir türüne broker izin vermiyor.")
         opts = self._options(tag)
+        labelled = "clientId" in opts
         minutes = int(self.risk_config.pending_entry_expiry_min or 0)
         modes = symbol.extra.get("expiration_modes") or []
         if minutes > 0 and ("SYMBOL_EXPIRATION_SPECIFIED" in modes or self._platform == "mt4"):
@@ -1254,6 +1409,8 @@ class MetaApiBroker(MetaTraderLegBroker):
         leg = new_leg(ticket=str(oid), order_ticket=str(oid), state="pending", volume=float(volume),
                       entry=float(price), sl=float(sl), tp=tp, tag=tag)
         leg["order_type"] = ("BUY_" if side is Side.LONG else "SELL_") + ("LIMIT" if limit else "STOP")
+        if labelled and "clientId" not in opts:
+            leg["unlabelled"] = True          # MetaApi refused its clientId: sent without (_send_order)
         return leg
 
     async def _modify_leg(self, symbol: str, side: Side, leg: dict[str, Any], sl: float, tp: float | None) -> None:
@@ -1290,6 +1447,17 @@ class MetaApiBroker(MetaTraderLegBroker):
         await self._rpc("emir iptali", conn.cancel_order, str(leg["order_ticket"]))
 
     # ---- state primitives ---------------------------------------------------------------
+    def _own_tag(self, item: dict[str, Any]) -> str:
+        """The internal tag of a position / order of this bot ("" for anything else). Only our own magic counts
+        for idempotency matching. The clientId decides when there is one (decode_client_id); an order sent without
+        one (MetaApi refused it, see _send_order) carries the tag in its comment."""
+        if int(item.get("magic") or 0) != int(self.cfg.magic):
+            return ""
+        if item.get("clientId"):
+            return decode_client_id(item.get("clientId"))
+        comment = str(item.get("comment") or "")
+        return comment if _TAG_RE.fullmatch(comment) else ""
+
     async def _snapshot(self, symbol: str) -> tuple[dict[str, dict[str, Any]], dict[str, dict[str, Any]]]:
         conn = self._require()
         try:
@@ -1298,12 +1466,7 @@ class MetaApiBroker(MetaTraderLegBroker):
         except BrokerError:
             self._snapshot_failures += 1      # _adopt_lost_leg: "not found" and "could not look" are different
             raise
-        magic = int(self.cfg.magic)
-
-        def own_tag(item: dict[str, Any]) -> str:
-            # only our own magic counts for idempotency matching
-            return str(item.get("clientId") or "") if int(item.get("magic") or 0) == magic else ""
-
+        own_tag = self._own_tag
         positions = {
             str(p["id"]): {
                 "ticket": str(p["id"]), "volume": _f(p.get("volume")), "entry": _f(p.get("openPrice")) or None,

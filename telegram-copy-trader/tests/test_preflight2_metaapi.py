@@ -887,11 +887,13 @@ def test_a5_long_details_are_trimmed_and_plain_errors_unchanged() -> None:
 
 async def test_a5_owner_sees_what_metaapi_refused(conn: TroubleConn, broker: MetaApiBroker) -> None:
     sym = await eth(broker)
+    # Was "clientId": a refused label field (clientId, comment) is now sent once more without it
+    # (test_review1_clientid.py); a refusal of any other field is final and the owner reads what was refused.
     conn.fail["create_market_buy_order"] = [
-        ValidationException("Validation failed", [{"parameter": "clientId", "message": "invalid characters"}])]
+        ValidationException("Validation failed", [{"parameter": "volume", "message": "invalid characters"}])]
     with pytest.raises(BrokerError) as ei:
         await broker.open_position(make_req(sym, 0.05, make_plan()))
-    assert "clientId" in str(ei.value) and "invalid characters" in str(ei.value)
+    assert "volume" in str(ei.value) and "invalid characters" in str(ei.value)
     assert conn.creates() == ["create_market_buy_order"]
 
 
