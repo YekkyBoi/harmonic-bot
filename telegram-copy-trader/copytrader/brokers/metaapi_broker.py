@@ -82,6 +82,7 @@ RECONNECT_TIMEOUT_SEC = 180.0    # one reconnect attempt: the same limit the eng
 LINK_WATCH_SEC = 0.5             # the adapter looks at the SDK's own view of the link this often (no request is made);
                                  # a socket that ends wakes it at once (_handle_eio_disconnect), this is the fallback
 LINK_CONFIRM_SEC = 0.0           # ... and rebuilds the connection when the SDK has reported its sockets ended this long
+FAST_RETRY_AFTER_FAIL_SEC = 15.0  # a rebuild the link watch started at once and that failed: the next one this soon
                                  # without bringing them back itself: at once. Production (2026-11-13): MetaApi closed
                                  # both sockets every 10-15 min and the SDK's own socket reconnect never brought them
                                  # back within the 20 s this used to wait (it made one attempt and then none for hours
@@ -1230,7 +1231,18 @@ class MetaApiBroker(MetaTraderLegBroker):
             return
         logger.warning("%s: MetaApi reconnect attempt %d failed: %s", self.name, attempt,
                        _TOKEN_RE.sub(r"\1***", reason))
-        if _RECONNECT_FAILED in self._policy.attempt_finished(False, loop.time()):
+        events = self._policy.attempt_finished(False, loop.time())
+        if attempt == 1 and self._outage_fast:
+            # The link watch started this outage at once, so a short network outage can outlast the SDK's own REST
+            # retries (~31 s) and fail this first attempt. Try once more soon rather than after the first back-off,
+            # and keep the owner's "could not rebuild" notice for a second failure.
+            now = loop.time()
+            if self._policy.retry_at is None or self._policy.retry_at > now + FAST_RETRY_AFTER_FAIL_SEC:
+                self._policy.retry_at = now + FAST_RETRY_AFTER_FAIL_SEC
+            if _RECONNECT_FAILED in events:
+                self._policy.failed_told = False
+            return
+        if _RECONNECT_FAILED in events:
             self._tell_reconnect_failed(reason, connected=False)
 
     def _tell_reconnect_failed(self, reason: str, *, connected: bool) -> None:
