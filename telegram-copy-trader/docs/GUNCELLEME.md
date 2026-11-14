@@ -84,6 +84,12 @@ bot hiç açılmaz (sizin hesaplarınız dahil). `type: metaapi` yazmak bunu ç�
 güncellemeden önceki yedeğiyle (`config.yaml.yedek-...` ya da `yedek\<tarih>\config.yaml`) değiştirilmelidir.
 Bu ayarlar Tickmill terminali bulunamasa da eklenir (`risk_usd` ve `lot_rounding`).
 
+Önerilen sıra (sizin fx hesabınız için en güvenlisi): önce Tickmill terminalini KURMADAN bu sürüme güncelleyin ve
+botun fx hesabına bağlandığını görün (bot o anda FundingPips terminalini `data\mt5_terminal_fx.json` dosyasına
+kaydeder). Tickmill terminalini ondan sonra kurup giriş yapın ve güncellemeyi bir kez daha çalıştırın: 6. adım
+terminali o zaman bulur ve `tickmill` bloğunu çevirir. Geçişi, arkadaşınızın tickmill hesabında açık işlem yokken
+yapın.
+
 Terminal Program Files dışında bir yere kurulduysa 3. adımdaki satırın sonuna bir boşluk bırakıp
 `--tickmill-terminal "C:\...\terminal64.exe"` yazın. MetaApi'de kalmak için `--tickmill-terminal yok` yazın.
 
