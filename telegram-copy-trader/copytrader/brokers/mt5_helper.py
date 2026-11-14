@@ -13,6 +13,13 @@ plain dict (type name, text, a few attributes) and is rebuilt on the other side.
 stdout carries the protocol only: file descriptor 1 is pointed at stderr right at the start, so nothing printed (by
 Python or by a native library) can break a frame. Logging goes to stderr, which the bot copies into its own log.
 When stdin ends (the bot exited, crashed or was killed) this process ends at once: it never outlives the bot.
+
+Windows: no thread may sit in a blocking read of stdin. While a synchronous read is pending on the pipe, any other
+use of the same handle waits for it - and a library that sets up its own C runtime when it is loaded (numpy, which
+the MetaTrader5 package imports) asks Windows about the standard handles and so hung for ever (live, 2026-11-14:
+"MT5 yardımcı süreci 170 sn içinde yanıt vermedi"; reproduced on the server with tools/teshis_mt5*.py). So the
+reader waits for data by polling the pipe (PeekNamedPipe) and only then reads what is there, and the MetaTrader5
+package is loaded before the reader thread starts.
 """
 
 from __future__ import annotations
@@ -26,6 +33,7 @@ import pickle
 import struct
 import sys
 import threading
+import time
 from typing import Any, BinaryIO
 
 PROTOCOL = 1
@@ -34,6 +42,7 @@ MAX_FRAME = 64 * 1024 * 1024
 EXIT_CLOSE_SEC = 5.0              # "exit": how long the adapter's close() may take before the process just ends
 # Tests only: "module:callable" returning a fake MetaTrader5 module (the real package is imported otherwise), and
 # a folder put in front of sys.path for it.
+STDIN_POLL_SEC = 0.005            # Windows: how often the reader looks whether the bot has written something
 FAKE_ENV = "COPYTRADER_MT5_HELPER_FAKE"
 FAKE_PATH_ENV = "COPYTRADER_MT5_HELPER_FAKE_PATH"
 
@@ -57,30 +66,98 @@ def write_frame(stream: BinaryIO, obj: Any) -> None:
     stream.flush()
 
 
-def read_frame(stream: BinaryIO) -> Any:
-    """The next message, or None at the end of the stream (also for a frame cut off by the end)."""
-    head = _read_exact(stream, _HEADER.size)
+def read_frame(stream: BinaryIO, wait: Any = None) -> Any:
+    """The next message, or None at the end of the stream (also for a frame cut off by the end). ``wait``: called
+    before every read; it returns once the stream has data (True) or has ended (False), see :func:`pipe_waiter`."""
+    head = _read_exact(stream, _HEADER.size, wait)
     if head is None:
         return None
     (size,) = _HEADER.unpack(head)
     if size > MAX_FRAME:
         raise ValueError(f"frame too large: {size}")
-    body = _read_exact(stream, size)
+    body = _read_exact(stream, size, wait)
     if body is None:
         return None
     return pickle.loads(body)      # noqa: S301 - our own parent / child process over a private pipe
 
 
-def _read_exact(stream: BinaryIO, size: int) -> bytes | None:
+def _read_exact(stream: BinaryIO, size: int, wait: Any = None) -> bytes | None:
     parts: list[bytes] = []
     left = size
     while left > 0:
+        if wait is not None and not wait():
+            return None
         chunk = stream.read(left)
         if not chunk:
             return None
         parts.append(chunk)
         left -= len(chunk)
     return b"".join(parts)
+
+
+def pipe_waiter(fd: int, *, peek: Any = None, sleep: Any = time.sleep) -> Any:
+    """A ``wait`` for :func:`read_frame` that never leaves a blocking read pending on ``fd`` (see the module text):
+    it polls the pipe until it has data (True) or its other end is closed (False). None where that is not needed or
+    not possible: not Windows, or ``fd`` is not a pipe (the reads then block as they always did).
+    ``peek(handle) -> bytes available, or None when the pipe is broken`` and ``sleep`` are injectable for tests."""
+    if peek is None:
+        if sys.platform != "win32":
+            return None
+        peek = _windows_peek(fd)
+        if peek is None:
+            return None
+
+    def wait() -> bool:
+        while True:
+            available = peek()
+            if available is None:
+                return False
+            if available:
+                return True
+            sleep(STDIN_POLL_SEC)
+
+    return wait
+
+
+def _windows_peek(fd: int) -> Any:
+    """``peek()`` for a pipe on Windows (PeekNamedPipe: bytes available, None when the pipe is broken); None if
+    ``fd`` is not a pipe or the call is not available."""
+    try:
+        import ctypes
+        import msvcrt
+        from ctypes import wintypes
+
+        kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)          # type: ignore[attr-defined]
+        kernel32.PeekNamedPipe.argtypes = [wintypes.HANDLE, ctypes.c_void_p, wintypes.DWORD, ctypes.c_void_p,
+                                           ctypes.POINTER(wintypes.DWORD), ctypes.c_void_p]
+        kernel32.PeekNamedPipe.restype = wintypes.BOOL
+        kernel32.GetFileType.argtypes = [wintypes.HANDLE]
+        kernel32.GetFileType.restype = wintypes.DWORD
+        handle = msvcrt.get_osfhandle(fd)                                  # type: ignore[attr-defined]
+        if kernel32.GetFileType(handle) != 3:                              # FILE_TYPE_PIPE
+            return None
+    except Exception:  # noqa: BLE001 - the blocking read is the fallback
+        logger.warning("stdin cannot be polled; reading it the blocking way", exc_info=True)
+        return None
+
+    def peek() -> int | None:
+        available = wintypes.DWORD(0)
+        if not kernel32.PeekNamedPipe(handle, None, 0, None, ctypes.byref(available), None):
+            return None                      # broken pipe (the bot is gone) or any other failure: the stream ended
+        return int(available.value)
+
+    return peek
+
+
+def preload_mt5() -> None:
+    """Load the MetaTrader5 package (and numpy with it) now: before the reader thread exists and before anything
+    else could be waiting on a standard handle. A missing package is reported later, by Mt5Broker.connect()."""
+    if os.environ.get(FAKE_ENV) or sys.platform != "win32":
+        return
+    try:
+        importlib.import_module("MetaTrader5")
+    except Exception:  # noqa: BLE001 - connect() tells the owner what is wrong
+        logger.warning("MetaTrader5 package could not be loaded at the start", exc_info=True)
 
 
 def error_to_wire(exc: BaseException) -> dict[str, Any]:
@@ -175,6 +252,7 @@ async def _run(hello: dict[str, Any], stdin: BinaryIO, out: BinaryIO) -> None:
     from ..config import Mt5BridgeBrokerConfig
     from .mt5_broker import Mt5Broker, TerminalGuard
 
+    preload_mt5()
     cfg = Mt5BridgeBrokerConfig.model_validate(hello["config"])
     guard = TerminalGuard(**(hello.get("guard") or {}))
     broker = Mt5Broker(cfg, mt5_module=_load_mt5(), pin_dir=hello.get("pin_dir"), guard=guard)  # type: ignore[arg-type]
@@ -184,10 +262,12 @@ async def _run(hello: dict[str, Any], stdin: BinaryIO, out: BinaryIO) -> None:
     loop = asyncio.get_running_loop()
     inbox: asyncio.Queue[Any] = asyncio.Queue()
 
+    wait = pipe_waiter(stdin.fileno())
+
     def reader() -> None:
         try:
             while True:
-                msg = read_frame(stdin)
+                msg = read_frame(stdin, wait)
                 if msg is None:
                     break
                 loop.call_soon_threadsafe(inbox.put_nowait, msg)
@@ -211,7 +291,7 @@ def main() -> int:
     sys.stdout = sys.stderr
     _no_inherit(0, 1, 2, out_fd)
     out = os.fdopen(out_fd, "wb", buffering=0)
-    hello = read_frame(stdin)
+    hello = read_frame(stdin, pipe_waiter(stdin.fileno()))
     if not isinstance(hello, tuple) or hello[0] != "hello":
         return 2
     info = hello[1]
