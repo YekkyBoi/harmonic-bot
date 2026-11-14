@@ -117,6 +117,31 @@ def native_aes() -> bool:
     return callable(getattr(libssl, "encrypt_ige", None)) and callable(getattr(libssl, "decrypt_ige", None))
 
 
+def trading_path_busy(listener: Any, notifier: Any, engine: Any) -> bool:
+    """The trading path is working: the listener stores / edits a source message or a batch waits for or is in the
+    engine; the notifier handles an owner command or button press; the engine runs an order flow or a monitor
+    sync (read-only looks, never a lock). What cannot be looked at counts as busy. Used by the group copy and by
+    the owner's report card (copytrader.karne) before and during a file transfer."""
+    for part in (listener, notifier):
+        check = getattr(part, "trading_busy", None)
+        if callable(check):
+            try:
+                if check():
+                    return True
+            except Exception:      # noqa: BLE001
+                return True
+    if engine is not None:
+        try:
+            if any(not t.done() for t in list(getattr(engine, "_critical", None) or ())):
+                return True
+            running = getattr(getattr(engine, "monitor", None), "_running", None) or {}
+            if any(not t.done() for t in list(running.values())):
+                return True
+        except Exception:      # noqa: BLE001
+            return True
+    return False
+
+
 def role_of(topic_title: str | None) -> str:
     """'sohbet' for a topic whose title contains "sohbet" (any case, with or without Turkish letters), else 'ana'."""
     if topic_title and (SOHBET_PART in fold_tr(topic_title) or SOHBET_PART in fold_ascii(topic_title)):
@@ -791,25 +816,7 @@ class GroupMirror:
         """The trading path is working: the listener stores / edits a source message or a batch waits for or is in the
         engine; the notifier handles an owner command or button press; the engine runs an order flow or a monitor
         sync (read-only looks, never a lock)."""
-        for part in (self._listener, self._notifier):
-            check = getattr(part, "trading_busy", None)
-            if callable(check):
-                try:
-                    if check():
-                        return True
-                except Exception:      # noqa: BLE001
-                    return True
-        engine = self._engine
-        if engine is not None:
-            try:
-                if any(not t.done() for t in list(getattr(engine, "_critical", None) or ())):
-                    return True
-                running = getattr(getattr(engine, "monitor", None), "_running", None) or {}
-                if any(not t.done() for t in list(running.values())):
-                    return True
-            except Exception:      # noqa: BLE001
-                return True
-        return False
+        return trading_path_busy(self._listener, self._notifier, self._engine)
 
     def _stopped(self) -> bool:
         return self._stopping or bool(getattr(self._notifier, "_shut", False))

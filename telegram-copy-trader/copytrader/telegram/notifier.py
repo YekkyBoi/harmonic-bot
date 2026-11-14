@@ -76,6 +76,45 @@ from .formatting import (
 
 log = logging.getLogger(__name__)
 
+
+def keep_pillow_out_of_telethon() -> None:
+    """Telethon uses Pillow, when it is installed, to look at and shrink every PHOTO it uploads
+    (``telethon.client.uploads._resize_photo_if_needed``: decode, resize, re-encode as JPEG) - on the event loop,
+    in the bot's own process. Pillow is there only for the report card, which is drawn in ANOTHER process
+    (copytrader.karne) and whose Pillow is kept in a folder this process does not import from
+    (karne.render.packages_dir): normally there is nothing to do here. This is the second line of defence, for a
+    Pillow that is in the bot's own environment all the same (installed by hand, a Docker image): uploads must
+    behave exactly as without it - the group copy's photos go out as they are and nothing decodes a picture between
+    two orders. Telethon reads its module-level ``PIL`` at every call, so clearing it switches that path off.
+    When Pillow can be imported here and Telethon has no such attribute (a Telethon that changed), that is said
+    with a WARNING: the switch then no longer works. Called once when this module is imported; never raises."""
+    try:
+        from telethon.client import uploads as tl_uploads
+
+        if getattr(tl_uploads, "PIL", None) is not None:
+            tl_uploads.PIL = None
+            log.info("Pillow is installed: Telethon's photo resizing in the bot's process is switched off")
+        elif not hasattr(tl_uploads, "PIL") and _pillow_importable():
+            log.warning("Pillow can be imported in the bot's process and this Telethon has no 'uploads.PIL' to "
+                        "switch off: Telethon may resize uploaded photos with it on the event loop. Remove Pillow "
+                        "from the bot's Python environment (the report card uses its own copy in karne_paketleri).")
+    except Exception:      # noqa: BLE001 - never a reason not to start
+        log.warning("Could not check Telethon's use of Pillow", exc_info=True)
+
+
+def _pillow_importable() -> bool:
+    """Pillow is loaded, or could be imported, in THIS process (looked up, not imported)."""
+    import importlib.util
+    import sys
+
+    try:
+        return "PIL" in sys.modules or importlib.util.find_spec("PIL") is not None
+    except Exception:      # noqa: BLE001
+        return False
+
+
+keep_pillow_out_of_telethon()
+
 MAX_CHUNK = 4000                  # Telegram limit is 4096 chars after entity parsing
 CLOSEALL_TTL_SEC = 120.0          # a "close all" yes-button older than this is refused
 STOP_GRACE_SEC = 30.0
@@ -125,6 +164,8 @@ HELP_TEXT = (
     "(/sonradan: göster)\n"
     "/grup ac · /grup kapat · /grup konular &lt;ad, ad&gt; — kaynak grubun kopyası arkadaşınızın gruplarına "
     "(/grup: durum; grupları arkadaşınız o gruplarda /bagla ile bağlar)\n"
+    "/karne — bu haftanın karnesi, şu ana kadar (haftalık karne her pazar 22:00'de, İngiltere saatiyle, kendiliğinden "
+    "gelir); /karne hepsi — bugüne kadarki tüm işlemler\n"
     "/yardim — bu mesaj\n\n"
     "Onay mesajlarında: ✅ Onayla · ✏️ Düzelt (doğrusunu yazarsınız) · ❌ İptal\n"
     "Bir onay mesajını yanıtlayarak da düzeltme yazabilirsiniz."
@@ -173,6 +214,13 @@ GROUP_POLL_SEC = 0.5
 GROUP_ALERT_EVERY_SEC = 3600.0    # failing group copies: the owner is told at most this often (a throttle of its own)
 FRIEND_FLOOD_MAX_SEC = 300.0      # the friend's own messages wait out a FloodWait up to this long (longer: as before)
 FRIEND_FLOOD_TRIES = 1            # an ordinary message is sent once more after a FloodWait (questions: until closed)
+# A file for the owner himself (the weekly report card): one bounded request, see BotNotifier.send_owner_document
+OWNER_FILE_TIMEOUT_SEC = 120.0    # the whole upload (a card is under 1 MB); no answer by then: left to Telethon
+OWNER_FILE_PAUSE_SEC = 30.0       # the upload waits this long (before it and between its parts) for an idle trading path
+OWNER_FILE_POLL_SEC = 0.2
+OWNER_FILE_NO_AES = ("Telegram'a dosya göndermek için hızlı şifreleme paketi (cryptg) kurulu değil; kurmak için botun "
+                     "klasöründe: python -m pip install cryptg")
+KARNE_OFF_TEXT = "ℹ️ Karne bu kurulumda kullanılamıyor."
 ROLE_TR = {"ana": "ana grup", "sohbet": "sohbet grubu"}
 ROLE_ACC = {"ana": "ana grubu", "sohbet": "sohbet grubu"}
 ROLE_DATIVE = {"ana": "ana grubuna", "sohbet": "sohbet grubuna"}
@@ -241,6 +289,7 @@ _COMMANDS = {
     "sonradan": "catchup",
     "grup": "group",
     "bagla": "bind", "bağla": "bind",
+    "karne": "karne",
 }
 _COMMAND_RE = re.compile(r"^/([^\s@]+)(?:@\S+)?\s*(.*)$", re.S)
 _SENT, _RETRY, _DROP = "sent", "retry", "drop"
@@ -395,6 +444,7 @@ class BotNotifier:
         self._group_hold_until = 0.0                           # monotonic: FloodWait of a group copy until then
         self._group_alert_at: float | None = None              # monotonic: the owner was told about a failed copy then
         self._group_peers: dict[int, Any] = {}                 # a supergroup a group was upgraded to -> its input peer
+        self._karne: Any = None                                # karne.service.KarneService (set by the app): /karne
         self._username: str | None = None                      # the bot's own username (for /bagla@...)
         self._me_id: int | None = None                         # the bot's own user id (its posts are never copied)
 
@@ -757,6 +807,10 @@ class BotNotifier:
             reply = await engine.catch_up_command(args)
         elif command == "group":
             await self._group_command(args)
+            return
+        elif command == "karne":             # (answers at once; the card follows from the service's own task)
+            karne = self._karne
+            await self._send(await karne.command(args) if karne is not None else KARNE_OFF_TEXT, mirror=False)
             return
         elif command == "bind":              # (written here, in the private chat: it belongs in the friend's group)
             cmd = self._bind_cmd()
@@ -1290,6 +1344,85 @@ class BotNotifier:
         except Exception:                     # noqa: BLE001 - never in the way of /arkadas
             log.exception("Group copy: could not drop the earlier friend's bindings")
             return False
+
+    # ---- the owner's report card (/karne; copytrader.karne) ------------------------------------------------
+    def set_karne(self, karne: Any) -> None:
+        """The app's KarneService: ``/karne`` asks it for a card; it sends through :meth:`send_owner_document` and
+        :meth:`tell_owner`."""
+        self._karne = karne
+
+    async def tell_owner(self, text: str) -> None:
+        """HTML for the owner alone: as it is (no severity icon) and without a copy for the owner's friend. Queued
+        and delivered like every other message; never raises."""
+        await self._send(text, mirror=False)
+
+    async def send_owner_document(self, path: str, *, caption: str = "", name: str | None = None,
+                                  busy: Callable[[], bool] | None = None) -> str | None:
+        """One file for the OWNER, as a document (Telegram does not recompress it), with ``caption`` (HTML) and the
+        file name ``name``. Returns None when Telegram confirmed it, else the reason in Turkish (the caller then
+        sends its text instead); never raises.
+
+        Never in the way of trading, never twice: only while the connection works and nothing waits in the owner's
+        queue (the file never overtakes a notice); only when Telethon encrypts natively (cryptg or libssl: its
+        pure-Python AES would hold the event loop for seconds per MB); before the upload and between its parts it
+        waits while ``busy()`` says the trading path is working (each wait at most OWNER_FILE_PAUSE_SEC, then the
+        upload is given up); ONE request, waited for at most OWNER_FILE_TIMEOUT_SEC and then left to Telethon - not
+        cancelled, not sent again (the file may still arrive; the reason says so). No copy goes to the friend."""
+        client = self._client
+        if client is None or self._shut:
+            return "bildirim botu çalışmıyor"
+        if self._queue or self._link_down():
+            return "Telegram bağlantısı şu an yok ya da sırada bekleyen mesajlar var"
+        try:
+            from .group_mirror import native_aes      # (that module imports this one)
+
+            if not native_aes():
+                return OWNER_FILE_NO_AES
+
+            async def pause(*_progress: Any) -> None:
+                deadline = time.monotonic() + OWNER_FILE_PAUSE_SEC
+                while True:
+                    if self._shut:
+                        raise TransferAborted("bot kapanıyor")
+                    try:
+                        working = bool(busy()) if busy is not None else False
+                    except Exception:      # noqa: BLE001 - not knowable: taken as busy
+                        working = True
+                    if not working:
+                        return
+                    if time.monotonic() >= deadline:
+                        raise TransferAborted(f"işlem trafiği {OWNER_FILE_PAUSE_SEC:g} sn boyunca yoğundu")
+                    await asyncio.sleep(OWNER_FILE_POLL_SEC)
+
+            await pause()
+            attributes = [types.DocumentAttributeFilename(name)] if name else None
+            task = self._track(asyncio.ensure_future(client.send_file(
+                self._owner, path, caption=caption, parse_mode="html", force_document=True, attributes=attributes,
+                progress_callback=pause)))
+            done, _ = await asyncio.wait({task}, timeout=OWNER_FILE_TIMEOUT_SEC)
+            if not done:
+                return (f"Telegram {OWNER_FILE_TIMEOUT_SEC:g} sn içinde yanıt vermedi; dosya sonradan da gelebilir")
+            if task.cancelled():
+                return "gönderim yarıda kesildi"
+            exc = task.exception()
+            if exc is None:
+                return None
+            if not isinstance(exc, Exception):
+                raise exc
+            if isinstance(exc, TransferAborted):
+                return str(exc)
+            log.error("Sending a file to the owner failed: %s", exc)
+            seconds = getattr(exc, "seconds", None)
+            if isinstance(exc, errors.FloodError) and seconds:
+                return f"Telegram {seconds} sn beklememizi istiyor"
+            if self._is_unreachable(exc):
+                return "bot size mesaj gönderemiyor (botu Telegram'da açıp Start'a basın)"
+            return str(exc) or type(exc).__name__
+        except asyncio.CancelledError:
+            raise
+        except Exception as exc:      # noqa: BLE001 - told to the caller, never raised
+            log.exception("Sending a file to the owner failed unexpectedly")
+            return str(exc) or type(exc).__name__
 
     # ---- the copy of the source group for the friend's groups (/grup, /bagla) ---------------------------
     def set_group_mirror(self, mirror: Any) -> None:

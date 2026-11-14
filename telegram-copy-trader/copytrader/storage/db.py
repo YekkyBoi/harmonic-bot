@@ -175,6 +175,7 @@ CREATE INDEX IF NOT EXISTS ix_events_kind ON events (kind, id);
 """
 
 _ACTIVE_TRADE = (TradeStatus.OPENING, TradeStatus.PENDING, TradeStatus.OPEN)
+CLOSED_TRADES_SLICE = 50          # rows closed_trades_between turns into records between two pauses for the loop
 _TERMINAL_TRADE = frozenset({TradeStatus.CLOSED, TradeStatus.CANCELLED, TradeStatus.FAILED})
 _ACTIVE_POSITION = (PositionStatus.PENDING, PositionStatus.OPEN)
 # FAILED is included on purpose: an adapter may emergency-close a filled position
@@ -692,6 +693,40 @@ class Database:
                 (_dt_to_db(since),),
             )
         return [_row_to_trade(r) for r in rows]
+
+    async def closed_trades_between(self, start: datetime | None, end: datetime) -> list[TradeRecord]:
+        """Trades that have ENDED (CLOSED / CANCELLED / FAILED) with ``start <= closed_at < end`` (``start`` None:
+        from the beginning), in the order they ended. ``closed_at`` is the time the trade as a whole reached its
+        final status (see :meth:`update_trade`); a trade that is active again has none. Read only (the weekly
+        report card). The rows are turned into records AFTER the database lock is released and in slices of
+        CLOSED_TRADES_SLICE with a pause for the event loop between them: "every trade so far" grows with the bot's
+        whole history, and nothing else may wait for it."""
+        marks = ", ".join("?" for _ in _TERMINAL_TRADE)
+        where = [f"status IN ({marks})", "closed_at IS NOT NULL", "closed_at < ?"]
+        params: list[Any] = [*sorted(s.value for s in _TERMINAL_TRADE), _dt_to_db(end)]
+        if start is not None:
+            where.append("closed_at >= ?")
+            params.append(_dt_to_db(start))
+        async with self._read() as conn:
+            rows = await self._fetchall(
+                conn, f"SELECT * FROM trades WHERE {' AND '.join(where)} ORDER BY closed_at, id", params)
+        trades: list[TradeRecord] = []
+        for first in range(0, len(rows), CLOSED_TRADES_SLICE):
+            if first:
+                await asyncio.sleep(0)
+            trades += [_row_to_trade(r) for r in rows[first:first + CLOSED_TRADES_SLICE]]
+        return trades
+
+    async def first_trade_with_position_data(self, key: str) -> int | None:
+        """The lowest id of a trade one of whose positions - whatever its status - carries ``key`` in its adapter
+        data (``position.data[key]``), None when no position does. Read only (the report card: the first trade of
+        the version that stores a position's real initial risk)."""
+        escaped = key.replace("\\", "\\\\").replace("%", "\\%").replace("_", "\\_")
+        async with self._read() as conn:
+            row = await self._fetchone(
+                conn, "SELECT MIN(trade_id) FROM broker_positions WHERE position_json LIKE ? ESCAPE '\\'",
+                (f'%"{escaped}"%',))
+        return int(row[0]) if row is not None and row[0] is not None else None
 
     async def update_trade(
         self,

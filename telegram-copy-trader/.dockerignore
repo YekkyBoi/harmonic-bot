@@ -1,4 +1,5 @@
 data/
+karne_paketleri/
 .env
 config.yaml
 *.session
