@@ -433,7 +433,10 @@ async def test_f4_an_unknown_binance_open_is_named_in_every_later_report_and_in_
     report = next(t for t in texts if "🔗 İşlem" in t)
     assert report.splitlines()[-1] == ("• binance: açılış emrinin sonucu bilinmiyordu; bot bu hesapta pozisyon "
                                        "yönetmiyor. Emir açıldıysa pozisyonu elle kapatın."), report
-    (summary,) = [t for t in texts if t.startswith("🏁")]
+    (summary,) = [t for t in texts if "🏁" in t]
+    # (the result-in-R headline names the account it knows: it does not speak for binance, where an order may be)
+    assert summary.splitlines()[0] == "😐 başa baş kapattık (tickmill 0R)", summary
+    assert summary.splitlines()[1].startswith("🏁 #1 BTC LONG (giriş 74000) kapandı."), summary
     assert summary.splitlines()[-1] == ("⚠️ binance: açılış emrinin sonucu bilinmiyordu; emir açıldıysa pozisyonu elle "
                                         "kapatın (bekleyen emir olarak duruyorsa iptal edin)."), summary
     assert p.binance.net.get(BTC) == pytest.approx(0.012)      # (the bot never touched it: the owner is told)
@@ -447,6 +450,8 @@ async def test_f4_a_trade_without_an_unknown_open_reads_as_before(p: Prod) -> No
                 reply_to=sig)
     texts = p.texts()
     assert not [t for t in texts if "sonucu bilinmiyordu" in t or "gönderilmiş olabilir" in t], texts
-    (summary,) = [t for t in texts if t.startswith("🏁")]
-    assert "\n" not in summary
+    (summary,) = [t for t in texts if "🏁" in t]
+    # (closed at once at about the entry price: the result-in-R headline, then the one line as before)
+    headline, money = summary.splitlines()
+    assert headline == "😐 başa baş kapattık (0R)" and money.startswith("🏁 #1 BTC LONG (giriş 74000) kapandı."), summary
     assert cid_lookups(p.binance) == 0

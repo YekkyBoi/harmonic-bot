@@ -406,7 +406,8 @@ def reported(texts: list[str], broker: str, pnl: float | None) -> bool:
 
 
 def finals(texts: list[str]) -> list[str]:
-    return [t for t in texts if t.startswith("🏁")]
+    """The closing notices: the "🏁 ..." line, below the result in R when the trade has one (closing_headline)."""
+    return [t for t in texts if any(line.startswith("🏁") for line in t.splitlines()[:2])]
 
 
 @pytest.mark.parametrize("which", ["takeProfitPrice", "stopLossPrice"])
@@ -434,12 +435,54 @@ async def test_m2_binance_exit_before_the_traders_close_is_in_the_one_closing_su
     texts = owner_texts(prod)
     assert (await prod.trades())[0].status is TradeStatus.CLOSED
     (summary,) = finals(texts)
-    assert summary.startswith("🏁 #1 BTC LONG (giriş 74000) kapandı. Gerçekleşen K/Z: ")
+    # It opens with the result in R of the accounts the bot really traded, counted in what each position really
+    # had at its stop (binance: 0.012 BTC x 701 = 8.41 USD of its 10 USD target, the lot rounded down; tickmill:
+    # 42.06 of 45): the target at 2.14R reads +2.1R, a full stop -1R. breakout is traded by hand: its figure is
+    # the simulator's and is in the money line only.
+    headline, money = summary.splitlines()
+    assert headline == ("🟢 hooopp +2.1R koyduk başkanım" if which == "takeProfitPrice"
+                        else "🔴 amk -1R yedik"), summary
+    assert {b: p.data["initial_risk"] for b, p in pos.items()} == {
+        "binance": {"loss": pytest.approx(8.412), "quantity": 0.012},
+        "breakout": {"loss": pytest.approx(49.771), "quantity": 0.071},
+        "tickmill": {"loss": pytest.approx(42.06), "quantity": 0.06}}
+    assert money.startswith("🏁 #1 BTC LONG (giriş 74000) kapandı. Gerçekleşen K/Z: ")
     for broker in ("binance", "breakout", "tickmill"):
         assert pos[broker].realized_pnl is not None and reported([summary], broker, pos[broker].realized_pnl), (
             broker, summary)
     # it comes after the management report
     assert texts.index(summary) > next(i for i, t in enumerate(texts) if "#1 BTC LONG: uygulandı" in t)
+
+
+async def test_m2_the_owners_example_half_at_two_r_the_rest_at_four_r_reads_about_three_r(prod: Prod) -> None:
+    """"4R hedef; yarısı 2R'da kapandı (+1R), kalanı 4R'da (+2R): toplam +3R". BTC long 74000, stop 73300 (700):
+    TP1 75400 (2R, half), TP2 76800 (4R, the rest); every account exits at its own venue."""
+    from copytrader.models import TakeProfit
+    await prod.say(btc(EntryType.MARKET, 74000.0, 73300.0, 75400.0).model_copy(update={"take_profits": [
+        TakeProfit(price=75400.0, close_fraction=0.5), TakeProfit(price=76800.0, close_fraction=0.5)]}), KRIPTO,
+        "btc 1R long piyasadan tp 75400 / 76800")
+    tp1, tp2 = sorted(prod.binance.trigger_orders("takeProfitPrice"), key=lambda o: float(o["takeProfitPrice"]))
+    low, high = sorted(prod.tickmill.positions, key=lambda pid: float(prod.tickmill.positions[pid]["takeProfit"]))
+    prod.binance.set_price("BTC", 75400.0, 75402.0)
+    prod.tickmill.set_price("BTCUSD", 75350.0, 75352.0)
+    prod.binance.fill(tp1["id"])
+    prod.tickmill.hit(low, "DEAL_REASON_TP", 75350.0)
+    await passes(prod, 2)
+    assert (await prod.trades())[0].status is TradeStatus.OPEN
+    prod.binance.set_price("BTC", 76800.0, 76802.0)
+    prod.tickmill.set_price("BTCUSD", 76750.0, 76752.0)
+    prod.binance.fill(tp2["id"])
+    prod.tickmill.hit(high, "DEAL_REASON_TP", 76750.0)
+    await passes(prod, 3)
+    assert (await prod.trades())[0].status is TradeStatus.CLOSED
+    pos = await prod.positions(1)
+    (summary,) = finals(owner_texts(prod))
+    # binance: 24.89 on 8.41 at risk = 2.96R (the fees it paid are the rest), tickmill: 125.94 on 42.06 = 2.99R
+    assert summary.splitlines() == [
+        "🟢 hooopp +3R koyduk başkanım",
+        "🏁 #1 BTC LONG (giriş 74000) kapandı. Gerçekleşen K/Z: binance +24.89, breakout +149.73, tickmill +125.94 "
+        "· 📁 kripto"], summary
+    assert pos["binance"].risk_amount == 10.0 and pos["tickmill"].risk_amount == 45.0      # (the targets, unused)
 
 
 async def test_m2_prop_account_stop_before_the_traders_stop_is_in_the_closing_summary(prod: Prod) -> None:
@@ -460,6 +503,11 @@ async def test_m2_prop_account_stop_before_the_traders_stop_is_in_the_closing_su
     (summary,) = finals(owner_texts(prod))
     assert reported([summary], "fx", pos["fx"].realized_pnl), summary
     assert pos["fx"].realized_pnl < 0
+    # fx lost its 1R; the friend's tickmill was closed at about its entry: a loss, each account with its own result
+    # (in the order of the money line below it)
+    assert summary.splitlines() == [
+        "🔴 amk tickmill 0R · fx -1R yedik",
+        "🏁 #1 EUR SHORT (giriş 1.10872) kapandı. Gerçekleşen K/Z: tickmill -0.00, fx -99.75 · 📁 fx"], summary
 
 
 async def test_m2_control_every_copy_exits_at_its_venue_one_summary_only(prod: Prod) -> None:

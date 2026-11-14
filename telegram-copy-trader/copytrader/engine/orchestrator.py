@@ -98,6 +98,7 @@ from .monitor import (
     ACTIVE_TRADE,
     CLOSE_RETRY_BACKOFF_SEC,
     CLOSE_WANTED,
+    INITIAL_RISK,
     MANAGE_WANTED,
     VENUE_BELOW_RECORD,
     VENUE_FLAT_SEEN,
@@ -722,6 +723,35 @@ def capped_real_risk(size: SizingResult, contract_size: float, quote: str | None
         if real > 0:
             return real
     return loss * abs(live_entry - stop) / abs(sizing_entry - stop)
+
+
+def initial_risk_basis(size: SizingResult, contract_size: float, quote: str | None, currency: str | None,
+                       live_entry: float, sizing_entry: float, stop: float) -> dict[str, float] | None:
+    """What goes into ``pos.data[INITIAL_RISK]`` at the open (read by monitor.position_result_r for the closing
+    headline only; nothing that sizes, checks or sends an order reads it): {"loss": the money the quantity really
+    sent loses at the stop it was sized for, by the price move alone, "quantity": that quantity}; None when the
+    sizer gave no such figure (then the position has no result in R: the target ``risk_amount`` is never used
+    instead).
+
+    The loss is the broker's own ``est_loss_at_sl`` - the quantity after the rounding to the lot step, a raise to
+    the minimum lot or a cut for margin, in the account currency as the broker converts it - without the fee
+    estimate the broker counts into it (``est_fees_at_sl``): the trader's R is a price distance, and the fees
+    really paid are in the realized result it is compared with (counted on both sides, a clean 2R would read
+    less than +2R). It is brought from the sizing entry to the live one when the engine limited the size, the
+    way the owner's warning about that is computed (:func:`capped_real_risk`). Never raises."""
+    try:
+        loss, fees, quantity = float(size.est_loss_at_sl), float(size.est_fees_at_sl), float(size.quantity)
+        if not (math.isfinite(loss) and loss > 0 and math.isfinite(quantity) and quantity > 0
+                and math.isfinite(fees) and 0 <= fees < loss):
+            return None
+        by_price = size.model_copy(update={"est_loss_at_sl": loss - fees})
+        real = float(capped_real_risk(by_price, contract_size, quote, currency, live_entry, sizing_entry, stop))
+        if not (math.isfinite(real) and real > 0):
+            return None
+        return {"loss": real, "quantity": quantity}
+    except Exception:           # (a figure for a text: it must never stand in the way of saving an opened position)
+        logger.exception("Initial risk of the opened position could not be computed")
+        return None
 
 
 def price_multiplier(extra: dict[str, Any] | None) -> float:
@@ -4426,6 +4456,14 @@ class Engine:
             sent = True
             pos = await broker.open_position(req)
             pos.risk_amount = size.risk_amount
+            # (for the closing headline's result in R only, see monitor.INITIAL_RISK; sizing_stop: the stop the size
+            # was computed from - for a catch-up open the signal's own, farther one)
+            initial = initial_risk_basis(size, sym.contract_size, sym.quote_asset, ccy, entry, sizing_entry,
+                                         sizing_stop)
+            # (not for a capped size: its real risk shrinks towards zero as the live price nears the stop, and a
+            # result divided by it would read as a wild R; such a position's R is unknown)
+            if initial is not None and isinstance(pos.data, dict) and not size_capped:
+                pos.data[INITIAL_RISK] = initial
             pos.data.setdefault("price_multiplier", mult)
             if offset:
                 pos.data["price_offset"] = offset

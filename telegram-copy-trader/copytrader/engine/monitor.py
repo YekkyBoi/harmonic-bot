@@ -1466,12 +1466,140 @@ def unknown_open_brokers(trade: TradeRecord, positions: Sequence[BrokerPosition]
     return names, [b for b in names if b in maybe]
 
 
+CLOSING_FLAT_R = 0.05       # the closing headline calls a result within +-0.05R of zero break-even
+
+
+def _simulated(pos: BrokerPosition) -> bool:
+    """Fills that never were real money: dry-run, a paper account, the message-only (hand-traded) broker."""
+    return bool(pos.dry_run or (pos.data or {}).get("simulated"))
+
+
+# ``data[INITIAL_RISK]`` of a position: its real initial risk, written by the engine when it opens the position
+# (orchestrator.initial_risk_basis): {"loss": the money the quantity sent loses at the stop it was sized for by the
+# price move alone, as the broker's own sizing computed it at the open (after the rounding to its lot step, a raise
+# to the minimum lot, a cut for margin or by the size cap; without its fee estimate), "quantity": that quantity}.
+# The closing headline divides the realized result by it. A position without it (opened by an older version) has
+# no result in R: there is no other figure to fall back on.
+INITIAL_RISK = "initial_risk"
+# ``data[PNL_INCOMPLETE]`` of a position on an exchange account: the adapter's own note that ``realized_pnl`` does
+# not cover everything its orders closed (copytrader.brokers.ccxt_broker.PNL_INCOMPLETE; the monitor imports no
+# adapter, so the key is repeated here; tests/test_closing_headline.py fails when the two drift apart).
+PNL_INCOMPLETE = "pnl_incomplete"
+
+
+def _result_incomplete(pos: BrokerPosition) -> bool:
+    """The adapter itself knows that ``realized_pnl`` does not cover everything that was closed: part of the size
+    went outside the bot's orders (ccxt ``closed_outside``: "kâr/zarar yalnızca botun kendi emirlerini içerir"),
+    the exchange's trade list did not cover the bot's own exits (``PNL_INCOMPLETE``), or a filled MetaTrader leg
+    has no result (yet) (``legs[i]["realized"] is None``: only the other legs are summed). Data that cannot be
+    read counts as incomplete."""
+    d = pos.data or {}
+    try:
+        if d.get(PNL_INCOMPLETE) or float(d.get("closed_outside") or 0.0) > 0:
+            return True
+        return any(not isinstance(leg, dict) or (float(leg.get("filled") or 0.0) > 0 and leg.get("realized") is None)
+                   for leg in d.get("legs") or [])
+    except (TypeError, ValueError):
+        return True
+
+
+def position_initial_risk(pos: BrokerPosition) -> float | None:
+    """The money ``pos`` had at risk at its stop for the quantity that really filled: the loss stored at the open
+    (``data[INITIAL_RISK]``), scaled to ``filled_quantity`` (a limit entry that filled in part risked that part).
+    None without the stored figure, or when the figures are not positive finite numbers or do not fit together
+    (more filled than was sent)."""
+    basis = (pos.data or {}).get(INITIAL_RISK)
+    if not isinstance(basis, dict):
+        return None
+    try:
+        loss, quantity, filled = float(basis.get("loss")), float(basis.get("quantity")), float(pos.filled_quantity)
+    except (TypeError, ValueError):
+        return None
+    if not (math.isfinite(loss) and loss > 0 and math.isfinite(quantity) and quantity > 0
+            and math.isfinite(filled) and 0 < filled <= quantity * (1.0 + 1e-6)):
+        return None
+    return loss * min(1.0, filled / quantity)
+
+
+def position_result_r(pos: BrokerPosition, risk_r: float) -> float | None:
+    """The realized result of ``pos`` in R, as the trader counts it: ``realized_pnl`` / the position's real initial
+    risk (:func:`position_initial_risk`), times ``risk_r`` (the plan's size in R). None when that is not known
+    (never a guess).
+
+    A 1R trade that reaches its 2R target reads about +2R whatever the lot rounding did to its size, a full stop
+    about -1R (fees and slippage are in the realized money), half closed at 2R and the rest at 4R reads +3R
+    (``realized_pnl`` sums the partial closes), and a 0.5R signal that stops out reads about -0.5R.
+
+    None: no realized result; no stored initial risk (a position of an older version: the target amount
+    ``risk_amount`` is NOT used instead, the two would not mean the same); figures that are not positive finite
+    numbers; a result the adapter knows to be partial (:func:`_result_incomplete`); a result that is not real
+    money (:func:`_simulated`)."""
+    if _simulated(pos) or pos.realized_pnl is None or _result_incomplete(pos):
+        return None
+    risk = position_initial_risk(pos)
+    try:
+        pnl, size = float(pos.realized_pnl), float(risk_r)
+    except (TypeError, ValueError):
+        return None
+    if risk is None or not (math.isfinite(pnl) and math.isfinite(size) and size > 0):
+        return None
+    value = pnl * size / risk
+    return value if math.isfinite(value) else None
+
+
+def _r_text(value: float) -> str:
+    """One decimal, without a trailing ".0": "+2R", "+1.5R", "-0.4R", "0R"."""
+    shown = round(value, 1)
+    if shown == 0:
+        return "0R"
+    return f"{shown:+.1f}".removesuffix(".0") + "R"
+
+
+def closing_headline(trade: TradeRecord, positions: Sequence[BrokerPosition], status: TradeStatus) -> str | None:
+    """The first line of the closing notice: the result in R, in the owner's own words. Only for a CLOSED trade
+    with at least one account whose result in R is known (:func:`position_result_r`). Over those accounts
+    (flat: within +-CLOSING_FLAT_R of zero, always shown as 0R):
+    a loss when at least one lost and none won, a win when at least one won and none lost, flat when all are
+    flat. A win and a loss together, nothing known, CANCELLED / FAILED: no headline, None.
+
+    One bare figure ("+2R") when every known account shows the same value at one decimal AND the figure speaks
+    for every real account that traded; otherwise each known account is named ("binance +1.9R · fx +2.1R",
+    "fx -1R · tickmill 0R"), so that the line never claims a result for an account that did not have it or whose
+    R is not known: one that was filled without a known result, or one whose open outcome is unknown
+    (:func:`unknown_open_brokers`: an order may be there)."""
+    try:
+        if status is not TradeStatus.CLOSED:
+            return None
+        real = [p for p in positions if not _simulated(p)]
+        known = [(p.broker, r) for p in real if (r := position_result_r(p, trade.plan.risk_r)) is not None]
+        if not known:
+            return None
+        # (a flat account is always shown as 0R: 0.05 would round to 0.1)
+        known = [(b, r if abs(r) > CLOSING_FLAT_R else 0.0) for b, r in known]
+        won = any(r > 0 for _b, r in known)
+        lost = any(r < 0 for _b, r in known)
+        if won and lost:
+            return None
+        words = "🟢 hooopp {} koyduk başkanım" if won else "🔴 amk {} yedik" if lost else "😐 başa baş kapattık ({})"
+        traded = [p for p in real
+                  if p.realized_pnl is not None or p.status is PositionStatus.CLOSED or p.filled_quantity > 0]
+        whole = len(known) == len(traded) and not unknown_open_brokers(trade, positions)[0]
+        if whole and len({round(r, 1) for _b, r in known}) == 1:
+            return words.format(_r_text(known[0][1]))
+        return words.format(" · ".join(f"{esc(b)} {_r_text(r)}" for b, r in known))
+    except Exception:           # the notice with the money amounts must go out whatever happens here
+        logger.exception("Closing headline of trade #%s could not be built", getattr(trade, "id", "?"))
+        return None
+
+
 def closing_summary_text(trade: TradeRecord, positions: Sequence[BrokerPosition], status: TradeStatus) -> str:
     """The owner's notice that a trade has ended (``status``: CLOSED / CANCELLED / FAILED), with the realized result
     of every position of it that has one - also those that ended at their venue earlier. One text for the monitor
     and for the engine's management that ends a trade, so that the two never drift apart. A broker whose open
     outcome was unknown (see :func:`unknown_open_brokers`) gets a line of its own: the bot never managed an order
-    that may be there."""
+    that may be there. A CLOSED trade whose result in R is known opens with that result
+    (:func:`closing_headline`); the line with the money amounts and the warnings follow it unchanged."""
+    headline = closing_headline(trade, positions, status)
     pnl = [(p.broker, p.realized_pnl) for p in positions if p.realized_pnl is not None]
     ever_filled = any(p.status is PositionStatus.CLOSED or p.filled_quantity > 0 for p in positions)
     pnl_text = ", ".join(f"{esc(b)} {v:+.2f}" for b, v in pnl) or (
@@ -1482,6 +1610,8 @@ def closing_summary_text(trade: TradeRecord, positions: Sequence[BrokerPosition]
     topic = f" · 📁 {esc(trade.plan.route)}" if trade.plan.route else ""     # forum topic route
     text = (f"🏁 #{trade.id} {esc(trade.plan.base_asset)} {trade.plan.side.value.upper()} (giriş {entry}) {word}. "
             f"Gerçekleşen K/Z: {pnl_text}{topic}")
+    if headline:
+        text = f"{headline}\n{text}"
     unknown, maybe = unknown_open_brokers(trade, positions)
     for name in unknown:
         how = "açılış emri gönderilmiş olabilir, sonucu bilinmiyordu" if name in maybe else (
@@ -1517,5 +1647,6 @@ __all__ = [
     "is_live_ccxt", "sync_error_text", "SYNC_TIMEOUT_SEC", "PASS_ERROR_ALERT_AFTER", "TURN_WAIT_SEC",
     "STARVED_AFTER_INTERVALS", "CLOSE_WANTED", "CLOSE_RETRY_BACKOFF_SEC", "close_wanted", "close_retry_delay",
     "trade_closing", "closing_summary_text", "VENUE_FLAT_SEEN", "MANAGE_WANTED", "manage_wanted", "note_unknown",
-    "unknown_open_brokers",
+    "unknown_open_brokers", "position_result_r", "position_initial_risk", "closing_headline", "CLOSING_FLAT_R",
+    "INITIAL_RISK", "PNL_INCOMPLETE",
 ]

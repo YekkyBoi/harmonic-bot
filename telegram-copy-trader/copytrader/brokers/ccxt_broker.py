@@ -61,6 +61,11 @@ logger = logging.getLogger(__name__)
 # reduce-only close is not sent: the earlier close may have gone through. Renaming it breaks that guard; it is pinned
 # by tests/test_review1_glue_engine.py::test_g4_*.
 FLAT_SEEN = "flat_seen"
+# ``pos.data[PNL_INCOMPLETE]`` (True, or absent): ``realized_pnl`` is known not to cover every exit the adapter
+# booked for the position - the exchange's trade list held less than the booked exits, or an exit without a price
+# was left out of the estimate. Only a note for texts (the engine's closing headline then gives no result in R
+# for the account, monitor.PNL_INCOMPLETE); nothing in this adapter reads it.
+PNL_INCOMPLETE = "pnl_incomplete"
 
 T = TypeVar("T")
 
@@ -825,7 +830,8 @@ class CcxtBroker(Broker):
                 f"açılıyor; stopta kayıp ~{loss:.2f} (hedef {result.risk_amount:.2f}). Serbest bakiye {free:.2f}, "
                 f"bu büyüklükte kullanılabilen en yüksek kaldıraç {lev}x.")
         return result.model_copy(update={
-            "quantity": qty, "notional": qty * unit, "est_loss_at_sl": loss, "warnings": [*result.warnings, note],
+            "quantity": qty, "notional": qty * unit, "est_loss_at_sl": loss,
+            "est_fees_at_sl": result.est_fees_at_sl * ratio, "warnings": [*result.warnings, note],
         })
 
     @staticmethod
@@ -2051,8 +2057,21 @@ class CcxtBroker(Broker):
         pos.realized_pnl = await self._realized_pnl(pos)
         logger.info("%s: %s %s closed (%s), pnl=%s", self.name, pos.broker_symbol, pos.side.value, reason, pos.realized_pnl)
 
+    def _note_uncovered_exits(self, pos: BrokerPosition, exit_trades: list[Any]) -> None:
+        """Mark the result as incomplete (PNL_INCOMPLETE) when the trades it is summed from hold less than the
+        exits booked for the position (the list was cut, is behind, or an exit's order is not among ours)."""
+        try:
+            covered = sum(num(t.get("amount")) or 0.0 for t in exit_trades)
+            booked = sum(num(e.get("qty")) or 0.0 for e in pos.data.get("exits") or [])
+            if covered < booked * (1.0 - 1e-6) - 1e-12:
+                pos.data[PNL_INCOMPLETE] = True
+        except Exception:           # (a note for a text: never in the way of closing the position's record)
+            logger.exception("%s: could not compare the trades of %s with its booked exits", self.name, pos.broker_symbol)
+            pos.data[PNL_INCOMPLETE] = True
+
     async def _realized_pnl(self, pos: BrokerPosition) -> float | None:
         d = pos.data
+        d.pop(PNL_INCOMPLETE, None)
         cs = float(d.get("contract_size", 1.0) or 1.0)
         direction = 1.0 if pos.side is Side.LONG else -1.0
         entry = pos.avg_entry_price
@@ -2080,6 +2099,7 @@ class CcxtBroker(Broker):
                         for fee in (t.get("fees") or ([t["fee"]] if t.get("fee") else [])):
                             if fee and str(fee.get("currency", "")).upper() == ccy:
                                 fees += num(fee.get("cost")) or 0.0
+                    self._note_uncovered_exits(pos, exits)
                     return gross - fees
         except cx.BaseError as e:
             logger.warning("%s: fetch_my_trades failed, estimating pnl: %s", self.name, e)
@@ -2093,6 +2113,8 @@ class CcxtBroker(Broker):
             price = num(ex.get("price"))
             qty = num(ex.get("qty")) or 0.0
             if price is None:
+                if qty > 0:
+                    d[PNL_INCOMPLETE] = True        # (this exit is not in the estimate)
                 continue
             total += (price - entry) * qty * cs * direction - fee_rate * (price + entry) * qty * cs
         return total

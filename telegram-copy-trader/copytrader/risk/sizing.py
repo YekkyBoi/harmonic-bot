@@ -150,8 +150,8 @@ def compute_linear_size(
         raise SizingError("Pozisyon hesaplanamadı: giriş ve stop aynı fiyatta.")
 
     loss_per_unit = abs(entry - stop) * contract_size
-    if include_fees:
-        loss_per_unit += fee_rate * (entry + stop) * contract_size
+    fee_per_unit = fee_rate * (entry + stop) * contract_size if include_fees else 0.0
+    loss_per_unit += fee_per_unit
 
     warnings: list[str] = []
     quantity = round_quantity(risk_amount / loss_per_unit, qty_step, rounding, risk_amount=risk_amount,
@@ -203,6 +203,7 @@ def compute_linear_size(
         quantity=quantity,
         risk_amount=risk_amount,
         est_loss_at_sl=quantity * loss_per_unit,
+        est_fees_at_sl=quantity * fee_per_unit,
         notional=quantity * unit_notional,
         leverage=None,
         margin_required=None,

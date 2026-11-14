@@ -152,7 +152,7 @@ async def test_g3_kapattik_while_the_fire_hangs_closes_binance_at_once_and_the_f
     assert ("⏳ Emir yanıt beklerken gelen talimat bu pozisyona şimdi uygulanıyor (pozisyonun tamamı kapatılacak); "
             "sonucu ayrıca bildirilecek.") in texts[i_fire], texts[i_fire]
     assert "• tickmill: tamamı kapatıldı" in texts[i_close] and "İşlem kapandı." in texts[i_close], texts[i_close]
-    summaries = [t for t in texts if t.startswith("🏁 #1 BTC LONG")]
+    summaries = [t for t in texts if "\n🏁 #1 BTC LONG" in t]       # (below the result-in-R headline)
     assert len(summaries) == 1 and "tickmill" in summaries[0] and "binance" in summaries[0], summaries
 
 
@@ -241,7 +241,7 @@ async def test_g3_fire_that_never_answers_still_lets_binance_close_and_the_owner
     assert "değişiklik gerekmedi" not in late
     # this answer ended the trade: said in the notice, and the one closing summary comes after it
     assert "• İşlem kapandı." in late, late
-    summaries = [i for i, t in enumerate(texts) if t.startswith("🏁 #1 BTC LONG")]
+    summaries = [i for i, t in enumerate(texts) if "\n🏁 #1 BTC LONG" in t]     # (below the result-in-R headline)
     assert summaries == [texts.index(late) + 1], texts
 
 

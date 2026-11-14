@@ -333,6 +333,7 @@ class SizingResult(BaseModel):
     quantity: float                       # broker units, already rounded DOWN to qty_step
     risk_amount: float                    # target money at risk (account currency)
     est_loss_at_sl: float                 # loss at SL after rounding (incl. fees if configured)
+    est_fees_at_sl: float = 0.0           # the part of est_loss_at_sl that is the fee estimate (0: fees not counted)
     notional: float                       # quantity * contract_size * entry
     leverage: float | None = None         # leverage to set (futures only)
     margin_required: float | None = None

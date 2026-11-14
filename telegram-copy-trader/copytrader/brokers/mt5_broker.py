@@ -647,7 +647,8 @@ class MetaTraderLegBroker(Broker, ABC):
         loss = await self._loss_per_lot(symbol, side, entry_price, stop_loss)
         if not math.isfinite(loss) or loss <= 0:
             raise SizingError(f"{symbol.broker_symbol}: stop mesafesinde lot başına zarar hesaplanamadı.")
-        per_lot = loss + self._fee_per_lot(loss, entry_price, stop_loss)
+        fee_per_lot = self._fee_per_lot(loss, entry_price, stop_loss)
+        per_lot = loss + fee_per_lot
         lots = compute_lot_size(
             risk_amount=risk_amount,
             loss_per_lot=per_lot,
@@ -685,6 +686,7 @@ class MetaTraderLegBroker(Broker, ABC):
             quantity=lots,
             risk_amount=risk_amount,
             est_loss_at_sl=est,
+            est_fees_at_sl=lots * fee_per_lot,
             notional=lots * symbol.contract_size * entry_price,
             leverage=None,
             margin_required=margin,
