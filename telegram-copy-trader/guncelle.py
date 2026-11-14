@@ -18,7 +18,9 @@ Steps (one numbered line each, ending in TAMAM or HATA; everything is also writt
 5. pip, only when requirements.txt changed
 
 Between the steps, without a number and never a reason to fail or undo the update: after step 3 the MetaApi
-token an older version wrote into ``data/logs/copytrader.log*`` is masked in place, and after step 8 the watchman
+token an older version wrote into ``data/logs/copytrader.log*`` is masked in place, after step 5 the optional
+packages are installed when they are missing (cryptg, Pillow: one bounded pip run each, binary wheels only, a
+warning when it does not work), and after step 8 the watchman
 (bekci.py) is registered as a Windows scheduled task (every 5 minutes, as SYSTEM) and asked for one test message.
 While the update runs ``<data_dir>/guncelleme.lock`` tells the watchman that the bot is down on purpose.
 
@@ -95,6 +97,21 @@ PIP_SURESI = 1800.0
 CRYPTG = "cryptg==0.6.1"
 CRYPTG_SURESI = 90.0            # seconds for its pip run (the bot is stopped meanwhile)
 CRYPTG_KONTROL_SURESI = 30.0    # seconds for "is it installed already?"
+# Optional, in the same way: Pillow, for the picture of the weekly report card (copytrader/karne; without it the card
+# comes as text). NOT in requirements.txt: step 5 must never run an unbounded pip for it. The version is pinned
+# (copytrader.karne.PILLOW names the same one): it has win_amd64 wheels for Python 3.11, 3.12 and 3.13.
+# It is NOT installed into the bot's own Python environment but into a folder of its own in the bot folder
+# (``pip install --target``; copytrader.karne.render.PACKAGES_DIR names the same folder): only the process that draws
+# the card imports from there. The bot's own process never can - Telethon would otherwise start resizing photos with
+# it on the event loop - and that stays true after a way back to a version that knows nothing of this folder: the
+# updater never touches it (it is not part of the package) and a way back needs no uninstall.
+PILLOW = "pillow==13.0.0"
+PILLOW_KLASORU = "karne_paketleri"
+PILLOW_SURESI = 120.0           # seconds for its pip run (one 7 MB wheel, nothing else; the bot is stopped meanwhile)
+PILLOW_KONTROL = ("import os, sys; k = os.path.abspath('" + PILLOW_KLASORU + "'); sys.path.insert(0, k); "
+                  "import PIL; from PIL import Image, ImageDraw, ImageFilter, ImageFont, features; "
+                  "raise SystemExit(0 if features.check('freetype2') and "
+                  "os.path.abspath(PIL.__file__).startswith(k + os.sep) else 1)")
 BEKLEME = 15.0                  # seconds before the single retry of a failed check
 CIKIS_TAMAM, CIKIS_GERI_ALINDI, CIKIS_REDDEDILDI, CIKIS_KESILDI = 0, 1, 2, 130
 # Step 6 (``copytrader migrate``) looks for the Tickmill MetaTrader 5 terminal in Program Files; ``--tickmill-terminal``
@@ -917,6 +934,43 @@ def cryptg_adimi(komut: Callable[..., tuple[int, list[str]]], gunluk: Any) -> bo
     return False
 
 
+def pillow_adimi(komut: Callable[..., tuple[int, list[str]]], gunluk: Any) -> bool:
+    """Step 5c, optional: Pillow (the picture of the weekly report card; without it the card comes as text), into
+    its own folder PILLOW_KLASORU in the bot folder (the commands run there), never into the bot's Python
+    environment. The same rules as :func:`cryptg_adimi`: skipped when a usable one is in that folder already
+    (whatever its version), otherwise ONE pip run - the pinned version, binary wheels only, nothing else
+    (``--no-deps``), 10 s network timeout, one retry, at most PILLOW_SURESI. A failure is one warning: the update goes
+    on, nothing is rolled back. True: Pillow is there now."""
+    kod, _ = komut("-c", PILLOW_KONTROL, sure=CRYPTG_KONTROL_SURESI, ekranda=False)
+    if kod == 0:
+        gunluk.dosyaya("   karne görseli paketi (Pillow) zaten kurulu")
+        return True
+    gunluk.yaz(f"   Haftalık karne görseli için Pillow paketi kuruluyor (en çok {PILLOW_SURESI:.0f} saniye)...")
+    kod, satirlar = komut("-m", "pip", "install", "--disable-pip-version-check", "--upgrade", "--no-deps",
+                          "--target", PILLOW_KLASORU, PILLOW, "--only-binary=:all:", "--timeout", "10",
+                          "--retries", "1", sure=PILLOW_SURESI, ekranda=False)
+    if kod == 0:
+        gunluk.yaz("   Karne görseli paketi (Pillow) kuruldu.")
+        return True
+    for metin in [m for m in satirlar if m.strip()][-3:]:
+        gunluk.yaz(f"   | {metin}")
+    gunluk.yaz("   UYARI: karne görseli paketi (Pillow) kurulamadı; güncelleme devam ediyor. Haftalık karne ve /karne "
+               "resim yerine metin olarak gelir. Sonra elle kurmak için (botun klasöründe, PowerShell'e olduğu gibi "
+               f'yapıştırılabilir): & "{sys.executable}" -m pip install --upgrade --no-deps --only-binary=:all: '
+               f'--target "{PILLOW_KLASORU}" {PILLOW}')
+    return False
+
+
+def ek_paketler(komut: Callable[..., tuple[int, list[str]]], gunluk: Any) -> None:
+    """The optional packages, one after the other; each on its own: one that fails (or raises) never keeps the
+    next from being tried, and none of them is a reason to stop or undo the update."""
+    for adim in (cryptg_adimi, pillow_adimi):
+        try:
+            adim(komut, gunluk)
+        except Exception as exc:          # noqa: BLE001
+            gunluk.yaz(f"   UYARI: isteğe bağlı paket adımı başarısız ({exc}); güncelleme devam ediyor.")
+
+
 def botu_baslat(hedef: Path, python: str, komut: list[str] | None = None) -> int:
     """Step 9: the bot as a child in the same window; returns its exit code.
 
@@ -1208,7 +1262,7 @@ def main(
     if ek_paket is OTOMATIK:
         # the real optional step with the real subprocess runner; a caller that replaces the runner (tests) passes
         # its own step, or none
-        ek_paket = cryptg_adimi if calistir is komut_calistir else None
+        ek_paket = ek_paketler if calistir is komut_calistir else None
     if gorev is OTOMATIK:
         gorev = varsayilan_gorev()
     for akis in (sys.stdout, sys.stderr):
@@ -1348,7 +1402,7 @@ def main(
                 gunluk.adim(5, "Gerekli paketler kuruldu")
             if ek_paket is not None:
                 try:
-                    ek_paket(komut, gunluk)       # optional (cryptg): a warning at most, never a rollback
+                    ek_paket(komut, gunluk)       # optional (cryptg, Pillow): a warning at most, never a rollback
                 except Exception as exc:          # noqa: BLE001
                     gunluk.yaz(f"   UYARI: isteğe bağlı paket adımı başarısız ({exc}); güncelleme devam ediyor.")
 

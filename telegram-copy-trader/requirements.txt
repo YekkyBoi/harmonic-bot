@@ -10,3 +10,5 @@ tzdata
 # metaapi-cloud-sdk>=29   # MT4/MT5 through metaapi.cloud (Linux friendly)
 # MetaTrader5>=5.0.45     # native MT5 terminal, Windows only
 # cryptg                  # faster Telegram media downloads
+# pillow==13.0.0          # picture of the weekly report card (/karne): NOT into this environment - guncelle.py
+#                         # installs it into the folder karne_paketleri (pip --target); text card without it

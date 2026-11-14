@@ -288,6 +288,7 @@ class App:
     listener: Any
     broker_errors: list[str] = field(default_factory=list)
     mirror: Any = None               # the copy of the source group for the owner's friend (/grup), or None
+    karne: Any = None                # the owner's weekly report card (/karne), or None
 
 
 def build_app(
@@ -351,7 +352,32 @@ def build_app(
         mirror = GroupMirror(db, notifier, listener, str(data_dir), engine=engine)
         listener.set_group_mirror(mirror)
         notifier.set_group_mirror(mirror)
-    return App(config, db, parser, brokers, notifier, engine, listener, errors, mirror)
+    karne = None
+    if callable(getattr(notifier, "set_karne", None)):
+        try:
+            from .karne.service import KarneService
+            from .telegram.group_mirror import trading_path_busy
+
+            # /karne and the weekly report card: reads the database, draws in another process, sends through the
+            # notifier (see copytrader/karne/__init__.py); started and stopped by serve()
+            # (``pending``: the engine's own look whether an account's open order of a trade is still unanswered;
+            # read only, like the "busy" look)
+            karne = KarneService(db, notifier, data_dir, accounts=real_account_names(config),
+                                 busy=lambda: trading_path_busy(listener, notifier, engine),
+                                 pending=lambda trade_id: engine._has_late_open_leg(trade_id))
+            notifier.set_karne(karne)
+        except Exception:      # noqa: BLE001 - a report card is never a reason not to trade
+            logger.exception("Report card (karne) could not be set up; the bot runs without it")
+            karne = None
+    return App(config, db, parser, brokers, notifier, engine, listener, errors, mirror, karne)
+
+
+def real_account_names(config: AppConfig) -> list[str]:
+    """The configured accounts that trade real money, in the config's order (none in dry-run; never a paper or a
+    message-only account): the accounts row of the report card."""
+    if config.dry_run:
+        return []
+    return [b.name for b in config.enabled_brokers if getattr(b, "type", None) not in ("paper", "manual")]
 
 
 SHUTDOWN_NOTICE_TR = "Kapanıyor, lütfen bekleyin (en çok 2 dakika). Tekrar Ctrl+C YAPMAYIN."
@@ -612,6 +638,11 @@ async def serve(app: App, stop: asyncio.Event | None = None, *, stop_file: Path 
             await app.engine.start()
             await app.listener.start()
         logger.info("Copy trader running (%s)", "DRY-RUN" if app.config.dry_run else "LIVE")
+        if app.karne is not None:
+            try:
+                app.karne.start()             # (the weekly report card's schedule: a task of its own, returns at once)
+            except Exception:      # noqa: BLE001 - never a reason not to trade
+                logger.exception("Report card (karne) schedule could not be started; the bot runs without it")
         listen_task = asyncio.ensure_future(app.listener.run_until_disconnected())
         stop_task = asyncio.ensure_future(stop.wait())
         done, _ = await asyncio.wait({listen_task, stop_task}, return_when=asyncio.FIRST_COMPLETED)
@@ -640,8 +671,11 @@ async def serve(app: App, stop: asyncio.Event | None = None, *, stop_file: Path 
             if begin_shutdown is not None:
                 with contextlib.suppress(Exception):
                     begin_shutdown()
-            # 2. Stop the group copy for the owner's friend (what still waits is dropped), then the Telegram listener
-            #    (waits for its running handlers).
+            # 2. Stop the report card's schedule (a card that is being drawn is given up; bounded), the group copy
+            #    for the owner's friend (what still waits is dropped), then the Telegram listener (waits for its
+            #    running handlers).
+            if app.karne is not None:
+                await _safe(app.karne.stop())
             if app.mirror is not None:
                 await _safe(app.mirror.stop())
             await _safe(app.listener.stop())
@@ -730,5 +764,6 @@ async def run(config_path: str | os.PathLike[str] = "config.yaml") -> bool:
 
 
 __all__ = ["App", "STOP_REQUEST_FILE", "build_app", "clear_stop_request", "config_secrets", "make_parser",
-           "mask_secrets", "parser_deadline_sec", "read_stop_request", "run", "serve", "setup_logging",
+           "mask_secrets", "parser_deadline_sec", "read_stop_request", "real_account_names", "run", "serve",
+           "setup_logging",
            "stop_request_path", "watch_event_loop", "watch_stop_request", "write_stop_request"]

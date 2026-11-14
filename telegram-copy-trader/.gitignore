@@ -6,6 +6,8 @@ config.yaml
 
 # Runtime data: Telegram sessions, database, images, logs, paper/dry-run state
 data/
+# Pillow for the report card's drawing process (guncelle.py: pip install --target; never part of a release)
+karne_paketleri/
 logs/
 *.log
 

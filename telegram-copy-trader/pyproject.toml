@@ -30,6 +30,9 @@ copytrader = "copytrader.__main__:main"
 [tool.setuptools.packages.find]
 include = ["copytrader*"]
 
+[tool.setuptools.package-data]
+"copytrader.karne" = ["fonts/*.ttf", "fonts/*.txt"]
+
 [tool.pytest.ini_options]
 asyncio_mode = "auto"
 asyncio_default_fixture_loop_scope = "function"
