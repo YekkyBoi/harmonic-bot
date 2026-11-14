@@ -765,6 +765,7 @@ class CcxtBroker(Broker):
             fee_rate=self._taker_fee(symbol),
             include_fees=risk.include_fees_in_risk,
             allow_min_qty_round_up=risk.allow_min_qty_round_up,
+            rounding=str(getattr(self.config, "lot_rounding", "down") or "down"),
         )
         free = await self.get_free_margin()
         frac = abs(entry_price - stop_loss) / entry_price

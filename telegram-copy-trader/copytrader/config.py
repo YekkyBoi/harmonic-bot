@@ -239,6 +239,10 @@ class _BrokerBase(_Base):
     # then measures the offset right then and opens a MARKET order with the shifted SL/TPs.
     entry_trigger: Literal["broker_limit", "reference_touch"] = "broker_limit"
     virtual_trigger_max_hours: float = Field(48.0, gt=0)   # a virtual entry not triggered within this is cancelled
+    # How the sized quantity is rounded to the broker's lot / quantity step: "down" (never more than the target
+    # risk; the default, every account of the owner) or "nearest" (0.125 -> 0.13), falling back to "down" when the
+    # nearest step would lose more than LOT_ROUNDING_MAX_OVERSHOOT times the target at the stop.
+    lot_rounding: Literal["down", "nearest"] = "down"
 
     @model_validator(mode="after")
     def _touch_needs_reference(self) -> "_BrokerBase":
@@ -291,11 +295,51 @@ class MetaApiBrokerConfig(_BrokerBase):
     magic: int = 770077
     slippage_points: int = 20
     commission_per_lot: float | None = None       # round-trip commission per 1 lot in account currency (risk buffer)
+    # Settings of type "mt5_bridge", kept in the block so that switching between the two types is the one line
+    # "type:". Not used by MetaApi.
+    terminal_path: str | None = None
+    broker_company: str | None = None
+    deviation_points: int | None = None
+    filling: Literal["auto", "fok", "ioc", "return"] | None = None
 
     @model_validator(mode="after")
     def _credentials(self) -> "MetaApiBrokerConfig":
         if not self.optional and not (self.token and self.account_id):
             raise ValueError(f"broker '{self.name}': token ve account_id gerekli")
+        return self
+
+
+class Mt5BridgeBrokerConfig(_BrokerBase):
+    """A second MetaTrader 5 terminal on the same Windows computer (e.g. the friend's Tickmill account), driven by the
+    same native adapter as type "mt5" but in a helper process of its own (copytrader/brokers/mt5_bridge.py): the
+    MetaTrader5 package can talk to ONE terminal per process, and the bot process already uses it for type "mt5".
+
+    The account is logged in once in that terminal's own window (the password is typed only there); the helper
+    attaches to the logged-in terminal at ``terminal_path`` and refuses any other terminal, a terminal whose account
+    server / company does not contain ``broker_company``, and (when given, or once seen) another login."""
+
+    type: Literal["mt5_bridge"]
+    terminal_path: str                            # full path of that terminal's terminal64.exe
+    broker_company: str | None = None             # e.g. "Tickmill": must appear in the account's server or company
+    login: int | None = None                      # optional: the account number the terminal must be logged in to
+    server: str | None = None                     # optional: the exact trade server name
+    password: str | None = None                   # normally empty: the terminal keeps its own log-in
+    magic: int = 770077
+    deviation_points: int = 20
+    filling: Literal["auto", "fok", "ioc", "return"] = "auto"
+    commission_per_lot: float | None = None       # round-trip commission per 1 lot in account currency (risk buffer)
+    # Settings of type "metaapi", kept in the block so that switching back is the one line "type:". Not used here.
+    token: str | None = None
+    account_id: str | None = None
+    region: str | None = None
+    slippage_points: int | None = None
+
+    @model_validator(mode="after")
+    def _bridge_identity(self) -> "Mt5BridgeBrokerConfig":
+        if not str(self.terminal_path or "").strip():
+            raise ValueError(f"broker '{self.name}': terminal_path gerekli (terminal64.exe dosyasının tam yolu)")
+        if not (self.broker_company or "").strip() and self.login is None:
+            raise ValueError(f"broker '{self.name}': broker_company (örn. Tickmill) ya da login gerekli")
         return self
 
 
@@ -323,9 +367,19 @@ class ManualBrokerConfig(_BrokerBase):
 
 
 BrokerConfig = Annotated[
-    Union[CcxtBrokerConfig, Mt5BrokerConfig, MetaApiBrokerConfig, PaperBrokerConfig, ManualBrokerConfig],
+    Union[CcxtBrokerConfig, Mt5BrokerConfig, Mt5BridgeBrokerConfig, MetaApiBrokerConfig, PaperBrokerConfig,
+          ManualBrokerConfig],
     Field(discriminator="type"),
 ]
+
+
+def terminal_key(path: str | None) -> str:
+    """Comparison key of a MetaTrader terminal: the FOLDER of its terminal64.exe (a path to the folder itself
+    counts as that folder), case-folded, with Windows or POSIX separators and without trailing separators."""
+    text = str(path or "").strip().strip('"').replace("/", "\\").rstrip("\\")
+    if text.lower().endswith(".exe"):
+        text = text.rsplit("\\", 1)[0] if "\\" in text else ""
+    return text.rstrip("\\").casefold()
 
 
 # --------------------------------------------------------------------------- #
@@ -372,6 +426,13 @@ class AppConfig(_Base):
         if not 0 < self.risk.risk_per_r_pct <= 10:
             raise ValueError("risk.risk_per_r_pct must be in (0, 10]")
         names = {b.name for b in self.brokers}
+        own_paths = {terminal_key(b.terminal_path): b.name for b in self.brokers
+                     if b.type == "mt5" and b.enabled and getattr(b, "terminal_path", None)}
+        for b in self.brokers:
+            if b.type == "mt5_bridge" and b.enabled and terminal_key(b.terminal_path) in own_paths:
+                raise ValueError(
+                    f"broker '{b.name}': terminal_path, '{own_paths[terminal_key(b.terminal_path)]}' hesabının "
+                    "terminaliyle aynı; her hesap kendi MetaTrader terminalini kullanmalı")
         for route in self.telegram.topics:
             unknown = [b for b in route.brokers if b not in names]
             if unknown:

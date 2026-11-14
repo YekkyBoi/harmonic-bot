@@ -107,7 +107,10 @@ class BrokerHeartbeat:
             if isinstance(result, BaseException):       # _probe handles its own errors; a backstop
                 result = (_SILENT, _short(str(result) or type(result).__name__))
             try:
-                await self._record(broker.name, result)
+                # An adapter that told the owner itself that its link is down (mt5_bridge: "MT5 bağlantısı koptu",
+                # followed by its own "yeniden kuruldu" notice with the outage's length): no second alert from here.
+                quiet = bool(getattr(broker, "link_outage_announced", False))
+                await self._record(broker.name, result, quiet=quiet)
             except asyncio.CancelledError:
                 if not stray_cancel():
                     raise
@@ -152,7 +155,7 @@ class BrokerHeartbeat:
         except Exception:
             logger.exception("Heartbeat: the hook for a healthy %s failed", name)
 
-    async def _record(self, name: str, problem: tuple[str, str] | None) -> None:
+    async def _record(self, name: str, problem: tuple[str, str] | None, *, quiet: bool = False) -> None:
         if problem is None:
             self._healthy(name)
             failed = self._count.pop(name, 0)
@@ -175,7 +178,7 @@ class BrokerHeartbeat:
         self._count[name] = count
         self._reason[name] = reason
         logger.warning("Heartbeat: %s problem (%d in a row): %s", name, count, reason)
-        if count < HEARTBEAT_ALERT_AFTER or name in self._alerted:
+        if count < HEARTBEAT_ALERT_AFTER or name in self._alerted or quiet:
             return
         await self.notifier.notify(
             f"🔌 <b>{esc(name)}</b> " + ("hesabında sorun var" if kind == _REPORTED else "yanıt vermiyor")

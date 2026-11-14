@@ -123,6 +123,7 @@ class ManualBroker(PaperBroker):
             risk_amount=risk_amount, entry=entry_price, stop=stop_loss, contract_size=symbol.contract_size,
             qty_step=symbol.qty_step, min_qty=0.0, max_qty=None, min_notional=None,
             fee_rate=0.0, include_fees=False, allow_min_qty_round_up=False,
+            rounding=str(getattr(self.config, "lot_rounding", "down") or "down"),
         )
         return result
 

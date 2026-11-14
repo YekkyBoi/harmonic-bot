@@ -39,6 +39,16 @@ from .errors import ConfigError
 MAX_OPEN_TRADES = 25              # risk.max_open_trades is raised to this when it is lower
 BINANCE_BROKER = "binance"        # broker names of the owner's config
 FX_BROKER = "fx"
+TICKMILL_BROKER = "tickmill"      # the friend's account
+TICKMILL_COMPANY = "Tickmill"
+# The friend's two requests the owner approved: 1R 45 -> 50 USD (only from exactly 45, and only together with the
+# first lot_rounding of the block: a later manual 45 stays), and sizes rounded to the NEAREST lot step.
+TICKMILL_OLD_RISK_USD, TICKMILL_NEW_RISK_USD = 45, 50
+# Manual override of the Tickmill terminal search (also set by ``guncelle.py --tickmill-terminal``): the path of its
+# terminal64.exe (or of its folder), or one of TERMINAL_OFF to stay on MetaApi.
+TICKMILL_TERMINAL_ENV = "COPYTRADER_TICKMILL_TERMINAL"
+TERMINAL_OFF = frozenset({"yok", "off", "metaapi", "kapali", "kapalı", "hayir", "hayır", "no"})
+TERMINAL_EXE = "terminal64.exe"
 
 _PLACEHOLDER = re.compile(r"\$\{[^}]*\}")
 _PLAIN_WORD = re.compile(r"[A-Za-z_][A-Za-z0-9_]*")
@@ -82,11 +92,115 @@ def _is_zero(value: Any) -> bool:
     return isinstance(value, (int, float)) and not isinstance(value, bool) and value == 0
 
 
-def plan_changes(raw: dict[str, Any], config: AppConfig) -> tuple[list[Change], list[str]]:
+# --------------------------------------------------------------------------- #
+# The Tickmill MetaTrader 5 terminal on this computer
+# --------------------------------------------------------------------------- #
+def program_files_roots(env: Any = None) -> list[Path]:
+    """The Program Files folders of this computer (64- and 32-bit), from the environment; on Windows also the
+    usual places when the environment does not name them. Nothing elsewhere."""
+    env = os.environ if env is None else env
+    found: list[str] = [str(env[n]) for n in ("ProgramW6432", "ProgramFiles", "ProgramFiles(x86)") if env.get(n)]
+    if os.name == "nt":
+        found += [r"C:\Program Files", r"C:\Program Files (x86)"]
+    out: list[Path] = []
+    seen: set[str] = set()
+    for item in found:
+        key = os.path.normcase(os.path.normpath(item))
+        if key not in seen:
+            seen.add(key)
+            out.append(Path(item))
+    return out
+
+
+def find_tickmill_terminals(roots: list[Path]) -> list[Path]:
+    """Every terminal64.exe in a folder of ``roots`` whose name contains "Tickmill" (any case), directly in it or
+    one folder below it ("Tickmill MT5 Terminal\\terminal64.exe", "Tickmill\\MT5\\terminal64.exe")."""
+    out: list[Path] = []
+    seen: set[str] = set()
+
+    def add(exe: Path) -> None:
+        key = os.path.normcase(str(exe))
+        try:
+            ok = exe.is_file()
+        except OSError:
+            ok = False
+        if ok and key not in seen:
+            seen.add(key)
+            out.append(exe)
+
+    for root in roots:
+        try:
+            subs = sorted(root.iterdir())
+        except OSError:
+            continue
+        for sub in subs:
+            try:
+                if "tickmill" not in sub.name.casefold() or not sub.is_dir():
+                    continue
+                add(sub / TERMINAL_EXE)
+                for inner in sorted(sub.iterdir()):
+                    if inner.is_dir():
+                        add(inner / TERMINAL_EXE)
+            except OSError:
+                continue
+    return out
+
+
+def tickmill_terminal(env: Any = None, roots: list[Path] | None = None) -> tuple[str | None, str | None]:
+    """(path of the Tickmill terminal64.exe to switch to, None) or (None, one Turkish line why tickmill stays on
+    MetaApi). The override (TICKMILL_TERMINAL_ENV) wins over the search."""
+    env = os.environ if env is None else env
+    stay = "tickmill MetaApi ile çalışmaya devam ediyor"
+    how = (f"terminal başka bir yerdeyse güncellemeyi 'python guncelle.py --tickmill-terminal "
+           f"\"<terminal64.exe yolu>\"' ile ya da {TICKMILL_TERMINAL_ENV} ortam değişkeniyle yapın")
+    override = str(env.get(TICKMILL_TERMINAL_ENV) or "").strip().strip('"').strip()
+    if override:
+        if override.casefold() in TERMINAL_OFF:
+            return None, f"{TICKMILL_BROKER}: MT5 terminaline geçiş {TICKMILL_TERMINAL_ENV}={override} ile kapatıldı; {stay}."
+        exe = Path(override)
+        if exe.is_dir():
+            exe = exe / TERMINAL_EXE
+        if exe.is_file() and exe.name.casefold() == TERMINAL_EXE:
+            return str(exe), None
+        return None, f"{TICKMILL_BROKER}: belirtilen Tickmill terminali bulunamadı ({override}); {stay}."
+    found = find_tickmill_terminals(program_files_roots(env) if roots is None else roots)
+    if len(found) == 1:
+        return str(found[0]), None
+    if not found:
+        return None, (f"{TICKMILL_BROKER}: bu bilgisayarda Tickmill MT5 terminali bulunamadı (Program Files içinde adında "
+                      f"Tickmill geçen klasörde {TERMINAL_EXE} yok); {stay}; {how}.")
+    names = ", ".join(str(f) for f in found)
+    return None, (f"{TICKMILL_BROKER}: birden fazla Tickmill MT5 terminali bulundu ({names}); hangisinin kullanılacağı "
+                  f"bilinmediği için {stay}; {how}.")
+
+
+def _other_accounts_terminal(path: str, config: AppConfig) -> str | None:
+    """The name of the OTHER account whose terminal ``path`` is (its configured terminal_path, or the terminal it
+    was last connected to: its pin in the data folder), else None."""
+    from .brokers.mt5_broker import read_pins
+    from .config import terminal_key
+
+    key = terminal_key(path)
+    for b in config.brokers:
+        if b.name != TICKMILL_BROKER and getattr(b, "terminal_path", None) and terminal_key(b.terminal_path) == key:
+            return b.name
+    for name, rec in read_pins(str(config.data_dir)).items():
+        if name != TICKMILL_BROKER and rec.get("folder") and terminal_key(str(rec["folder"])) == key:
+            return name
+    return None
+
+
+def _same_number(value: Any, number: float) -> bool:
+    return isinstance(value, (int, float)) and not isinstance(value, bool) and float(value) == float(number)
+
+
+def plan_changes(raw: dict[str, Any], config: AppConfig, *,
+                 terminal: tuple[str | None, str | None] | None = None) -> tuple[list[Change], list[str]]:
     """(changes, notes) for the raw YAML data ``raw`` whose loaded form is ``config``.
 
     A key the installed config model does not know, or one whose present value is a ``${VAR}`` placeholder,
-    is skipped with a note (never written)."""
+    is skipped with a note (never written). ``terminal``: the result of :func:`tickmill_terminal` (looked for on
+    this computer when None, and only when the tickmill block can switch)."""
     changes: list[Change] = []
     notes: list[str] = []
 
@@ -170,6 +284,58 @@ def plan_changes(raw: dict[str, Any], config: AppConfig) -> tuple[list[Change], 
                 "(explicit_market_drift: follow)",
                 lambda c, j=j: c.telegram.topics[j].explicit_market_drift == "follow",
                 f"{name} konusu", wanted=lambda v: v == "follow")
+
+    # 7. tickmill (the friend's account): MetaApi -> this computer's Tickmill MetaTrader 5 terminal (type mt5_bridge),
+    #    once: a block that already names a terminal_path (switched before, and maybe switched back by hand with the
+    #    one line "type: metaapi") is never switched again. Every other key stays, the MetaApi ones included.
+    i = broker_index(TICKMILL_BROKER)
+    if i is not None and _broker(config, TICKMILL_BROKER) is not None:
+        block, model = brokers[i], type(_broker(config, TICKMILL_BROKER))
+        if block.get("type") == "metaapi" and "terminal_path" not in block:
+            path, why = terminal if terminal is not None else tickmill_terminal()
+            if path is not None:
+                owner = _other_accounts_terminal(path, config)
+                if owner is not None:
+                    notes.append(f"{TICKMILL_BROKER}: {path} '{owner}' hesabının terminali; tickmill bu terminale "
+                                 "çevrilmedi ve MetaApi ile çalışmaya devam ediyor. Tickmill'in kendi terminal64.exe "
+                                 "yolunu verin.")
+                    path = why = None
+                elif "tickmill" not in path.casefold():
+                    notes.append(f"{TICKMILL_BROKER}: dikkat, {path} klasörünün adında 'Tickmill' geçmiyor; bot bu "
+                                 "terminale yalnızca içinde bir Tickmill hesabı açıksa bağlanır.")
+            if path is None:
+                if why:
+                    notes.append(why)
+            elif all(_knows(model, key) for key in ("type", "terminal_path", "broker_company")):
+                text = (f"{TICKMILL_BROKER}: MetaApi yerine bu bilgisayardaki Tickmill MT5 terminali kullanılacak "
+                        f"(type: mt5_bridge, terminal_path: {path}); MetaApi ayarları blokta duruyor, bu sürümde "
+                        "MetaApi'ye geri dönmek için type: metaapi yazmanız yeterli (eski bir sürüme dönüş yalnızca "
+                        "guncelle.py --geri-al ile)")
+                changes.append(Change(("brokers", i), "type", "mt5_bridge", text,
+                                      lambda c: _broker(c, TICKMILL_BROKER).type == "mt5_bridge"))
+                changes.append(Change(("brokers", i), "terminal_path", path, "",
+                                      lambda c, p=path: getattr(_broker(c, TICKMILL_BROKER), "terminal_path", None) == p))
+                if "broker_company" not in block:
+                    changes.append(Change(("brokers", i), "broker_company", TICKMILL_COMPANY, "",
+                                          lambda c: getattr(_broker(c, TICKMILL_BROKER), "broker_company", None)
+                                          == TICKMILL_COMPANY))
+            else:
+                notes.append(f"bu sürüm mt5_bridge ayarlarını tanımıyor; {TICKMILL_BROKER} MetaApi'de bırakıldı")
+        # 8. The friend's requests: 1R 45 -> 50 USD and lots rounded to the nearest step. Both only together with the
+        #    block's first lot_rounding: once it is there, whatever the owner writes later stays.
+        if "lot_rounding" not in block:
+            risk_now = block.get("risk_usd", _MISSING)
+            if _same_number(risk_now, TICKMILL_OLD_RISK_USD) and _knows(model, "risk_usd"):
+                changes.append(Change(
+                    ("brokers", i), "risk_usd", TICKMILL_NEW_RISK_USD,
+                    f"{TICKMILL_BROKER}: 1R riski {TICKMILL_OLD_RISK_USD} → {TICKMILL_NEW_RISK_USD} USD "
+                    f"(risk_usd: {TICKMILL_NEW_RISK_USD})",
+                    lambda c: getattr(_broker(c, TICKMILL_BROKER), "risk_usd", None) == TICKMILL_NEW_RISK_USD))
+            setting(("brokers", i), block, model, "lot_rounding", "nearest",
+                    f"{TICKMILL_BROKER}: lot en yakın adıma yuvarlanacak (0.125 → 0.13; stopta kayıp hedefi %15'ten "
+                    "fazla aşacaksa aşağı yuvarlanır) (lot_rounding: nearest)",
+                    lambda c: getattr(_broker(c, TICKMILL_BROKER), "lot_rounding", None) == "nearest",
+                    TICKMILL_BROKER, wanted=lambda v: True)
     return changes, notes
 
 
@@ -414,7 +580,7 @@ def _backup_path(path: Path, now: datetime) -> Path:
 
 
 def migrate_config(path: str | os.PathLike[str] = "config.yaml", *, notes: list[str] | None = None,
-                   now: datetime | None = None) -> list[str]:
+                   now: datetime | None = None, terminal: tuple[str | None, str | None] | None = None) -> list[str]:
     """Update ``path`` in place. Returns one Turkish line per change (empty: the file was already up to date
     and nothing was written). ``notes`` (optional list) receives remarks: skipped settings, the backup's name,
     lost comments. Raises :class:`MigrationError` when the file cannot be migrated; the file on disk is then
@@ -434,7 +600,7 @@ def migrate_config(path: str | os.PathLike[str] = "config.yaml", *, notes: list[
         raise MigrationError(
             f"{p.name} bu sürümle yüklenemiyor ({_short_error(exc)}); hiçbir şey değiştirilmedi") from exc
 
-    changes, found = plan_changes(data, config)
+    changes, found = plan_changes(data, config, terminal=terminal)
     remarks = list(found)
     try:
         if not changes:
@@ -474,7 +640,7 @@ def migrate_config(path: str | os.PathLike[str] = "config.yaml", *, notes: list[
         if rewritten:
             remarks.append("dosyadaki açıklama satırları korunamadı (dosya baştan yazıldı); açıklamalı eski "
                            f"hali {backup.name} dosyasında")
-        return [c.text for c in changes]
+        return [c.text for c in changes if c.text]
     finally:
         if notes is not None:
             notes.extend(remarks)

@@ -61,6 +61,35 @@ yazar.
 | `risk` > `allow_min_qty_round_up` | `true` | 1R en küçük emir miktarının altında kalırsa en küçük miktarla açılır |
 | `fx` > `daily_loss_include_open_risk` | `true` | Günlük zarar sınırına açık işlemlerin riski de sayılır |
 | kripto konusu > `explicit_market_drift` | `follow` | "market" yazan sinyalde fiyat uzaklaşmışsa sormadan devam edilir |
+| `tickmill` > `risk_usd` | `50` | Arkadaşınızın hesabında 1R 45 → 50 USD (yalnızca şu an tam 45 ise ve bir kez; sonra elle yazdığınız değer kalır) |
+| `tickmill` > `lot_rounding` | `nearest` | Lot en yakın adıma yuvarlanır (0.125 → 0.13); stopta kayıp hedefi %15'ten fazla aşacaksa aşağı yuvarlanır. Sizin hesaplarınız aşağı yuvarlamada kalır |
+| `tickmill` > `type` | `mt5_bridge` | Bilgisayarda Tickmill MT5 terminali bulunursa MetaApi yerine o terminal kullanılır (bir kez; bulunamazsa MetaApi'de kalır ve bunu bir satırla yazar) |
+| `tickmill` > `terminal_path` | bulunan `terminal64.exe` yolu | Program Files içinde adında "Tickmill" geçen klasördeki terminal |
+| `tickmill` > `broker_company` | `Tickmill` | Bot yalnızca Tickmill hesabı açık olan terminale bağlanır |
+
+### Tickmill MT5 terminaline geçiş
+
+Arkadaşınızın hesabı (tickmill) MetaApi bulutu yerine bu bilgisayara kurulan Tickmill MetaTrader 5 terminaliyle
+çalışabilir. Sizin yapmanız gereken yalnızca şu: Tickmill'in MT5 terminalini kurun, açın ve arkadaşınızın hesabıyla
+giriş yapın (şifre yalnızca terminale yazılır, "şifreyi kaydet" işaretli olsun). FundingPips terminalinizde olduğu
+gibi bu terminalde de üst araç çubuğundaki "Algo Trading" düğmesi yeşil olmalı ve Araçlar > Seçenekler > Uzman
+Danışmanlar sekmesinde "Python API" geçen devre dışı bırakma kutusu işaretli olmamalı. Sonra her zamanki gibi güncelleyin:
+6. adım terminali bulur ve `tickmill` bloğunu ona çevirir. MetaApi ayarları (`token`, `account_id`) blokta kalır;
+BU sürümde MetaApi'ye geri dönmek için bloktaki `type: mt5_bridge` satırını `type: metaapi` yapmanız yeterlidir.
+
+Eski bir sürüme dönmek için yalnızca `.\venv\Scripts\python.exe guncelle.py --geri-al` kullanın: kodla birlikte
+o zamanki `config.yaml` dosyasını da yedekten geri koyar. Eski kodu elle (yalnızca kod dosyalarını) geri koymayın:
+eski sürümler bu güncellemenin eklediği `lot_rounding`, `terminal_path` ve `broker_company` ayarlarını tanımaz ve
+bot hiç açılmaz (sizin hesaplarınız dahil). `type: metaapi` yazmak bunu çözmez; elle dönülecekse `config.yaml` da
+güncellemeden önceki yedeğiyle (`config.yaml.yedek-...` ya da `yedek\<tarih>\config.yaml`) değiştirilmelidir.
+Bu ayarlar Tickmill terminali bulunamasa da eklenir (`risk_usd` ve `lot_rounding`).
+
+Terminal Program Files dışında bir yere kurulduysa 3. adımdaki satırın sonuna bir boşluk bırakıp
+`--tickmill-terminal "C:\...\terminal64.exe"` yazın. MetaApi'de kalmak için `--tickmill-terminal yok` yazın.
+
+Bot, sizin FundingPips terminalinizi (fx) ilk bağlandığı terminal olarak `data\mt5_terminal_fx.json` dosyasına
+kaydeder ve sonra hep o terminale bağlanır; başka bir terminale (örneğin Tickmill'inkine) asla bağlanmaz, bağlanmak
+zorunda kalırsa bağlantıyı keser ve size yazar.
 
 ## Bekçi: bot çalışmıyorsa haber verir
 

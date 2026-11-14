@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import logging
+import os
 from typing import Any
 
 from .base import Broker, BrokerError
@@ -10,11 +11,25 @@ from .base import Broker, BrokerError
 logger = logging.getLogger(__name__)
 
 
+_MT_FAMILY = ("mt5", "mt5_bridge", "metaapi")
+
+
+def _guard(cfg: Any, app_config: Any, data_dir: str) -> Any:
+    """The terminals the MetaTrader account ``cfg`` must never attach to: those of the config's OTHER MetaTrader
+    accounts (enabled or not: their terminal is on this computer all the same) and their pins (mt5_broker)."""
+    from .mt5_broker import build_guard
+
+    others = [b for b in (getattr(app_config, "brokers", None) or [])
+              if getattr(b, "type", None) in _MT_FAMILY and b.name != cfg.name]
+    own_words = [cfg.name, getattr(cfg, "server", None) or "", getattr(cfg, "broker_company", None) or ""]
+    return build_guard(cfg.name, others, data_dir, own_words)
+
+
 def create_broker(cfg: Any, *, dry_run: bool, app_config: Any) -> Broker:
     """Build the adapter for one BrokerConfig.
 
-    type "ccxt" -> CcxtBroker, "mt5" -> Mt5Broker, "metaapi" -> MetaApiBroker,
-    "paper" -> PaperBroker. When ``dry_run`` is True every non-paper adapter is
+    type "ccxt" -> CcxtBroker, "mt5" -> Mt5Broker, "mt5_bridge" -> Mt5BridgeBroker (a second terminal through a
+    helper process), "metaapi" -> MetaApiBroker, "paper" -> PaperBroker. When ``dry_run`` is True every non-paper adapter is
     wrapped in DryRunBroker (reads are real, writes are simulated). Imports of
     optional SDKs (MetaTrader5, metaapi_cloud_sdk) happen lazily inside this
     function so a missing optional package only breaks that broker type.
@@ -41,7 +56,13 @@ def create_broker(cfg: Any, *, dry_run: bool, app_config: Any) -> Broker:
         elif kind == "mt5":
             from .mt5_broker import Mt5Broker
 
-            broker = Mt5Broker(cfg)
+            pins = os.path.abspath(data_dir)
+            broker = Mt5Broker(cfg, pin_dir=pins, guard=_guard(cfg, app_config, pins))
+        elif kind == "mt5_bridge":
+            from .mt5_bridge import Mt5BridgeBroker
+
+            pins = os.path.abspath(data_dir)
+            broker = Mt5BridgeBroker(cfg, pin_dir=pins, guard=_guard(cfg, app_config, pins))
         elif kind == "metaapi":
             from .metaapi_broker import MetaApiBroker
 

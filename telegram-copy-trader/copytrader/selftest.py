@@ -66,7 +66,7 @@ _TAG = re.compile(r"<[^>]+>")
 _FX_MARKETS = (MarketType.FOREX, MarketType.CFD)
 _KIND_TR = {"manual": "elle işlem", "paper": "sanal hesap"}
 _CRYPTO_TYPES = frozenset({"ccxt", "paper", "manual"})
-_MT_TYPES = frozenset({"mt5", "metaapi"})
+_MT_TYPES = frozenset({"mt5", "mt5_bridge", "metaapi"})
 
 OK, BAD, WARN, SKIP = "[TAMAM]", "[SORUN]", "[UYARI]", "[  -- ]"
 
@@ -352,7 +352,7 @@ async def _account(broker: Broker, config: AppConfig, report: _Report, bases: li
             report.problem(broker.name, _plain(warning))
             details.append(f"{BAD} {_plain(warning)}")
     details += health or []
-    if kind == "mt5":
+    if kind in ("mt5", "mt5_bridge"):
         version = _package_version("MetaTrader5")
         details.append(f"MetaTrader5 paketi: {version or 'sürümü okunamadı'}")
     own = await _report_lines(broker, bases, report)

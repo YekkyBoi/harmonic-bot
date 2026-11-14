@@ -30,7 +30,9 @@ Never touched: ``.env``, ``data/``, ``venv/``, session files, ``*.yedek*`` and a
 not ship. Running it twice is harmless.
 
 Options: ``--hedef <folder>`` (bot folder, default: current directory), ``--baslatma`` (do not start the
-bot), ``--kontrol-yok`` (skip steps 7 and 8; for tests), ``--bekci-yok`` (do not register the watchman).
+bot), ``--kontrol-yok`` (skip steps 7 and 8; for tests), ``--bekci-yok`` (do not register the watchman),
+``--tickmill-terminal <terminal64.exe>`` (step 6 switches the friend's tickmill account to that MetaTrader 5
+terminal instead of looking for one in Program Files; ``yok``: it stays on MetaApi).
 
 ``--bekci-kur`` only registers the watchman (no update, no zip; the bot may keep running): for a window that was
 not opened as administrator at update time, or after the bot folder was moved.
@@ -95,6 +97,9 @@ CRYPTG_SURESI = 90.0            # seconds for its pip run (the bot is stopped me
 CRYPTG_KONTROL_SURESI = 30.0    # seconds for "is it installed already?"
 BEKLEME = 15.0                  # seconds before the single retry of a failed check
 CIKIS_TAMAM, CIKIS_GERI_ALINDI, CIKIS_REDDEDILDI, CIKIS_KESILDI = 0, 1, 2, 130
+# Step 6 (``copytrader migrate``) looks for the Tickmill MetaTrader 5 terminal in Program Files; ``--tickmill-terminal``
+# names it instead (or "yok": tickmill stays on MetaApi). Handed over in this variable (copytrader/migrate.py).
+TICKMILL_DEGISKENI = "COPYTRADER_TICKMILL_TERMINAL"
 
 # "python -m copytrader run" (also the console script "copytrader run"), however it is quoted / spaced.
 BOT_KOMUTU = re.compile(r"""(?:-m\s+copytrader(?:\.__main__)?|[\\/]copytrader(?:\.exe)?["']?)\s+run(?:\s|$)""",
@@ -1004,6 +1009,8 @@ def _secenekler(argv: list[str] | None) -> argparse.Namespace:
                    help="güncelleme yapma: yalnızca bekçiyi kur (bot çalışırken de yapılabilir)")
     p.add_argument("--geri-al", action="store_true", dest="geri_al",
                    help="güncelleme yapma: son güncellemeden önceki sürümü ve config.yaml'ı yedekten geri koy")
+    p.add_argument("--tickmill-terminal", default=None, dest="tickmill_terminal", metavar="YOL",
+                   help="6. adım: Tickmill MT5 terminalinin terminal64.exe yolu (aranmaz); 'yok' = MetaApi'de kal")
     return p.parse_args(argv)
 
 
@@ -1210,6 +1217,8 @@ def main(
         except (AttributeError, ValueError):
             pass
     secenek = _secenekler(argv)
+    if secenek.tickmill_terminal:
+        os.environ[TICKMILL_DEGISKENI] = secenek.tickmill_terminal     # read by step 6 (copytrader migrate)
     gunluk = Gunluk()
     hedef = Path(secenek.hedef).expanduser() if secenek.hedef else Path.cwd()
     hedef = Path(os.path.abspath(hedef))

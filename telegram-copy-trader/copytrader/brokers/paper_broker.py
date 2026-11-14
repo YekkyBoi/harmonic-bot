@@ -583,6 +583,7 @@ class PaperBroker(Broker):
             fee_rate=self.cfg.fee_rate,
             include_fees=risk.include_fees_in_risk,
             allow_min_qty_round_up=risk.allow_min_qty_round_up,
+            rounding=str(getattr(self.config, "lot_rounding", "down") or "down"),
         )
         # Leverage is informational on paper: the smallest that fits the balance.
         equity = max(await self.get_equity(), 1e-9)

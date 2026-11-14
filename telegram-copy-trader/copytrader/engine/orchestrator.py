@@ -655,6 +655,14 @@ def broker_risk_amount(broker: Broker, equity: float, plan: TradePlan) -> float:
 DEFAULT_MAX_SIZE_MULTIPLE = 2.0        # RiskConfig.max_size_multiple when the config does not carry the field
 
 
+def rounding_headroom(broker: Broker) -> float:
+    """How much more than its target risk a size of ``broker`` may lose at the stop through its lot rounding:
+    1 for "down" (the default: never more), LOT_ROUNDING_MAX_OVERSHOOT for "nearest" (sizing.round_quantity)."""
+    if str(getattr(broker.config, "lot_rounding", "down") or "down") == "nearest":
+        return sizing.LOT_ROUNDING_MAX_OVERSHOOT
+    return 1.0
+
+
 def market_sizing_entry(
     side: Side, live_entry: float, stop: float, signal_entry: float | None,
     max_multiple: Any = DEFAULT_MAX_SIZE_MULTIPLE,
@@ -4323,7 +4331,9 @@ class Engine:
                     # stay within the limit (guards.position_open_risk says what "at risk" covers).
                     at_risk = guards.open_risk(p for tid, p in await self.db.active_broker_positions()
                                                if p.broker == name and tid != trade.id)
-                    wanted = broker_risk_amount(broker, equity, plan)
+                    # (lot_rounding "nearest" may round the size UP: at most LOT_ROUNDING_MAX_OVERSHOOT x the target
+                    # is at the stop then, and that is what is counted before the size is known)
+                    wanted = broker_risk_amount(broker, equity, plan) * rounding_headroom(broker)
                     if guards.daily_loss_would_exceed(realized, at_risk, wanted, equity, loss_limit):
                         total = guards.daily_loss_with_open_risk(realized, at_risk, wanted)
                         limit_text, total_text, excess_text = _over_limit_figures(equity * loss_limit / 100.0, total)

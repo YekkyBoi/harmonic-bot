@@ -20,6 +20,10 @@ logger = logging.getLogger(__name__)
 _STEP_EPS = Decimal("1e-9")
 # Round-up to the minimum order is refused above this multiple of the target risk.
 _MAX_ROUND_UP_RISK_MULT = 2.0
+# lot_rounding "nearest" (a broker setting): the quantity is rounded to the NEAREST step only while the loss at the
+# stop stays within this multiple of the target risk; above it the quantity is rounded down as usual.
+LOT_ROUNDING_MAX_OVERSHOOT = 1.15
+LOT_ROUNDINGS = ("down", "nearest")
 
 
 class SizingError(BrokerError):
@@ -45,6 +49,25 @@ def _quantize_steps(value: float, step: float, rounding: str) -> float:
     else:
         q = q.to_integral_value(rounding=rounding)
     return float(q * _d(step))
+
+
+def round_quantity(raw: float, step: float, rounding: str = "down", *, risk_amount: float | None = None,
+                   loss_per_unit: float | None = None) -> float:
+    """``raw`` (the exact size for the target risk) on the broker's ``step``: rounded DOWN (``rounding`` "down", the
+    default and any unknown value), or to the NEAREST step ("nearest": 0.125 -> 0.13, 0.124 -> 0.12) as long as
+    that size loses at most LOT_ROUNDING_MAX_OVERSHOOT x ``risk_amount`` at the stop (``loss_per_unit`` per unit);
+    above that, or without both figures, rounded down. The one rounding rule of every sizing function here."""
+    down = floor_to_step(raw, step)
+    if rounding != "nearest" or step <= 0 or not math.isfinite(raw):
+        return down
+    nearest = _quantize_steps(raw, step, ROUND_HALF_UP)
+    if nearest <= down:
+        return down
+    if risk_amount is None or loss_per_unit is None or not (risk_amount > 0 and loss_per_unit > 0):
+        return down
+    if nearest * loss_per_unit > risk_amount * LOT_ROUNDING_MAX_OVERSHOOT * (1 + 1e-12):
+        return down
+    return nearest
 
 
 def risk_amount(equity: float, risk_pct: float, multiplier: float = 1.0) -> float:
@@ -99,8 +122,11 @@ def compute_linear_size(
     fee_rate: float = 0.0,
     include_fees: bool = True,
     allow_min_qty_round_up: bool = False,
+    rounding: str = "down",
 ) -> SizingResult:
     """Size for linear instruments (USDT-margined perps, spot, paper).
+
+    ``rounding``: the broker's ``lot_rounding`` (see :func:`round_quantity`; "down" unless the broker says so).
 
     loss_per_unit = |entry - stop| * contract_size
                     + (fee_rate * (entry + stop) * contract_size if include_fees)
@@ -128,7 +154,8 @@ def compute_linear_size(
         loss_per_unit += fee_rate * (entry + stop) * contract_size
 
     warnings: list[str] = []
-    quantity = floor_to_step(risk_amount / loss_per_unit, qty_step)
+    quantity = round_quantity(risk_amount / loss_per_unit, qty_step, rounding, risk_amount=risk_amount,
+                              loss_per_unit=loss_per_unit)
     if max_qty is not None and quantity > max_qty:
         capped = floor_to_step(max_qty, qty_step)
         warnings.append(
@@ -191,18 +218,21 @@ def compute_lot_size(
     min_lot: float,
     max_lot: float | None = None,
     allow_min_qty_round_up: bool = False,
+    rounding: str = "down",
 ) -> float:
     """Lots for MT4/MT5-style instruments where the broker reports the money lost per 1 lot at the stop.
 
     Same rounding / minimum rules as compute_linear_size. Returns the lot size.
     ``loss_per_lot`` should already include commission if the caller wants fees in the risk.
+    ``rounding``: the broker's ``lot_rounding`` (see :func:`round_quantity`).
     """
     _require_positive(risk_amount=risk_amount, loss_per_lot=loss_per_lot, lot_step=lot_step)
     _require_non_negative(min_lot=min_lot)
     if max_lot is not None:
         _require_positive(max_lot=max_lot)
 
-    lots = floor_to_step(risk_amount / loss_per_lot, lot_step)
+    lots = round_quantity(risk_amount / loss_per_lot, lot_step, rounding, risk_amount=risk_amount,
+                          loss_per_unit=loss_per_lot)
     if max_lot is not None and lots > max_lot:
         logger.warning("Lot size %s capped at broker max %s", lots, max_lot)
         lots = floor_to_step(max_lot, lot_step)

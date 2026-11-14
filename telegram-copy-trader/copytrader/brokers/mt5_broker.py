@@ -38,7 +38,10 @@ from __future__ import annotations
 import asyncio
 import importlib
 import logging
+import json
 import math
+import os
+import re
 import sys
 import threading
 import time
@@ -48,9 +51,10 @@ from collections.abc import Callable, Sequence
 from concurrent.futures import Future as ThreadFuture
 from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass, field
+from pathlib import Path
 from typing import Any, TypeVar
 
-from ..config import Mt5BrokerConfig, RiskConfig
+from ..config import Mt5BrokerConfig, RiskConfig, terminal_key
 from ..models import (
     BrokerPosition,
     EntryType,
@@ -164,6 +168,8 @@ _MODIFY_OK = (MT5.TRADE_RETCODE_DONE, MT5.TRADE_RETCODE_PLACED, MT5.TRADE_RETCOD
 # Native terminal calls (Mt5Broker). The MetaTrader5 package waits for the terminal without any time limit.
 CALL_TIMEOUT_SEC = 30.0         # one native call
 INIT_TIMEOUT_SEC = 90.0         # initialize(): the package itself gives the terminal 60 s to start and log in
+LOOK_TIMEOUT_MS = 10_000        # an attach-only look at a terminal before any log-in (no pin yet, see _initialize)
+MAX_TERMINAL_LOOKS = 3          # installed terminals looked at, at most, when the package reached another one
 HEALTH_TIMEOUT_SEC = 10.0       # each call of health_problem() (the engine's heartbeat allows 30 s for the check)
 LOST_REPLY_WAIT_SEC = 60.0      # an order_send ran out of time: wait this long for the terminal before the look-up
 
@@ -393,6 +399,33 @@ def tag_matches(value: str | None, tag: str) -> bool:
     return bool(value) and (value == tag or value.startswith(tag + "-"))  # type: ignore[union-attr]
 
 
+# The order tag as the MetaApi adapter sent it (metaapi_broker.encode_client_id): clientId "CT_<body>[L<leg>]_<x>"
+# for the internal tag "ct<body>[-<leg>]". MetaApi keeps the clientId in the MetaTrader order / position COMMENT
+# (with its own comment after or before it, separated by one character: "clientId and comment together <= 30
+# characters, 31 without a comment"). A position opened through MetaApi on an account that is later driven by the
+# native terminal therefore shows that text in its comment: it is read back as the internal tag, so that the native
+# adapter recognises the positions the MetaApi adapter opened on the same account (a change of the connection type
+# while a position is open). The trailing part may have been cut by the terminal's 31-character comment limit.
+_METAAPI_CID_IN_COMMENT = re.compile(
+    r"(?:^|[^A-Za-z0-9_])CT_([A-Za-z0-9]+?)(?:L([1-9][0-9]*))?(?:_[A-Za-z0-9]*)?(?=$|[^A-Za-z0-9_])")
+_INTERNAL_TAG = re.compile(r"ct[A-Za-z0-9]+(?:-[1-9][0-9]*)?")
+
+
+def comment_tag(comment: Any) -> str:
+    """The internal order tag a MetaTrader comment carries: the comment itself when it is one of the tags this bot
+    writes ("ct<plan>[-<leg>]", the native adapter and the MetaApi adapter without a clientId), the tag behind a
+    MetaApi clientId in it ("CT_d7c454ab04L2_0|copytrader" -> "ctd7c454ab04-2"), else the comment unchanged (tag
+    matching then finds nothing for it)."""
+    text = str(comment or "")
+    if _INTERNAL_TAG.fullmatch(text):
+        return text
+    m = _METAAPI_CID_IN_COMMENT.search(text)
+    if m is not None:
+        body, leg = m.groups()
+        return f"ct{body}" + (f"-{leg}" if leg else "")
+    return text
+
+
 def closed_by_deals(s: dict[str, Any] | None) -> bool:
     """The deal summary of a position shows it fully closed: closing deals cover every lot it opened. A summary
     with an opening deal only (just filled), or with fewer closed lots than opened (partly closed, or the newest
@@ -587,6 +620,11 @@ class MetaTraderLegBroker(Broker, ABC):
         return positions.get(str(ticket))
 
     # ---- sizing ------------------------------------------------------------
+    def _lot_rounding(self) -> str:
+        """The broker's ``lot_rounding`` ("down" unless the config says "nearest")."""
+        value = str(getattr(self.config, "lot_rounding", "down") or "down")
+        return value if value in ("down", "nearest") else "down"
+
     def _fee_per_lot(self, loss_per_lot: float, entry: float, stop: float) -> float:
         """MT brokers do not report commission up front: optional buffer.
 
@@ -617,13 +655,20 @@ class MetaTraderLegBroker(Broker, ABC):
             min_lot=symbol.min_qty,
             max_lot=symbol.max_qty,
             allow_min_qty_round_up=rc.allow_min_qty_round_up,
+            rounding=self._lot_rounding(),
         )
         warnings: list[str] = []
         est = lots * per_lot
-        if symbol.max_qty and risk_amount / per_lot > symbol.max_qty + _EPS:
+        exact = risk_amount / per_lot
+        if symbol.max_qty and exact > symbol.max_qty + _EPS:
             warnings.append(f"Lot brokerın azami lotuyla ({_num(symbol.max_qty)}) sınırlandı; risk hedefin altında.")
         if est > risk_amount * (1 + 1e-6):
-            warnings.append(f"Lot minimum lota yükseltildi; stopta kayıp ~{est:.2f} (hedef {risk_amount:.2f}).")
+            if floor_to_step(exact, symbol.qty_step) >= max(symbol.min_qty, symbol.qty_step) - _EPS:
+                # lot_rounding "nearest": the next step up was nearer (at most LOT_ROUNDING_MAX_OVERSHOOT x the target)
+                warnings.append(f"Lot en yakın adıma yukarı yuvarlandı ({_num(round(exact, 6))} -> {_num(lots)}); "
+                                f"stopta kayıp ~{est:.2f} (hedef {risk_amount:.2f}).")
+            else:
+                warnings.append(f"Lot minimum lota yükseltildi; stopta kayıp ~{est:.2f} (hedef {risk_amount:.2f}).")
 
         margin = await self._margin_for(symbol, side, lots, entry_price)
         free = await self.get_free_margin()
@@ -931,6 +976,55 @@ class MetaTraderLegBroker(Broker, ABC):
         leg["state"] = "failed"
         leg["reason"] = "no_stop"
         return f"Stop konulamadı ({last}); pozisyon #{leg['ticket']} piyasa fiyatından kapatıldı."
+
+    async def adopt_tagged(self, req: OpenRequest) -> BrokerPosition | None:
+        """The position of ``req`` as the account shows it now, found by its client tag only (NOTHING is sent):
+        for an open whose whole answer was lost (mt5_bridge: the helper process ended while the open ran). None when
+        no order or position carries the tag. Raises BrokerError when the account cannot be read."""
+        sym = req.symbol
+        positions, orders = await self._snapshot(sym.broker_symbol)
+        legs = self._legs_from_snapshot(positions, orders, req.client_tag)
+        if not legs:
+            return None
+        step, tick = sym.qty_step, sym.price_tick
+        tps = [TakeProfit(price=round_to_tick(t.price, tick), close_fraction=t.close_fraction) for t in req.take_profits]
+        # The legs the open would have placed (the same plan as _open_position), to tell the owner which are missing.
+        planned, emulated = self._plan(floor_to_step(req.quantity, step), tps, step, sym.min_qty)
+        wanted = [leg_tag(req.client_tag, i, len(planned), self.tag_limit) for i in range(len(planned))]
+        found = {leg["tag"] for leg in legs}
+        for leg in legs:
+            if leg["state"] == "pending":
+                leg["order_ticket"] = leg["ticket"]
+            i = wanted.index(leg["tag"]) if leg["tag"] in wanted else None
+            leg["tp_indexes"] = list(planned[i].tp_indexes) if i is not None else []
+        # What the account really holds: the found legs' size and their own targets (never the whole request).
+        held = _snap(sum(float(leg.get("volume") or leg.get("filled") or 0.0) for leg in legs), step)
+        if emulated:
+            kept_tps = tps
+        else:
+            idx = sorted({i for leg in legs for i in leg["tp_indexes"]})
+            kept_tps = [tps[i] for i in idx] if idx else [t for t in tps if any(
+                leg.get("tp") and abs(float(leg["tp"]) - t.price) < max(tick, _EPS) for leg in legs)]
+        warnings: list[str] = []
+        missing = [t for t in wanted if t not in found]
+        if missing:
+            warnings.append(
+                f"Bu emrin {len(wanted)} bacağından yalnızca {len(wanted) - len(missing)} tanesi hesapta bulundu "
+                f"({_num(held)} lot); {', '.join(missing)} etiketli bacak(lar) açılmamış olabilir ya da durumu "
+                "belirsiz, tekrar gönderilmedi: MT5'te kontrol edin.")
+        pos = BrokerPosition(
+            broker=self.name, broker_symbol=sym.broker_symbol, side=req.plan.side,
+            status=PositionStatus.OPEN, quantity=held,
+            stop_loss=round_to_tick(req.stop_loss, tick),
+            take_profits=kept_tps,
+            data={"legs": legs, "client_tag": req.client_tag, "netting": self._netting, "volume_step": step,
+                  "volume_min": sym.min_qty, "price_tick": tick, "emulated_tps": emulated if len(legs) == 1 else [],
+                  "warnings": warnings},
+        )
+        if missing:
+            pos.error = warnings[0]
+        self._aggregate(pos)
+        return pos
 
     async def _adopt_lost_leg(
         self, symbol: str, tag: str, volume: float, sl: float, tp: float | None
@@ -1742,6 +1836,139 @@ class MetaTraderLegBroker(Broker, ABC):
 # --------------------------------------------------------------------------- #
 _ACTIVE_LOGINS: dict[int, int] = {}     # id(MetaTrader5 module) -> login: the package drives ONE terminal per process
 
+# --------------------------------------------------------------------------- #
+# Which terminal an account uses ("pin")
+# --------------------------------------------------------------------------- #
+# A second MetaTrader 5 terminal on the same computer (the friend's Tickmill terminal, driven by type "mt5_bridge")
+# means that MetaTrader5.initialize() without a path may attach to the WRONG terminal. So the first successful
+# connect of an account writes down which terminal it was (its folder and company, the account's server and login)
+# into <data_dir>/mt5_terminal_<broker>.json; every later initialize() / re-login uses that terminal's path, and a
+# terminal that is not that one (another folder or company), or that another account of the bot uses, is refused
+# before anything is read or sent (fail closed: the owner is told why). An explicit terminal_path in the config always
+# wins over the pin.
+PIN_PREFIX = "mt5_terminal_"
+TERMINAL_EXE = "terminal64.exe"
+_MARKER_MIN_LEN = 5          # a broker name / company shorter than this is never used as a marker
+
+
+def pin_file(pin_dir: str, name: str) -> Path:
+    safe = re.sub(r"[^A-Za-z0-9_.-]", "_", name) or "broker"
+    return Path(pin_dir) / f"{PIN_PREFIX}{safe}.json"
+
+
+def read_pins(pin_dir: str | None) -> dict[str, dict[str, Any]]:
+    """Every pin in ``pin_dir``: broker name -> record. Unreadable files are skipped (logged)."""
+    out: dict[str, dict[str, Any]] = {}
+    if not pin_dir:
+        return out
+    try:
+        files = sorted(Path(pin_dir).glob(f"{PIN_PREFIX}*.json"))
+    except OSError:
+        return out
+    for f in files:
+        try:
+            data = json.loads(f.read_text(encoding="utf-8"))
+        except (OSError, ValueError) as exc:
+            logger.warning("MT5 terminal pin %s cannot be read: %s", f, exc)
+            continue
+        if isinstance(data, dict) and data.get("broker"):
+            out[str(data["broker"])] = data
+    return out
+
+
+def write_pin(pin_dir: str, name: str, record: dict[str, Any]) -> None:
+    path = pin_file(pin_dir, name)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    tmp = path.with_name(path.name + ".tmp")
+    tmp.write_text(json.dumps({"broker": name, **record}, ensure_ascii=False, indent=1), encoding="utf-8")
+    os.replace(tmp, path)
+
+
+def _folder_key(path: Any) -> str:
+    """terminal_info().path is the terminal's FOLDER, a config path names its terminal64.exe: both give the
+    same key (config.terminal_key)."""
+    return terminal_key(str(path or ""))
+
+
+def program_files() -> list[Path]:
+    """The Program Files folders of this computer (64- and 32-bit), from the environment and, on Windows, the usual
+    places."""
+    found = [os.environ[n] for n in ("ProgramW6432", "ProgramFiles", "ProgramFiles(x86)") if os.environ.get(n)]
+    if sys.platform == "win32":
+        found += [r"C:\Program Files", r"C:\Program Files (x86)"]
+    out: list[Path] = []
+    for item in found:
+        if all(os.path.normcase(str(p)) != os.path.normcase(item) for p in out):
+            out.append(Path(item))
+    return out
+
+
+def installed_terminals(roots: Sequence[Path] | None = None) -> list[str]:
+    """Folders with a terminal64.exe right below a Program Files folder or one level deeper."""
+    out: list[str] = []
+    for root in program_files() if roots is None else roots:
+        try:
+            subs = sorted(root.iterdir())
+        except OSError:
+            continue
+        for sub in subs:
+            try:
+                if not sub.is_dir():
+                    continue
+                for folder in [sub, *sorted(x for x in sub.iterdir() if x.is_dir())]:
+                    if (folder / TERMINAL_EXE).is_file() and str(folder) not in out:
+                        out.append(str(folder))
+            except OSError:
+                continue
+    return out
+
+
+def _exe_in(folder: str) -> str:
+    sep = "\\" if ("\\" in folder or ":" in folder[:3]) else "/"
+    return folder.rstrip("\\/") + sep + TERMINAL_EXE
+
+
+@dataclass
+class TerminalGuard:
+    """What an account must NOT attach to: the terminals other accounts of the bot use (folder keys: their
+    configured terminal_path, their pins), their companies (from their pins) and marker words (other MetaTrader
+    accounts' names and broker_company: a terminal whose folder or company contains one is someone else's)."""
+
+    folders: dict[str, str] = field(default_factory=dict)       # folder key -> broker name
+    companies: dict[str, str] = field(default_factory=dict)     # company (casefold) -> broker name
+    markers: dict[str, str] = field(default_factory=dict)       # marker (casefold) -> broker name
+
+    def known(self) -> bool:
+        return bool(self.folders or self.companies or self.markers)
+
+
+def build_guard(own: str, others: Sequence[Any], pin_dir: str | None, own_words: Sequence[str] = ()) -> TerminalGuard:
+    """The TerminalGuard of broker ``own``: from the configs of the OTHER MetaTrader-family brokers (``others``:
+    mt5 / mt5_bridge / metaapi configs) and the pins in ``pin_dir``. A marker that also appears in ``own_words``
+    (this account's own name / server / broker_company) is left out: it cannot tell the two apart."""
+    guard = TerminalGuard()
+    mine = " ".join(w for w in own_words if w).casefold()
+    for cfg in others:
+        name = str(getattr(cfg, "name", ""))
+        if not name or name == own:
+            continue
+        path = getattr(cfg, "terminal_path", None)
+        if path:
+            guard.folders[_folder_key(path)] = name
+        for word in (name, getattr(cfg, "broker_company", None)):
+            w = str(word or "").strip().casefold()
+            if len(w) >= _MARKER_MIN_LEN and w not in mine:
+                guard.markers[w] = name
+    for name, rec in read_pins(pin_dir).items():
+        if name == own:
+            continue
+        if rec.get("folder"):
+            guard.folders[_folder_key(rec["folder"])] = name
+        company = str(rec.get("company") or "").strip().casefold()
+        if company:
+            guard.companies[company] = name
+    return guard
+
 
 def _last_error(mt5: Any) -> tuple[int, str]:
     try:
@@ -1890,7 +2117,14 @@ class Mt5Broker(MetaTraderLegBroker):
     requote_delay_sec: float = 0.4       # pause before a requote is retried with a fresh price
     transient_retry_sec: float = 1.5     # pause before the single retry after a transient refusal
 
-    def __init__(self, config: Mt5BrokerConfig, *, mt5_module: Any | None = None) -> None:
+    def __init__(self, config: Mt5BrokerConfig, *, mt5_module: Any | None = None, pin_dir: str | None = None,
+                 guard: TerminalGuard | None = None) -> None:
+        """``pin_dir``: folder of the terminal pins (see PIN_PREFIX; None = no pin, as before). ``guard``: the
+        terminals of the bot's other MetaTrader accounts, never to be attached to (None = none known).
+
+        A config of type "mt5_bridge" (the helper process of mt5_bridge.py runs this adapter for it) is an ATTACH
+        account: the terminal at ``terminal_path`` keeps its own log-in (no password), and connect() refuses any
+        other terminal and an account whose server / company does not contain ``broker_company``."""
         super().__init__(config)
         self.startup_warnings: list[str] = []
         self.cfg = config
@@ -1899,15 +2133,247 @@ class Mt5Broker(MetaTraderLegBroker):
         self._calls: deque[_NativeCall] = deque()      # handed to the worker thread and not finished, oldest first
         self._connected = False
         self._filling_cache: dict[str, int] = {}
+        self._pin_dir = pin_dir
+        self._guard = guard or TerminalGuard()
+        self._pin: dict[str, Any] | None = None        # this account's pin as read at connect()
+        self._attach_problem: str | None = None        # why _initialize refused the terminal it reached (Turkish)
+        self._refused = False                          # ... and since then nothing goes to the terminal
+        self._login: int | None = int(config.login) if getattr(config, "login", None) is not None else None
+
+    # ---- which terminal --------------------------------------------------------
+    @property
+    def _attach_only(self) -> bool:
+        """No credentials in the config: attach to the terminal's own log-in (type mt5_bridge)."""
+        return not getattr(self.cfg, "password", None)
+
+    @property
+    def _bridge(self) -> bool:
+        return getattr(self.cfg, "type", "mt5") == "mt5_bridge"
+
+    def _terminal_target(self) -> str | None:
+        """The terminal64.exe to initialize(): the config's terminal_path, else this account's pin, else None."""
+        explicit = getattr(self.cfg, "terminal_path", None)
+        if explicit:
+            return str(explicit)
+        pin = self._pin or {}
+        if pin.get("path"):
+            return str(pin["path"])
+        if pin.get("folder"):
+            return _exe_in(str(pin["folder"]))
+        return None
+
+    def _must_verify(self) -> bool:
+        """Whether the terminal reached by initialize() is checked (terminal_info) before it is used: always for an
+        attach account, a pinned one or when another MetaTrader account of the bot is known; never otherwise (a
+        single-terminal setup behaves exactly as before)."""
+        return self._bridge or bool(self._pin) or self._guard.known()
+
+    def _judge_terminal(self, info: Any, account: Any = None) -> str | None:
+        """None when ``info`` (terminal_info()) / ``account`` (account_info(), when read) is a terminal this account
+        may use; otherwise the Turkish reason it is refused."""
+        name = self.name
+        folder = str(getattr(info, "path", "") or "") if info is not None else ""
+        company = str(getattr(info, "company", "") or "") if info is not None else ""
+        fkey, ckey = _folder_key(folder) if folder else "", company.strip().casefold()
+        stop = "Güvenlik için bağlantı kesildi; bu hesapta işlem yapılmayacak."
+        explicit = getattr(self.cfg, "terminal_path", None)
+        if not folder:
+            if self._must_verify():
+                return (f"{name}: bağlanılan MetaTrader terminalinin klasörü okunamadı; bu bilgisayarda bot birden "
+                        "fazla MetaTrader terminali kullandığı için doğru terminal olduğu doğrulanamadı. " + stop +
+                        " config.yaml'da bu hesaba terminal_path yazın (terminal64.exe dosyasının tam yolu).")
+            return None
+        if explicit and fkey != _folder_key(explicit):
+            return (f"{name}: MetaTrader paketi config.yaml'daki terminal yerine başka bir terminale bağlandı "
+                    f"({folder}; beklenen: {explicit}). {stop}")
+        pin = self._pin or {}
+        if not explicit and pin:
+            pin_folder, pin_company = str(pin.get("folder") or ""), str(pin.get("company") or "")
+            moved = bool(pin_folder) and fkey != _folder_key(pin_folder)
+            other_company = bool(pin_company) and bool(company) and ckey != pin_company.strip().casefold()
+            if moved or other_company:
+                where = pin_file(self._pin_dir, name) if self._pin_dir else "terminal kaydı"
+                return (f"{name}: MetaTrader paketi bu hesabın daha önce kullandığı terminal yerine başka bir "
+                        f"terminale bağlandı ({folder}, şirket: {company or '?'}; kayıtlı terminal: "
+                        f"{pin_folder or '?'}, şirket: {pin_company or '?'}). {stop} Terminal gerçekten değiştiyse "
+                        f"config.yaml'da bu hesaba terminal_path yazın ya da {where} dosyasını silin.")
+        other = self._guard.folders.get(fkey)
+        if other is None and ckey and ckey in self._guard.companies and ckey != str(pin.get("company") or "").casefold():
+            other = self._guard.companies[ckey]
+        if other is None:
+            other = next((who for word, who in self._guard.markers.items()
+                          if word in fkey or word in ckey), None)
+        if other is not None:
+            return (f"{name}: MetaTrader paketi '{other}' hesabının terminaline bağlandı ({folder}, şirket: "
+                    f"{company or '?'}). {stop} Bu hesabın kendi terminalinin açık olduğundan emin olun; gerekirse "
+                    "config.yaml'da bu hesaba terminal_path yazın.")
+        if self._bridge:
+            want = str(getattr(self.cfg, "broker_company", "") or "").strip()
+            server = str(getattr(account, "server", "") or "") if account is not None else ""
+            acc_company = str(getattr(account, "company", "") or "") if account is not None else ""
+            if want and not any(want.casefold() in t.casefold() for t in (server, acc_company, company)):
+                return (f"{name}: {folder} terminalinde açık olan hesap bir {want} hesabı görünmüyor (sunucu: "
+                        f"{server or '?'}, şirket: {acc_company or company or '?'}). Güvenlik için bu terminale "
+                        f"bağlanılmadı. Terminalde {want} hesabıyla giriş yapın.")
+            expected = self._expected_login()
+            login = getattr(account, "login", None) if account is not None else None
+            if expected is not None and login is not None and int(login) != int(expected):
+                return (f"{name}: {folder} terminali farklı bir hesaba bağlı ({login}, beklenen {expected}). Güvenlik "
+                        "için bu terminale bağlanılmadı. Terminalde doğru hesapla giriş yapın.")
+        return None
+
+    def _expected_login(self) -> int | None:
+        if self._login is not None:
+            return self._login
+        pin = self._pin or {}
+        return int(pin["login"]) if pin.get("login") else None
 
     # ---- plumbing ------------------------------------------------------------
     def _initialize(self, mt5: Any) -> bool:
-        kwargs: dict[str, Any] = {
-            "login": int(self.cfg.login), "password": self.cfg.password, "server": self.cfg.server, "timeout": 60_000,
+        """Log in to (or attach to) THIS account's terminal. Runs on the worker thread (connect() and the re-login
+        after an IPC error). False with ``_attach_problem`` set: the terminal reached is not this account's (it was
+        shut down again at once, nothing was read or sent through it)."""
+        self._attach_problem = None
+        kwargs: dict[str, Any] = {"timeout": 60_000}
+        if not self._attach_only:
+            kwargs.update(login=int(self.cfg.login), password=self.cfg.password, server=self.cfg.server)
+        target = self._terminal_target()
+        if target is None and self._must_verify():
+            # No path known and another terminal is in use on this computer: look first (attach only, no log-in,
+            # nothing changes in that terminal), then log in through the path of the terminal that was found.
+            # The account's credentials only ever go to a terminal that passed _judge_terminal while attached
+            # WITHOUT them.
+            refused: str | None = None
+            refused_keys: set[str] = set()
+            if mt5.initialize(timeout=LOOK_TIMEOUT_MS):
+                info = mt5.terminal_info() if hasattr(mt5, "terminal_info") else None
+                refused = self._judge_terminal(info)
+                if refused is None:
+                    target = _exe_in(str(info.path))
+                    if self._attach_only:
+                        return True
+                elif str(getattr(info, "path", "") or ""):
+                    refused_keys.add(_folder_key(info.path))     # never a candidate below
+                mt5.shutdown()
+            else:
+                logger.warning("%s: MT5 attach-only look failed (%s)", self.name, _last_error(mt5))
+            if target is None:
+                # The package reached another account's terminal, or no logged-in one: this account's terminal is
+                # the ONE installed terminal that is nobody else's AND passes the check while attached without a
+                # log-in. Never a log-in without a path while a terminal of another account is installed.
+                mine, foreign = self._installed_split()
+                foreign += [m for m in mine if _folder_key(m) in refused_keys]
+                mine = [m for m in mine if _folder_key(m) not in refused_keys]
+                passed: list[str] = []
+                for folder in mine[:MAX_TERMINAL_LOOKS]:
+                    verdict = self._look_at(mt5, _exe_in(folder))
+                    if verdict is None:
+                        passed.append(folder)
+                    elif verdict:
+                        foreign.append(folder)
+                if len(passed) == 1:
+                    target = _exe_in(passed[0])
+                    logger.warning("%s: logging in at the only other installed terminal, %s", self.name, passed[0])
+                elif refused is not None or foreign or mine or self._guard.folders:
+                    # (the last one: another account's terminal is configured or pinned - wherever it is installed,
+                    # a log-in without a path could reach it; only with none known is that kept, as before)
+                    problem = refused or (
+                        f"{self.name}: bu hesabın MetaTrader terminali belirlenemedi"
+                        + (f" (bu bilgisayarda başka bir hesabın terminali de kurulu: {', '.join(foreign)})"
+                           if foreign else "")
+                        + ". Güvenlik için bağlanılmadı; bu hesapta işlem yapılmayacak. Bu hesabın terminalini "
+                        "açıp giriş yapın ya da config.yaml'da bu hesaba terminal_path yazın.")
+                    if mine:
+                        problem += f" (Kurulu terminaller: {', '.join(mine)}.)"
+                    self._refuse_terminal(mt5, problem)
+                    return False
+        ok = bool(mt5.initialize(target, **kwargs)) if target else bool(mt5.initialize(**kwargs))
+        if not ok or not self._must_verify():
+            return ok
+        info = mt5.terminal_info() if hasattr(mt5, "terminal_info") else None
+        account = mt5.account_info() if self._bridge else None
+        problem = self._judge_terminal(info, account)
+        if problem is not None:
+            self._refuse_terminal(mt5, problem)
+            return False
+        return True
+
+    def _look_at(self, mt5: Any, exe: str) -> str | None:
+        """Attach to the terminal at ``exe`` WITHOUT credentials (nothing changes in it), judge it, shut down again.
+        None: it may be this account's; "" : it could not be attached to (not running and logged in, unknown);
+        a text: it is another account's terminal."""
+        try:
+            if not mt5.initialize(exe, timeout=LOOK_TIMEOUT_MS):
+                logger.warning("%s: MT5 look at %s failed (%s)", self.name, exe, _last_error(mt5))
+                return ""
+            info = mt5.terminal_info() if hasattr(mt5, "terminal_info") else None
+            verdict = self._judge_terminal(info)
+            if verdict is None and _folder_key(getattr(info, "path", "") or "") != _folder_key(exe):
+                verdict = f"{self.name}: {exe} yerine başka bir terminale ulaşıldı"
+            return verdict
+        finally:
+            try:
+                mt5.shutdown()
+            except Exception:  # noqa: BLE001 - a look only
+                logger.debug("shutdown after a look failed", exc_info=True)
+
+    def _installed_split(self) -> tuple[list[str], list[str]]:
+        """(installed terminal folders that may be this account's, those that are another account's), from
+        :func:`installed_terminals` and the guard."""
+        mine: list[str] = []
+        foreign: list[str] = []
+        for folder in installed_terminals():
+            key = _folder_key(folder)
+            other = key in self._guard.folders or any(word in key for word in self._guard.markers)
+            (foreign if other else mine).append(folder)
+        return mine, foreign
+
+    def _refuse_terminal(self, mt5: Any, problem: str) -> None:
+        self._attach_problem = problem
+        self._refused = True            # every later call fails with this text until the next connect()
+        logger.critical("%s: %s", self.name, problem)
+        try:
+            mt5.shutdown()
+        except Exception:  # noqa: BLE001 - the refusal stands whatever shutdown does
+            logger.exception("%s: shutdown after a refused terminal failed", self.name)
+
+    def _load_pin(self) -> None:
+        """This account's pin and the other accounts' pins (into the guard), read afresh at each connect()."""
+        if not self._pin_dir:
+            return
+        pins = read_pins(self._pin_dir)
+        self._pin = pins.get(self.name)
+        for name, rec in pins.items():
+            if name == self.name:
+                continue
+            if rec.get("folder"):
+                self._guard.folders[_folder_key(rec["folder"])] = name
+            company = str(rec.get("company") or "").strip().casefold()
+            if company:
+                self._guard.companies[company] = name
+
+    def _save_pin(self, info: Any, account: Any) -> None:
+        """Write down the terminal this account connected to (first connect, or what changed in the account)."""
+        if not self._pin_dir:
+            return
+        folder = str(getattr(info, "path", "") or "") if info is not None else ""
+        if not folder:
+            return
+        record = {
+            "folder": folder, "path": _exe_in(folder), "company": str(getattr(info, "company", "") or ""),
+            "server": str(getattr(account, "server", "") or ""), "login": int(getattr(account, "login", 0) or 0),
         }
-        if self.cfg.terminal_path:
-            return bool(mt5.initialize(self.cfg.terminal_path, **kwargs))
-        return bool(mt5.initialize(**kwargs))
+        old = self._pin or {}
+        if all(old.get(k) == v for k, v in record.items()):
+            return
+        record["since"] = old.get("since") or time.strftime("%Y-%m-%d %H:%M:%S")
+        try:
+            write_pin(self._pin_dir, self.name, record)
+            self._pin = {"broker": self.name, **record}
+            logger.info("%s: MT5 terminal pinned: %s (%s, server %s)", self.name, folder, record["company"],
+                        record["server"])
+        except OSError as exc:
+            logger.error("%s: the MT5 terminal pin could not be written: %s", self.name, exc)
 
     def _oldest_call(self) -> _NativeCall | None:
         """The call the worker thread is busy with: the oldest one that has not finished (one thread, FIFO)."""
@@ -2116,6 +2582,8 @@ class Mt5Broker(MetaTraderLegBroker):
         return res
 
     def _require(self) -> None:
+        if self._refused and self._attach_problem:
+            raise BrokerError(self._attach_problem)
         if not self._connected:
             raise BrokerError(f"{self.name}: MT5 bağlı değil (connect çağrılmadı).")
 
@@ -2135,7 +2603,7 @@ class Mt5Broker(MetaTraderLegBroker):
                 raise BrokerError("MetaTrader5 paketi kurulu değil: pip install MetaTrader5") from exc
         key = id(self._mt5)
         other = _ACTIVE_LOGINS.get(key)
-        if other is not None and other != int(self.cfg.login):
+        if other is not None and (self._login is None or other != self._login):
             raise BrokerError(
                 f"Aynı programda yalnızca bir MT5 hesabı kullanılabilir (zaten bağlı: {other}). "
                 f"İkinci hesap için ayrı bir kopya çalıştırın ya da 'metaapi' kullanın."
@@ -2148,25 +2616,60 @@ class Mt5Broker(MetaTraderLegBroker):
                 + _LOOK_AT_TERMINAL_TR
             )
         self.startup_warnings = []
+        self._refused = False
+        self._load_pin()
         self._executor = ThreadPoolExecutor(max_workers=1, thread_name_prefix=f"mt5-{self.name}")
         try:
+            pinned = not getattr(self.cfg, "terminal_path", None) and bool(self._terminal_target())
+            looking = self._terminal_target() is None and self._must_verify()
+            # (the attach-only looks before the log-in have their own, shorter limit each: LOOK_TIMEOUT_MS)
+            limit = INIT_TIMEOUT_SEC + (LOOK_TIMEOUT_MS / 1000.0 * (1 + MAX_TERMINAL_LOOKS) if looking else 0.0)
             ok, err = await self._run(
-                lambda m: (self._initialize(m), _last_error(m)), timeout=INIT_TIMEOUT_SEC, what="initialize"
+                lambda m: (self._initialize(m), _last_error(m)), timeout=limit, what="initialize"
             )
             if not ok:
+                if self._attach_problem:
+                    raise BrokerError(self._attach_problem)
+                if pinned and not self._bridge:
+                    where = pin_file(self._pin_dir, self.name) if self._pin_dir else "terminal kaydı"
+                    raise BrokerError(
+                        f"MT5 terminaline bağlanılamadı: {_err_text(err)}. Bu hesap daha önce "
+                        f"{self._terminal_target()} terminaline bağlanmıştı ve bot yalnızca o terminale bağlanır. "
+                        "Terminal açık değilse açıp giriş yapın; terminal taşındı ya da kaldırıldıysa config.yaml'da "
+                        f"bu hesaba yeni terminal_path yazın ya da {where} dosyasını silin (bot bir sonraki "
+                        "bağlantıda terminali yeniden bulur).")
+                if self._attach_only:
+                    raise BrokerError(
+                        f"MT5 terminaline bağlanılamadı: {_err_text(err)}. Terminal ({self.cfg.terminal_path}) "
+                        "kurulu mu, açık mı ve hesaba giriş yapılmış mı?")
                 raise BrokerError(
                     f"MT5 terminaline bağlanılamadı: {_err_text(err)}. Terminal kurulu mu, "
                     f"login/şifre/sunucu doğru mu?"
                 )
             acc = await self._get("account_info", what="hesap bilgisi")
-            if int(acc.login) != int(self.cfg.login):
-                raise BrokerError(f"MT5 terminali farklı bir hesaba bağlı ({acc.login}, beklenen {self.cfg.login}).")
+            expected = self._expected_login()
+            if expected is not None and int(acc.login) != int(expected):
+                raise BrokerError(f"MT5 terminali farklı bir hesaba bağlı ({acc.login}, beklenen {expected}).")
+            pin = self._pin or {}
+            if (not getattr(self.cfg, "terminal_path", None) and pin.get("server") and getattr(acc, "server", None)
+                    and str(acc.server) != str(pin["server"]) and self.cfg.server in (None, pin["server"])):
+                where = pin_file(self._pin_dir, self.name) if self._pin_dir else "terminal kaydı"
+                raise BrokerError(
+                    f"{self.name}: MetaTrader terminali bu hesabın daha önce bağlandığı sunucudan ({pin['server']}) "
+                    f"farklı bir sunucuya bağlı ({acc.server}). Güvenlik için bağlantı kesildi; bu hesapta işlem "
+                    f"yapılmayacak. Hesap gerçekten değiştiyse config.yaml'da server ayarını güncelleyin ya da "
+                    f"{where} dosyasını silin.")
             if not getattr(acc, "trade_allowed", True):
                 raise BrokerError("Bu MT5 hesabında işlem izni yok (yatırımcı şifresi mi girildi?).")
             if not getattr(acc, "trade_expert", True):
                 raise BrokerError("MT5 hesabında otomatik (EA) işlem kapalı.")
             if hasattr(self._mt5, "terminal_info"):
                 ti, _ = await self._call("terminal_info")
+                if self._must_verify():
+                    problem = self._judge_terminal(ti, acc if self._bridge else None)
+                    if problem is not None:
+                        raise BrokerError(problem)
+                self._save_pin(ti, acc)
                 for problem in terminal_problems(ti) if ti is not None else []:
                     # Not fatal: each of them can be put right in the terminal without restarting the bot.
                     # Until then an order fails with an actionable text of its own (10027 / -8 / 10031).
@@ -2179,11 +2682,14 @@ class Mt5Broker(MetaTraderLegBroker):
         except BaseException:
             await self._shutdown_terminal()
             raise
-        _ACTIVE_LOGINS[key] = int(self.cfg.login)
+        if self._login is None:
+            self._login = int(acc.login)        # attach account: the login it found (checked on every later call)
+        _ACTIVE_LOGINS[key] = int(self._login)
         self._connected = True
         logger.info(
             "%s: MT5 connected login=%s server=%s currency=%s netting=%s",
-            self.name, acc.login, self.cfg.server, getattr(acc, "currency", "?"), self._netting,
+            self.name, acc.login, getattr(acc, "server", None) or self.cfg.server, getattr(acc, "currency", "?"),
+            self._netting,
         )
 
     async def _shutdown_terminal(self) -> None:
@@ -2197,7 +2703,7 @@ class Mt5Broker(MetaTraderLegBroker):
         self._executor = None
 
     async def close(self) -> None:
-        if self._mt5 is not None and _ACTIVE_LOGINS.get(id(self._mt5)) == int(self.cfg.login):
+        if self._mt5 is not None and self._login is not None and _ACTIVE_LOGINS.get(id(self._mt5)) == self._login:
             _ACTIVE_LOGINS.pop(id(self._mt5), None)
         self._connected = False
         await self._shutdown_terminal()
@@ -2206,6 +2712,8 @@ class Mt5Broker(MetaTraderLegBroker):
         """Heartbeat check: None when the terminal answers, is logged in to our account, is connected to the
         trade server and lets this program trade; otherwise a short Turkish text naming the problem and what to
         do about it. Bounded (two short calls, circuit breaker); never raises a BrokerError."""
+        if self._refused and self._attach_problem:
+            return self._attach_problem
         if not self._connected:
             return "MT5 bağlı değil."
         limit = min(HEALTH_TIMEOUT_SEC, CALL_TIMEOUT_SEC)
@@ -2214,8 +2722,9 @@ class Mt5Broker(MetaTraderLegBroker):
             if acc is None:
                 return (f"MT5 hesap bilgisi alınamadı: {_err_text(err)}. Terminal açık mı ve hesaba giriş "
                         f"yapılmış mı, bakın.")
-            if int(acc.login) != int(self.cfg.login):
-                return (f"MT5 terminali farklı bir hesaba bağlı ({acc.login}, beklenen {self.cfg.login}). "
+            expected = self._expected_login()
+            if expected is not None and int(acc.login) != int(expected):
+                return (f"MT5 terminali farklı bir hesaba bağlı ({acc.login}, beklenen {expected}). "
                         f"Terminalde doğru hesaba giriş yapın.")
             if not getattr(acc, "trade_allowed", True):
                 return "Bu MT5 hesabında işlem izni yok (yatırımcı şifresiyle mi giriş yapıldı?)."
@@ -2834,8 +3343,9 @@ class Mt5Broker(MetaTraderLegBroker):
         return {
             "ticket": int(p.ticket), "volume": _f(p.volume), "entry": _f(p.price_open) or None,
             "sl": _f(p.sl) or None, "tp": _f(p.tp) or None,
-            # Only our own orders count for tag matching / idempotency.
-            "tag": str(getattr(p, "comment", "") or "") if magic == int(self.cfg.magic) else "",
+            # Only our own orders count for tag matching / idempotency. comment_tag: also a position the MetaApi
+            # adapter opened on this account (its clientId is in the comment).
+            "tag": comment_tag(getattr(p, "comment", "")) if magic == int(self.cfg.magic) else "",
             "magic": magic, "realized": None,
         }
 
@@ -2853,7 +3363,7 @@ class Mt5Broker(MetaTraderLegBroker):
             str(o.ticket): {
                 "ticket": int(o.ticket), "volume": _f(getattr(o, "volume_current", 0.0) or getattr(o, "volume_initial", 0.0)),
                 "price": _f(o.price_open) or None, "sl": _f(o.sl) or None, "tp": _f(o.tp) or None,
-                "tag": str(getattr(o, "comment", "") or ""), "magic": int(getattr(o, "magic", 0) or 0),
+                "tag": comment_tag(getattr(o, "comment", "")), "magic": int(getattr(o, "magic", 0) or 0),
             }
             for o in os_
             if int(getattr(o, "type", 0)) >= MT5.ORDER_TYPE_BUY_LIMIT

@@ -127,8 +127,13 @@ ENV = {
 }
 SECRETS = [v for v in ENV.values() if "SECRET" in v]
 KNOWS_OPEN_RISK = "daily_loss_include_open_risk" in _BrokerBase.model_fields
-# Settings the production replica needs: binance x2, notifier x2, risk x2, the kripto topic (+ fx open risk).
-N_CHANGES = 8 if KNOWS_OPEN_RISK else 7
+KNOWS_LOT_ROUNDING = "lot_rounding" in _BrokerBase.model_fields
+# Settings the production replica needs: binance x2, notifier x2, risk x2, the kripto topic (+ fx open risk)
+# (+ tickmill: risk_usd 45 -> 50 and lot_rounding: nearest; no Tickmill terminal on the test machine: it stays on
+# MetaApi, see tests/test_mt5_bridge_migrate.py).
+N_CHANGES = (8 if KNOWS_OPEN_RISK else 7) + (2 if KNOWS_LOT_ROUNDING else 0)
+# The production text as the friend's 1R change leaves it (the only value replaced in place in the tickmill block).
+PROD_AFTER = PROD_YAML.replace("    risk_usd: 45\n", "    risk_usd: 50\n") if KNOWS_LOT_ROUNDING else PROD_YAML
 PLACEHOLDER = re.compile(r"\$\{[^}]*\}")
 
 
@@ -185,13 +190,14 @@ def test_migrate_prod_replica_changes_only_the_wanted_keys(tmp_path: Path) -> No
 
     new_text = path.read_text(encoding="utf-8")
     # the file is the old text plus new lines: every old line is still there, in order, comments included
-    assert is_subsequence(PROD_YAML.splitlines(), new_text.splitlines())
+    assert is_subsequence(PROD_AFTER.splitlines(), new_text.splitlines())
     # (a multiset difference: "    daily_loss_limit_pct: 0" and "    no_hedge: true" are also lines of the old file)
-    added = list((Counter(new_text.splitlines()) - Counter(PROD_YAML.splitlines())).elements())
+    added = list((Counter(new_text.splitlines()) - Counter(PROD_AFTER.splitlines())).elements())
     assert sorted(a.strip() for a in added) == sorted(
         ["explicit_market_drift: follow", "notify_on_execution: true", "notify_on_ignored: true",
          "daily_loss_limit_pct: 0", "no_hedge: true", "risk:", "max_open_trades: 25", "allow_min_qty_round_up: true"]
-        + (["daily_loss_include_open_risk: true"] if KNOWS_OPEN_RISK else []))
+        + (["daily_loss_include_open_risk: true"] if KNOWS_OPEN_RISK else [])
+        + (["lot_rounding: nearest"] if KNOWS_LOT_ROUNDING else []))
     # the two binance settings sit at the end of the binance block, in the block's own indentation
     assert "    max_leverage: 125\n    daily_loss_limit_pct: 0\n    no_hedge: true\n  - name: breakout\n" in new_text
     # placeholders byte for byte, no secret written
@@ -246,7 +252,8 @@ def test_migrate_existing_keys_with_other_values_are_changed_in_place(tmp_path: 
     assert "  notify_on_execution: true    # her işlemi bildir\n" in new and "  notify_on_ignored: true\n" in new
     assert "  max_open_trades: 25 # eski\n" in new and "  allow_min_qty_round_up: true\n" in new
     assert "      explicit_market_drift: follow\n" in new
-    assert len(new.splitlines()) == len(text.splitlines()) + (1 if KNOWS_OPEN_RISK else 0)   # nothing else added
+    assert len(new.splitlines()) == len(text.splitlines()) + (1 if KNOWS_OPEN_RISK else 0) + (
+        1 if KNOWS_LOT_ROUNDING else 0)                                   # nothing else added
     assert new.count("\nrisk:") == 1                                      # the existing section was used, no second one
 
 
@@ -259,6 +266,8 @@ def test_migrate_leaves_alone_what_is_already_as_wanted(tmp_path: Path) -> None:
     text = text.replace("    daily_loss_limit_pct: 3\n", "    daily_loss_limit_pct: 3\n    daily_loss_include_open_risk: true\n"
                         if KNOWS_OPEN_RISK else "    daily_loss_limit_pct: 3\n")
     text += "risk:\n  max_open_trades: 40\n  allow_min_qty_round_up: true\n"
+    if KNOWS_LOT_ROUNDING:      # (lot_rounding already there: the friend's 45 is a value written by hand, it stays)
+        text = text.replace("    risk_usd: 45\n", "    risk_usd: 45\n    lot_rounding: nearest\n")
     path = prod_file(tmp_path, text)
     assert m.migrate_config(path) == []
     assert path.read_text(encoding="utf-8") == text
@@ -274,7 +283,8 @@ def test_migrate_config_without_fx_and_binance_brokers(tmp_path: Path) -> None:
     path = prod_file(tmp_path, yaml.safe_dump(data, sort_keys=False, allow_unicode=True))
     notes: list[str] = []
     lines = m.migrate_config(path, notes=notes)
-    assert len(lines) == 5 and not any(line.startswith(("binance", "fx")) for line in lines)
+    assert len(lines) == 5 + (2 if KNOWS_LOT_ROUNDING else 0)          # (+ the two tickmill settings)
+    assert not any(line.startswith(("binance", "fx")) for line in lines)
     assert any("'fx' adlı broker yok" in n for n in notes) and any("'binance' adlı broker yok" in n for n in notes)
     cfg = load_config(path)
     assert cfg.notifier.notify_on_execution and cfg.risk.max_open_trades == 25
@@ -289,7 +299,8 @@ def test_migrate_skips_a_key_the_installed_config_model_does_not_know(tmp_path: 
     path = prod_file(tmp_path)
     notes: list[str] = []
     lines = m.migrate_config(path, notes=notes)
-    assert len(lines) == 7 and "daily_loss_include_open_risk" not in path.read_text(encoding="utf-8")
+    assert len(lines) == 7 + (2 if KNOWS_LOT_ROUNDING else 0)
+    assert "daily_loss_include_open_risk" not in path.read_text(encoding="utf-8")
     assert any("daily_loss_include_open_risk" in n and "tanımıyor" in n for n in notes)
     load_config(path)                                                    # still a valid file
 
@@ -313,7 +324,8 @@ def test_migrate_keeps_line_endings_bom_and_indentation(tmp_path: Path, variant:
         assert out.startswith(b"\xef\xbb\xbf")
     if variant == "indent4":
         assert b"\n    notify_on_execution: true\n" in out and b"\nrisk:\n    max_open_trades: 25\n" in out
-    assert is_subsequence(raw.decode("utf-8").splitlines(), out.decode("utf-8").splitlines())
+    before = raw.decode("utf-8").replace("risk_usd: 45", "risk_usd: 50") if KNOWS_LOT_ROUNDING else raw.decode("utf-8")
+    assert is_subsequence(before.splitlines(), out.decode("utf-8").splitlines())
     assert load_config(path).risk.max_open_trades == 25
     assert m.migrate_config(path) == []
 
@@ -366,7 +378,7 @@ def test_migrate_verification_catches_unplanned_differences() -> None:
     changes, _notes = m.plan_changes(data, cfg)
     good = m._edit_text(PROD_YAML, changes)
     assert m._verify(PROD_YAML, good, changes) is None
-    assert m._verify(PROD_YAML, good.replace("risk_usd: 45", "risk_usd: 46"), changes)          # another value
+    assert m._verify(PROD_YAML, good.replace("risk_usd: 100", "risk_usd: 101"), changes)        # another value
     assert m._verify(PROD_YAML, good.replace("leverage: 125\n", "leverage: 125.0\n", 1), changes)  # a type
     assert m._verify(PROD_YAML, good.replace("${METAAPI_TOKEN:-}", "${METAAPI_TOKEN}"), changes)  # a placeholder
     assert m._verify(PROD_YAML, good.replace("    daily_loss_limit_pct: 0\n", "", 1), changes)   # a missing change
@@ -2379,3 +2391,170 @@ def test_update_cryptg_with_a_hanging_package_index_is_cut_off_in_time(
     assert "   | 6 saniye içinde bitmedi; durduruldu" in lines
     assert not (tmp_path / "target").exists() or not any((tmp_path / "target").iterdir())
     assert any("UYARI: hızlı şifreleme paketi (cryptg) kurulamadı" in line for line in lines)
+
+
+# =========================================================================== #
+# T2b  migrate: the friend's tickmill block -> this computer's Tickmill MetaTrader 5 terminal (type mt5_bridge)
+# =========================================================================== #
+TICKMILL_EXE_DIR = "Tickmill MT5 Terminal"
+
+
+def program_files(tmp_path: Path, *folders: str) -> Path:
+    """A Program Files folder with a terminal64.exe in each of ``folders`` (relative paths)."""
+    root = tmp_path / "Program Files"
+    for folder in folders:
+        (root / folder).mkdir(parents=True, exist_ok=True)
+        (root / folder / "terminal64.exe").write_bytes(b"MZ")
+    root.mkdir(exist_ok=True)
+    return root
+
+
+def tickmill_block(cfg: AppConfig) -> Any:
+    return broker_of(cfg, "tickmill")
+
+
+def test_migrate_switches_tickmill_to_the_tickmill_terminal_and_keeps_every_other_key(tmp_path: Path) -> None:
+    m = migrate_mod()
+    root = program_files(tmp_path, TICKMILL_EXE_DIR, "MetaTrader 5", "FundingPips MT5 Terminal")
+    exe = str(root / TICKMILL_EXE_DIR / "terminal64.exe")
+    path = prod_file(tmp_path)
+    notes: list[str] = []
+    lines = m.migrate_config(path, notes=notes, terminal=m.tickmill_terminal(env={}, roots=[root]))
+    assert (f"tickmill: MetaApi yerine bu bilgisayardaki Tickmill MT5 terminali kullanılacak (type: mt5_bridge, "
+            f"terminal_path: {exe}); MetaApi ayarları blokta duruyor, bu sürümde MetaApi'ye geri dönmek için type: metaapi "
+            "yazmanız yeterli (eski bir sürüme dönüş yalnızca guncelle.py --geri-al ile)"
+            ) in lines
+    assert "tickmill: 1R riski 45 → 50 USD (risk_usd: 50)" in lines
+    assert ("tickmill: lot en yakın adıma yuvarlanacak (0.125 → 0.13; stopta kayıp hedefi %15'ten fazla aşacaksa "
+            "aşağı yuvarlanır) (lot_rounding: nearest)") in lines
+    assert len(lines) == N_CHANGES + 1                                    # one line for the switch (3 keys)
+    new_text = path.read_text(encoding="utf-8")
+    assert "    type: mt5_bridge\n" in new_text and "    type: metaapi\n" not in new_text
+    assert "${METAAPI_TOKEN:-}" in new_text and "${METAAPI_ACCOUNT_ID:-}" in new_text   # kept for the way back
+    cfg = load_config(path)
+    t = tickmill_block(cfg)
+    assert (t.type, t.terminal_path, t.broker_company, t.risk_usd, t.lot_rounding) == (
+        "mt5_bridge", exe, "Tickmill", 50, "nearest")
+    old = yaml.safe_load(PROD_YAML)["brokers"][3]
+    new = yaml.safe_load(new_text)["brokers"][3]
+    assert {k: v for k, v in new.items() if k in old and k not in ("type", "risk_usd")} == {
+        k: v for k, v in old.items() if k not in ("type", "risk_usd")}                  # every other key as it was
+    assert list(new)[:len(old)] == list(old)                                            # in the same order
+    assert broker_of(cfg, "fx").type == "mt5" and broker_of(cfg, "fx").lot_rounding == "down"   # the owner's: untouched
+    assert broker_of(cfg, "binance").lot_rounding == "down"
+    # a second update changes nothing; the way back is the one line "type: metaapi" and it stays that way
+    assert m.migrate_config(path, terminal=m.tickmill_terminal(env={}, roots=[root])) == []
+    path.write_text(new_text.replace("    type: mt5_bridge\n", "    type: metaapi\n"), encoding="utf-8")
+    back = load_config(path)
+    assert tickmill_block(back).type == "metaapi" and tickmill_block(back).terminal_path == exe
+    assert m.migrate_config(path, terminal=m.tickmill_terminal(env={}, roots=[root])) == []
+    assert tickmill_block(load_config(path)).type == "metaapi"
+
+
+def test_migrate_without_a_tickmill_terminal_leaves_metaapi_and_says_so_in_one_line(tmp_path: Path) -> None:
+    m = migrate_mod()
+    root = program_files(tmp_path, "MetaTrader 5", "FundingPips MT5 Terminal")
+    path = prod_file(tmp_path)
+    notes: list[str] = []
+    lines = m.migrate_config(path, notes=notes, terminal=m.tickmill_terminal(env={}, roots=[root]))
+    assert len(lines) == N_CHANGES and not any("mt5_bridge" in line for line in lines)
+    (said,) = [n for n in notes if n.startswith("tickmill:")]
+    assert said == ("tickmill: bu bilgisayarda Tickmill MT5 terminali bulunamadı (Program Files içinde adında "
+                    "Tickmill geçen klasörde terminal64.exe yok); tickmill MetaApi ile çalışmaya devam ediyor; "
+                    "terminal başka bir yerdeyse güncellemeyi 'python guncelle.py --tickmill-terminal "
+                    "\"<terminal64.exe yolu>\"' ile ya da COPYTRADER_TICKMILL_TERMINAL ortam değişkeniyle yapın.")
+    t = tickmill_block(load_config(path))
+    assert t.type == "metaapi" and t.terminal_path is None
+    assert t.risk_usd == 50 and t.lot_rounding == "nearest"               # the friend's two requests all the same
+
+
+def test_tickmill_terminal_search_and_its_override(tmp_path: Path) -> None:
+    m = migrate_mod()
+    x64 = program_files(tmp_path / "a", "TICKMILL MT5 Terminal")
+    x86 = program_files(tmp_path / "b", "Tickmill/MT5")                  # one folder deeper, in Program Files (x86)
+    other = program_files(tmp_path / "c", "MetaTrader 5", "FundingPips")
+    exe64 = str(x64 / "TICKMILL MT5 Terminal" / "terminal64.exe")
+    exe86 = str(x86 / "Tickmill" / "MT5" / "terminal64.exe")
+    assert m.find_tickmill_terminals([x64]) == [Path(exe64)]              # the folder name in any case
+    assert m.find_tickmill_terminals([x86]) == [Path(exe86)]
+    assert m.find_tickmill_terminals([other, tmp_path / "yok"]) == []
+    env = {"ProgramFiles": str(x64), "ProgramFiles(x86)": str(x86)}
+    assert [str(r) for r in m.program_files_roots(env)][:2] == [str(x64), str(x86)]
+    path, why = m.tickmill_terminal(env=env)
+    assert path is None and why is not None and "birden fazla Tickmill MT5 terminali bulundu" in why
+    assert exe64 in why and exe86 in why and "--tickmill-terminal" in why
+    assert m.tickmill_terminal(env={"ProgramFiles": str(x64)}) == (exe64, None)
+    # the override wins: a file, a folder, "yok", or a path that does not exist
+    assert m.tickmill_terminal(env={**env, m.TICKMILL_TERMINAL_ENV: exe86}) == (exe86, None)
+    assert m.tickmill_terminal(env={m.TICKMILL_TERMINAL_ENV: f'"{Path(exe86).parent}"'}) == (exe86, None)
+    stay, said = m.tickmill_terminal(env={**env, m.TICKMILL_TERMINAL_ENV: "yok"})
+    assert stay is None and said == ("tickmill: MT5 terminaline geçiş COPYTRADER_TICKMILL_TERMINAL=yok ile kapatıldı; "
+                                     "tickmill MetaApi ile çalışmaya devam ediyor.")
+    missing, said = m.tickmill_terminal(env={m.TICKMILL_TERMINAL_ENV: str(tmp_path / "nope.exe")})
+    assert missing is None and "belirtilen Tickmill terminali bulunamadı" in (said or "")
+
+
+def test_migrate_raises_tickmill_risk_only_from_exactly_45_and_only_once(tmp_path: Path) -> None:
+    m = migrate_mod()
+    none = (None, None)
+    path = prod_file(tmp_path, PROD_YAML.replace("    risk_usd: 45\n", "    risk_usd: 40\n"))
+    lines = m.migrate_config(path, terminal=none)
+    assert not any("risk_usd" in line for line in lines) and tickmill_block(load_config(path)).risk_usd == 40
+    path = prod_file(tmp_path)
+    assert "tickmill: 1R riski 45 → 50 USD (risk_usd: 50)" in m.migrate_config(path, terminal=none)
+    # the owner (or the friend) goes back to 45 by hand later: the next update leaves it
+    text = path.read_text(encoding="utf-8").replace("    risk_usd: 50\n", "    risk_usd: 45\n")
+    path.write_text(text, encoding="utf-8")
+    assert m.migrate_config(path, terminal=none) == []
+    assert tickmill_block(load_config(path)).risk_usd == 45
+    # a lot_rounding chosen by hand is never changed either
+    path.write_text(text.replace("    lot_rounding: nearest\n", "    lot_rounding: down\n"), encoding="utf-8")
+    assert m.migrate_config(path, terminal=none) == [] and tickmill_block(load_config(path)).lot_rounding == "down"
+
+
+def test_update_hands_the_tickmill_terminal_option_to_step_6(g: Any, tmp_path: Path,
+                                                           capsys: pytest.CaptureFixture[str]) -> None:
+    exe = program_files(tmp_path / "pf", "Benim Tickmill") / "Benim Tickmill" / "terminal64.exe"
+    bot = old_bot(tmp_path)
+    code, runner, started = update(g, bot, "--tickmill-terminal", str(exe))
+    out = capsys.readouterr().out
+    assert code == 130 and "6. Ayar dosyası (config.yaml) güncel hale getirildi: TAMAM" in out
+    assert "tickmill: MetaApi yerine bu bilgisayardaki Tickmill MT5 terminali kullanılacak" in out
+    t = tickmill_block(load_config(bot / "config.yaml"))
+    assert (t.type, t.terminal_path, t.risk_usd) == ("mt5_bridge", str(exe), 50)
+
+
+def test_update_without_a_tickmill_terminal_keeps_metaapi_and_says_so(g: Any, tmp_path: Path,
+                                                                     capsys: pytest.CaptureFixture[str]) -> None:
+    bot = old_bot(tmp_path)
+    code, _runner, _started = update(g, bot)
+    out = capsys.readouterr().out
+    assert code == 130
+    assert "not: tickmill: bu bilgisayarda Tickmill MT5 terminali bulunamadı" in out
+    assert tickmill_block(load_config(bot / "config.yaml")).type == "metaapi"
+
+
+def test_migrate_refuses_a_tickmill_override_that_is_another_accounts_terminal(tmp_path: Path) -> None:
+    m = migrate_mod()
+    fp = program_files(tmp_path, "FundingPips MT5 Terminal") / "FundingPips MT5 Terminal"
+    path = prod_file(tmp_path)
+    (tmp_path / "data").mkdir()
+    (tmp_path / "data" / "mt5_terminal_fx.json").write_text(json.dumps(
+        {"broker": "fx", "folder": str(fp), "company": "FundingPips Ltd", "server": "FP", "login": 1}), encoding="utf-8")
+    notes: list[str] = []
+    lines = m.migrate_config(path, notes=notes, terminal=(str(fp / "terminal64.exe"), None))
+    assert not any("mt5_bridge" in line for line in lines)
+    assert any(n.startswith(f"tickmill: {fp / 'terminal64.exe'} 'fx' hesabının terminali; tickmill bu terminale "
+                            "çevrilmedi") for n in notes)
+    assert tickmill_block(load_config(path)).type == "metaapi"
+
+
+def test_migrate_warns_when_the_tickmill_override_folder_is_not_named_tickmill(tmp_path: Path) -> None:
+    m = migrate_mod()
+    exe = program_files(tmp_path, "MetaTrader 5") / "MetaTrader 5" / "terminal64.exe"
+    path = prod_file(tmp_path)
+    notes: list[str] = []
+    lines = m.migrate_config(path, notes=notes, terminal=(str(exe), None))
+    assert any("type: mt5_bridge" in line for line in lines)
+    assert (f"tickmill: dikkat, {exe} klasörünün adında 'Tickmill' geçmiyor; bot bu terminale yalnızca içinde bir "
+            "Tickmill hesabı açıksa bağlanır.") in notes

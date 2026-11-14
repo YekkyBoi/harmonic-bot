@@ -78,7 +78,7 @@ def default_symbol(config: AppConfig, cfg: Any) -> str:
     for route in config.telegram.topics:
         if (not route.brokers or cfg.name in route.brokers) and route.kind in PROBE_ASSETS:
             return PROBE_ASSETS[route.kind][0]
-    return PROBE_ASSETS["fx" if getattr(cfg, "type", "") in ("mt5", "metaapi") else "crypto"][0]
+    return PROBE_ASSETS["fx" if getattr(cfg, "type", "") in ("mt5", "mt5_bridge", "metaapi") else "crypto"][0]
 
 
 def minimal_quantity(sym: SymbolInfo, price: float) -> float:

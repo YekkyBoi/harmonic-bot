@@ -56,3 +56,15 @@ telegram:
       title_contains: ["Fx İşlemleri"]
       brokers: [fx, tickmill]                   # <- tickmill eklendi
       kind: fx
+
+# ---------------------------------------------------------------------
+# 3) MetaApi yerine bu bilgisayardaki Tickmill MT5 terminali (type: mt5_bridge)
+#    Tickmill'in MT5 terminalini kurup arkadaşınızın hesabıyla giriş yapın (şifre yalnızca terminale yazılır).
+#    Güncelleme (guncelle.py, 6. adım) terminali Program Files içinde bulur ve bloğu kendisi çevirir:
+#      type: mt5_bridge
+#      terminal_path: C:\Program Files\Tickmill MT5 Terminal\terminal64.exe
+#      broker_company: Tickmill          # yalnızca Tickmill hesabı açık olan terminale bağlanılır
+#    token / account_id satırları kalır: bu sürümde MetaApi'ye dönmek için "type: metaapi" yazmanız yeterli.
+#    Eski bir sürüme dönüş yalnızca guncelle.py --geri-al ile (o zamanki config.yaml da geri gelir).
+#    İsteğe bağlı: lot_rounding: nearest  (0.125 -> 0.13; stopta kayıp hedefi %15'ten fazla aşacaksa aşağı)
+# ---------------------------------------------------------------------
