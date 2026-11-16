@@ -19,7 +19,11 @@ every sentence and mark below is the same on all three):
   notice (realized result / the position's real initial risk stored at the open, times the plan's size in R). There
   is no second definition: no stored initial risk (a position opened by an older version, a size the engine limited),
   a result the adapter knows to be partial, a simulated account -> not known.
-* **R of a trade**: the mean of its real accounts with a known R. None known: the trade is listed with "—" and is
+* **One person's card** (the owner's / his friend's, ``only`` / ``exclude``): one ROW PER ACCOUNT of that person in a
+  trade, with that account's own R and note; its count, total and rates are of those rows (an account's trade is
+  one row: two of his accounts in one trade are two rows, each named). The owner's card is every account but the
+  friend's (so accounts no longer configured, and simulated ones, stay on it as before); the friend's only his.
+* **R of a trade** (the card of every account, one row per trade): the mean of its real accounts with a known R. None known: the trade is listed with "—" and is
   in no total, no rate, no best / worst; the card says how many such trades there are. Some known, some not: the
   row and the account's own figure are marked with "*" and the card says in how many trades an account is missing.
 * **Break-even**: within +-CLOSING_FLAT_R (0.05R) of zero, as in the closing notice, and such a trade is printed
@@ -369,11 +373,12 @@ class Report:
 
 
 def trade_rows(trade: TradeRecord, positions: Sequence[BrokerPosition], *, approximate: bool = False,
-               only: Collection[str] | None = None) -> list[Row]:
+               only: Collection[str] | None = None, exclude: Collection[str] = ()) -> list[Row]:
     """The rows of an ended trade on a card of ``only`` (a set of accounts: one person's card): ONE ROW PER ACCOUNT of
-    them that traded it, with that account's own R and its own note ([] when none of them traded it). A trade only
-    simulated accounts traded: one row without a figure, as :func:`trade_row`."""
-    mine = [p for p in positions if only is None or p.broker in only]
+    them that traded it, with that account's own R and its own note ([] when none of them traded it). ``exclude``:
+    never these accounts (the owner's card: not the friend's). A trade only simulated accounts traded: one row
+    without a figure, as :func:`trade_row`."""
+    mine = [p for p in positions if (only is None or p.broker in only) and p.broker not in exclude]
     if trade.closed_at is None or not any(traded(p) for p in mine):
         return []
     real = [p for p in mine if traded(p) and not _simulated(p)]
@@ -462,7 +467,7 @@ async def build_report(db: Any, start: datetime | None, end: datetime, *, mode: 
                        accounts: Sequence[str] = (), late: bool = False,
                        pending: Callable[[int], bool] | None = None, carried: Sequence[int] = (),
                        listed: Sequence[int] = (), waited: Mapping[int, int] | None = None,
-                       only: Collection[str] | None = None) -> Report:
+                       only: Collection[str] | None = None, exclude: Collection[str] | None = None) -> Report:
     """The report of the trades that ended in ``[start, end)`` (``start`` None: every trade so far), read from
     ``db``. Read only.
 
@@ -472,8 +477,8 @@ async def build_report(db: Any, start: datetime | None, end: datetime, *, mode: 
     that were on the last cards - never listed again. (The last two: a period's cards only.) ``waited``: how many
     weekly cards each trade has been left off; one that has waited MAX_DEFERRALS cards is listed although its order
     is still unanswered (``Report.unsettled``: its late account's result may be missing). ``only``: one person's
-    card - only these accounts, one row per account of them in a trade (:func:`trade_rows`); None: every account,
-    one row per trade (their mean)."""
+    card - only these accounts, one row per account of them in a trade (:func:`trade_rows`); ``exclude``: one
+    person's card of every account but these; both None: every account, one row per trade (their mean)."""
     # Approximate figures: on the card of every trade only, and only for trades older than the first one that has a
     # position with a stored real initial risk (the version that stores it; None: no such trade yet).
     newer_from: int | None = None
@@ -503,8 +508,8 @@ async def build_report(db: Any, start: datetime | None, end: datetime, *, mode: 
                 continue
         old = mode == MODE_ALL and (newer_from is None or trade.id < newer_from)
         positions = await db.broker_positions(trade.id)
-        if only is not None:
-            rows.extend(trade_rows(trade, positions, approximate=old, only=only))
+        if only is not None or exclude is not None:
+            rows.extend(trade_rows(trade, positions, approximate=old, only=only, exclude=exclude or ()))
             continue
         row = trade_row(trade, positions, approximate=old)
         if row is not None:

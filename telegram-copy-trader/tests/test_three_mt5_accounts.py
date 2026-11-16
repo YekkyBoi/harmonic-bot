@@ -241,3 +241,12 @@ async def test_the_new_account_refuses_its_terminal_logged_in_to_another_company
     with pytest.raises(Exception, match="bir BEM hesabı görünmüyor"):
         await asyncio.wait_for(bem.connect(), GUARD)
     await bem.close()
+
+
+def test_the_report_card_accounts_of_each_person() -> None:
+    from copytrader.app import real_account_names
+    c = _app([FX, TICKMILL, BEM, {"name": "breakout", "type": "manual", "risk_usd": 50}])
+    c.dry_run = False
+    assert real_account_names(c, friend=False) == ["fx", "fx2"]           # (a manual account is on no card)
+    assert real_account_names(c, friend=True) == ["tickmill"]
+    assert real_account_names(c) == ["fx", "tickmill", "fx2"]

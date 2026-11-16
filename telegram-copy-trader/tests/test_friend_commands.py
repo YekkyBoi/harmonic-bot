@@ -77,7 +77,7 @@ async def test_he_picks_his_position_from_his_list_the_owners_stays_and_the_owne
     await world.friend_says("1")
     assert await world.status(tid) == {"fx": PositionStatus.OPEN, "tickmill": PositionStatus.CLOSED}
     reply = world.to_friend()[-1]
-    assert f"#{tid} ETH LONG (tickmill)" in reply and "sürüyor: fx (açık)" in reply
+    assert f"#{tid} ETH LONG (tickmill)" in reply and "fx" not in reply          # nothing of the owner's accounts
     assert any(t.startswith("👤 Arkadaşınız /pozkapat listesinden <code>1</code> seçti:") for t in world.texts())
     # a shortcut naming his only position closes it at once
     other = await world.open("XAU")
@@ -128,3 +128,36 @@ async def test_the_owner_closes_every_position_of_an_account_with_hepsi(world: W
         assert await world.status(tid) == {"fx": PositionStatus.CLOSED, "tickmill": PositionStatus.OPEN}
     await world.say("/pozkapat fx1 xau hepsi")
     assert any("tek başına yazılır" in t for t in world.texts())
+
+
+async def test_his_close_that_ends_the_trade_tells_him_nothing_of_the_owners_and_the_owner_gets_the_summary(
+        world: World) -> None:
+    world.engine.config.notifier.notify_on_execution = True          # (as on the server)
+    tid = await world.open()
+    await world.say("/pozkapat fx1")                                 # the owner's account is done first
+    world.client.sent.clear()
+    await world.friend_says("/pozkapat")
+    await world.friend_says("1")
+    assert await world.status(tid) == {"fx": PositionStatus.CLOSED, "tickmill": PositionStatus.CLOSED}
+    reply = world.to_friend()[-1]
+    assert "tickmill" in reply and "fx" not in reply and "🏁" not in reply
+    assert any(f"🏁 #{tid} ETH LONG" in t for t in world.texts())          # the trade's summary: the owner's
+
+
+async def test_his_positions_list_leaves_out_trades_he_is_out_of(world: World) -> None:
+    tid = await world.open()
+    await world.friend_says("/pozkapat")
+    await world.friend_says("1")
+    world.client.sent.clear()
+    await world.friend_says("/pozisyonlar")
+    (reply,) = world.to_friend()
+    assert reply == "📂 Açık işlem yok." and (await world.status(tid))["fx"] is PositionStatus.OPEN
+
+
+async def test_an_empty_account_list_is_no_command(world: World) -> None:
+    tid = await world.open()
+    await world.say("/pozkapat ,")
+    assert any(t.startswith("Hangi hesap?") for t in world.texts())
+    await world.friend_says("/pozkapat xau 7")
+    assert "Hesaplar: tickmill" in world.to_friend()[-1] and "fx" not in world.to_friend()[-1]
+    assert await world.status(tid) == {"fx": PositionStatus.OPEN, "tickmill": PositionStatus.OPEN}

@@ -17,13 +17,19 @@ from pathlib import Path
 from typing import Any
 
 import pytest
-
 from test_karne_data import closed, position
 from test_karne_render import FAKE_PNG, gone, pid_of, stand_in
 
 from copytrader.karne import service as service_mod
 from copytrader.karne.data import MODE_ALL, MODE_INTERIM, MODE_WEEK
-from copytrader.karne.render import FAILED, NO_PILLOW, OK, TIMEOUT, RenderResult, render_card
+from copytrader.karne.render import (
+    FAILED,
+    NO_PILLOW,
+    OK,
+    TIMEOUT,
+    RenderResult,
+    render_card,
+)
 from copytrader.karne.service import COMMAND_GAP_SEC, STATE_KEY, KarneService, file_name
 from copytrader.karne.uktime import previous_slot
 from copytrader.models import Severity
@@ -851,3 +857,57 @@ async def test_review2_a_trade_stuck_in_flight_is_counted_and_listed_after_two_c
     assert ("1 işlem 2 karne boyunca bekletildi ve yine de listelendi: bir hesabın açılış emri hâlâ yanıtsız, o "
             "hesabın sonucu eksik olabilir.") in w.owner.files[2]["caption"]
     assert "önceki haftadan" in w.owner.files[2]["caption"]                       # (and it is a carried trade)
+
+
+# --------------------------------------------------------------------------- #
+# one card per person: the owner's (every account but the friend's) and the friend's (his only), same trades
+# --------------------------------------------------------------------------- #
+class OwnerAndFriend(Owner):
+    def __init__(self, db: Database | None = None, clock: Clock | None = None) -> None:
+        super().__init__(db, clock)
+        self.friend_files: list[dict[str, Any]] = []
+        self.friend_texts: list[str] = []
+
+    def has_friend(self) -> bool:
+        return True
+
+    async def send_friend_document(self, path: str, *, caption: str = "", name: str | None = None,
+                                   busy: Any = None) -> str | None:
+        self.friend_files.append({"caption": caption, "name": name})
+        return None
+
+    async def tell_friend(self, text: str) -> None:
+        self.friend_texts.append(text)
+
+
+async def test_the_weekly_cards_of_both_people_are_of_the_same_trades_each_with_his_own_accounts(
+        world: World) -> None:
+    w = world
+    w.owner = OwnerAndFriend(w.db, w.clock)
+    looks: list[int] = []
+
+    def pending(trade_id: int) -> bool:          # an answer arrives between two looks: both cards see the first
+        looks.append(trade_id)
+        return trade_id == 2 and looks.count(2) == 1
+
+    w.service = KarneService(w.db, w.owner, w.tmp_path, accounts=["binance", "fx"], friend_accounts=["tickmill"],
+                             busy=lambda: False, pending=pending, clock=w.clock, sleep=w.sleeper,
+                             renderer=w.drawer, pillow=lambda: True, monotonic=lambda: w.mono)
+    now = w.clock.now
+    await closed(w.db, w.clock, SUNDAY - timedelta(days=3), [position("binance", 20.0), position("tickmill", 48.0)],
+                 asset="AAA")
+    await closed(w.db, w.clock, SUNDAY - timedelta(minutes=2), [position("fx", -10.0), position("tickmill", -5.0)],
+                 asset="BBB")
+    await closed(w.db, w.clock, SUNDAY - timedelta(days=1), [position("old_account", 10.0)], asset="CCC")
+    w.clock.now = now
+    await started(w)
+    await w.sleeper.run_to(SUNDAY + timedelta(hours=1))
+    owner_card, friend_card = w.drawer.cards[0], w.drawer.cards[1]
+    assert [t["pair"] for t in owner_card["trades"]] == ["AAA", "CCC"]           # BBB waits on both cards
+    assert [a["name"] for a in owner_card["accounts"]] == ["binance", "fx", "old_account"]   # never tickmill
+    assert [t["pair"] for t in friend_card["trades"]] == ["AAA"]
+    assert [a["name"] for a in friend_card["accounts"]] == ["tickmill"]
+    assert len(w.owner.files) == 1 and len(w.owner.friend_files) == 1
+    state = await w.state()
+    assert (state["carry"], sorted(state["listed"])) == ([2], [1, 3])
+    assert looks.count(2) == 1                                                     # looked at once for both

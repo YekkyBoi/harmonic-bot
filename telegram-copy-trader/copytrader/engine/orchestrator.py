@@ -5058,13 +5058,16 @@ class Engine:
                 Severity.INFO,
             )
 
-    async def execute_management(self, plan: ManagementPlan, *, notify: bool = True) -> str:
+    async def execute_management(self, plan: ManagementPlan, *, notify: bool = True, hide_others: bool = False) -> str:
         """Apply ``plan`` to every active broker position of the trade. Returns an HTML result text.
         Runs as a critical section (see :meth:`execute_open`)."""
-        return await self._critical_section(self._execute_management(plan, notify),
+        return await self._critical_section(self._execute_management(plan, notify, hide_others),
                                             f"manage-{plan.trade_id}-{plan.plan_id}")
 
-    async def _execute_management(self, plan: ManagementPlan, notify: bool) -> str:
+    async def _execute_management(self, plan: ManagementPlan, notify: bool, hide_others: bool = False) -> str:
+        # ``hide_others`` (the friend's /pozkapat, restricted to his accounts): the text returned says nothing of the
+        # trade's other accounts (where it goes on, the closing summary with their results); a closing summary goes
+        # to the owner by itself instead.
         # ``plan.brokers``: only those accounts (the owner's /pozkapat): the trade goes on on the others, so nothing
         # that stands for the whole trade (its stop / targets, the other accounts' late opens) is touched.
         only = frozenset(plan.brokers)
@@ -5188,7 +5191,7 @@ class Engine:
                 label += f" ({_names(sorted(only))})"
             lines = (([f"• {o.text}" for o in outcomes] + late_lines + unknown_lines)
                      or ["• Aktif broker pozisyonu yok."])
-            if only:
+            if only and not hide_others:
                 # Where the trade goes on, as it stands: never a position whose close is owed, never an open that is
                 # to be closed on arrival.
                 still = [f"{esc(p.broker)} ({pos_status_text(p)})" for p in merged
@@ -5234,7 +5237,7 @@ class Engine:
             if notify and (ok or slow or owed_to or pending) and self.config.notifier.notify_on_execution:
                 await self._notify(f"{head}\n{fmt.format_management(plan, trade, before=before)}\n\n"
                                    + "\n".join(lines), Severity.INFO)
-            if summary is not None and notify and self.config.notifier.notify_on_execution:
+            if summary is not None and (notify or hide_others) and self.config.notifier.notify_on_execution:
                 await self._notify(summary, Severity.INFO)          # (as the monitor's: only with notify_on_execution)
             await self._log("manage_done", {
                 "trade_id": trade.id, "action": plan.action.value, "plan": plan.model_dump(mode="json"),
@@ -5245,7 +5248,8 @@ class Engine:
                 leg.announced.set()     # the late results may be reported now (always after this report)
         # A caller that reports the result itself (notify=False: /hepsini_kapat) gets the summary in its text; with
         # notify it went out on its own already (an approval's result text does not repeat it).
-        return "\n".join([head, *lines, *([summary] if summary is not None and not notify else [])])
+        return "\n".join([head, *lines, *([summary] if summary is not None and not notify and not hide_others
+                                          else [])])
 
     # ------------------------------------------------------------------ broker legs of a management flow
     async def _run_manage_legs(
@@ -7242,7 +7246,8 @@ class Engine:
         if accounts is not None:
             mine = []
             for t in trades:
-                if (any(p.broker in accounts for p in await self.db.broker_positions(t.id))
+                if (any(p.broker in accounts and p.status in ACTIVE_POSITION
+                        for p in await self.db.broker_positions(t.id))
                         or any(leg.broker in accounts for leg in self._late_legs_of(t.id))):
                     mine.append(t)
             trades = mine
@@ -7252,7 +7257,8 @@ class Engine:
         for t in trades:
             lines.append("")
             lines.append(fmt.format_trade_line(t) + (f" · 📁 {esc(t.plan.route)}" if t.plan.route else ""))
-            hit, _share = tp_progress(t, await self.db.broker_positions(t.id))
+            hit, _share = tp_progress(t, [p for p in await self.db.broker_positions(t.id)
+                                          if accounts is None or p.broker in accounts])
             tps = " / ".join(fmt_price(tp.price) + (" ✔" if h else "")
                              for tp, h in zip(t.current_take_profits, hit)) or "yok"
             price = await self._price(t.plan.base_asset, t.plan.quote_asset, t.plan.market_type)
@@ -7365,9 +7371,11 @@ class Engine:
                 keys.setdefault(fold_ascii(str(word)), b)
         return keys
 
-    def _accounts_hint(self) -> str:
+    def _accounts_hint(self, allowed: Collection[str] | None = None) -> str:
         parts = []
         for b in self.configured_brokers:
+            if allowed is not None and b.name not in allowed:
+                continue
             aliases = [str(a) for a in (getattr(b.config, "aliases", None) or [])]
             parts.append(esc(b.name) + (f" ({esc(', '.join(aliases))})" if aliases else ""))
         return ", ".join(parts)
@@ -7386,7 +7394,7 @@ class Engine:
             if not own:
                 return "Size ait bir hesap yok. Hiçbir pozisyon kapatılmadı.", []
             first = [keys.get(fold_ascii(w)) for w in words[0].split(",") if w] if words else []
-            if words and all(b is not None for b in first):
+            if words and first and all(b is not None for b in first):
                 if any(b.name not in allowed for b in first if b is not None):
                     return "Yalnızca kendi hesabınızdaki pozisyonları kapatabilirsiniz. Hiçbir pozisyon kapatılmadı.", []
             else:
@@ -7395,6 +7403,9 @@ class Engine:
             return (f"Kullanım: <code>/pozkapat fx1</code> · <code>/pozkapat fx1,fx2</code> · "
                     f"<code>/pozkapat fx2 xau</code>\nHesaplar: {self._accounts_hint()}"), []
         accounts: list[Broker] = []
+        if not [w for w in words[0].split(",") if w]:
+            return (f"Hangi hesap? Ör. <code>/pozkapat fx1</code>. Hiçbir pozisyon kapatılmadı.\nHesaplar: "
+                    f"{self._accounts_hint(allowed)}"), []
         for word in (w for w in words[0].split(",") if w):
             broker = keys.get(fold_ascii(word))
             if broker is None:
@@ -7419,7 +7430,8 @@ class Engine:
                 continue
             if re.fullmatch(r"\d+", word):         # ("fx 2" for "fx2": never taken as trade #2)
                 return (f"<b>{esc(word)}</b> anlaşılamadı (işlem numarası için <code>#{esc(word)}</code> yazın; hesap "
-                        f"adını boşluksuz yazın). Hiçbir pozisyon kapatılmadı.\nHesaplar: {self._accounts_hint()}"), []
+                        f"adını boşluksuz yazın). Hiçbir pozisyon kapatılmadı.\nHesaplar: "
+                        f"{self._accounts_hint(allowed)}"), []
             base, quote, _market = normalize_symbol(word)
             if not base or not re.fullmatch(r"[^\W_]+(?:[./:_&-][^\W_]+)*(?:\.P)?", word, re.I) \
                     or not any(ch.isalpha() for ch in word):
@@ -7456,7 +7468,7 @@ class Engine:
         """:meth:`close_on_accounts` for one account."""
         return await self.close_on_accounts([(broker, tid) for tid in trade_ids])
 
-    async def close_on_accounts(self, pairs: Sequence[tuple[str, int]]) -> str:
+    async def close_on_accounts(self, pairs: Sequence[tuple[str, int]], *, hide_others: bool = False) -> str:
         """Close (a pending entry: cancel) each (account, trade)'s position, and only those: the trade goes on on its
         other accounts (:meth:`execute_management` with ``brokers``). The accounts of one trade go in ONE plan, so
         that they are judged together (e.g. none of them is closed while the trade's last other account has not
@@ -7483,7 +7495,7 @@ class Engine:
                 summary_tr=f"{', '.join(brokers)} hesabında kapatıldı (/pozkapat)", created_at=now, brokers=brokers,
             )
             try:
-                lines.append(await self.execute_management(plan, notify=False))
+                lines.append(await self.execute_management(plan, notify=False, hide_others=hide_others))
             except Exception as exc:
                 logger.exception("pozkapat: trade %s on %s", trade_id, brokers)
                 lines.append(f"🚨 #{trade_id} ({esc(', '.join(brokers))}): <code>{esc(exc)}</code>")

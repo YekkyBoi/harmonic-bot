@@ -923,7 +923,7 @@ class BotNotifier:
             else:
                 listed.extend((target.broker, tid, label) for tid, label in target.matches)
         if singles:
-            result = await engine.close_on_accounts(singles)
+            result = await engine.close_on_accounts(singles, hide_others=friend)
             if result in _NOT_NOW:              # (said before anything was done)
                 return "\n\n".join([*parts, result + "\nHiçbir pozisyon kapatılmadı."])
             parts.append(result)
@@ -962,7 +962,7 @@ class BotNotifier:
                     "numara yazın.")
         self._pk_lists.pop(chat, None)              # one use only (before any await)
         pairs = [(listed[n - 1][0], listed[n - 1][1]) for n in numbers]
-        result = await engine.close_on_accounts(pairs)
+        result = await engine.close_on_accounts(pairs, hide_others=friend)
         if result in _NOT_NOW:
             self._pk_lists.setdefault(chat, entry)  # nothing was done: the list stays for the rest of its time
             return result + "\nHiçbir pozisyon kapatılmadı."
@@ -1367,6 +1367,7 @@ class BotNotifier:
             self._friend_put(_FriendMessage(text="Sistem henüz hazır değil; biraz sonra tekrar deneyin."))
             return
         args = m.group(2).strip() if m else ""
+        asker = self._friend
         names = list(engine.friend_account_names())
         if not names:
             self._friend_put(_FriendMessage(text=FRIEND_NO_ACCOUNT))
@@ -1383,6 +1384,9 @@ class BotNotifier:
             reply = await karne.command(args, audience="friend") if karne is not None else KARNE_OFF_TEXT
         else:
             reply = await self._friend_pozkapat(engine, args, names)
+        if self._friend != asker:          # (the owner changed his friend meanwhile: not for the new chat)
+            log.warning("The friend's chat changed while his /%s ran; its answer was not sent", command)
+            return
         self._friend_put(_FriendMessage(text=reply or "✔️"))
 
     async def _friend_pozkapat(self, engine: Any, args: str, names: list[str]) -> str:
@@ -1538,7 +1542,7 @@ class BotNotifier:
         if friend is None:
             return "arkadaş sohbeti ayarlı değil"
         if self._friend_queue:
-            return "arkadaşınıza giden mesajlar sırada bekliyor"
+            return "sohbete giden mesajlar sırada bekliyor"
         return await self._send_document(friend, path, caption=caption, name=name, busy=busy)
 
     async def send_owner_document(self, path: str, *, caption: str = "", name: str | None = None,
@@ -1561,7 +1565,8 @@ class BotNotifier:
         client = self._client
         if client is None or self._shut:
             return "bildirim botu çalışmıyor"
-        if self._queue or self._link_down():
+        # (the owner's queue holds back the owner's files only: the friend's chat has its own, looked at by the caller)
+        if (chat == self._owner and self._queue) or self._link_down():
             return "Telegram bağlantısı şu an yok ya da sırada bekleyen mesajlar var"
         try:
             from .group_mirror import native_aes      # (that module imports this one)

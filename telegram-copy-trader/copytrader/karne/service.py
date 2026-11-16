@@ -175,6 +175,9 @@ class KarneService:
         self._task: asyncio.Task[None] | None = None
         self._jobs: set[asyncio.Task[None]] = set()
         self._lock = asyncio.Lock()                 # one card at a time (the schedule's or the owner's)
+        # the friend's own /karne: a lock of its own (his card never holds back the owner's or the weekly one)
+        self._friend_lock = asyncio.Lock()
+        self._job_audience: dict[asyncio.Task[None], str] = {}
         self._handled: datetime | None = None       # the stored "handled", once read (no read every few minutes)
         self._last_command: dict[str, float] = {}   # monotonic time of the last accepted /karne, per audience
         self._stopping = False
@@ -269,17 +272,29 @@ class KarneService:
             start = cutoff if cutoff is not None and cutoff < slot else previous_slot(slot)
             carried, listed = _ids(state.get("carry")), _ids(state.get("listed"))
             waited = _counts(state.get("waited"))
-            # One card per person, both of the same trades (the same period, the same trades left for later): each
-            # shows only that person's accounts.
+            # One card per person, both of the same trades: the same period, and whether a trade still waits for an
+            # order is looked at ONCE for both (an answer arriving between the two must not list a trade on one card
+            # and leave it for later on the other).
+            looked: dict[int, bool] = {}
+            source = self._pending
+
+            def pending(trade_id: int) -> bool:
+                if trade_id not in looked:
+                    looked[trade_id] = bool(source(trade_id)) if source is not None else False
+                return looked[trade_id]
+
             cards: list[tuple[str, Report]] = []
             for audience in self._audiences():
                 cards.append((audience, await build_report(
                     self._db, start, slot, mode=MODE_WEEK, accounts=self._accounts_of(audience),
-                    late=late > LATE_NOTE_SEC, pending=self._pending, carried=carried, listed=listed, waited=waited,
-                    only=set(self._accounts_of(audience)))))
+                    late=late > LATE_NOTE_SEC, pending=pending if source is not None else None, carried=carried,
+                    listed=listed, waited=waited, **self._scope(audience))))
             report = cards[0][1]
             shown = list(dict.fromkeys(row.trade_id for _audience, card in cards for row in card.rows))
-            pictures = [await self._prepare(card) for _audience, card in cards]
+            # The owner's picture is drawn first: a stop while it is drawn leaves nothing stored, and the card goes
+            # out after the restart. (The friend's is drawn after the owner's card went out: it never holds that back;
+            # a stop while it is drawn loses his picture of this week.)
+            picture = await self._prepare(report)
             try:
                 # Stored BEFORE the first message: whatever happens from here on, these cards are never sent again,
                 # and neither is one of their trades (``listed``); the trades they left for later are remembered.
@@ -288,13 +303,12 @@ class KarneService:
                     "waited": {str(i): waited.get(i, 0) + 1 for i in report.deferred},
                     "listed": (shown + listed)[:LISTED_MAX]})
             except BaseException:
-                for picture in pictures:
-                    remove_picture(picture.path if picture is not None else None)
+                remove_picture(picture.path if picture is not None else None)
                 raise
-            for (audience, card), picture in zip(cards, pictures):
+            for index, (audience, card) in enumerate(cards):
                 logger.info("Karne: weekly card (%s) %s .. %s UTC: %d row(s), total %.2fR", audience,
                             start.isoformat(), slot.isoformat(), len(card.rows), card.total_r)
-                await self._send(card, picture, audience)
+                await self._send(card, picture if index == 0 else await self._prepare(card), audience)
 
     # ---- the owner's command ------------------------------------------------------------------------
     def _audiences(self) -> list[str]:
@@ -306,6 +320,12 @@ class KarneService:
     def _accounts_of(self, audience: str) -> list[str]:
         return self._friend_accounts if audience == FRIEND else self._accounts
 
+    def _scope(self, audience: str) -> dict[str, Any]:
+        """Whose rows: the friend's card only his accounts; the owner's every account but the friend's."""
+        if audience == FRIEND:
+            return {"only": set(self._friend_accounts)}
+        return {"exclude": set(self._friend_accounts)}
+
     async def command(self, args: str = "", audience: str = OWNER) -> str:
         """``/karne`` / ``/karne hepsi`` of the owner (``audience`` FRIEND: of the friend, his own card): the answer
         for now (HTML); the card itself follows. Never raises."""
@@ -316,7 +336,8 @@ class KarneService:
             return REPLY_USAGE
         if self._stopping:
             return REPLY_STOPPING
-        if self._lock.locked() or any(not job.done() for job in self._jobs):
+        lock = self._friend_lock if audience == FRIEND else self._lock
+        if lock.locked() or any(not job.done() and self._job_audience.get(job) == audience for job in self._jobs):
             return REPLY_BUSY
         now = self._monotonic()
         last = self._last_command.get(audience)
@@ -325,19 +346,21 @@ class KarneService:
         self._last_command[audience] = now
         mode = MODE_ALL if word else MODE_INTERIM
         job: asyncio.Task[None] = asyncio.ensure_future(self._on_demand(mode, audience))
-        job.set_name(f"karne-{mode}")
+        job.set_name(f"karne-{mode}-{audience}")
         self._jobs.add(job)
+        self._job_audience[job] = audience
         job.add_done_callback(self._job_done)
         return REPLY_STARTED_ALL if mode == MODE_ALL else REPLY_STARTED
 
     def _job_done(self, job: asyncio.Task[None]) -> None:
         self._jobs.discard(job)
+        self._job_audience.pop(job, None)
         if not job.cancelled() and job.exception() is not None:
             logger.error("Karne: an on-demand card failed", exc_info=job.exception())
 
     async def _on_demand(self, mode: str, audience: str = OWNER) -> None:
         try:
-            async with self._lock:
+            async with self._friend_lock if audience == FRIEND else self._lock:
                 now = self._now()
                 start: datetime | None = None
                 carried: list[int] = []
@@ -349,10 +372,9 @@ class KarneService:
                     start = cutoff if cutoff is not None and cutoff < now else last_slot(now)
                     carried, listed = _ids(state.get("carry")), _ids(state.get("listed"))
                     waited = _counts(state.get("waited"))
-                accounts = self._accounts_of(audience)
-                report = await build_report(self._db, start, now, mode=mode, accounts=accounts,
+                report = await build_report(self._db, start, now, mode=mode, accounts=self._accounts_of(audience),
                                             pending=self._pending, carried=carried, listed=listed,
-                                            waited=waited if mode == MODE_INTERIM else None, only=set(accounts))
+                                            waited=waited if mode == MODE_INTERIM else None, **self._scope(audience))
                 await self._send(report, await self._prepare(report), audience)
         except asyncio.CancelledError:
             if self._stopping or not stray_cancel():
@@ -413,6 +435,10 @@ class KarneService:
             reason = (f"{RENDER_TIMEOUT_SEC:.0f} sn içinde bitmedi, çizim durduruldu" if picture.status == TIMEOUT
                       else f"çizim hatası: <code>{esc(picture.detail[:200])}</code>")
             why = RENDER_FAILED_TR.format(why=reason)
+        if audience == FRIEND and why:
+            # (why the picture did not go - install paths, the bot's own queue - is the owner's business)
+            logger.warning("Karne: the friend's card went as text: %s", why)
+            why = ""
         await self._tell(summary_text(report, why), audience)
 
     async def _tell(self, text: str, audience: str = OWNER) -> None:
