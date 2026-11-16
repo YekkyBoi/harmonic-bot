@@ -1817,6 +1817,12 @@ class Engine:
                 logger.exception("%s: owed changes of trade #%s failed; the monitor tries them", name, trade_id)
 
     # ------------------------------------------------------------------ catch-up of a signal an optional broker missed
+    def _friend_account(self, broker: Broker) -> bool:
+        """``broker`` is the owner's friend's account (config ``friend_account``; not written: an optional broker),
+        whose catch-up question the friend answers (/arkadas). The owner answers it for every other account."""
+        flag = getattr(broker.config, "friend_account", None)
+        return self._is_optional(broker) if flag is None else bool(flag)
+
     def _optional_name(self, name: str) -> bool:
         """``name`` is a configured optional broker (a friend's account)."""
         broker = next((b for b in self.configured_brokers if b.name == name), None)
@@ -2346,8 +2352,9 @@ class Engine:
             catch_up={"trade_id": trade.id, "broker": name, "label": label, "signal_at": signal_at.isoformat(),
                       "raw_symbol": item.get("raw_symbol"),
                       "question": f"{esc(label)} {n} hesabında da açılsın mı?",
-                      # who answers it: the owner's friend set now (/arkadas), else the owner (None)
-                      "decider": self._friend_chat,
+                      # who answers it: the owner's friend set now (/arkadas) for the friend's account, else the
+                      # owner (None)
+                      "decider": self._friend_chat if self._friend_account(broker) else None,
                       "details": "\n".join(lines)},
         )
         await self._post_question(conf)

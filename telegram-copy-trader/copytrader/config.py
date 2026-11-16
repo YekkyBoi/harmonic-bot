@@ -219,6 +219,10 @@ class _BrokerBase(_Base):
     # optional: a broker that is not essential (e.g. a friend's account). If it cannot connect (bad token, service
     # down...) the bot still starts, warns the owner once, skips its trades and retries in the background.
     optional: bool = False
+    # friend_account: whose account this is. True: the owner's friend's (/arkadas): the friend answers the question
+    # whether a signal this account missed is opened there later. False: the owner's own (the owner answers it). Not
+    # written: an optional account is the friend's, every other one the owner's (as before this setting existed).
+    friend_account: bool | None = None
     symbol_map: dict[str, str] = Field(default_factory=dict)   # "ETH" -> "ETHUSD" (base asset or raw symbol -> broker symbol)
     allowed_assets: list[str] = Field(default_factory=list)     # empty = all assets
     risk_multiplier: float = 1.0                  # scale risk on this broker only (1.0 = 2% per R)
@@ -429,10 +433,13 @@ class AppConfig(_Base):
         own_paths = {terminal_key(b.terminal_path): b.name for b in self.brokers
                      if b.type == "mt5" and b.enabled and getattr(b, "terminal_path", None)}
         for b in self.brokers:
-            if b.type == "mt5_bridge" and b.enabled and terminal_key(b.terminal_path) in own_paths:
-                raise ValueError(
-                    f"broker '{b.name}': terminal_path, '{own_paths[terminal_key(b.terminal_path)]}' hesabının "
-                    "terminaliyle aynı; her hesap kendi MetaTrader terminalini kullanmalı")
+            if b.type == "mt5_bridge" and b.enabled:
+                key = terminal_key(b.terminal_path)
+                if key in own_paths:
+                    raise ValueError(
+                        f"broker '{b.name}': terminal_path, '{own_paths[key]}' hesabının "
+                        "terminaliyle aynı; her hesap kendi MetaTrader terminalini kullanmalı")
+                own_paths[key] = b.name     # two mt5_bridge accounts: never the same terminal either
         for route in self.telegram.topics:
             unknown = [b for b in route.brokers if b not in names]
             if unknown:
