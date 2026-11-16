@@ -273,3 +273,30 @@ def test_a_fill_tells_its_levels_once_never_as_a_stop_move() -> None:
     broken = filled.model_copy(update={"status": PositionStatus.FAILED, "error": "stop yok"})
     assert friend_position_events(filled, broken) == ["broken"]
     assert "hata durumunda" in friend_position_text(trade, filled, broken, ["broken"])  # type: ignore[arg-type]
+
+
+def test_a_result_booked_after_the_close_is_told_again_and_a_bare_kind_is_no_reason() -> None:
+    from types import SimpleNamespace
+
+    from copytrader.engine.orchestrator import (
+        friend_position_events,
+        friend_position_text,
+    )
+    from copytrader.models import BrokerPosition, Side
+    closed = BrokerPosition(broker="tickmill", broker_symbol="BTCUSD", side=Side.LONG, status=PositionStatus.CLOSED,
+                            quantity=0.1, filled_quantity=0.1, remaining_quantity=0.0, realized_pnl=10.0)
+    later = closed.model_copy(update={"realized_pnl": 24.5})
+    trade = SimpleNamespace(id=7, plan=SimpleNamespace(base_asset="BTC", side=Side.LONG, risk_r=1.0))
+    assert friend_position_events(closed, closed) == [] and friend_position_events(closed, later) == ["result"]
+    assert friend_position_text(trade, closed, later, ["result"], "USD") == (       # type: ignore[arg-type]
+        "🏁 #7 BTC LONG tickmill: sonuç güncellendi, K/Z +24.50 USD")
+    waiting = closed.model_copy(update={"status": PositionStatus.PENDING, "realized_pnl": None})
+    refused = waiting.model_copy(update={"status": PositionStatus.FAILED, "error": "error"})
+    assert friend_position_text(trade, waiting, refused, ["failed"]) == (            # type: ignore[arg-type]
+        "⚠️ #7 BTC LONG tickmill hesabınızda açılamadı")
+
+
+async def test_an_asset_his_account_does_not_trade_tells_him_nothing(world: World) -> None:
+    world.tm.config.allowed_assets = ["BTC"]
+    await world.open("ETH")
+    assert world.feed == []

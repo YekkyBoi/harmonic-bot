@@ -445,6 +445,8 @@ def _format_catch_up(conf: PendingConfirmation, *, with_expiry: bool, decider: s
     if with_expiry:
         parts.append(decider or f"{CATCH_UP_YES} = {broker} hesabında aç · {CATCH_UP_NO} = açma")
     details = info.get("friend_details") if friend and "friend_details" in info else info.get("details")
+    if friend and "friend_details" not in info:     # (a question stored before his own details existed)
+        details = re.sub(r" İşlem [^.]*? açık\.", "", str(details or ""))
     parts += ["", str(details or "")]
     if with_expiry:
         parts.append(f"⏳ {expiry_minutes(conf)} dk içinde yanıt gelmezse {broker} hesabında işlem açılmaz.")

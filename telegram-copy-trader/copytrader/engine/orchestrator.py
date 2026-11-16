@@ -906,6 +906,7 @@ def virtual_entry_wanted(broker: Broker, plan: TradePlan, route_kind: str | None
 
 
 OPEN_UNKNOWN = "open_unknown"     # position data: its open order's answer was lost (it may be open at the broker)
+_OUTCOME_KINDS = frozenset({"ok", "partial", "unsupported", "skipped", "error", "late", "filtered"})
 
 
 def _moved(a: float | None, b: float | None) -> bool:
@@ -923,6 +924,9 @@ def friend_position_events(before: BrokerPosition | None, after: BrokerPosition)
                 PositionStatus.FAILED: ["failed"], PositionStatus.CLOSED: ["opened", "closed"]}.get(after.status, [])
     if before.status in active and after.status is PositionStatus.CLOSED:
         return ["closed"]
+    if (before.status is PositionStatus.CLOSED and after.status is PositionStatus.CLOSED
+            and after.realized_pnl is not None and _moved(before.realized_pnl, after.realized_pnl)):
+        return ["result"]           # (the rest of a result booked after the close: the figure he was told changed)
     if before.status is PositionStatus.PENDING and after.status is PositionStatus.CANCELLED:
         return ["cancelled"]
     if before.status is PositionStatus.PENDING and after.status is PositionStatus.FAILED:
@@ -971,7 +975,8 @@ def friend_position_text(trade: TradeRecord, before: BrokerPosition | None, afte
             lines.append(f"⚠️ {label} {name}: açılış emri gönderildi ama sonucu bilinmiyor; emir açılmış olabilir. "
                          "Hesabınızda kontrol edin.")
         elif event == "failed":
-            lines.append(f"⚠️ {label} {name} hesabınızda açılamadı" + (f": {esc(after.error)}" if after.error else ""))
+            reason = after.error if after.error and after.error not in _OUTCOME_KINDS else None
+            lines.append(f"⚠️ {label} {name} hesabınızda açılamadı" + (f": {esc(reason)}" if reason else ""))
         elif event == "broken":
             lines.append(f"🚨 {label} {name}: pozisyonunuz hata durumunda"
                          + (f" ({esc(after.error)})" if after.error else "") + ". Hesabınızda kontrol edin.")
@@ -984,6 +989,10 @@ def friend_position_text(trade: TradeRecord, before: BrokerPosition | None, afte
             lines.append(f"✂️ {label} {name}: pozisyonun bir kısmı kapandı, kalan {_qty(after.remaining_quantity)}")
         elif event == "cancelled":
             lines.append(f"❌ {label} {name}: bekleyen giriş emri iptal edildi")
+        elif event == "result":
+            r = None if _result_incomplete(after) else position_result_r(after, trade.plan.risk_r)
+            lines.append(f"🏁 {label} {name}: sonuç güncellendi, K/Z {after.realized_pnl:+.2f}"
+                         + (f" {esc(currency)}" if currency else "") + (f" ({r:+.1f}R)" if r is not None else ""))
         elif event == "closed":
             r = position_result_r(after, trade.plan.risk_r)
             money = (f"K/Z {after.realized_pnl:+.2f}" + (f" {esc(currency)}" if currency else "")
@@ -1978,8 +1987,8 @@ class Engine:
     async def _friend_open_note(self, label: str, outcome: BrokerOutcome) -> None:
         """An open that gave the friend's account no position (refused, skipped, failed, or its answer lost): he is
         told. The reason is his account's own (its adapter's text)."""
-        if not self._is_friend_name(outcome.broker):
-            return
+        if not self._is_friend_name(outcome.broker) or (outcome.kind == "filtered" and not outcome.unknown):
+            return              # (an asset his account does not trade: nothing to tell on every such signal)
         name = esc(outcome.broker)
         if outcome.unknown:
             text = (f"⚠️ {esc(label)} {name}: açılış emri gönderildi ama sonucu bilinmiyor; emir açılmış olabilir. "
