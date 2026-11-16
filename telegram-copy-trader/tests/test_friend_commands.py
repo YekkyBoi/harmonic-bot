@@ -3,7 +3,7 @@
   /yardim, /pozisyonlar, /bakiye, /pozkapat [varlık | #işlem | hepsi], /karne [hepsi]
 
 Never the owner's accounts (fx, binance, ...), never the owner's commands; what he closes is told to the owner too.
-His /pozkapat has no buttons: one matching position is closed at once, several are listed and he names one.
+His /pozkapat lists his open positions with numbers; he answers with the numbers ("1-3" = 1 and 3).
 
 REAL Engine and REAL BotNotifier (tests/test_pozkapat.py's world); brokers and Telegram are fakes.
 """
@@ -68,13 +68,21 @@ async def test_positions_and_balance_show_his_account_only(world: World) -> None
     assert "• tickmill:" in balance and "• fx:" not in balance
 
 
-async def test_his_only_position_closes_at_once_the_owners_stays_and_the_owner_is_told(world: World) -> None:
+async def test_he_picks_his_position_from_his_list_the_owners_stays_and_the_owner_is_told(world: World) -> None:
     tid = await world.open()
     await world.friend_says("/pozkapat")
+    (listing,) = world.to_friend()
+    assert f"1- #{tid} ETH LONG (açık) · tickmill" in listing and "· fx" not in listing
+    assert await world.status(tid) == {"fx": PositionStatus.OPEN, "tickmill": PositionStatus.OPEN}
+    await world.friend_says("1")
     assert await world.status(tid) == {"fx": PositionStatus.OPEN, "tickmill": PositionStatus.CLOSED}
-    (reply,) = world.to_friend()
+    reply = world.to_friend()[-1]
     assert f"#{tid} ETH LONG (tickmill)" in reply and "sürüyor: fx (açık)" in reply
-    assert any(t.startswith("👤 Arkadaşınız <code>/pozkapat </code> yazdı:") for t in world.texts())
+    assert any(t.startswith("👤 Arkadaşınız /pozkapat listesinden <code>1</code> seçti:") for t in world.texts())
+    # a shortcut naming his only position closes it at once
+    other = await world.open("XAU")
+    await world.friend_says("/pozkapat xau")
+    assert (await world.status(other))["tickmill"] is PositionStatus.CLOSED
 
 
 async def test_he_can_never_close_the_owners_account(world: World) -> None:
@@ -91,7 +99,7 @@ async def test_several_positions_are_listed_and_he_names_one_or_all(world: World
     xau = await world.open("XAU")
     await world.friend_says("/pozkapat")
     (reply,) = world.to_friend()
-    assert "tickmill</b> hesabınızda 2 pozisyon var" in reply and "Hiçbir pozisyon kapatılmadı" in reply
+    assert "1- #" in reply and "2- #" in reply and "henüz hiçbir pozisyon kapatılmadı" in reply
     assert not any(m.buttons for m in world.client.to(FRIEND))
     assert (await world.status(eth))["tickmill"] is PositionStatus.OPEN
     await world.friend_says("/pozkapat xau")

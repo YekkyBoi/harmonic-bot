@@ -1839,6 +1839,11 @@ class Engine:
         """The owner's friend's accounts (see :meth:`_friend_account`), in the config's order."""
         return [b.name for b in self.configured_brokers if self._friend_account(b)]
 
+    def owner_close_names(self) -> list[str]:
+        """The owner's own accounts a bare /pozkapat lists (never the friend's, never a manual one)."""
+        return [b.name for b in self.configured_brokers
+                if not self._friend_account(b) and getattr(b.config, "type", None) != "manual"]
+
     def _optional_name(self, name: str) -> bool:
         """``name`` is a configured optional broker (a friend's account)."""
         broker = next((b for b in self.configured_brokers if b.name == name), None)

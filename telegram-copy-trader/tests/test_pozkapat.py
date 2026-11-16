@@ -169,76 +169,14 @@ async def test_a_pending_entry_is_cancelled(world: World) -> None:
     assert [c for c, _ in world.fx.calls if c == "cancel_entry"]
 
 
-# --------------------------------------------------------------------------- #
-# several positions: the owner chooses
-# --------------------------------------------------------------------------- #
-async def test_several_positions_are_asked_and_only_the_chosen_one_closes(world: World) -> None:
-    eth = await world.open("ETH")
-    xau = await world.open("XAU")
-    await world.say("/pozkapat fx1")
-    (question,) = [m for m in world.client.to(OWNER) if m.buttons]
-    data = [b.type.data for row in question.buttons for b in row]
-    assert data == [f"pk:{eth}".encode(), f"pk:{xau}".encode(), b"pk:all", b"pk:x"]
-    assert (await world.status(eth))["fx"] is PositionStatus.OPEN          # nothing closed before the choice
-
-    await world.press(f"pk:{xau}", question.id)
-    assert (await world.status(xau))["fx"] is PositionStatus.CLOSED
-    assert (await world.status(eth))["fx"] is PositionStatus.OPEN
-    assert (await world.status(xau))["tickmill"] is PositionStatus.OPEN
-    # one use only
-    await world.press(f"pk:{eth}", question.id)
-    assert (await world.status(eth))["fx"] is PositionStatus.OPEN
 
 
-async def test_hepsini_kapat_closes_every_offered_position_of_that_account_only(world: World) -> None:
-    eth = await world.open("ETH")
-    xau = await world.open("XAU")
-    await world.say("/pozkapat fx1")
-    (question,) = [m for m in world.client.to(OWNER) if m.buttons]
-    await world.press("pk:all", question.id)
-    for tid in (eth, xau):
-        assert await world.status(tid) == {"fx": PositionStatus.CLOSED, "tickmill": PositionStatus.OPEN}
 
 
-async def test_vazgec_and_an_expired_question_close_nothing(world: World, monkeypatch: pytest.MonkeyPatch) -> None:
-    eth = await world.open("ETH")
-    await world.open("XAU")
-    await world.say("/pozkapat fx1")
-    (question,) = [m for m in world.client.to(OWNER) if m.buttons]
-    await world.press("pk:x", question.id)
-    await world.press(f"pk:{eth}", question.id)
-    assert (await world.status(eth))["fx"] is PositionStatus.OPEN
-    assert any("Vazgeçildi" in e.text for e in world.client.edits_of(OWNER))
-
-    world.client.sent.clear()
-    await world.say("/pozkapat fx1")
-    (question,) = [m for m in world.client.to(OWNER) if m.buttons]
-    real = time.monotonic
-    monkeypatch.setattr(notifier_mod.time, "monotonic", lambda: real() + notifier_mod.POZKAPAT_TTL_SEC + 1)
-    await world.press(f"pk:{eth}", question.id)
-    assert (await world.status(eth))["fx"] is PositionStatus.OPEN
-    assert any("Süresi doldu" in e.text for e in world.client.edits_of(OWNER))
 
 
-async def test_a_question_from_before_a_restart_closes_nothing(world: World) -> None:
-    eth = await world.open("ETH")
-    await world.open("XAU")
-    await world.say("/pozkapat fx1")
-    (question,) = [m for m in world.client.to(OWNER) if m.buttons]
-    world.n._pk_prompts.clear()                                     # (what a restart leaves: nothing in memory)
-    await world.press(f"pk:{eth}", question.id)
-    assert (await world.status(eth))["fx"] is PositionStatus.OPEN
 
 
-async def test_the_friend_can_never_press_it(world: World) -> None:
-    await world.say(f"/arkadas {FRIEND}")
-    eth = await world.open("ETH")
-    await world.open("XAU")
-    await world.say("/pozkapat fx1")
-    (question,) = [m for m in world.client.to(OWNER) if m.buttons]
-    await world.press(f"pk:{eth}", question.id, sender=FRIEND)
-    assert (await world.status(eth))["fx"] is PositionStatus.OPEN
-    assert not any(m.buttons for m in world.client.to(FRIEND))
 
 
 # --------------------------------------------------------------------------- #
@@ -266,7 +204,6 @@ async def test_a_currency_pair_filter_is_the_pair_not_the_currency(world: World)
 @pytest.mark.parametrize("command, expect", [
     ("/pozkapat fx1,fx3", "Bilinmeyen hesap: <b>fx3</b>"),
     ("/pozkapat breakout", "elle işlem hesabı"),
-    ("/pozkapat", "Kullanım"),
     ("/pozkapat fx1 ???", "anlaşılamadı"),
     ("/pozkapat fx 1", "işlem numarası için <code>#1</code> yazın"),       # ("fx 1": never trade #1)
     ("/pozkapat fx 7 eth", "anlaşılamadı"),
@@ -420,20 +357,6 @@ async def test_shutting_down_closes_nothing_and_says_so(world: World) -> None:
     assert any("Hiçbir pozisyon kapatılmadı" in t for t in world.texts())
 
 
-async def test_vazgec_while_the_chosen_close_runs_changes_nothing(world: World) -> None:
-    eth = await world.open("ETH")
-    await world.open("XAU")
-    await world.say("/pozkapat fx1")
-    (question,) = [m for m in world.client.to(OWNER) if m.buttons]
-    world.n._pk_running.add(question.id)                           # (a chosen close is being carried out)
-    try:
-        await world.press("pk:x", question.id)
-        await world.press(f"pk:{eth}", question.id)
-    finally:
-        world.n._pk_running.discard(question.id)
-    assert not any("Vazgeçildi" in e.text for e in world.client.edits_of(OWNER))
-    assert (await world.status(eth))["fx"] is PositionStatus.OPEN
-    assert question.id in world.n._pk_prompts                       # still answerable once that close is done
 
 
 async def test_a_restricted_stop_move_never_changes_the_whole_trade(world: World) -> None:
@@ -447,20 +370,110 @@ async def test_a_restricted_stop_move_never_changes_the_whole_trade(world: World
     assert trade is not None and trade.current_stop_loss == 2200.0
 
 
-async def test_the_result_is_written_before_other_presses_are_taken_again(world: World,
+
+
+# --------------------------------------------------------------------------- #
+# the numbered list: /pozkapat, then the numbers ("1-3" = 1 AND 3)
+# --------------------------------------------------------------------------- #
+def numbered(world: World) -> str:
+    (text,) = [t for t in world.texts() if "Hangi pozisyon kapatılsın?" in t][-1:]
+    return text
+
+
+async def test_bare_pozkapat_lists_the_owners_positions_and_closes_nothing(world: World) -> None:
+    eth = await world.open("ETH")
+    await world.say("/pozkapat")
+    text = numbered(world)
+    assert f"1- #{eth} ETH LONG (açık) · fx" in text and "tickmill" not in text      # his own accounts only
+    assert "henüz hiçbir pozisyon kapatılmadı" in text
+    assert not any(m.buttons for m in world.client.to(OWNER))
+    assert await world.status(eth) == {"fx": PositionStatus.OPEN, "tickmill": PositionStatus.OPEN}
+    await world.say("1")
+    assert await world.status(eth) == {"fx": PositionStatus.CLOSED, "tickmill": PositionStatus.OPEN}
+
+
+async def test_one_and_three_close_and_two_stays(world: World) -> None:
+    ids = [await world.open(asset) for asset in ("ETH", "XAU", "EUR")]
+    await world.say("/pozkapat")
+    assert [line[:2] for line in numbered(world).splitlines() if line[:1].isdigit()] == ["1-", "2-", "3-"]
+    await world.say("1-3")
+    assert [(await world.status(t))["fx"] for t in ids] == [PositionStatus.CLOSED, PositionStatus.OPEN,
+                                                             PositionStatus.CLOSED]
+    for t in ids:
+        assert (await world.status(t))["tickmill"] is PositionStatus.OPEN
+
+
+async def test_an_account_with_several_positions_is_listed_and_the_command_form_picks_too(world: World) -> None:
+    eth = await world.open("ETH")
+    xau = await world.open("XAU")
+    await world.say("/pozkapat fx1")
+    assert "2- #" in numbered(world)
+    assert (await world.status(eth))["fx"] is PositionStatus.OPEN
+    await world.say("/pozkapat 2")
+    assert (await world.status(xau))["fx"] is PositionStatus.CLOSED and (await world.status(eth))["fx"] is PositionStatus.OPEN
+
+
+async def test_a_number_not_on_the_list_closes_nothing_and_the_list_stays(world: World) -> None:
+    eth = await world.open("ETH")
+    await world.say("/pozkapat")
+    await world.say("1, 5")
+    assert any("5 listede yok (1–1). Hiçbir pozisyon kapatılmadı" in t for t in world.texts())
+    assert (await world.status(eth))["fx"] is PositionStatus.OPEN
+    await world.say("1")
+    assert (await world.status(eth))["fx"] is PositionStatus.CLOSED
+
+
+async def test_a_list_is_used_once_expires_and_is_forgotten_by_a_restart(world: World,
                                                                           monkeypatch: pytest.MonkeyPatch) -> None:
     eth = await world.open("ETH")
-    await world.open("XAU")
-    await world.say("/pozkapat fx1")
-    (question,) = [m for m in world.client.to(OWNER) if m.buttons]
-    seen: list[bool] = []
-    real_edit = world.n._edit
+    xau = await world.open("XAU")
+    await world.say("/pozkapat")
+    await world.say("1")
+    await world.say("2")                                             # the list was used
+    assert (await world.status(xau))["fx"] is PositionStatus.OPEN
+    assert any("Seçilecek bir liste yok" in t for t in world.texts())
+    await world.say("/pozkapat")
+    real = time.monotonic
+    monkeypatch.setattr(notifier_mod.time, "monotonic", lambda: real() + notifier_mod.POZKAPAT_TTL_SEC + 1)
+    await world.say("1")
+    assert (await world.status(xau))["fx"] is PositionStatus.OPEN
+    monkeypatch.setattr(notifier_mod.time, "monotonic", real)
+    await world.say("/pozkapat")
+    world.n._pk_lists.clear()                                        # (what a restart leaves: nothing in memory)
+    await world.say("1")
+    assert (await world.status(xau))["fx"] is PositionStatus.OPEN
+    assert (await world.status(eth))["fx"] is PositionStatus.CLOSED
 
-    async def edit(msg_id: int, text: str, **kw: Any) -> bool:
-        if msg_id == question.id and f"#{eth} ETH LONG (fx)" in text:     # the final result
-            seen.append(msg_id in world.n._pk_running)
-        return await real_edit(msg_id, text, **kw)
 
-    monkeypatch.setattr(world.n, "_edit", edit)
-    await world.press(f"pk:{eth}", question.id)
-    assert seen == [True] and question.id not in world.n._pk_running
+async def test_the_friend_can_never_pick_from_the_owners_list(world: World) -> None:
+    await world.say(f"/arkadas {FRIEND}")
+    eth = await world.open("ETH")
+    await world.say("/pozkapat")
+    await world.n.handle_message(MsgEvent("1", sender_id=FRIEND))
+    await world.n.handle_message(MsgEvent("/pozkapat 1", sender_id=FRIEND))
+    await world.settle()
+    assert await world.status(eth) == {"fx": PositionStatus.OPEN, "tickmill": PositionStatus.OPEN}
+    await world.say("1")                                             # the owner's list is still his
+    assert (await world.status(eth))["fx"] is PositionStatus.CLOSED
+
+
+async def test_shutting_down_keeps_the_list_and_closes_nothing(world: World) -> None:
+    eth = await world.open("ETH")
+    await world.say("/pozkapat")
+    world.engine._accepting = False
+    try:
+        await world.say("1")
+    finally:
+        world.engine._accepting = True
+    assert (await world.status(eth))["fx"] is PositionStatus.OPEN
+    assert any("Hiçbir pozisyon kapatılmadı" in t for t in world.texts())
+    await world.say("1")
+    assert (await world.status(eth))["fx"] is PositionStatus.CLOSED
+
+
+async def test_numbers_are_never_a_range(world: World) -> None:
+    ids = [await world.open(asset) for asset in ("ETH", "XAU", "EUR")]
+    await world.say("/pozkapat")
+    await world.say("1 ve 3")
+    assert (await world.status(ids[1]))["fx"] is PositionStatus.OPEN
+    assert (await world.status(ids[0]))["fx"] is PositionStatus.CLOSED and (await world.status(ids[2]))["fx"] is PositionStatus.CLOSED
