@@ -404,7 +404,9 @@ async def test_an_open_with_an_unknown_outcome_is_named_not_called_no_position(w
     await world.db.update_trade(tid, note="tickmill: unknown")
     await world.say("/pozkapat tickmill")
     (reply,) = [t for t in world.texts() if "tickmill" in t]
+    assert not any(m.buttons for m in world.client.to(OWNER))         # nothing to choose from
     assert "açılış emrinin sonucu bilinmiyordu" in reply and "elle kapatın" in reply
+    assert "kapatılacak açık pozisyon yok" not in reply
 
 
 async def test_shutting_down_closes_nothing_and_says_so(world: World) -> None:
@@ -443,3 +445,22 @@ async def test_a_restricted_stop_move_never_changes_the_whole_trade(world: World
     assert by["fx"].stop_loss == 2210.0 and by["tickmill"].stop_loss != 2210.0
     trade = await world.db.get_trade(tid)
     assert trade is not None and trade.current_stop_loss == 2200.0
+
+
+async def test_the_result_is_written_before_other_presses_are_taken_again(world: World,
+                                                                          monkeypatch: pytest.MonkeyPatch) -> None:
+    eth = await world.open("ETH")
+    await world.open("XAU")
+    await world.say("/pozkapat fx1")
+    (question,) = [m for m in world.client.to(OWNER) if m.buttons]
+    seen: list[bool] = []
+    real_edit = world.n._edit
+
+    async def edit(msg_id: int, text: str, **kw: Any) -> bool:
+        if msg_id == question.id and f"#{eth} ETH LONG (fx)" in text:     # the final result
+            seen.append(msg_id in world.n._pk_running)
+        return await real_edit(msg_id, text, **kw)
+
+    monkeypatch.setattr(world.n, "_edit", edit)
+    await world.press(f"pk:{eth}", question.id)
+    assert seen == [True] and question.id not in world.n._pk_running

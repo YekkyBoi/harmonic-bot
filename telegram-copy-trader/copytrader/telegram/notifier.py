@@ -870,7 +870,8 @@ class BotNotifier:
             what = f" ({esc(target.what)})" if target.what else ""
             parts.extend(target.notes)
             if not target.matches:
-                parts.append(f"ℹ️ <b>{esc(target.broker)}</b>{what}: kapatılacak açık pozisyon yok.")
+                if not target.notes:                         # (a note already says what is there)
+                    parts.append(f"ℹ️ <b>{esc(target.broker)}</b>{what}: kapatılacak açık pozisyon yok.")
             elif len(target.matches) == 1:
                 singles.append((target.broker, target.matches[0][0]))
             else:
@@ -933,7 +934,7 @@ class BotNotifier:
             await self._answer(event, "Sistem henüz hazır değil", alert=True)
             return
         self._pk_prompts.pop(msg_id, None)          # one use only (before any await)
-        self._pk_running.add(msg_id)
+        self._pk_running.add(msg_id)        # (until its result is on the message: no other press writes over it)
         try:
             await self._answer(event, "⏳ Kapatılıyor…")
             await self._edit(msg_id, f"⏳ {esc(broker)} hesabında kapatılıyor…")
@@ -942,18 +943,18 @@ class BotNotifier:
             except Exception as exc:
                 log.exception("pozkapat failed")
                 result = f"🚨 Kapatma sırasında hata: <code>{esc(exc)}</code>"
+            if result in _NOT_NOW:
+                # Nothing was done: the question gets its buttons back for the rest of its time.
+                self._pk_prompts.setdefault(msg_id, prompt)
+                await self._edit(msg_id, text, buttons=buttons)
+                await self._send(result)
+                return
+            final = result or "✔️ Tamamlandı."
+            self._mirror(final)
+            if not await self._edit(msg_id, final):
+                await self._send(final, importance=2, edit_first=(msg_id, final), mirror=False)
         finally:
             self._pk_running.discard(msg_id)
-        if result in _NOT_NOW:
-            # Nothing was done: the question gets its buttons back for the rest of its time.
-            self._pk_prompts.setdefault(msg_id, prompt)
-            await self._edit(msg_id, text, buttons=buttons)
-            await self._send(result)
-            return
-        final = result or "✔️ Tamamlandı."
-        self._mirror(final)
-        if not await self._edit(msg_id, final):
-            await self._send(final, importance=2, edit_first=(msg_id, final), mirror=False)
 
     # ---- button presses (testable) ------------------------------------------
     async def handle_callback(self, event: Any) -> None:
