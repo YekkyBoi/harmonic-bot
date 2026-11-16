@@ -388,7 +388,7 @@ async def test_g2_grup_commands_are_the_owners_stored_and_survive_a_restart(tmp_
     await w.n.handle_message(MsgEvent("/grup kapat", sender_id=OWNER, is_private=False))
     await w.settle()
     assert w.mirror.enabled and w.db.state["group_mirror"]["on"] is True
-    assert w.friend_texts()[friend_before:] == ["Bu bot komutlarını yalnızca sahibi kullanabilir."]
+    assert w.friend_texts()[friend_before:] == ["Bu komutu yalnızca bot sahibi kullanabilir. Sizin komutlarınız için /yardim yazın."]
     assert len(w.bot.to(OWNER)) == owner_before and w.bot.to(STRANGER) == []
 
     await w.owner_says("/grup KAPAT")
