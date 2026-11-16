@@ -824,7 +824,12 @@ class Database:
                 rows = await self._fetchall(
                     conn, "SELECT position_json FROM broker_positions WHERE trade_id = ? AND broker = ?",
                     (trade_id, pos.broker))
-                old = _load_position(rows[0]["position_json"]) if rows else None
+                try:
+                    old = _load_position(rows[0]["position_json"]) if rows else None
+                except Exception:      # (an old row that no longer reads: the write goes on, the hook sees "new")
+                    log.exception("A stored position of trade %s / %s could not be read for its hook",
+                                  trade_id, pos.broker)
+                    old = None
             await conn.execute(sql, (trade_id, pos.broker, position_json, status.value, closed_at, pnl, now))
         for hook in hooks:
             try:

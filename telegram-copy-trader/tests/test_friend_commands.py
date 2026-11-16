@@ -216,3 +216,60 @@ def test_a_save_that_changes_nothing_for_him_says_nothing() -> None:
     assert friend_position_events(pos.model_copy(update={"status": PositionStatus.PENDING}),
                                   pos.model_copy(update={"status": PositionStatus.CANCELLED})) == ["cancelled"]
     assert friend_position_events(None, pos) == ["opened"]
+
+
+# --------------------------------------------------------------------------- #
+# review round 2: refusals told to him, no fake stop moves, no owner account in his close refusal
+# --------------------------------------------------------------------------- #
+async def test_an_open_his_account_refused_is_told_to_him_with_its_reason(world: World) -> None:
+    from copytrader.brokers.base import BrokerError
+    world.tm.fail = {"open_position": BrokerError("Yetersiz teminat: 2.36 lot için 177.23 USD gerekiyor (test)")}
+    tid = await world.open()
+    assert any(f"⚠️ #{tid} ETH LONG tickmill hesabınızda açılmadı:" in t and "Yetersiz teminat" in t
+               for t in world.feed), world.feed
+    assert not any("fx" in t for t in world.feed)
+
+
+async def test_his_close_refused_for_an_open_in_flight_names_no_other_account(world: World) -> None:
+    import asyncio
+
+    from copytrader.engine.orchestrator import _LateLeg
+    tid = await world.open(names=("tickmill",))
+    task = asyncio.ensure_future(asyncio.get_running_loop().create_future())
+    world.engine._late_legs[(tid, "fx")] = _LateLeg(trade_id=tid, broker="fx", label="x", task=task)
+    try:
+        await world.friend_says("/pozkapat xau eth")
+        reply = world.to_friend()[-1]
+        assert "başka bir hesaptaki açılış emri henüz yanıtlanmadı" in reply and "fx" not in reply
+        assert (await world.status(tid))["tickmill"] is PositionStatus.OPEN
+    finally:
+        world.engine._late_legs.pop((tid, "fx"), None)
+        task.cancel()
+
+
+def test_a_fill_tells_its_levels_once_never_as_a_stop_move() -> None:
+    from types import SimpleNamespace
+
+    from copytrader.engine.orchestrator import (
+        OPEN_UNKNOWN,
+        friend_position_events,
+        friend_position_text,
+    )
+    from copytrader.models import BrokerPosition, Side, TakeProfit
+    waiting = BrokerPosition(broker="tickmill", broker_symbol="BTCUSD", side=Side.LONG, status=PositionStatus.PENDING,
+                             quantity=0.1, filled_quantity=0.0, remaining_quantity=0.0, stop_loss=2200.0,
+                             take_profits=[TakeProfit(price=2300.0)])
+    filled = waiting.model_copy(update={"status": PositionStatus.OPEN, "filled_quantity": 0.1,
+                                        "remaining_quantity": 0.1, "avg_entry_price": 2251.5, "stop_loss": 2201.5,
+                                        "take_profits": [TakeProfit(price=2301.5)]})
+    assert friend_position_events(waiting, filled) == ["filled"]
+    trade = SimpleNamespace(id=7, plan=SimpleNamespace(base_asset="BTC", side=Side.LONG, risk_r=1.0))
+    assert friend_position_text(trade, waiting, filled, ["filled"]) == (       # type: ignore[arg-type]
+        "✅ #7 BTC LONG tickmill: giriş emri doldu, giriş ~2251.5, stop 2201.5, hedef 2301.5")
+    unknown = waiting.model_copy(update={"status": PositionStatus.FAILED, "error": "error",
+                                         "data": {OPEN_UNKNOWN: True}})
+    text = friend_position_text(trade, waiting, unknown, friend_position_events(waiting, unknown))  # type: ignore[arg-type]
+    assert "sonucu bilinmiyor" in text and "açılamadı" not in text
+    broken = filled.model_copy(update={"status": PositionStatus.FAILED, "error": "stop yok"})
+    assert friend_position_events(filled, broken) == ["broken"]
+    assert "hata durumunda" in friend_position_text(trade, filled, broken, ["broken"])  # type: ignore[arg-type]

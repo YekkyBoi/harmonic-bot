@@ -345,6 +345,15 @@ def _outcome(text: str) -> str:
     return f"<b>Sonuç:</b> {text.strip()}" if text and text.strip() else "<b>Sonuç:</b> —"
 
 
+def _friend_outcome(text: str) -> str:
+    """The outcome of the friend's own catch-up question, for HIM: an answer, an expiry or the open's start as it is
+    (they speak of his account only); a refusal without its reason (it may name the owner's accounts)."""
+    shown = (text or "").strip()
+    if shown.startswith(("✅", "❌", "⌛")):
+        return _outcome(shown)
+    return _outcome("⛔ Şartlar artık uygun değil; işlem hesabınızda açılmadı.")
+
+
 def _utc(dt: datetime) -> datetime:
     return dt.replace(tzinfo=timezone.utc) if dt.tzinfo is None else dt.astimezone(timezone.utc)
 
@@ -626,7 +635,8 @@ class BotNotifier:
             # The friend answers it (the engine wrote him into the question): he gets it with the buttons, the owner
             # the same text without them and who decides.
             self._remember(self._friend_routed, conf.id, None)
-            self._friend_put(_FriendMessage(text=text, buttons=[row], conf_id=conf.id, conf=conf))
+            self._friend_put(_FriendMessage(text=format_confirmation(conf, friend=True), buttons=[row],
+                                            conf_id=conf.id, conf=conf))
             item = _Outgoing(text=format_confirmation(conf, decider=FRIEND_DECIDES), importance=2, conf=conf,
                              closed_html=closed_html, mirror=False, decider=FRIEND_DECIDES)
         else:
@@ -663,7 +673,10 @@ class BotNotifier:
             # (only a question that was HIS - his catch-up question - shows him its outcome: he gets no other)
             decider = (conf.catch_up or {}).get("decider") if conf.kind == "catch_up" else None
             if self._friend is not None and decider is not None and decider == self._friend:
-                self._friend_put(_FriendMessage(text=f"{closed_html}\n\n{outcome}", conf_id=conf.id, closing=True))
+                self._friend_put(_FriendMessage(
+                    text=f"{format_confirmation(conf, with_expiry=False, friend=True)}\n\n"
+                         f"{_friend_outcome(result_text or _STATUS_OUTCOME.get(conf.status, ''))}",
+                    conf_id=conf.id, closing=True))
             reasked = self._owner_reask.pop(conf.id, None)
             if reasked is not None and reasked != msg_id:  # the copy sent to the owner with buttons after a change
                 await self._edit(reasked, f"{closed_html}\n\n{outcome}")
@@ -791,8 +804,15 @@ class BotNotifier:
         if engine is None:
             await self._send("⏳ Sistem henüz hazır değil, biraz sonra tekrar deneyin.")
             return
-        if reply_to is None and _PK_PICK_RE.match(text) and self._owner in self._pk_lists:
-            await self._send(await self._pozkapat_pick(engine, text, friend=False))     # (a choice from /pozkapat)
+        entry = self._pk_lists.get(self._owner)
+        if entry is not None and time.monotonic() - entry[0] > POZKAPAT_TTL_SEC:
+            self._pk_lists.pop(self._owner, None)       # (an expired list never takes a number any more)
+            entry = None
+        if (reply_to is None and entry is not None and _PK_PICK_RE.match(text)
+                and await engine.awaiting_correction_id() is None):
+            # A choice from /pozkapat - never while a correction is awaited: the number is the correction then
+            # (the list can still be answered with /pozkapat 2).
+            await self._send(await self._pozkapat_pick(engine, text, friend=False))
             return
         conf_id = self._by_msg.get(reply_to) if reply_to is not None else None
         if conf_id is not None and conf_id not in self._closed:
@@ -1263,7 +1283,7 @@ class BotNotifier:
                     return
                 if age >= LATE_MARK_SEC:
                     text = late_question_prefix(age) + "\n" + format_confirmation(
-                        conf.model_copy(update={"created_at": now}))
+                        conf.model_copy(update={"created_at": now}), friend=True)
             chunk = self._chunks(text)[-1]
             if isinstance(chunk, str):
                 request = self._client.send_message(chat, chunk, parse_mode="html", buttons=message.buttons,
@@ -1285,7 +1305,8 @@ class BotNotifier:
             raise exc
         msg_id = getattr(task.result(), "id", None)
         if msg_id is not None:
-            closed = format_confirmation(message.conf, with_expiry=False) if message.conf is not None else message.text
+            closed = (format_confirmation(message.conf, with_expiry=False, friend=True) if message.conf is not None
+                      else message.text)
             if chat != self._friend:
                 # The friend changed while this copy was on its way: it is not his question any more. Take its
                 # buttons away in the chat it reached; never record it (an edit would go to the new friend's chat).
@@ -1435,7 +1456,7 @@ class BotNotifier:
                 # Nothing was decided now (not his question, answered / expired already, shutting down): to him only.
                 self._friend_put(_FriendMessage(text=result or "—"))
             elif result and result.strip() and result.strip() != shown.strip():
-                await self._send(result, importance=2)          # (mirrored to him as well)
+                await self._send(result, importance=2)          # (the owner's: he got his outcome on his question)
         except Exception as exc:
             log.exception("The friend's button %s for confirmation %s failed", kind, conf_id)
             self._friend_put(_FriendMessage(text=f"🚨 İşlem sırasında hata: <code>{esc(exc)}</code>"))

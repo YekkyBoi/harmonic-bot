@@ -326,7 +326,7 @@ async def test_r10_a_miss_that_could_not_be_dropped_from_storage_is_not_opened(t
         assert fails and world.tm.entered == 0                                       # nothing sent
         assert _owner(world) == [KEPT + "kayıt silinemedi; iki kez açılmaması için açılmadı" + MAY_OPEN]
         assert [m.text for m in world.client.to(FRIEND)] == [                        # (never "AÇILMAYACAK")
-            "ℹ️ <b>tickmill</b> hesabınız yeniden bağlı. Bağlantı yokken atlanan şu işlem hesabınızda açılmadı:\n"
+            "ℹ️ <b>tickmill</b> hesabınız yeniden bağlı. Bağlantı yokken atlanan şu işlem hesabınızda şimdi açılmadı:\n"
             "• <b>#1 ETH LONG</b>"]
         assert list(await world.db.get_state("missed_optional_legs")) == ["1:tickmill"]
     finally:

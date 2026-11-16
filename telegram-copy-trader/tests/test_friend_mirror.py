@@ -25,6 +25,7 @@ from pathlib import Path
 from typing import Any
 
 import pytest
+from fakes import FakeBroker, FakePriceOracle
 from telethon import errors
 from test_notifier import CbEvent, FakeBotClient, MsgEvent
 
@@ -36,6 +37,7 @@ from copytrader.models import (
     EntryType,
     ParsedAction,
     PendingConfirmation,
+    PositionStatus,
     Severity,
     Side,
     TakeProfit,
@@ -44,8 +46,6 @@ from copytrader.models import (
 from copytrader.storage.db import Database
 from copytrader.telegram import notifier as notifier_mod
 from copytrader.telegram.notifier import BotNotifier
-
-from fakes import FakeBroker, FakePriceOracle
 
 OWNER, FRIEND = 777, 555
 CHAT = -1001234567890
@@ -127,7 +127,7 @@ class World:
         self.tmp_path = tmp_path
         self.path = path or str(tmp_path / "bot.db")
 
-    async def up(self, *, tickmill_down: bool = False) -> "World":
+    async def up(self, *, tickmill_down: bool = False) -> World:
         self.db = Database(self.path)
         await self.db.open()
         self.client = Client()
@@ -539,12 +539,11 @@ async def test_r6_a_question_that_reaches_the_friend_late_says_so_or_is_not_sent
 
 
 async def test_r7_the_friend_is_known_before_the_notifier_starts(tmp_path: Path) -> None:
+    from fakes import FakeNotifier, FakeParser
     from test_app_cli import FakeListener, write_config
 
     from copytrader.app import build_app, serve
     from copytrader.config import load_config
-
-    from fakes import FakeNotifier, FakeParser
 
     path = str(tmp_path / "bot.db")
     db = Database(path)
@@ -581,3 +580,27 @@ async def test_r8_a_reply_to_the_owners_copy_is_no_correction(world: World) -> N
     assert [m.text for m in world.client.to(OWNER)] == [
         "Bu soruyu tickmill hesabının sahibi (arkadaşınız) cevaplıyor; bu soruda düzeltme yok."]
     assert world.tm.opened == []
+
+
+# --------------------------------------------------------------------------- #
+# review: his question and its outcome never name the owner's accounts
+# --------------------------------------------------------------------------- #
+async def test_his_question_and_a_refused_outcome_never_name_the_owners_accounts(world: World) -> None:
+    await world.owner_says(f"/arkadas {FRIEND}")
+    conf = await world.ask_catch_up()
+    (question,) = [m for m in world.client.to(FRIEND) if m.buttons]
+    assert "binance" not in question.text and "tickmill hesabında da açılsın mı?" in question.text
+    (copy,) = [m for m in world.client.to(OWNER) if "açılsın mı?" in m.text]
+    assert "binance hesabında açık" in copy.text                    # the owner's copy keeps it
+    # the owner's binance position closes before his Evet: refused, and the reason names binance
+    (bpos,) = [p for p in await world.db.broker_positions(conf.catch_up["trade_id"]) if p.broker == "binance"]
+    await world.db.save_broker_position(conf.catch_up["trade_id"], bpos.model_copy(
+        update={"status": PositionStatus.CLOSED, "remaining_quantity": 0.0}))
+    await world.n.handle_callback(CbEvent(f"ok:{conf.id}".encode(), sender_id=FRIEND, message_id=question.id))
+    await world.settle()
+    assert world.tm.opened == []
+    friend_edit = [e for e in world.client.edits_of(FRIEND) if e.msg_id == question.id][-1]
+    assert friend_edit.text.endswith("<b>Sonuç:</b> ⛔ Şartlar artık uygun değil; işlem hesabınızda açılmadı.")
+    assert not any("binance" in m.text for m in world.client.to(FRIEND))
+    assert not any("binance" in e.text for e in world.client.edits_of(FRIEND))
+    assert any("binance" in e.text for e in world.client.edits_of(OWNER))      # the owner gets the reason

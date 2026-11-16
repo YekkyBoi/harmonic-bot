@@ -477,3 +477,29 @@ async def test_numbers_are_never_a_range(world: World) -> None:
     await world.say("1 ve 3")
     assert (await world.status(ids[1]))["fx"] is PositionStatus.OPEN
     assert (await world.status(ids[0]))["fx"] is PositionStatus.CLOSED and (await world.status(ids[2]))["fx"] is PositionStatus.CLOSED
+
+
+async def test_a_number_while_a_correction_is_awaited_is_the_correction_never_a_choice(world: World,
+                                                                                      monkeypatch: pytest.MonkeyPatch
+                                                                                      ) -> None:
+    eth = await world.open("ETH")
+    await world.open("XAU")
+    await world.say("/pozkapat")
+    taken: list[str] = []
+
+    async def awaiting() -> str:
+        return "c1"
+
+    async def correction(conf_id: str, text: str) -> str:
+        taken.append(text)
+        return "düzeltme alındı"
+
+    monkeypatch.setattr(world.engine, "awaiting_correction_id", awaiting)
+    monkeypatch.setattr(world.engine, "handle_correction", correction)
+    await world.say("2")
+    assert taken == ["2"]
+    assert (await world.status(eth))["fx"] is PositionStatus.OPEN
+    for t in [eth, eth + 1]:
+        assert (await world.status(t))["fx"] is PositionStatus.OPEN
+    await world.say("/pozkapat 2")                                   # the command form still takes the list
+    assert (await world.status(eth + 1))["fx"] is PositionStatus.CLOSED
