@@ -196,8 +196,10 @@ async def test_auto_tells_the_friend_too_and_never_asks_him(tmp_path: Path) -> N
         for chat in (OWNER, FRIEND):
             texts = [m.text for m in world.client.to(chat)]
             assert sum(AUTO.format(n=1, label="ETH LONG") in t for t in texts) == 1, (chat, texts)
-            assert any("tickmill hesabında sonradan açıldı (otomatik; şartlar uygundu)" in t for t in texts), chat
             assert not any(m.buttons for m in world.client.to(chat))
+        assert any("tickmill hesabında sonradan açıldı (otomatik; şartlar uygundu)" in m.text
+                   for m in world.client.to(OWNER))
+        assert any("✅ #1 ETH LONG tickmill hesabınızda açıldı" in m.text for m in world.client.to(FRIEND))
     finally:
         await world.down()
 
@@ -323,7 +325,9 @@ async def test_r10_a_miss_that_could_not_be_dropped_from_storage_is_not_opened(t
         await world.settle()
         assert fails and world.tm.entered == 0                                       # nothing sent
         assert _owner(world) == [KEPT + "kayıt silinemedi; iki kez açılmaması için açılmadı" + MAY_OPEN]
-        assert [m.text for m in world.client.to(FRIEND)] == _owner(world)            # (never "AÇILMAYACAK")
+        assert [m.text for m in world.client.to(FRIEND)] == [                        # (never "AÇILMAYACAK")
+            "ℹ️ <b>tickmill</b> hesabınız yeniden bağlı. Bağlantı yokken atlanan şu işlem hesabınızda açılmadı:\n"
+            "• <b>#1 ETH LONG</b>"]
         assert list(await world.db.get_state("missed_optional_legs")) == ["1:tickmill"]
     finally:
         world.db.set_state = orig  # type: ignore[method-assign]
@@ -495,12 +499,16 @@ async def test_r6_the_notice_comes_before_a_failed_result_in_both_chats(tmp_path
         world.tm.open_position = failed  # type: ignore[method-assign]
         world.engine.monitor.heartbeat.on_healthy("tickmill")
         await world.settle()
-        for chat in (OWNER, FRIEND):
-            texts = [m.text for m in world.client.to(chat)]
-            (auto,) = [i for i, t in enumerate(texts) if AUTO.format(n=1, label="ETH LONG") in t]
-            (error,) = [i for i, t in enumerate(texts) if t.startswith("🚨 tickmill: <code>stop yerleştirilemedi")]
-            (done,) = [i for i, t in enumerate(texts) if "sonradan açılamadı (otomatik; şartlar uygundu)" in t]
-            assert auto < error < done, (chat, texts)
+        texts = [m.text for m in world.client.to(OWNER)]
+        (auto,) = [i for i, t in enumerate(texts) if AUTO.format(n=1, label="ETH LONG") in t]
+        (error,) = [i for i, t in enumerate(texts) if t.startswith("🚨 tickmill: <code>stop yerleştirilemedi")]
+        (done,) = [i for i, t in enumerate(texts) if "sonradan açılamadı (otomatik; şartlar uygundu)" in t]
+        assert auto < error < done, texts
+        texts = [m.text for m in world.client.to(FRIEND)]                    # his: the notice, then his own result
+        (auto,) = [i for i, t in enumerate(texts) if AUTO.format(n=1, label="ETH LONG") in t]
+        (failed,) = [i for i, t in enumerate(texts)
+                     if "#1 ETH LONG tickmill hesabınızda açılamadı: stop yerleştirilemedi (test)" in t]
+        assert auto < failed, texts
     finally:
         await world.down()
 
@@ -511,13 +519,15 @@ async def test_r7_the_friend_texts_hold_in_both_modes_and_turkish_capitals_work(
         await world.owner_says(f"/arkadas {FRIEND}")
         assert world.client.to(FRIEND)[0].text == (
             "👋 Merhaba! Bu sohbet, kopya-trade botunun bildirimlerini almak için bot sahibi tarafından eklendi. Bundan "
-            "sonra bot sahibine giden her bildirim buraya da gelir. tickmill bağlı değilken gelen bir işlem, bağlantı "
-            "gelince şartlar uygunsa bot sahibinin ayarına göre ya kendiliğinden açılır ya da size \"sonradan açılsın "
-            "mı?\" diye sorulur (✅ Evet / ❌ Hayır). Bu sohbetten bot komutları çalıştırılamaz.")
+            "sonra kendi hesabınızla ilgili bildirimler buraya gelir (açılan, değişen, kapanan işlemleriniz ve "
+            "hesabınızın bağlantısı). Hesabınız bağlı değilken gelen bir işlem, bağlantı gelince şartlar uygunsa bot "
+            "sahibinin ayarına göre ya kendiliğinden açılır ya da size \"sonradan açılsın mı?\" diye sorulur (✅ Evet / "
+            "❌ Hayır). Kendi komutlarınız için /yardim yazın.")
         await world.owner_says("/arkadas")
         assert _owner(world)[-1] == (
-            f"👤 Arkadaşınızın sohbeti: <code>{FRIEND}</code>. Size gelen her bildirim ona da gider; bağlantı yokken "
-            "atlanan tickmill işlemleri <code>/sonradan</code> ayarına göre ya kendiliğinden açılır ya da ona sorulur. "
+            f"👤 Arkadaşınızın sohbeti: <code>{FRIEND}</code>. Kendi hesabıyla ilgili bildirimler ona gider (sizin "
+            "hesaplarınızınki gitmez); bağlantı yokken atlanan tickmill işlemleri <code>/sonradan</code> ayarına göre "
+            "ya kendiliğinden açılır ya da ona sorulur. "
             "Kaldırmak için: <code>/arkadas sil</code>")
         await world.owner_says("/sonradan SOR")
         assert await world.engine.catch_up_mode() == "sor"

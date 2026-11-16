@@ -65,6 +65,8 @@ class BrokerHeartbeat:
         # Called with the broker's name after every check it passed (the engine looks then whether that account
         # missed a signal while it was not connected). Must not block; whatever it raises is logged only.
         self.on_healthy: Callable[[str], Any] | None = None
+        # (name, text) -> awaitable: a down / back notice also for the account's owner when he is not the bot's owner
+        self.account_note: Callable[[str, str], Any] | None = None
 
     @staticmethod
     def watched(broker: Any) -> bool:
@@ -155,6 +157,17 @@ class BrokerHeartbeat:
         except Exception:
             logger.exception("Heartbeat: the hook for a healthy %s failed", name)
 
+    async def _account_note(self, name: str, text: str) -> None:
+        """The same notice for the account's owner when it is not the bot's owner (``account_note``, set by the
+        engine: the friend's account). Never raises."""
+        note = getattr(self, "account_note", None)
+        if note is None:
+            return
+        try:
+            await note(name, text)
+        except Exception:
+            logger.exception("Heartbeat: the account note for %s failed", name)
+
     async def _record(self, name: str, problem: tuple[str, str] | None, *, quiet: bool = False) -> None:
         if problem is None:
             self._healthy(name)
@@ -166,11 +179,10 @@ class BrokerHeartbeat:
                     logger.info("Heartbeat: %s answers again after %d problem(s)", name, failed)
                 return
             logger.info("Heartbeat: %s is well again", name)
-            await self.notifier.notify(
-                f"✅ <b>{esc(name)}</b> " + ("hesabındaki sorun giderildi." if kind == _REPORTED
-                                            else "tekrar yanıt veriyor."),
-                Severity.INFO,
-            )
+            text = f"✅ <b>{esc(name)}</b> " + ("hesabındaki sorun giderildi." if kind == _REPORTED
+                                               else "tekrar yanıt veriyor.")
+            await self.notifier.notify(text, Severity.INFO)
+            await self._account_note(name, text)
             del self._alerted[name]         # only after the owner was told (else: tried again next round)
             return
         kind, reason = problem
@@ -180,11 +192,10 @@ class BrokerHeartbeat:
         logger.warning("Heartbeat: %s problem (%d in a row): %s", name, count, reason)
         if count < HEARTBEAT_ALERT_AFTER or name in self._alerted or quiet:
             return
-        await self.notifier.notify(
-            f"🔌 <b>{esc(name)}</b> " + ("hesabında sorun var" if kind == _REPORTED else "yanıt vermiyor")
-            + f": {esc(reason)}. Yeni sinyaller bu hesapta açılamayabilir.",
-            Severity.WARNING,
-        )
+        text = (f"🔌 <b>{esc(name)}</b> " + ("hesabında sorun var" if kind == _REPORTED else "yanıt vermiyor")
+                + f": {esc(reason)}. Yeni sinyaller bu hesapta açılamayabilir.")
+        await self.notifier.notify(text, Severity.WARNING)
+        await self._account_note(name, text)
         self._alerted[name] = kind          # only after the owner was told (else: tried again next round)
 
 

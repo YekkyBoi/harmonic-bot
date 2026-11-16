@@ -113,6 +113,7 @@ from .monitor import (
     is_virtual_pending,
     manage_wanted,
     note_unknown,
+    position_result_r,
     protection_problem,
     rollup_status,
     trade_closing,
@@ -902,6 +903,93 @@ def virtual_entry_wanted(broker: Broker, plan: TradePlan, route_kind: str | None
     )
 
 
+def _moved(a: float | None, b: float | None) -> bool:
+    if a is None or b is None:
+        return a is not b
+    return abs(a - b) > 1e-9 * max(1.0, abs(a), abs(b))
+
+
+def friend_position_events(before: BrokerPosition | None, after: BrokerPosition) -> list[str]:
+    """What changed for the account's owner between two saves of a position (pure): "opened", "pending", "filled",
+    "failed", "closed", "cancelled", "stop", "tp", "partial". [] for a save that changed nothing of that (a sync)."""
+    active = (PositionStatus.PENDING, PositionStatus.OPEN)
+    if before is None:
+        return {PositionStatus.OPEN: ["opened"], PositionStatus.PENDING: ["pending"],
+                PositionStatus.FAILED: ["failed"], PositionStatus.CLOSED: ["opened", "closed"]}.get(after.status, [])
+    if before.status in active and after.status is PositionStatus.CLOSED:
+        return ["closed"]
+    if before.status is PositionStatus.PENDING and after.status is PositionStatus.CANCELLED:
+        return ["cancelled"]
+    if before.status in active and after.status is PositionStatus.FAILED:
+        return ["failed"]
+    if after.status not in active:
+        return []
+    events = []
+    if before.status is PositionStatus.PENDING and after.status is PositionStatus.OPEN:
+        events.append("filled")
+    if _moved(before.stop_loss, after.stop_loss):
+        events.append("stop")
+    if [round(tp.price, 10) for tp in before.take_profits] != [round(tp.price, 10) for tp in after.take_profits]:
+        events.append("tp")
+    if (before.status is PositionStatus.OPEN and after.status is PositionStatus.OPEN
+            and after.remaining_quantity < before.remaining_quantity * (1.0 - 1e-9)):
+        events.append("partial")
+    return events
+
+
+def friend_position_text(trade: TradeRecord, before: BrokerPosition | None, after: BrokerPosition,
+                         events: list[str], currency: str = "") -> str:
+    """The friend's message about HIS position (HTML): this account only, never another one."""
+    label = f"#{trade.id} {esc(trade.plan.base_asset)} {trade.plan.side.value.upper()}"
+    name = esc(after.broker)
+    tps = " / ".join(fmt_price(tp.price) for tp in after.take_profits) or "yok"
+    lines: list[str] = []
+    for event in events:
+        if event == "opened":
+            size = after.remaining_quantity if after.status is PositionStatus.OPEN else after.quantity
+            lines.append(f"✅ {label} {name} hesabınızda açıldı: {_qty(size)} {esc(after.broker_symbol)}"
+                         + (f", giriş ~{fmt_price(after.avg_entry_price)}" if after.avg_entry_price else "")
+                         + f", stop {fmt_price(after.stop_loss)}, hedef {tps}")
+        elif event == "pending":
+            lines.append(f"⏳ {label} {name} hesabınızda bekliyor ({pos_status_text(after)}): stop "
+                         f"{fmt_price(after.stop_loss)}, hedef {tps}")
+        elif event == "filled":
+            lines.append(f"✅ {label} {name}: giriş emri doldu"
+                         + (f", giriş ~{fmt_price(after.avg_entry_price)}" if after.avg_entry_price else ""))
+        elif event == "failed":
+            lines.append(f"⚠️ {label} {name} hesabınızda açılamadı" + (f": {esc(after.error)}" if after.error else ""))
+        elif event == "stop":
+            lines.append(f"🔧 {label} {name}: stop {fmt_price(before.stop_loss if before else None)} → "
+                         f"{fmt_price(after.stop_loss)}")
+        elif event == "tp":
+            lines.append(f"🎯 {label} {name}: hedef {tps}")
+        elif event == "partial":
+            lines.append(f"✂️ {label} {name}: pozisyonun bir kısmı kapandı, kalan {_qty(after.remaining_quantity)}")
+        elif event == "cancelled":
+            lines.append(f"❌ {label} {name}: bekleyen giriş emri iptal edildi")
+        elif event == "closed":
+            r = position_result_r(after, trade.plan.risk_r)
+            money = (f"K/Z {after.realized_pnl:+.2f}" + (f" {esc(currency)}" if currency else "")
+                     if after.realized_pnl is not None else "K/Z bilinmiyor")
+            lines.append(f"🏁 {label} {name} hesabınızda kapandı. {money}" + (f" ({r:+.1f}R)" if r is not None else ""))
+    return "\n".join(lines)
+
+
+class _AccountNotifier:
+    """The notifier an account's adapter talks through when the account is the friend's: every notice goes to the
+    owner as before and the same text to the friend (the adapter's notices are about that one account only)."""
+
+    def __init__(self, notifier: Any, name: str, note: Callable[[str, str], Coroutine[Any, Any, None]]) -> None:
+        self._notifier, self._name, self._note = notifier, name, note
+
+    async def notify(self, text: str, severity: Severity = Severity.INFO) -> None:
+        await self._notifier.notify(text, severity)
+        await self._note(self._name, text)
+
+    def __getattr__(self, item: str) -> Any:        # (anything else the adapter may use: the owner's notifier's)
+        return getattr(self._notifier, item)
+
+
 @dataclass
 class AccountCloseTarget:
     """One account of a /pozkapat command: the trades whose position on it the command means."""
@@ -1054,6 +1142,12 @@ class Engine:
         self._catch_up_lock = asyncio.Lock()
         self._friend_chat: int | None = None       # the owner's friend's chat (/arkadas), as handed to the notifier
         self.monitor.heartbeat.on_healthy = self._broker_healthy
+        # The friend's own feed: what happens to HIS accounts' positions, told to him (never the owner's accounts;
+        # he gets no copy of the owner's messages). Every saved position of his accounts is looked at here.
+        self.monitor.heartbeat.account_note = self._friend_account_note
+        add_hook = getattr(db, "add_position_hook", None)
+        if callable(add_hook):
+            add_hook(self._friend_position_saved, self._is_friend_name)
 
     # ------------------------------------------------------------------ utils
     def _now(self) -> datetime:
@@ -1649,6 +1743,8 @@ class Engine:
             await self._notify(f"✅ <b>{esc(name)}</b> bağlandı (bot başladıktan sonra). Bundan sonraki sinyaller bu "
                                f"hesapta da açılacak; bağlanana kadar gelen sinyaller bu hesapta açılmadı{skipped}.",
                                Severity.INFO)
+            await self._friend_account_note(name, f"✅ <b>{esc(name)}</b> hesabınız bağlandı; yeni sinyaller bu hesapta "
+                                                  "açılacak.")
             # (after that notice: what the bot owes this account's positions is done now, see _owed_after_connect)
             self._spawn(self._owed_after_connect(name), f"owed-{name}")
             self._start_catch_up_check(name)
@@ -1663,7 +1759,9 @@ class Engine:
         """Connect one broker and read its currency. Raises on failure (the caller decides what that means)."""
         set_notifier = getattr(broker, "set_notifier", None)
         if set_notifier is not None:     # manual (message-only) brokers talk to the owner
-            set_notifier(self.notifier)
+            # (the friend's account: its own notices - its link down / back - reach him too)
+            set_notifier(_AccountNotifier(self.notifier, broker.name, self._friend_account_note)
+                         if self._friend_account(broker) else self.notifier)
         broker.set_risk_config(self.config.risk)
         await asyncio.wait_for(broker.connect(), CONNECT_TIMEOUT_SEC)
         broker.set_risk_config(self.config.risk)
@@ -1695,6 +1793,9 @@ class Engine:
             logger.exception("Broker %s failed to connect", broker.name)
             if self._is_optional(broker):
                 self.optional_down[broker.name] = reason
+                await self._friend_account_note(
+                    broker.name, f"⚠️ <b>{esc(broker.name)}</b> hesabınıza şu an bağlanılamadı; bağlantı gelene kadar "
+                                 "sinyaller bu hesapta açılmaz. Bot birkaç dakikada bir yeniden deniyor.")
                 await self._notify(
                     f"⚠️ <b>{esc(broker.name)}</b> bağlanamadı (isteğe bağlı hesap). Bot ve diğer hesaplar "
                     f"normal çalışıyor; {esc(broker.name)} için gelen sinyaller atlanacak. Arka planda "
@@ -1838,6 +1939,41 @@ class Engine:
     def friend_account_names(self) -> list[str]:
         """The owner's friend's accounts (see :meth:`_friend_account`), in the config's order."""
         return [b.name for b in self.configured_brokers if self._friend_account(b)]
+
+    def _is_friend_name(self, name: str) -> bool:
+        broker = next((b for b in self.configured_brokers if b.name == name), None)
+        return broker is not None and self._friend_account(broker)
+
+    async def _friend_account_note(self, name: str, text: str) -> None:
+        """A notice about one account (its connection), also for the friend when it is his. Never raises."""
+        if not self._is_friend_name(name):
+            return
+        note = getattr(self.notifier, "friend_note", None)
+        if callable(note):
+            try:
+                await note(text)
+            except Exception:
+                logger.exception("Could not tell the friend about %s", name)
+
+    def _friend_position_saved(self, trade_id: int, before: BrokerPosition | None, after: BrokerPosition) -> None:
+        """Database hook (never waits): a position of the friend's account was saved; what changed for him is told
+        to him in a task of its own."""
+        events = friend_position_events(before, after)
+        if events and callable(getattr(self.notifier, "friend_note", None)):
+            self._spawn(self._friend_position_note(trade_id, before, after, events),
+                        f"friend-note-{trade_id}-{after.broker}")
+
+    async def _friend_position_note(self, trade_id: int, before: BrokerPosition | None, after: BrokerPosition,
+                                    events: list[str]) -> None:
+        try:
+            trade = await self.db.get_trade(trade_id)
+            if trade is None:
+                return
+            text = friend_position_text(trade, before, after, events, self._currency.get(after.broker, ""))
+            if text:
+                await self.notifier.friend_note(text)
+        except Exception:      # (the friend's feed never touches the trading path)
+            logger.exception("The friend's note for trade %s on %s failed", trade_id, after.broker)
 
     def owner_close_names(self) -> list[str]:
         """The owner's own accounts a bare /pozkapat lists (never the friend's, never a manual one)."""
@@ -1994,8 +2130,15 @@ class Engine:
 
     async def _tell_not_caught_up(self, name: str, told: list[str], kept: list[str]) -> None:
         """``told``: the misses that will not be opened (why for each); ``kept``: those not opened now whose
-        removal from storage failed (otomatik), so a restart within the age limit can still open each once."""
+        removal from storage failed (otomatik), so a restart within the age limit can still open each once.
+        The friend (his account): which trades, without the reasons (they may name the owner's accounts)."""
         n = esc(name)
+        if told or kept:
+            labels = [line.split("</b>:", 1)[0] + "</b>" if "</b>:" in line else line for line in told + kept]
+            await self._friend_account_note(
+                name, f"ℹ️ <b>{n}</b> hesabınız yeniden bağlı. Bağlantı yokken atlanan "
+                      + ("şu işlem" if len(labels) == 1 else "şu işlemler") + " hesabınızda açılmadı:\n"
+                      + "\n".join(labels))
         if told:
             await self._notify(
                 f"ℹ️ <b>{n}</b> yeniden bağlı. Bağlantı yokken atlanan "
@@ -2480,6 +2623,7 @@ class Engine:
         try:
             if notice is not None:
                 await self._notify(notice, Severity.INFO)
+                await self._friend_account_note(broker.name, notice)     # (about his account only)
         finally:
             leg.announced.set()                 # nothing else reports it: its own notice comes when it answers
         await self._log("catch_up_open", {"trade_id": trade.id, "broker": name})

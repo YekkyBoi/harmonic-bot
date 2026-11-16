@@ -164,7 +164,7 @@ HELP_TEXT = (
     "/pozkapat — açık pozisyonlarınızın numaralı listesi; sonra numara yazın (ör. 2 ya da 1-3 = 1. ve 3.). Kısa "
     "yollar: /pozkapat fx1 · /pozkapat fx2 xau · /pozkapat fx1 hepsi\n"
     "/test &lt;metin&gt; — bir mesajın nasıl anlaşılacağını dene (işlem açmaz)\n"
-    "/arkadas &lt;sohbet_id&gt; — tickmill hesabının sahibine bildirimlerin kopyası (/arkadas: göster, "
+    "/arkadas &lt;sohbet_id&gt; — tickmill hesabının sahibi: kendi hesabının bildirimleri ve komutları (/arkadas: göster, "
     "/arkadas sil: kaldır)\n"
     "/sonradan otomatik | sor — bağlantı yokken atlanan tickmill işlemi: şartlar uygunsa sormadan aç ya da sor "
     "(/sonradan: göster)\n"
@@ -214,9 +214,10 @@ FRIEND_NO_ACCOUNT = "Bu botta size ait bir hesap tanımlı değil."
 FRIEND_BUTTON_REFUSED = "Bu düğme yalnızca bot sahibi içindir."
 FRIEND_HELLO = (
     "👋 Merhaba! Bu sohbet, kopya-trade botunun bildirimlerini almak için bot sahibi tarafından eklendi. Bundan sonra "
-    "bot sahibine giden her bildirim buraya da gelir. tickmill bağlı değilken gelen bir işlem, bağlantı gelince "
-    "şartlar uygunsa bot sahibinin ayarına göre ya kendiliğinden açılır ya da size \"sonradan açılsın mı?\" diye "
-    "sorulur (✅ Evet / ❌ Hayır). Bu sohbetten bot komutları çalıştırılamaz."
+    "kendi hesabınızla ilgili bildirimler buraya gelir (açılan, değişen, kapanan işlemleriniz ve hesabınızın "
+    "bağlantısı). Hesabınız bağlı değilken gelen bir işlem, bağlantı gelince şartlar uygunsa bot sahibinin ayarına "
+    "göre ya kendiliğinden açılır ya da size \"sonradan açılsın mı?\" diye sorulur (✅ Evet / ❌ Hayır). Kendi "
+    "komutlarınız için /yardim yazın."
 )
 FRIEND_CATCH_UP_NOTE = ("bağlantı yokken atlanan tickmill işlemleri <code>/sonradan</code> ayarına göre ya kendiliğinden "
                         "açılır ya da ona sorulur.")
@@ -659,7 +660,9 @@ class BotNotifier:
                 late = self._sent.get(conf.id)
                 msg_id = late[0] if late else None
             closed_html = format_confirmation(conf, with_expiry=False)
-            if self._friend is not None:   # (his copy of the question shows the outcome too)
+            # (only a question that was HIS - his catch-up question - shows him its outcome: he gets no other)
+            decider = (conf.catch_up or {}).get("decider") if conf.kind == "catch_up" else None
+            if self._friend is not None and decider is not None and decider == self._friend:
                 self._friend_put(_FriendMessage(text=f"{closed_html}\n\n{outcome}", conf_id=conf.id, closing=True))
             reasked = self._owner_reask.pop(conf.id, None)
             if reasked is not None and reasked != msg_id:  # the copy sent to the owner with buttons after a change
@@ -1140,11 +1143,15 @@ class BotNotifier:
             and sender_id != self._owner
 
     def _mirror(self, text: str, *, buttons: bool = False) -> None:
-        """A read-only copy of an owner message for the friend (a message with buttons: without them, and one line
-        saying that the owner decides). Never waits, never raises."""
-        if self._friend is None or not text or not text.strip():
-            return
-        self._friend_put(_FriendMessage(text=f"{text}\n\n{FRIEND_OWNER_DECIDES}" if buttons else text))
+        """The friend gets NO copy of the owner's messages (they show the owner's accounts): his own messages are
+        made for him (:meth:`friend_note`: his account's positions and link, his questions, his commands' answers).
+        Kept as a no-op so that every former copy site stays closed."""
+        return
+
+    async def friend_note(self, text: str) -> None:
+        """A message made for the friend alone (about his own account). Never raises; nothing without a friend."""
+        if self._friend is not None and text and text.strip():
+            self._friend_put(_FriendMessage(text=text))
 
     def _friend_put(self, message: _FriendMessage) -> None:
         if self._friend is None or self._client is None or self._shut:
@@ -1456,8 +1463,8 @@ class BotNotifier:
                 await self._send("👤 Arkadaş sohbeti ayarlı değil. Eklemek için: <code>/arkadas &lt;sohbet_id&gt;</code> "
                                  "(arkadaşınız önce botu Telegram'da açıp Start'a basmalı).", mirror=False)
             else:
-                await self._send(f"👤 Arkadaşınızın sohbeti: <code>{self._friend}</code>. Size gelen her bildirim ona "
-                                 f"da gider; {FRIEND_CATCH_UP_NOTE} Kaldırmak için: <code>/arkadas sil</code>",
+                await self._send(f"👤 Arkadaşınızın sohbeti: <code>{self._friend}</code>. Kendi hesabıyla ilgili bildirimler ona gider (sizin hesaplarınızınki gitmez); "
+                                 f"{FRIEND_CATCH_UP_NOTE} Kaldırmak için: <code>/arkadas sil</code>",
                                  mirror=False)
             return
         if store is None:
@@ -1500,7 +1507,7 @@ class BotNotifier:
         if mirror is not None and old != chat and self._send_bind_help(mirror):
             extra += GROUP_FRIEND_HELP_SENT          # (the copy is on: the new friend is told how to bind his groups)
         await self._send(f"✅ Arkadaşınızın sohbeti kaydedildi (<code>{chat}</code>); deneme mesajı ulaştı. Bundan sonra "
-                         f"size gelen her bildirim ona da gider; {FRIEND_CATCH_UP_NOTE}" + extra, mirror=False)
+                         f"kendi hesabıyla ilgili bildirimler ona gider (sizin hesaplarınızınki gitmez); {FRIEND_CATCH_UP_NOTE}" + extra, mirror=False)
 
     async def _group_friend_changed(self, old: int | None, new: int | None) -> bool:
         """The friend changed (or was removed): the group copy's bindings, waiting copies and edit memory were his and
@@ -2032,7 +2039,7 @@ class BotNotifier:
                 await mirror.set_enabled(False)
                 text = "✅ Grup kopyası kapatıldı; kaynak gruptaki mesajlar artık arkadaşınızın gruplarına gönderilmiyor."
                 if self._friend is not None:
-                    text += " Size gelen bildirimlerin kopyası ona gitmeye devam eder."
+                    text += " Kendi hesabıyla ilgili bildirimler ona gitmeye devam eder."
                 await self._send(text, mirror=False)
                 if was_on:
                     self._friend_put(_FriendMessage(text=GROUP_OFF_FRIEND))

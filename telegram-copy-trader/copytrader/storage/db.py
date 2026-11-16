@@ -275,6 +275,14 @@ def _json_default(obj: Any) -> Any:
 # --------------------------------------------------------------------------- #
 # Database
 # --------------------------------------------------------------------------- #
+def _wants(wants: Callable[[str], bool], broker: str) -> bool:
+    try:
+        return bool(wants(broker))
+    except Exception:
+        log.exception("A position hook's filter failed for %s", broker)
+        return False
+
+
 class Database:
     """Async SQLite persistence (see :class:`copytrader.interfaces.Storage`)."""
 
@@ -287,6 +295,9 @@ class Database:
         self._conn: aiosqlite.Connection | None = None
         self._lock: asyncio.Lock | None = None
         self._pinned: dict[int, set[int]] = {}     # chat -> message ids of triggered, unprocessed batches
+        # (hook, wants): told about every saved position of an account ``wants(broker)`` (add_position_hook)
+        self._position_hooks: list[tuple[Callable[[int, BrokerPosition | None, BrokerPosition], None],
+                                         Callable[[str], bool]]] = []
 
     @property
     def is_memory(self) -> bool:
@@ -806,8 +817,27 @@ class Database:
                 updated_at = excluded.updated_at
         """
         position_json = _model_to_json(pos)
+        hooks = [hook for hook, wants in self._position_hooks if _wants(wants, pos.broker)]
+        old: BrokerPosition | None = None
         async with self._write() as conn:
+            if hooks:      # (what it was, read in the same write: only for the accounts a hook looks at)
+                rows = await self._fetchall(
+                    conn, "SELECT position_json FROM broker_positions WHERE trade_id = ? AND broker = ?",
+                    (trade_id, pos.broker))
+                old = _load_position(rows[0]["position_json"]) if rows else None
             await conn.execute(sql, (trade_id, pos.broker, position_json, status.value, closed_at, pnl, now))
+        for hook in hooks:
+            try:
+                hook(trade_id, old, pos)
+            except Exception:      # (a watcher never fails a write)
+                log.exception("A position hook failed for trade %s / %s", trade_id, pos.broker)
+
+    def add_position_hook(self, hook: Callable[[int, BrokerPosition | None, BrokerPosition], None],
+                          wants: Callable[[str], bool]) -> None:
+        """``hook(trade_id, before, after)`` right after a position of an account ``wants(broker)`` was saved
+        (``before``: as stored until then, None for a new one). It must not wait (start a task for anything slow)
+        and never raises into the write."""
+        self._position_hooks.append((hook, wants))
 
     async def broker_positions(self, trade_id: int) -> list[BrokerPosition]:
         """Positions of one trade, in the order they were first saved."""

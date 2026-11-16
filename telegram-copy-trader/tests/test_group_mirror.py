@@ -302,6 +302,13 @@ class World:
         return self.texts(OWNER)
 
 
+
+async def both(w: Any, text: str) -> None:
+    """A notice for the owner and the friend's own message of the same text (the friend gets no copy of the
+    owner's messages: his own are made for him)."""
+    await w.n.notify(text)
+    await w.n.friend_note("ℹ️ " + text)
+
 async def world(tmp_path: Path, **kw: Any) -> World:
     return await World(tmp_path, **kw).up()
 
@@ -393,7 +400,7 @@ async def test_g2_grup_commands_are_the_owners_stored_and_survive_a_restart(tmp_
 
     await w.owner_says("/grup KAPAT")
     assert w.owner_texts()[-1] == ("✅ Grup kopyası kapatıldı; kaynak gruptaki mesajlar artık arkadaşınızın gruplarına "
-                                   "gönderilmiyor. Size gelen bildirimlerin kopyası ona gitmeye devam eder.")
+                                   "gönderilmiyor. Kendi hesabıyla ilgili bildirimler ona gitmeye devam eder.")
     assert w.friend_texts()[-1] == ("👥 Bot sahibi grup kopyasını kapattı; kaynak gruptaki mesajlar artık gruplarınıza "
                                     "gelmeyecek.")
     stored = w.db.state["group_mirror"]
@@ -541,9 +548,9 @@ async def test_b3_a_new_friend_drops_the_bindings_queue_and_edit_memory_and_gets
     held.set_result(None)
     await w.settle()
     assert w.owner_texts()[-1] == (
-        f"✅ Arkadaşınızın sohbeti kaydedildi (<code>{NEW_FRIEND}</code>); deneme mesajı ulaştı. Bundan sonra size gelen "
-        "her bildirim ona da gider; bağlantı yokken atlanan tickmill işlemleri <code>/sonradan</code> ayarına göre ya "
-        "kendiliğinden açılır ya da ona sorulur.\n"
+        f"✅ Arkadaşınızın sohbeti kaydedildi (<code>{NEW_FRIEND}</code>); deneme mesajı ulaştı. Bundan sonra kendi "
+        "hesabıyla ilgili bildirimler ona gider (sizin hesaplarınızınki gitmez); bağlantı yokken atlanan tickmill "
+        "işlemleri <code>/sonradan</code> ayarına göre ya kendiliğinden açılır ya da ona sorulur.\n"
         "Eski arkadaşınızın grup kopyası için bağladığı gruplar ve bekleyen kopyalar kaldırıldı.\n"
         "Grup kopyası açık: arkadaşınıza gruplarını nasıl bağlayacağı yazıldı.")
     assert w.texts(NEW_FRIEND)[-1] == BIND_HELP_BOTH
@@ -1067,7 +1074,7 @@ async def test_g8_r3_failures_are_told_once_an_hour_with_a_throttle_of_their_own
     assert w.mirror.failed == 2 and len([r for r in caplog.records if "to the ana group failed" in r.getMessage()]) == 2
     # later the friend blocks the bot: the owner hears about his notifications all the same (reviewer r3)
     w.bot.fail_for[FRIEND] = errors.UserIsBlockedError(request=None)
-    await w.n.notify("tickmill: ETH long açıldı")
+    await both(w, "tickmill: ETH long açıldı")
     await w.settle()
     assert any(t.startswith(f"⚠️ Arkadaşınıza (<code>{FRIEND}</code>) mesaj iletilemedi") for t in w.owner_texts())
 
@@ -1082,7 +1089,7 @@ async def test_g9_flood_wait_is_waited_for_each_copy_goes_once_and_the_friends_q
     await w.deliver(Msg(id=1001, message="bir", reply_to=in_topic(SOHBET)),
                     Msg(id=1002, message="iki", reply_to=in_topic(SOHBET)))
     await asyncio.sleep(0.2)
-    await w.n.notify("bildirim")                                # the friend's own copy during the group FloodWait
+    await both(w, "bildirim")                                # the friend's own copy during the group FloodWait
     await w.settle()
     assert time.monotonic() - t0 >= 1.0
     assert [body(t) for t in w.sohbet()] == ["bir", "iki"]     # each once, in order
@@ -1105,7 +1112,7 @@ async def test_g9_a_flood_wait_of_the_friends_own_message_is_waited_out_not_drop
     monkeypatch.setattr(notifier_mod, "FLOOD_MARGIN_SEC", 0.0)
     w = await world(tmp_path, on=False, bind=False)
     w.bot.fail_once_for[FRIEND] = [errors.FloodWaitError(request=None, capture=1)]
-    await w.n.notify("tickmill bağlandı")
+    await both(w, "tickmill bağlandı")
     await w.settle()
     assert w.friend_texts() == ["ℹ️ tickmill bağlandı"] and w.owner_texts() == ["ℹ️ tickmill bağlandı"]
 
@@ -1132,9 +1139,9 @@ async def test_g10_a_send_without_an_answer_is_never_cancelled_nor_sent_twice(
 async def test_g11_the_friends_own_messages_go_first(tmp_path: Path) -> None:
     w = await world(tmp_path)
     w.bot.send_delay = 0.05
-    await w.n.notify("tickmill bağlandı")
+    await both(w, "tickmill bağlandı")
     await w.deliver(Msg(id=1201, message="grup mesajı", reply_to=in_topic(SOHBET)))
-    await w.n.notify("ikinci bildirim")
+    await both(w, "ikinci bildirim")
     await w.settle()
     order = [m.text for m in w.bot.sent if m.entity in (FRIEND, SOHBET_G)]
     assert order == ["ℹ️ tickmill bağlandı", "ℹ️ ikinci bildirim", "💬 <b>Sohbet</b> · Kadir\ngrup mesajı"]
@@ -1416,7 +1423,7 @@ async def test_n4_a_group_flood_wait_never_delays_the_friends_own_messages_nor_h
     w.n._group_hold_until = time.monotonic() + 3600             # a group got a long FloodWait (group copies held)
     t0 = time.monotonic()
     for i in range(4):
-        await w.n.notify(f"bildirim {i}")
+        await both(w, f"bildirim {i}")
     await w.settle(10)
     assert w.friend_texts() == [f"ℹ️ bildirim {i}" for i in range(4)] and time.monotonic() - t0 < 0.5
     from test_friend_mirror import _open_conf
@@ -1505,7 +1512,7 @@ async def test_n3i_an_open_question_goes_before_an_ordinary_message_waiting_out_
     from test_friend_mirror import _open_conf
 
     w.bot.fail_once_for[FRIEND] = [errors.FloodWaitError(request=None, capture=2)]
-    await w.n.notify("sıradan bildirim")                        # its send gets a FloodWait of 2 s ...
+    await both(w, "sıradan bildirim")                        # its send gets a FloodWait of 2 s ...
     conf = _open_conf("q2")
     conf.kind, conf.catch_up = "catch_up", {"decider": FRIEND, "broker": "tickmill"}
     await w.n.ask_confirmation(conf)                             # ... and the tickmill question comes behind it
@@ -1533,7 +1540,7 @@ async def test_r3_a_flood_wait_on_the_second_part_of_a_long_friend_message_never
         return await real(entity, message, **kw)
 
     w.bot.send_message = send_message                            # type: ignore[method-assign]
-    await w.n.notify("BIRINCI_PARCA " + "x " * 2500 + " IKINCI_PARCA")
+    await both(w, "BIRINCI_PARCA " + "x " * 2500 + " IKINCI_PARCA")
     await w.settle(10)
     texts = w.friend_texts()
     assert len([t for t in texts if "BIRINCI_PARCA" in t]) == 1 and len([t for t in texts if "IKINCI_PARCA" in t]) == 1

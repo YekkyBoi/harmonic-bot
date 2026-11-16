@@ -219,8 +219,9 @@ async def test_f2_arkadas_stores_the_chat_after_a_test_message_reaches_it(tmp_pa
         assert hello.text.startswith("👋 Merhaba! Bu sohbet, kopya-trade botunun bildirimlerini almak için bot sahibi "
                                      "tarafından eklendi.")
         assert world.client.to(OWNER)[-1].text == (
-            f"✅ Arkadaşınızın sohbeti kaydedildi (<code>{FRIEND}</code>); deneme mesajı ulaştı. Bundan sonra size "
-            "gelen her bildirim ona da gider; bağlantı yokken atlanan tickmill işlemleri <code>/sonradan</code> ayarına "
+            f"✅ Arkadaşınızın sohbeti kaydedildi (<code>{FRIEND}</code>); deneme mesajı ulaştı. Bundan sonra kendi "
+            "hesabıyla ilgili bildirimler ona gider (sizin hesaplarınızınki gitmez); bağlantı yokken atlanan tickmill "
+            "işlemleri <code>/sonradan</code> ayarına "
             "göre ya kendiliğinden açılır ya da ona sorulur.")
         assert await world.db.get_state("friend_chat_id") == FRIEND
         await world.owner_says("/arkadas")
@@ -231,9 +232,9 @@ async def test_f2_arkadas_stores_the_chat_after_a_test_message_reaches_it(tmp_pa
 
     again = await World(tmp_path, world.path).up()           # a restart keeps it
     try:
-        await again.n.notify("yeniden başladı")
+        await again.n.friend_note("yeniden başladı")
         await again.settle()
-        assert [m.text for m in again.client.to(FRIEND)] == ["ℹ️ yeniden başladı"]
+        assert [m.text for m in again.client.to(FRIEND)] == ["yeniden başladı"]
         await again.owner_says("/arkadas sil")
         assert again.client.to(OWNER)[-1].text == ("✅ Arkadaş sohbeti kaldırıldı; bildirimler artık yalnızca size "
                                                    "gelir (<code>/sonradan sor</code> seçiliyse tickmill sorularını siz "
@@ -265,32 +266,30 @@ async def test_f3_arkadas_refuses_wrong_ids_and_explains_start(world: World) -> 
     assert await world.db.get_state("friend_chat_id") is None
 
 
-async def test_f4_every_owner_message_is_mirrored_and_buttons_stay_with_the_owner(world: World) -> None:
+async def test_f4_the_friend_gets_no_copy_of_the_owners_messages_only_his_own(world: World) -> None:
+    """(The owner's choice changed from "Her şey" to "only tickmill": no copy of any owner message - they show the
+    owner's accounts; the friend's own messages are made for him.)"""
     await world.owner_says(f"/arkadas {FRIEND}")
     world.client.sent.clear()
-    await world.n.notify("tickmill bağlandı", Severity.INFO)
+    await world.n.notify("fx bakiyesi 9973 USD", Severity.INFO)
     await world.settle()
-    assert [m.text for m in world.client.to(OWNER)] == ["ℹ️ tickmill bağlandı"]
-    assert [m.text for m in world.client.to(FRIEND)] == ["ℹ️ tickmill bağlandı"]
+    assert [m.text for m in world.client.to(OWNER)] == ["ℹ️ fx bakiyesi 9973 USD"]
+    assert world.client.to(FRIEND) == []
 
     conf = _open_conf()
     conf.bot_message_id = await world.n.ask_confirmation(conf)
     await world.settle()
     (asked,) = [m for m in world.client.to(OWNER) if m.buttons]
     assert [t for t, _ in buttons(asked)] == ["✅ Onayla", "✏️ Düzelt", "❌ İptal"]
-    mirrored = world.client.to(FRIEND)[-1]
-    assert mirrored.buttons is None
-    assert mirrored.text == asked.text + "\n\n👤 Bu mesajdaki seçimi bot sahibi yapar (düğmeler yalnızca onda)."
     await world.n.close_confirmation(conf, "✅ İşlem açıldı")
+    await world.owner_says("/yardim")
+    await world.owner_says("/bakiye")
     await world.settle()
-    assert world.client.edits_of(OWNER)[-1].text.endswith("<b>Sonuç:</b> ✅ İşlem açıldı")
-    outcome = world.client.to(FRIEND)[-1]
-    assert outcome.text.endswith("<b>Sonuç:</b> ✅ İşlem açıldı") and "ETH" in outcome.text and outcome.buttons is None
-    assert world.client.edits_of(FRIEND) == []
+    assert world.client.to(FRIEND) == [] and world.client.edits_of(FRIEND) == []
 
-    await world.owner_says("/yardim")                        # replies to the owner's own commands too ("Her şey")
-    assert world.client.to(FRIEND)[-1].text == world.client.to(OWNER)[-1].text
-    assert "/arkadas" in world.client.to(OWNER)[-1].text
+    await world.n.friend_note("✅ #1 ETH LONG tickmill hesabınızda açıldı")       # his own messages: his
+    await world.settle()
+    assert [m.text for m in world.client.to(FRIEND)] == ["✅ #1 ETH LONG tickmill hesabınızda açıldı"]
 
 
 async def test_f5_the_friend_answers_the_tickmill_question_and_both_see_the_result(world: World) -> None:
@@ -316,9 +315,9 @@ async def test_f5_the_friend_answers_the_tickmill_question_and_both_see_the_resu
     assert owner_edit.text.endswith(f"<b>Sonuç:</b> {answer}") and owner_edit.buttons is None
     friend_edit = [e for e in world.client.edits_of(FRIEND) if e.msg_id == question.id][-1]
     assert friend_edit.text.endswith(f"<b>Sonuç:</b> {answer}") and friend_edit.buttons is None
-    for chat in (OWNER, FRIEND):                             # the open's own result reaches both
-        assert any("tickmill hesabında sonradan açıldı (tickmill hesabının sahibinin onayıyla)" in m.text
-                   for m in world.client.to(chat)), chat
+    assert any("tickmill hesabında sonradan açıldı (tickmill hesabının sahibinin onayıyla)" in m.text
+               for m in world.client.to(OWNER))
+    assert any("✅ #1 ETH LONG tickmill hesabınızda açıldı" in m.text for m in world.client.to(FRIEND))
     # once only
     await world.n.handle_callback(CbEvent(f"ok:{conf.id}".encode(), sender_id=FRIEND, message_id=question.id))
     await world.settle()
@@ -359,6 +358,7 @@ async def test_f7_a_dead_friend_chat_never_holds_the_owner_and_is_told_once_an_h
     t0 = time.monotonic()
     for i in range(3):
         await world.n.notify(f"bildirim {i}")
+        await world.n.friend_note(f"onun bildirimi {i}")
     assert time.monotonic() - t0 < 0.5
     assert [m.text for m in world.client.to(OWNER)] == ["ℹ️ bildirim 0", "ℹ️ bildirim 1", "ℹ️ bildirim 2"]
     await world.settle()
@@ -368,6 +368,7 @@ async def test_f7_a_dead_friend_chat_never_holds_the_owner_and_is_told_once_an_h
     world.client.hang_for.clear()
     world.client.fail_for[FRIEND] = errors.UserIsBlockedError(request=None)
     await world.n.notify("bir tane daha")
+    await world.n.friend_note("onun bir tane daha")
     await world.settle()
     assert len([m for m in world.client.to(OWNER) if "Arkadaşınıza" in m.text]) == 1      # not again within the hour
     assert world.client.to(FRIEND) == []
@@ -492,8 +493,8 @@ async def test_r4_who_approved_is_named_in_both_chats(world: World) -> None:
     await world.n.handle_callback(CbEvent(f"ok:{conf.id}".encode(), sender_id=FRIEND, message_id=question.id))
     await world.settle()
     title = "✅ <b>#1 ETH LONG</b> — tickmill hesabında sonradan açıldı (tickmill hesabının sahibinin onayıyla)"
-    for chat in (OWNER, FRIEND):
-        assert any(title in m.text for m in world.client.to(chat)), chat
+    assert any(title in m.text for m in world.client.to(OWNER))
+    assert any("✅ #1 ETH LONG tickmill hesabınızda açıldı" in m.text for m in world.client.to(FRIEND))
     assert not any("onayınızla" in m.text for m in world.client.sent)
 
 
@@ -504,9 +505,8 @@ async def test_r4_the_owners_own_approval_is_named_when_a_friend_reads_along(wor
     await world.n.handle_callback(CbEvent(f"ok:{conf.id}".encode(), sender_id=OWNER, message_id=owner_q.id))
     await world.settle()
     title = "✅ <b>#1 ETH LONG</b> — tickmill hesabında sonradan açıldı (bot sahibinin onayıyla)"
-    for chat in (OWNER, FRIEND):
-        assert any(title in m.text for m in world.client.to(chat)), chat
-    assert any("✅ Evet (yanıtlayan: bot sahibi): tickmill hesabına emir" in m.text for m in world.client.to(FRIEND))
+    assert any(title in m.text for m in world.client.to(OWNER))
+    assert any("✅ #1 ETH LONG tickmill hesabınızda açıldı" in m.text for m in world.client.to(FRIEND))
 
 
 async def test_r5_a_friend_press_on_a_question_he_was_never_given_is_refused(world: World) -> None:

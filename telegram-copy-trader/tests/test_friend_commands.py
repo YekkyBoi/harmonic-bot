@@ -38,6 +38,14 @@ class World(_World):
             await asyncio.sleep(0.01)
         await asyncio.sleep(0.02)
 
+    async def open(self, *args, **kw):  # type: ignore[override]
+        """As the base, then the friend's own feed of that open is waited for and set aside."""
+        tid = await super().open(*args, **kw)
+        await self.friend_settle()
+        self.feed = [m.text for m in self.client.to(FRIEND)]
+        self.client.sent[:] = [m for m in self.client.sent if m.entity != FRIEND]
+        return tid
+
     async def friend_says(self, text: str) -> None:
         await self.n.handle_message(MsgEvent(text, sender_id=FRIEND))
         await self.friend_settle()
@@ -161,3 +169,50 @@ async def test_an_empty_account_list_is_no_command(world: World) -> None:
     await world.friend_says("/pozkapat xau 7")
     assert "Hesaplar: tickmill" in world.to_friend()[-1] and "fx" not in world.to_friend()[-1]
     assert await world.status(tid) == {"fx": PositionStatus.OPEN, "tickmill": PositionStatus.OPEN}
+
+
+# --------------------------------------------------------------------------- #
+# his own feed: what happens to his account, nothing of the owner's
+# --------------------------------------------------------------------------- #
+async def test_his_feed_tells_his_open_stop_move_and_close_and_nothing_of_the_owners(world: World) -> None:
+    from datetime import UTC, datetime
+
+    from copytrader.models import ActionType, ManagementPlan
+    tid = await world.open()
+    assert world.feed == [(f"✅ #{tid} ETH LONG tickmill hesabınızda açıldı: 6.079 ETH/USDT:USDT, giriş ~2232.9, "
+                           "stop 2200, hedef 2300")]
+    move = ManagementPlan(plan_id="m", action=ActionType.MOVE_SL, trade_id=tid, new_stop_loss=2210.0,
+                          source_chat_id=-1001234567890, source_message_ids=[7], summary_tr="stop 2210",
+                          created_at=datetime.now(UTC))
+    await world.engine.execute_management(move)
+    close = ManagementPlan(plan_id="c", action=ActionType.CLOSE, trade_id=tid, close_fraction=1.0,
+                           source_chat_id=-1001234567890, source_message_ids=[8], summary_tr="kapattık",
+                           created_at=datetime.now(UTC))
+    await world.engine.execute_management(close)
+    await world.friend_settle()
+    texts = world.to_friend()
+    assert texts == [f"🔧 #{tid} ETH LONG tickmill: stop 2200 → 2210",
+                     f"🏁 #{tid} ETH LONG tickmill hesabınızda kapandı. K/Z +0.00 USDT (+0.0R)"]
+    assert not any("fx" in t for t in [*texts, *world.feed])
+
+
+async def test_the_owners_messages_never_reach_him(world: World) -> None:
+    await world.open()
+    for command in ("/bakiye", "/pozisyonlar", "/yardim", "/durum", "/karne"):
+        await world.say(command)
+    await world.n.notify("fx bakiyesi 9973 USD")
+    await world.friend_settle()
+    assert world.to_friend() == []
+
+
+def test_a_save_that_changes_nothing_for_him_says_nothing() -> None:
+    from copytrader.engine.orchestrator import friend_position_events
+    from copytrader.models import BrokerPosition, Side
+    pos = BrokerPosition(broker="tickmill", broker_symbol="ETHUSD", side=Side.LONG, status=PositionStatus.OPEN,
+                         quantity=1.0, filled_quantity=1.0, remaining_quantity=1.0, avg_entry_price=2000.0,
+                         stop_loss=1900.0)
+    assert friend_position_events(pos, pos.model_copy(update={"data": {"synced": 1}})) == []
+    assert friend_position_events(pos, pos.model_copy(update={"remaining_quantity": 0.5})) == ["partial"]
+    assert friend_position_events(pos.model_copy(update={"status": PositionStatus.PENDING}),
+                                  pos.model_copy(update={"status": PositionStatus.CANCELLED})) == ["cancelled"]
+    assert friend_position_events(None, pos) == ["opened"]
