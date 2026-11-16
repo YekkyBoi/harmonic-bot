@@ -117,6 +117,7 @@ keep_pillow_out_of_telethon()
 
 MAX_CHUNK = 4000                  # Telegram limit is 4096 chars after entity parsing
 CLOSEALL_TTL_SEC = 120.0          # a "close all" yes-button older than this is refused
+POZKAPAT_TTL_SEC = 300.0          # a /pozkapat choice button older than this is refused
 STOP_GRACE_SEC = 30.0
 _CACHE_SIZE = 500
 
@@ -157,6 +158,8 @@ HELP_TEXT = (
     "/durdur — yeni işlem açmayı durdur\n"
     "/devam — yeni işlem açmaya devam et\n"
     "/hepsini_kapat — tüm pozisyonları kapat (onay ister)\n"
+    "/pozkapat &lt;hesap&gt; [varlık] — sadece o hesaptaki pozisyonu kapat (ör. /pozkapat fx1 · /pozkapat fx1,fx2 · "
+    "/pozkapat fx2 xau); tek pozisyon varsa hemen kapatır, birden fazlaysa hangisi diye sorar\n"
     "/test &lt;metin&gt; — bir mesajın nasıl anlaşılacağını dene (işlem açmaz)\n"
     "/arkadas &lt;sohbet_id&gt; — tickmill hesabının sahibine bildirimlerin kopyası (/arkadas: göster, "
     "/arkadas sil: kaldır)\n"
@@ -284,6 +287,7 @@ _COMMANDS = {
     "durdur": "pause", "pause": "pause",
     "devam": "resume", "resume": "resume",
     "hepsini_kapat": "closeall", "closeall": "closeall",
+    "pozkapat": "pozkapat",
     "test": "test",
     "arkadas": "friend", "arkadaş": "friend",
     "sonradan": "catchup",
@@ -403,6 +407,8 @@ class BotNotifier:
         self._sent: OrderedDict[str, tuple[int, str]] = OrderedDict()     # conf id -> (msg id, closed html)
         self._by_msg: OrderedDict[int, str] = OrderedDict()               # bot msg id -> conf id
         self._closeall_prompt: tuple[int, float] | None = None
+        # /pozkapat questions: message id -> (sent at, account, trade ids offered, text, buttons); in memory only
+        self._pk_prompts: dict[int, tuple[float, str, list[int], str, Any]] = {}
         self._tasks: set[asyncio.Task[Any]] = set()
         self._unreachable_logged = False
         # ---- delivery state (see the module docstring) ----
@@ -800,6 +806,9 @@ class BotNotifier:
         elif command == "closeall":
             await self._ask_close_all()
             return
+        elif command == "pozkapat":
+            await self._pozkapat_command(engine, args)
+            return
         elif command == "friend":
             await self._friend_command(args)
             return
@@ -845,6 +854,90 @@ class BotNotifier:
 
         await self._send(text, buttons=buttons, on_sent=prompt_sent)
 
+    # ---- /pozkapat: one account's positions ---------------------------------
+    async def _pozkapat_command(self, engine: Any, args: str) -> None:
+        """Each named account: no position -> said; exactly one -> closed at once; more -> asked which (buttons)."""
+        problem, targets = await engine.account_close_request(args)
+        if problem:
+            await self._send(problem)
+            return
+        done: list[str] = []
+        for target in targets:
+            what = f" ({esc(target.what)})" if target.what else ""
+            if not target.matches:
+                done.append(f"ℹ️ <b>{esc(target.broker)}</b>{what}: kapatılacak açık pozisyon yok.")
+            elif len(target.matches) == 1:
+                result = await engine.close_on_account(target.broker, [target.matches[0][0]])
+                if result in _NOT_NOW:
+                    await self._send(result + "\nHiçbir pozisyon kapatılmadı.")
+                    return
+                done.append(result)
+            else:
+                await self._ask_pozkapat(target, what)
+        if done:
+            await self._send("\n\n".join(done))
+
+    async def _ask_pozkapat(self, target: Any, what: str) -> None:
+        ids = [tid for tid, _label in target.matches]
+        text = (f"❓ <b>{esc(target.broker)}</b> hesabında {len(ids)} pozisyon var{what}. Hangisi kapatılsın?\n"
+                + "\n".join(f"• {esc(label)}" for _tid, label in target.matches)
+                + f"\n({int(POZKAPAT_TTL_SEC // 60)} dk içinde seçin.)")
+        buttons = [[Button.inline(f"🔒 {label}"[:60], f"pk:{tid}".encode())] for tid, label in target.matches]
+        buttons.append([Button.inline("🔒 Hepsini kapat", b"pk:all"), Button.inline("❌ Vazgeç", b"pk:x")])
+
+        def prompt_sent(msg_id: int) -> None:    # (its time starts at delivery)
+            self._pk_prompts[msg_id] = (time.monotonic(), target.broker, ids, text, buttons)
+
+        await self._send(text, buttons=buttons, on_sent=prompt_sent)
+
+    async def _handle_pozkapat(self, event: Any, choice: str) -> None:
+        msg_id = getattr(event, "message_id", None)
+        prompt = self._pk_prompts.get(msg_id) if msg_id is not None else None
+        if choice == "x":
+            self._pk_prompts.pop(msg_id, None)
+            await self._answer(event, "Vazgeçildi")
+            if msg_id is not None:
+                self._mirror("❌ Vazgeçildi, hiçbir pozisyon kapatılmadı.")
+                await self._edit(msg_id, "❌ Vazgeçildi, hiçbir pozisyon kapatılmadı.")
+            return
+        if prompt is None or time.monotonic() - prompt[0] > POZKAPAT_TTL_SEC:
+            self._pk_prompts.pop(msg_id, None)
+            await self._answer(event, "Bu sorunun süresi doldu; /pozkapat komutunu tekrar gönderin.", alert=True)
+            if msg_id is not None:
+                self._mirror("⌛ Süresi doldu, hiçbir pozisyon kapatılmadı.")
+                await self._edit(msg_id, "⌛ Süresi doldu, hiçbir pozisyon kapatılmadı.")
+            return
+        _sent_at, broker, offered, text, buttons = prompt
+        if choice == "all":
+            ids = list(offered)
+        elif choice.isdigit() and int(choice) in offered:
+            ids = [int(choice)]
+        else:
+            await self._answer(event, "Geçersiz seçim", alert=True)
+            return
+        engine = self._engine
+        if engine is None:
+            await self._answer(event, "Sistem henüz hazır değil", alert=True)
+            return
+        self._pk_prompts.pop(msg_id, None)          # one use only (before any await)
+        await self._answer(event, "⏳ Kapatılıyor…")
+        await self._edit(msg_id, f"⏳ {esc(broker)} hesabında kapatılıyor…")
+        try:
+            result = await engine.close_on_account(broker, ids)
+        except Exception as exc:
+            log.exception("pozkapat failed")
+            result = f"🚨 Kapatma sırasında hata: <code>{esc(exc)}</code>"
+        if result in _NOT_NOW:
+            # Nothing was done: the question gets its buttons back for the rest of its time.
+            self._pk_prompts.setdefault(msg_id, prompt)
+            await self._edit(msg_id, text, buttons=buttons)
+            await self._send(result)
+            return
+        final = result or "✔️ Tamamlandı."
+        self._mirror(final)
+        if not await self._edit(msg_id, final):
+            await self._send(final, importance=2, edit_first=(msg_id, final), mirror=False)
+
     # ---- button presses (testable) ------------------------------------------
     async def handle_callback(self, event: Any) -> None:
         if self._is_friend(getattr(event, "sender_id", None)):
@@ -858,6 +951,9 @@ class BotNotifier:
         data = bytes(getattr(event, "data", None) or b"").decode("utf-8", "replace")
         if data.startswith("closeall:"):
             await self._handle_close_all(event, data.partition(":")[2])
+            return
+        if data.startswith("pk:"):
+            await self._handle_pozkapat(event, data.partition(":")[2])
             return
         kind, _, conf_id = data.partition(":")
         if kind not in ("ok", "no", "fix") or not conf_id:

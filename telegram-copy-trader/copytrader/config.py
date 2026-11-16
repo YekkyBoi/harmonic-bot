@@ -223,6 +223,8 @@ class _BrokerBase(_Base):
     # whether a signal this account missed is opened there later. False: the owner's own (the owner answers it). Not
     # written: an optional account is the friend's, every other one the owner's (as before this setting existed).
     friend_account: bool | None = None
+    # Other names the owner may use for this account in commands (/pozkapat fx1): never a name of another account.
+    aliases: list[str] = Field(default_factory=list)
     symbol_map: dict[str, str] = Field(default_factory=dict)   # "ETH" -> "ETHUSD" (base asset or raw symbol -> broker symbol)
     allowed_assets: list[str] = Field(default_factory=list)     # empty = all assets
     risk_multiplier: float = 1.0                  # scale risk on this broker only (1.0 = 2% per R)
@@ -440,6 +442,15 @@ class AppConfig(_Base):
                         f"broker '{b.name}': terminal_path, '{own_paths[key]}' hesabının "
                         "terminaliyle aynı; her hesap kendi MetaTrader terminalini kullanmalı")
                 own_paths[key] = b.name     # two mt5_bridge accounts: never the same terminal either
+        taken: dict[str, str] = {fold_ascii(b.name): b.name for b in self.brokers}
+        for b in self.brokers:
+            for alias in b.aliases:
+                key = fold_ascii(alias)
+                if not key or " " in key or "," in key:
+                    raise ValueError(f"broker '{b.name}': aliases içinde geçersiz ad {alias!r} (boşluk ve virgül olmaz)")
+                if taken.get(key, b.name) != b.name:
+                    raise ValueError(f"broker '{b.name}': '{alias}' adı '{taken[key]}' hesabında da kullanılıyor")
+                taken[key] = b.name
         for route in self.telegram.topics:
             unknown = [b for b in route.brokers if b not in names]
             if unknown:

@@ -227,6 +227,8 @@ class ManagementPlan(BaseModel):
     source_message_ids: list[int] = Field(default_factory=list)
     summary_tr: str = ""
     created_at: datetime
+    # Only the positions of these accounts (the owner's /pozkapat); empty = every account of the trade.
+    brokers: list[str] = Field(default_factory=list)
 
 
 class PendingConfirmation(BaseModel):

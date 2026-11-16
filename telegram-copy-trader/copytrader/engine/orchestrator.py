@@ -44,10 +44,11 @@ import contextlib
 import inspect
 import logging
 import math
+import re
 import secrets
 import time
 import uuid
-from collections.abc import AsyncIterator, Callable, Coroutine
+from collections.abc import AsyncIterator, Callable, Collection, Coroutine, Sequence
 from dataclasses import dataclass, field
 from datetime import datetime, timedelta, timezone
 from typing import Any, Literal, TypeVar
@@ -898,6 +899,15 @@ def virtual_entry_wanted(broker: Broker, plan: TradePlan, route_kind: str | None
         and bool(plan.entry_price)
         and is_crypto_plan(plan, route_kind)
     )
+
+
+@dataclass
+class AccountCloseTarget:
+    """One account of a /pozkapat command: the trades whose position on it the command means."""
+
+    broker: str
+    matches: list[tuple[int, str]]      # (trade id, label)
+    what: str = ""                       # the filter as typed ("" = every position)
 
 
 class _VirtualEntryOps:
@@ -5043,6 +5053,10 @@ class Engine:
                                             f"manage-{plan.trade_id}-{plan.plan_id}")
 
     async def _execute_management(self, plan: ManagementPlan, notify: bool) -> str:
+        # ``plan.brokers``: only those accounts (the owner's /pozkapat): the trade goes on on the others, so nothing
+        # that stands for the whole trade (its stop / targets, the other accounts' late opens) is touched.
+        only = frozenset(plan.brokers)
+        why_end = "sizin /pozkapat komutunuzla kapatıldı" if only else "trader işlemi kapattı / iptal etti"
         async with self.trade_lock(plan.trade_id):
             trade = await self.db.get_trade(plan.trade_id)
             if trade is None:
@@ -5051,13 +5065,23 @@ class Engine:
                 text = f"#{trade.id} işlemi aktif değil ({trade.status.value})."
                 if self._ends_trade(plan.action, plan.close_fraction):
                     # Not active (any more), but a broker may still owe the answer to its open: closed on arrival.
-                    marked = self._close_late_legs(trade.id, "trader işlemi kapattı / iptal etti")
+                    marked = self._close_late_legs(trade.id, why_end, only)
                     text += self._late_close_note(marked)
                     await self._late_state(update=self._late_legs_of(trade.id))
                 return text
             before = trade                  # as it was: the report shows the stop / targets as old -> new
             positions = await self.db.broker_positions(trade.id)
-            active = [p for p in positions if p.status in ACTIVE_POSITION]
+            if only and self._ends_trade(plan.action, plan.close_fraction):
+                # Closing these accounts would leave the trade with no position while another account's open is
+                # still unanswered: the trade would count as ended and that open be closed on arrival. Not done.
+                others = [p for p in positions if p.status in ACTIVE_POSITION and p.broker not in only]
+                waiting_open = sorted({leg.broker for leg in self._late_legs_of(trade.id) if leg.broker not in only})
+                if waiting_open and not others:
+                    return (f"⏳ #{trade.id} {esc(trade.plan.base_asset)} {trade.plan.side.value.upper()}: "
+                            f"{_names(waiting_open)} hesabının açılış emri henüz yanıtlanmadı; şimdi kapatılırsa işlem "
+                            f"bitmiş sayılır ve o hesapta da kapatılır. Hiçbir pozisyon kapatılmadı; biraz sonra "
+                            f"tekrar deneyin.")
+            active = [p for p in positions if p.status in ACTIVE_POSITION and (not only or p.broker in only)]
             flow = _OpenFlow()
             answered, waiting = await self._run_manage_legs(plan, trade, active, flow)
             outcomes: list[BrokerOutcome] = [answered[p.broker] for p in active]
@@ -5067,7 +5091,8 @@ class Engine:
             owed_to = [o.broker for o in outcomes if o.deferred]
             # (a late leg whose position is stored already - it has answered, its booking is still to come - is
             # managed through that position by this flow, not queued as well: never applied twice)
-            in_flight = [leg for leg in self._late_legs_of(trade.id) if leg.broker not in answered]
+            in_flight = [leg for leg in self._late_legs_of(trade.id)
+                         if leg.broker not in answered and (not only or leg.broker in only)]
             # Such a late leg may still hold an OLDER stop / older targets for its catch-up (queued while its open was
             # unanswered, see _book_late_leg): this plan supersedes them where this flow applied it, owes it (the bot
             # applies it later) or is still applying it (a late management leg) - the catch-up must never put the
@@ -5076,6 +5101,8 @@ class Engine:
             part = _OWED_PART.get(plan.action)
             if part in ("sl", "tp"):
                 for leg in self._late_legs_of(trade.id):
+                    if only and leg.broker not in only:
+                        continue
                     here = answered.get(leg.broker)
                     if here is not None and (here.deferred or here.kind not in ("error", "unsupported", "filtered")):
                         leg.missed_plans = [m for m in leg.missed_plans if _OWED_PART.get(m.action) != part]
@@ -5085,11 +5112,11 @@ class Engine:
             refused = any(o.kind in ("error", "partial") and not o.deferred for o in outcomes)
             accepted = ok or (bool(owed_to) and not refused) or (not outcomes and bool(in_flight))
             update: dict[str, Any] = {}
-            if accepted and plan.action is ActionType.MOVE_SL:
+            if accepted and plan.action is ActionType.MOVE_SL and not only:
                 new_sl = plan.new_stop_loss if plan.new_stop_loss is not None else trade.plan.entry_price
                 if new_sl is not None:
                     update["current_stop_loss"] = new_sl
-            if accepted and plan.action is ActionType.MOVE_TP:
+            if accepted and plan.action is ActionType.MOVE_TP and not only:
                 update["current_take_profits"] = list(plan.take_profits)
             if merged:
                 status = rollup_status(merged)
@@ -5106,7 +5133,7 @@ class Engine:
             # Brokers that have not answered this trade's open yet: there is no position to apply this to now.
             ends = self._ends_trade(plan.action, plan.close_fraction)
             if ends:
-                pending = self._close_late_legs(trade.id, "trader işlemi kapattı / iptal etti")
+                pending = self._close_late_legs(trade.id, why_end, only)
                 late_lines = [f"• ⏳ {esc(n)}: açılış emri henüz yanıtlanmadı; açılırsa hemen kapatılacak"
                               for n in pending]
             else:
@@ -5128,7 +5155,7 @@ class Engine:
                 + ("açılış emri gönderilmiş olabilir, sonucu bilinmiyordu" if n in maybe_open
                    else "açılış emrinin sonucu bilinmiyordu")
                 + f"; bot bu hesapta pozisyon yönetmiyor. Emir açıldıysa {todo}."
-                for n in unknown_open if n not in late_names]
+                for n in unknown_open if n not in late_names and (not only or n in only)]
             # (what is now promised to the late legs survives a restart: the restart notice names it)
             await self._late_state(update=self._late_legs_of(trade.id))
             label_text = f"#{trade.id} {trade.plan.base_asset} {trade.plan.side.value.upper()}"
@@ -5142,8 +5169,15 @@ class Engine:
                 if o.kind == "error":
                     await self._management_leg_failed(plan, trade.id, o)
             label = f"#{trade.id} {esc(trade.plan.base_asset)} {trade.plan.side.value.upper()}"
+            if only:
+                label += f" ({_names(sorted(only))})"
             lines = (([f"• {o.text}" for o in outcomes] + late_lines + unknown_lines)
                      or ["• Aktif broker pozisyonu yok."])
+            if only:
+                rest = sorted({p.broker for p in merged if p.status in ACTIVE_POSITION and p.broker not in only}
+                              | {leg.broker for leg in self._late_legs_of(trade.id) if leg.broker not in only})
+                if rest:
+                    lines.append(f"• İşlem {_names(rest)} hesabında açık kalıyor.")
             slow = [o.broker for o in outcomes if o.kind == "late"]
             failed = [o for o in outcomes if o.kind in ("error", "partial") and not o.deferred]
             # What still follows (each broker's line below says it too): the headline never reads "uygulandı" alone
@@ -5428,12 +5462,13 @@ class Engine:
         return (f" ⏳ {', '.join(esc(n) for n in brokers)}: bu işlemin açılışına henüz yanıt vermedi; açılırsa "
                 "hemen kapatılacak.")
 
-    def _close_late_legs(self, trade_id: int | None, why: str) -> list[str]:
+    def _close_late_legs(self, trade_id: int | None, why: str, brokers: Collection[str] = ()) -> list[str]:
         """Mark the late legs of a trade (None: of every trade): whatever they still open is closed at once
-        when they answer (see :meth:`_book_late_leg`). Returns "broker" names marked."""
+        when they answer (see :meth:`_book_late_leg`). ``brokers``: only those accounts' legs (empty: every
+        account). Returns "broker" names marked."""
         marked: list[str] = []
         for (tid, name), leg in self._late_legs.items():
-            if trade_id is None or tid == trade_id:
+            if (trade_id is None or tid == trade_id) and (not brokers or name in brokers):
                 leg.close_on_arrival = leg.close_on_arrival or why
                 marked.append(name)
         return marked
@@ -7288,6 +7323,102 @@ class Engine:
         lines += orphans
         await self._log("close_all", {"trades": [t.id for t in trades]})
         return "\n".join(lines)
+
+    # ------------------------------------------------------------------ /pozkapat: one account's positions
+    def _account_keys(self) -> dict[str, Broker]:
+        """Command name (the account's name or one of its ``aliases``, Turkish-insensitive) -> configured account."""
+        keys: dict[str, Broker] = {}
+        for b in self.configured_brokers:
+            for word in (b.name, *(getattr(b.config, "aliases", None) or [])):
+                keys.setdefault(fold_ascii(str(word)), b)
+        return keys
+
+    def _accounts_hint(self) -> str:
+        parts = []
+        for b in self.configured_brokers:
+            aliases = [str(a) for a in (getattr(b.config, "aliases", None) or [])]
+            parts.append(esc(b.name) + (f" ({esc(', '.join(aliases))})" if aliases else ""))
+        return ", ".join(parts)
+
+    async def account_close_request(self, args: str) -> tuple[str | None, list[AccountCloseTarget]]:
+        """``/pozkapat <hesap[,hesap...]> [varlık | #işlem ...]``: (problem, targets). Nothing is closed here. A problem
+        (no account, an unknown account, a manual account, an unreadable filter) means no target at all: nothing is
+        closed for a command that is partly wrong. Each target lists the trades whose position (or open still in
+        flight) on that account the command means."""
+        words = re.sub(r"\s*,\s*", ",", (args or "").strip()).split()
+        if not words:
+            return (f"Kullanım: <code>/pozkapat fx1</code> · <code>/pozkapat fx1,fx2</code> · "
+                    f"<code>/pozkapat fx2 xau</code>\nHesaplar: {self._accounts_hint()}"), []
+        keys = self._account_keys()
+        accounts: list[Broker] = []
+        for word in (w for w in words[0].split(",") if w):
+            broker = keys.get(fold_ascii(word))
+            if broker is None:
+                return (f"Bilinmeyen hesap: <b>{esc(word)}</b>. Hiçbir pozisyon kapatılmadı.\n"
+                        f"Hesaplar: {self._accounts_hint()}"), []
+            if getattr(broker.config, "type", None) == "manual":
+                return (f"<b>{esc(broker.name)}</b> elle işlem hesabı; orada pozisyonu bot kapatamaz. Hiçbir pozisyon "
+                        "kapatılmadı."), []
+            if broker not in accounts:
+                accounts.append(broker)
+        trade_ids: set[int] = set()
+        assets: list[tuple[str, str | None]] = []
+        for word in words[1:]:
+            if re.fullmatch(r"#?\d+", word):
+                trade_ids.add(int(word.lstrip("#")))
+                continue
+            base, quote, _market = normalize_symbol(word)
+            if not base or not re.fullmatch(r"[^\W_]+(?:[./:_&-][^\W_]+)*(?:\.P)?", word, re.I) \
+                    or not any(ch.isalpha() for ch in word):
+                return f"<b>{esc(word)}</b> anlaşılamadı. Hiçbir pozisyon kapatılmadı.", []
+            # (a currency pair names its quote too: "eurgbp" is not EURUSD; any other asset by its base)
+            assets.append((base, quote if base in FIAT_CURRENCIES else None))
+        trades = await self.db.active_trades()
+        targets: list[AccountCloseTarget] = []
+        for broker in accounts:
+            matches: list[tuple[int, str]] = []
+            for t in trades:
+                if words[1:] and not (t.id in trade_ids or any(
+                        canonical_asset(t.plan.base_asset) == base and (q is None or (t.plan.quote_asset or "") == q)
+                        for base, q in assets)):
+                    continue
+                held = [p for p in await self.db.broker_positions(t.id)
+                        if p.broker == broker.name and p.status in ACTIVE_POSITION]
+                late = any(leg.broker == broker.name for leg in self._late_legs_of(t.id))
+                if not held and not late:
+                    continue
+                state = pos_status_text(held[0]) if held else "açılış sürüyor"
+                matches.append((t.id, f"#{t.id} {t.plan.base_asset} {t.plan.side.value.upper()} ({state})"))
+            what = " ".join(words[1:])
+            targets.append(AccountCloseTarget(broker=broker.name, matches=sorted(matches), what=what))
+        return None, targets
+
+    async def close_on_account(self, broker: str, trade_ids: Sequence[int]) -> str:
+        """Close (a pending entry: cancel) ``broker``'s position of each trade, and only that one: the trade goes on
+        on its other accounts (:meth:`execute_management` with ``brokers``). HTML result."""
+        if not self._accepting:
+            return SHUTDOWN_TEXT
+        if self._starting:
+            return STARTING_TEXT
+        lines: list[str] = []
+        now = self._now()
+        for trade_id in dict.fromkeys(trade_ids):
+            trade = await self.db.get_trade(trade_id)
+            if trade is None:
+                lines.append(f"#{trade_id} işlemi bulunamadı.")
+                continue
+            plan = ManagementPlan(
+                plan_id=uuid.uuid4().hex[:10], action=ActionType.CLOSE, trade_id=trade_id, close_fraction=1.0,
+                source_chat_id=trade.plan.source_chat_id, summary_tr=f"{broker} hesabında kapatıldı (/pozkapat)",
+                created_at=now, brokers=[broker],
+            )
+            try:
+                lines.append(await self.execute_management(plan, notify=False))
+            except Exception as exc:
+                logger.exception("pozkapat: trade %s on %s", trade_id, broker)
+                lines.append(f"🚨 #{trade_id} ({esc(broker)}): <code>{esc(exc)}</code>")
+        await self._log("pozkapat", {"broker": broker, "trades": list(trade_ids)})
+        return "\n\n".join(lines)
 
     async def test_parse(self, text: str) -> str:
         now = self._now()
