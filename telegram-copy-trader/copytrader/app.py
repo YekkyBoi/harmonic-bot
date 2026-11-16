@@ -18,7 +18,7 @@ from pathlib import Path
 from typing import Any
 
 from .brokers.base import Broker, BrokerError
-from .config import AppConfig, load_config
+from .config import AppConfig, is_friend_account, load_config
 from .engine.orchestrator import Engine
 from .errors import ConfigError, ParserError
 from .models import Severity
@@ -362,7 +362,8 @@ def build_app(
             # notifier (see copytrader/karne/__init__.py); started and stopped by serve()
             # (``pending``: the engine's own look whether an account's open order of a trade is still unanswered;
             # read only, like the "busy" look)
-            karne = KarneService(db, notifier, data_dir, accounts=real_account_names(config),
+            karne = KarneService(db, notifier, data_dir, accounts=real_account_names(config, friend=False),
+                                 friend_accounts=real_account_names(config, friend=True),
                                  busy=lambda: trading_path_busy(listener, notifier, engine),
                                  pending=lambda trade_id: engine._has_late_open_leg(trade_id))
             notifier.set_karne(karne)
@@ -372,12 +373,14 @@ def build_app(
     return App(config, db, parser, brokers, notifier, engine, listener, errors, mirror, karne)
 
 
-def real_account_names(config: AppConfig) -> list[str]:
+def real_account_names(config: AppConfig, *, friend: bool | None = None) -> list[str]:
     """The configured accounts that trade real money, in the config's order (none in dry-run; never a paper or a
-    message-only account): the accounts row of the report card."""
+    message-only account): the accounts row of the report card. ``friend``: only the owner's (False) or only the
+    friend's (True, see :func:`is_friend_account`); None: all."""
     if config.dry_run:
         return []
-    return [b.name for b in config.enabled_brokers if getattr(b, "type", None) not in ("paper", "manual")]
+    return [b.name for b in config.enabled_brokers if getattr(b, "type", None) not in ("paper", "manual")
+            and (friend is None or is_friend_account(b) == friend)]
 
 
 SHUTDOWN_NOTICE_TR = "Kapanıyor, lütfen bekleyin (en çok 2 dakika). Tekrar Ctrl+C YAPMAYIN."

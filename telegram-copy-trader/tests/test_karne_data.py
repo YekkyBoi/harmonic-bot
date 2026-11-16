@@ -1040,3 +1040,35 @@ async def test_review2_n2b_a_failing_look_defers_the_trade_and_is_logged_once(
     # it cannot be deferred for ever: after two cards the trades are listed, with the warning
     third = await build_report(db, START, END, pending=broken, waited={first.id: 2, second.id: 2})
     assert [row.pair for row in third.rows] == ["AAA", "BBB"] and third.unsettled == [first.id, second.id]
+
+
+# --------------------------------------------------------------------------- #
+# one person's card (the owner's / the friend's): only his accounts, one row per account
+# --------------------------------------------------------------------------- #
+async def test_each_persons_card_shows_only_his_accounts_each_with_its_own_r(world: Any) -> None:
+    db, clock = world
+    # binance closed at +2R (the owner's /pozkapat), tickmill went on to +4.8R: one trade, two people
+    await closed(db, clock, START + timedelta(days=1), [position("binance", 20.0), position("tickmill", 48.0)])
+    owner = await build_report(db, START, END, accounts=["binance", "fx"], only={"binance", "fx"})
+    friend = await build_report(db, START, END, accounts=["tickmill"], only={"tickmill"})
+    assert r_of(owner) == [("ETH", 2.0)] and r_of(friend) == [("ETH", 4.8)]
+    assert [a.name for a in owner.accounts] == ["binance", "fx"]                      # never tickmill
+    assert [a.name for a in friend.accounts] == ["tickmill"]
+    assert owner.total_r == pytest.approx(2.0) and friend.total_r == pytest.approx(4.8)
+    # the card of everyone (as before): one row, the mean
+    assert r_of(await build_report(db, START, END, accounts=ACCOUNTS)) == [("ETH", 3.4)]
+
+
+async def test_two_of_one_persons_accounts_in_a_trade_are_two_rows(world: Any) -> None:
+    db, clock = world
+    await closed(db, clock, START + timedelta(days=1), [position("binance", 20.0), position("fx", -10.0)])
+    report = await build_report(db, START, END, accounts=["binance", "fx"], only={"binance", "fx"})
+    assert r_of(report) == [("ETH · binance", 2.0), ("ETH · fx", -1.0)]
+    assert report.total_r == pytest.approx(1.0) and report.wins == 1 and report.losses == 1
+
+
+async def test_a_trade_none_of_his_accounts_traded_is_not_on_his_card(world: Any) -> None:
+    db, clock = world
+    await closed(db, clock, START + timedelta(days=1), [position("tickmill", 48.0)])
+    report = await build_report(db, START, END, accounts=["binance"], only={"binance"})
+    assert report.rows == [] and [(a.name, a.r) for a in report.accounts] == [("binance", 0.0)]

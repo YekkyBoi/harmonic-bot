@@ -159,7 +159,7 @@ HELP_TEXT = (
     "/devam — yeni işlem açmaya devam et\n"
     "/hepsini_kapat — tüm pozisyonları kapat (onay ister)\n"
     "/pozkapat &lt;hesap&gt; [varlık] — sadece o hesaptaki pozisyonu kapat (ör. /pozkapat fx1 · /pozkapat fx1,fx2 · "
-    "/pozkapat fx2 xau); tek pozisyon varsa hemen kapatır, birden fazlaysa hangisi diye sorar\n"
+    "/pozkapat fx2 xau · /pozkapat fx1 hepsi); tek pozisyon varsa hemen kapatır, birden fazlaysa hangisi diye sorar\n"
     "/test &lt;metin&gt; — bir mesajın nasıl anlaşılacağını dene (işlem açmaz)\n"
     "/arkadas &lt;sohbet_id&gt; — tickmill hesabının sahibine bildirimlerin kopyası (/arkadas: göster, "
     "/arkadas sil: kaldır)\n"
@@ -189,7 +189,25 @@ FRIEND_REPLY_EVERY_SEC = 60.0     # the friend's own messages get the refusal li
 FRIEND_OWNER_DECIDES = "👤 Bu mesajdaki seçimi bot sahibi yapar (düğmeler yalnızca onda)."
 FRIEND_DECIDES = ("👤 Bu soruyu tickmill hesabının sahibi (arkadaşınız) cevaplayacak; düğmeler onda. Size bilgi için "
                   "gönderildi.")
-FRIEND_REFUSED = "Bu bot komutlarını yalnızca sahibi kullanabilir."
+FRIEND_REFUSED = ("Bu komutu yalnızca bot sahibi kullanabilir. Sizin komutlarınız için /yardim yazın.")
+FRIEND_HELP = (
+    "🤖 <b>Sizin komutlarınız</b> (yalnızca kendi hesabınız: {accounts})\n\n"
+    "/pozisyonlar — açık işlemleriniz\n"
+    "/bakiye — bakiyeniz\n"
+    "/pozkapat — pozisyonunuzu kapatır (tek pozisyon varsa hemen; birden fazlaysa liste gelir, sonra "
+    "<code>/pozkapat xau</code>, <code>/pozkapat #13</code> ya da <code>/pozkapat hepsi</code> yazarsınız)\n"
+    "/karne — bu haftanın karneniz; <code>/karne hepsi</code> — bugüne kadarki tüm işlemleriniz\n"
+    "/yardim — bu mesaj\n\n"
+    "Yaptığınız kapatmalar bot sahibine de bildirilir."
+)
+FRIEND_COMMANDS = {
+    "start": "help", "yardim": "help", "yardım": "help", "help": "help",
+    "pozisyonlar": "positions", "positions": "positions",
+    "bakiye": "balance", "balance": "balance",
+    "pozkapat": "pozkapat",
+    "karne": "karne",
+}
+FRIEND_NO_ACCOUNT = "Bu botta size ait bir hesap tanımlı değil."
 FRIEND_BUTTON_REFUSED = "Bu düğme yalnızca bot sahibi içindir."
 FRIEND_HELLO = (
     "👋 Merhaba! Bu sohbet, kopya-trade botunun bildirimlerini almak için bot sahibi tarafından eklendi. Bundan sonra "
@@ -735,7 +753,12 @@ class BotNotifier:
                 await self._handle_bind(event, bind)
             return
         if self._is_friend(getattr(event, "sender_id", None)):
-            self._friend_refuse()          # never executed, whatever it is
+            # Only the friend's own commands, for his own accounts; anything else is never executed.
+            try:
+                await self._handle_friend_text((getattr(event, "raw_text", None) or "").strip())
+            except Exception as exc:
+                log.exception("Friend message handling failed")
+                self._friend_put(_FriendMessage(text=f"🚨 Hata: <code>{esc(exc)}</code>"))
             return
         if not self._is_owner(getattr(event, "sender_id", None), "message"):
             return
@@ -872,8 +895,8 @@ class BotNotifier:
             if not target.matches:
                 if not target.notes:                         # (a note already says what is there)
                     parts.append(f"ℹ️ <b>{esc(target.broker)}</b>{what}: kapatılacak açık pozisyon yok.")
-            elif len(target.matches) == 1:
-                singles.append((target.broker, target.matches[0][0]))
+            elif len(target.matches) == 1 or target.every:
+                singles.extend((target.broker, tid) for tid, _label in target.matches)
             else:
                 asks.append((target, what))
         if singles:
@@ -1338,6 +1361,69 @@ class BotNotifier:
         await self._send(f"⚠️ Arkadaşınıza (<code>{chat}</code>) mesaj iletilemedi: {self._friend_why(exc)}.{why} "
                          "(Bu uyarı en fazla saatte bir gönderilir.)", mirror=False)
 
+    async def _handle_friend_text(self, text: str) -> None:
+        """A message of the friend: /yardim, /pozisyonlar, /bakiye, /pozkapat and /karne, each for HIS accounts only
+        (the engine's ``friend_account_names``). Everything else is refused (a line now and then), never executed."""
+        m = _COMMAND_RE.match(text or "")
+        command = FRIEND_COMMANDS.get(m.group(1).lower()) if m else None
+        engine = self._engine
+        if command is None:
+            self._friend_refuse()
+            return
+        if engine is None:
+            self._friend_put(_FriendMessage(text="Sistem henüz hazır değil; biraz sonra tekrar deneyin."))
+            return
+        args = m.group(2).strip() if m else ""
+        names = list(engine.friend_account_names())
+        if not names:
+            self._friend_put(_FriendMessage(text=FRIEND_NO_ACCOUNT))
+            return
+        log.info("The friend's command /%s %s", command, args)
+        if command == "help":
+            reply = FRIEND_HELP.format(accounts=esc(", ".join(names)))
+        elif command == "positions":
+            reply = await engine.positions_text(accounts=set(names))
+        elif command == "balance":
+            reply = await engine.balances_text(accounts=set(names))
+        elif command == "karne":
+            karne = self._karne
+            reply = await karne.command(args, audience="friend") if karne is not None else KARNE_OFF_TEXT
+        else:
+            reply = await self._friend_pozkapat(engine, args, names)
+        self._friend_put(_FriendMessage(text=reply or "✔️"))
+
+    async def _friend_pozkapat(self, engine: Any, args: str, names: list[str]) -> str:
+        """The friend's /pozkapat: his accounts only. One matching position (or "hepsi"): closed at once and the owner
+        is told what was closed; several: the list, and how to name one (no buttons in his chat)."""
+        problem, targets = await engine.account_close_request(args, allowed=set(names))
+        if problem:
+            return problem
+        parts: list[str] = []
+        singles: list[tuple[str, int]] = []
+        for target in targets:
+            what = f" ({esc(target.what)})" if target.what else ""
+            parts.extend(target.notes)
+            if not target.matches:
+                if not target.notes:
+                    parts.append(f"ℹ️ <b>{esc(target.broker)}</b>{what}: kapatılacak açık pozisyon yok.")
+            elif len(target.matches) == 1 or target.every:
+                singles.extend((target.broker, tid) for tid, _label in target.matches)
+            else:
+                parts.append(f"❓ <b>{esc(target.broker)}</b> hesabınızda {len(target.matches)} pozisyon var{what}:\n"
+                             + "\n".join(f"• {esc(label)}" for _tid, label in target.matches)
+                             + "\nHangisini kapatmak istiyorsanız onu yazın: ör. <code>/pozkapat xau</code> ya da "
+                             "<code>/pozkapat #13</code>; hepsi için <code>/pozkapat hepsi</code>. Hiçbir pozisyon "
+                             "kapatılmadı.")
+        if singles:
+            result = await engine.close_on_accounts(singles)
+            if result in _NOT_NOW:
+                parts.append(result + "\nHiçbir pozisyon kapatılmadı.")
+            else:
+                parts.append(result)
+                # The owner's bot: what the friend closed is told to the owner as well (not mirrored back to him).
+                await self._send(f"👤 Arkadaşınız <code>/pozkapat {esc(args)}</code> yazdı:\n{result}", mirror=False)
+        return "\n\n".join(parts)
+
     def _friend_refuse(self) -> None:
         """A message from the friend's chat: never executed; one refusal line now and then."""
         log.info("A message from the friend's chat was not executed (commands are the owner's)")
@@ -1470,6 +1556,26 @@ class BotNotifier:
         and delivered like every other message; never raises."""
         await self._send(text, mirror=False)
 
+    def has_friend(self) -> bool:
+        """The owner has set his friend's chat (/arkadas)."""
+        return self._friend is not None
+
+    async def tell_friend(self, text: str) -> None:
+        """HTML for the friend alone (his own report card's text, its problems). Never raises; nothing when no friend
+        is set."""
+        if self._friend is not None and text and text.strip():
+            self._friend_put(_FriendMessage(text=text))
+
+    async def send_friend_document(self, path: str, *, caption: str = "", name: str | None = None,
+                                   busy: Callable[[], bool] | None = None) -> str | None:
+        """:meth:`send_owner_document` for the friend's chat (his own report card): never while his messages wait."""
+        friend = self._friend
+        if friend is None:
+            return "arkadaş sohbeti ayarlı değil"
+        if self._friend_queue:
+            return "arkadaşınıza giden mesajlar sırada bekliyor"
+        return await self._send_document(friend, path, caption=caption, name=name, busy=busy)
+
     async def send_owner_document(self, path: str, *, caption: str = "", name: str | None = None,
                                   busy: Callable[[], bool] | None = None) -> str | None:
         """One file for the OWNER, as a document (Telegram does not recompress it), with ``caption`` (HTML) and the
@@ -1482,6 +1588,11 @@ class BotNotifier:
         waits while ``busy()`` says the trading path is working (each wait at most OWNER_FILE_PAUSE_SEC, then the
         upload is given up); ONE request, waited for at most OWNER_FILE_TIMEOUT_SEC and then left to Telethon - not
         cancelled, not sent again (the file may still arrive; the reason says so). No copy goes to the friend."""
+        return await self._send_document(self._owner, path, caption=caption, name=name, busy=busy)
+
+    async def _send_document(self, chat: int, path: str, *, caption: str = "", name: str | None = None,
+                             busy: Callable[[], bool] | None = None) -> str | None:
+        """One file to ``chat`` (the owner's or the friend's), as :meth:`send_owner_document` describes."""
         client = self._client
         if client is None or self._shut:
             return "bildirim botu çalışmıyor"
@@ -1511,7 +1622,7 @@ class BotNotifier:
             await pause()
             attributes = [types.DocumentAttributeFilename(name)] if name else None
             task = self._track(asyncio.ensure_future(client.send_file(
-                self._owner, path, caption=caption, parse_mode="html", force_document=True, attributes=attributes,
+                chat, path, caption=caption, parse_mode="html", force_document=True, attributes=attributes,
                 progress_callback=pause)))
             done, _ = await asyncio.wait({task}, timeout=OWNER_FILE_TIMEOUT_SEC)
             if not done:
@@ -1530,7 +1641,8 @@ class BotNotifier:
             if isinstance(exc, errors.FloodError) and seconds:
                 return f"Telegram {seconds} sn beklememizi istiyor"
             if self._is_unreachable(exc):
-                return "bot size mesaj gönderemiyor (botu Telegram'da açıp Start'a basın)"
+                return ("bot size mesaj gönderemiyor (botu Telegram'da açıp Start'a basın)" if chat == self._owner
+                        else "bot arkadaşınıza mesaj gönderemiyor")
             return str(exc) or type(exc).__name__
         except asyncio.CancelledError:
             raise

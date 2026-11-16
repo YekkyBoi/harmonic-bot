@@ -44,8 +44,14 @@ PNG = b"\x89PNG\r\n\x1a\n" + b"k" * 30_000
 class Engine:
     """What the notifier needs of the engine for a command."""
 
+    def __init__(self) -> None:
+        self.friend_names: list[str] = []
+
     async def status_text(self) -> str:
         return "durum"
+
+    def friend_account_names(self) -> list[str]:
+        return list(self.friend_names)
 
 
 def notifier(tmp_path: Path, *, friend: bool = True) -> tuple[BotNotifier, Bot]:
@@ -129,7 +135,7 @@ async def test_karne_hepsi_and_the_bot_name_in_the_command(world: Any) -> None:
 
 async def test_only_the_owner_can_ask_for_a_card(world: Any) -> None:
     n, bot, service, drawer, _db = world
-    await n.handle_message(MsgEvent("/karne", sender_id=FRIEND))                 # the friend: never executed
+    await n.handle_message(MsgEvent("/karne", sender_id=FRIEND))       # the friend without an account of his: no card
     await n.handle_message(MsgEvent("/karne hepsi", sender_id=FRIEND))
     await n.handle_message(MsgEvent("/karne", sender_id=STRANGER))               # anyone else: ignored, silently
     await n.handle_message(MsgEvent("/karne", sender_id=OWNER, is_private=False))   # in a group: nothing at all
@@ -138,7 +144,40 @@ async def test_only_the_owner_can_ask_for_a_card(world: Any) -> None:
     await asyncio.sleep(0.05)
     assert drawer.cards == [] and bot.files == [] and not service._jobs
     assert bot.to(OWNER) == [] and bot.to(STRANGER) == []
-    assert [m.text for m in bot.to(FRIEND)] == ["Bu bot komutlarını yalnızca sahibi kullanabilir."]
+    assert [m.text for m in bot.to(FRIEND)] == ["Bu botta size ait bir hesap tanımlı değil."] * 2
+
+
+async def test_the_friend_gets_his_own_card_in_his_chat_and_the_owner_none(tmp_path: Path) -> None:
+    n, bot = notifier(tmp_path)
+    n._engine.friend_names = ["tickmill"]                                      # type: ignore[attr-defined]
+    clock = Clock(NOW)
+    db = Database(tmp_path / "copytrader.db", clock=clock)
+    await db.open()
+    drawer = Drawer()
+    service = KarneService(db, n, tmp_path, accounts=["binance"], friend_accounts=["tickmill"], busy=lambda: False,
+                           clock=clock, renderer=drawer, pillow=lambda: True)
+    n.set_karne(service)
+    try:
+        await n.handle_message(MsgEvent("/karne", sender_id=FRIEND))
+        await card_out(service)
+        await friend_idle(n)
+        (file,) = bot.files
+        assert file.entity == FRIEND and file.force_document is True
+        assert next(m.text for m in bot.to(FRIEND)) == "⏳ Karne hazırlanıyor; birkaç saniye içinde gelecek."
+        assert file.text.startswith("📊 <b>Ara karne")                               # (the file's caption)
+        assert bot.to(OWNER) == []
+        assert [a["name"] for a in drawer.cards[0]["accounts"]] == ["tickmill"]       # his account only
+        # the owner's own /karne right after: his card, his accounts only (no tickmill), to him
+        await n.handle_message(MsgEvent("/karne"))
+        await card_out(service)
+        assert bot.files[-1].entity == OWNER
+        assert [a["name"] for a in drawer.cards[-1]["accounts"]] == ["binance"]
+    finally:
+        await service.stop()
+        await n.drain(2)
+        for task in list(n._send_tasks) + [t for t in (n._pump_task, n._friend_pump) if t is not None]:
+            task.cancel()
+        await db.close()
 
 
 async def test_many_karne_commands_draw_one_card(world: Any) -> None:

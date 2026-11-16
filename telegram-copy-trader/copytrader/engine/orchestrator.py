@@ -54,7 +54,8 @@ from datetime import datetime, timedelta, timezone
 from typing import Any, Literal, TypeVar
 
 from ..brokers.base import Broker, BrokerError, BrokerUnavailableError, OrderOutcomeUnknownError, outcome_unknown
-from ..config import AppConfig, TopicRoute, effective_risk, fold_ascii, match_topic, route_thresholds
+from ..config import (AppConfig, TopicRoute, effective_risk, fold_ascii, is_friend_account, match_topic,
+                      route_thresholds)
 from ..errors import ParserError
 from ..interfaces import (
     NO_CORRECTION_FRIEND_TEXT,
@@ -909,6 +910,7 @@ class AccountCloseTarget:
     matches: list[tuple[int, str]]      # (trade id, label)
     what: str = ""                       # the filter as typed ("" = every position)
     notes: list[str] = field(default_factory=list)   # HTML: what the bot cannot close there (an unknown open)
+    every: bool = False                  # "hepsi": every position of it, without asking which
 
 
 class _VirtualEntryOps:
@@ -1831,8 +1833,11 @@ class Engine:
     def _friend_account(self, broker: Broker) -> bool:
         """``broker`` is the owner's friend's account (config ``friend_account``; not written: an optional broker),
         whose catch-up question the friend answers (/arkadas). The owner answers it for every other account."""
-        flag = getattr(broker.config, "friend_account", None)
-        return self._is_optional(broker) if flag is None else bool(flag)
+        return is_friend_account(broker.config)
+
+    def friend_account_names(self) -> list[str]:
+        """The owner's friend's accounts (see :meth:`_friend_account`), in the config's order."""
+        return [b.name for b in self.configured_brokers if self._friend_account(b)]
 
     def _optional_name(self, name: str) -> bool:
         """``name`` is a configured optional broker (a friend's account)."""
@@ -7226,8 +7231,16 @@ class Engine:
         lines.append(f"Risk: 1R = {esc(self._risk_per_r_text())}")
         return "\n".join(lines)
 
-    async def positions_text(self) -> str:
+    async def positions_text(self, accounts: Collection[str] | None = None) -> str:
+        """``accounts``: only the trades these accounts are in, and only their lines (the friend's /pozisyonlar)."""
         trades = await self.db.active_trades()
+        if accounts is not None:
+            mine = []
+            for t in trades:
+                if (any(p.broker in accounts for p in await self.db.broker_positions(t.id))
+                        or any(leg.broker in accounts for leg in self._late_legs_of(t.id))):
+                    mine.append(t)
+            trades = mine
         if not trades:
             return "📂 Açık işlem yok."
         lines = [f"📂 <b>Açık işlemler</b> ({len(trades)})"]
@@ -7240,6 +7253,8 @@ class Engine:
             price = await self._price(t.plan.base_asset, t.plan.quote_asset, t.plan.market_type)
             lines.append(f"🎯 TP: {tps}" + (f" · 💹 anlık {fmt_price(price)}" if price else ""))
             for p in await self.db.broker_positions(t.id):
+                if accounts is not None and p.broker not in accounts:
+                    continue
                 if is_virtual_pending(p):
                     ref_id = str(p.data.get("reference_exchange") or "")
                     trig = p.data.get("trigger_price")
@@ -7268,10 +7283,13 @@ class Engine:
                     bits.append(f"⏳ bekleyen değişiklik: {esc(owed)} (bot uygulamayı deniyor)")
                 lines.append(" · ".join(bits))
             for leg in self._late_legs_of(t.id):
+                if accounts is not None and leg.broker not in accounts:
+                    continue
                 lines.append(f"• {esc(leg.broker)}: ⏳ açılış sürüyor, broker henüz yanıt vermedi")
         return "\n".join(lines)
 
-    async def balances_text(self) -> str:
+    async def balances_text(self, accounts: Collection[str] | None = None) -> str:
+        """``accounts``: only these (the friend's /bakiye)."""
         lines = ["💰 <b>Bakiyeler</b>"]
 
         async def one(b: Broker) -> str:
@@ -7288,8 +7306,8 @@ class Engine:
             except Exception as exc:
                 return f"• {esc(b.name)}: okunamadı <code>{esc(exc) or type(exc).__name__}</code>"
 
-        lines += await asyncio.gather(*(one(b) for b in self.brokers))
-        lines += [f"• {esc(n)}: ❌ bağlı değil" for n in self.failed_brokers]
+        lines += await asyncio.gather(*(one(b) for b in self.brokers if accounts is None or b.name in accounts))
+        lines += [f"• {esc(n)}: ❌ bağlı değil" for n in self.failed_brokers if accounts is None or n in accounts]
         if len(lines) == 1:
             lines.append("Bağlı broker yok.")
         return "\n".join(lines)
@@ -7349,16 +7367,28 @@ class Engine:
             parts.append(esc(b.name) + (f" ({esc(', '.join(aliases))})" if aliases else ""))
         return ", ".join(parts)
 
-    async def account_close_request(self, args: str) -> tuple[str | None, list[AccountCloseTarget]]:
+    async def account_close_request(self, args: str, *, allowed: Collection[str] | None = None,
+                                    ) -> tuple[str | None, list[AccountCloseTarget]]:
         """``/pozkapat <hesap[,hesap...]> [varlık | #işlem ...]``: (problem, targets). Nothing is closed here. A problem
         (no account, an unknown account, a manual account, an unreadable filter) means no target at all: nothing is
         closed for a command that is partly wrong. Each target lists the trades whose position (or open still in
         flight) on that account the command means."""
         words = re.sub(r"\s*,\s*", ",", (args or "").strip()).split()
+        keys = self._account_keys()
+        if allowed is not None:
+            # The friend: only his own accounts; naming them is optional ("/pozkapat", "/pozkapat xau").
+            own = [b for b in self.configured_brokers if b.name in allowed]
+            if not own:
+                return "Size ait bir hesap yok. Hiçbir pozisyon kapatılmadı.", []
+            first = [keys.get(fold_ascii(w)) for w in words[0].split(",") if w] if words else []
+            if words and all(b is not None for b in first):
+                if any(b.name not in allowed for b in first if b is not None):
+                    return "Yalnızca kendi hesabınızdaki pozisyonları kapatabilirsiniz. Hiçbir pozisyon kapatılmadı.", []
+            else:
+                words = [",".join(b.name for b in own), *words]
         if not words:
             return (f"Kullanım: <code>/pozkapat fx1</code> · <code>/pozkapat fx1,fx2</code> · "
                     f"<code>/pozkapat fx2 xau</code>\nHesaplar: {self._accounts_hint()}"), []
-        keys = self._account_keys()
         accounts: list[Broker] = []
         for word in (w for w in words[0].split(",") if w):
             broker = keys.get(fold_ascii(word))
@@ -7372,6 +7402,12 @@ class Engine:
                 accounts.append(broker)
         trade_ids: set[int] = set()
         assets: list[tuple[str, str | None]] = []
+        every = [w for w in words[1:] if fold_ascii(w) in ("hepsi", "tumu", "all")]
+        if every and len(words) > 2:
+            return ("<code>hepsi</code> tek başına yazılır (ör. <code>/pozkapat fx1 hepsi</code>). Hiçbir pozisyon "
+                    "kapatılmadı."), []
+        if every:
+            words = words[:1]
         for word in words[1:]:
             if re.fullmatch(r"#\d+", word):
                 trade_ids.add(int(word[1:]))
@@ -7406,8 +7442,9 @@ class Engine:
                     continue
                 state = pos_status_text(held[0]) if held else "açılış sürüyor"
                 matches.append((t.id, f"#{t.id} {t.plan.base_asset} {t.plan.side.value.upper()} ({state})"))
-            what = " ".join(words[1:])
-            targets.append(AccountCloseTarget(broker=broker.name, matches=sorted(matches), what=what, notes=notes))
+            what = "hepsi" if every else " ".join(words[1:])
+            targets.append(AccountCloseTarget(broker=broker.name, matches=sorted(matches), what=what, notes=notes,
+                                              every=bool(every)))
         return None, targets
 
     async def close_on_account(self, broker: str, trade_ids: Sequence[int]) -> str:

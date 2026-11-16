@@ -48,8 +48,8 @@ from __future__ import annotations
 
 import logging
 import math
-from collections.abc import Callable, Mapping, Sequence
-from dataclasses import dataclass, field
+from collections.abc import Callable, Collection, Mapping, Sequence
+from dataclasses import dataclass, field, replace
 from datetime import datetime, timedelta
 from typing import Any
 
@@ -368,6 +368,31 @@ class Report:
         return self.mode == MODE_INTERIM and self.start is not None and self.start < last_slot(self.end)
 
 
+def trade_rows(trade: TradeRecord, positions: Sequence[BrokerPosition], *, approximate: bool = False,
+               only: Collection[str] | None = None) -> list[Row]:
+    """The rows of an ended trade on a card of ``only`` (a set of accounts: one person's card): ONE ROW PER ACCOUNT of
+    them that traded it, with that account's own R and its own note ([] when none of them traded it). A trade only
+    simulated accounts traded: one row without a figure, as :func:`trade_row`."""
+    mine = [p for p in positions if only is None or p.broker in only]
+    if trade.closed_at is None or not any(traded(p) for p in mine):
+        return []
+    real = [p for p in mine if traded(p) and not _simulated(p)]
+    if not real:
+        row = trade_row(trade, mine, approximate=approximate)
+        return [row] if row is not None else []
+    names = list(dict.fromkeys(p.broker for p in real))
+    rows: list[Row] = []
+    for name in names:
+        own = [p for p in mine if p.broker == name]
+        row = trade_row(trade, own, approximate=approximate)
+        if row is None:
+            continue
+        if len(names) > 1:          # (two of this person's accounts in one trade: each row says whose it is)
+            row = replace(row, pair=f"{row.pair} · {name}")
+        rows.append(row)
+    return rows
+
+
 def trade_row(trade: TradeRecord, positions: Sequence[BrokerPosition], *, approximate: bool = False) -> Row | None:
     """The row of an ended trade, None when no account traded it. ``approximate``: a trade of an older version on
     the card of every trade so far (see the module text)."""
@@ -436,7 +461,8 @@ def _is_pending(pending: Callable[[int], bool] | None, trade_id: int) -> bool:
 async def build_report(db: Any, start: datetime | None, end: datetime, *, mode: str = MODE_WEEK,
                        accounts: Sequence[str] = (), late: bool = False,
                        pending: Callable[[int], bool] | None = None, carried: Sequence[int] = (),
-                       listed: Sequence[int] = (), waited: Mapping[int, int] | None = None) -> Report:
+                       listed: Sequence[int] = (), waited: Mapping[int, int] | None = None,
+                       only: Collection[str] | None = None) -> Report:
     """The report of the trades that ended in ``[start, end)`` (``start`` None: every trade so far), read from
     ``db``. Read only.
 
@@ -445,7 +471,9 @@ async def build_report(db: Any, start: datetime | None, end: datetime, *, mode: 
     deferred - listed now (when they have ended before ``end``), whatever their ``closed_at``. ``listed``: trades
     that were on the last cards - never listed again. (The last two: a period's cards only.) ``waited``: how many
     weekly cards each trade has been left off; one that has waited MAX_DEFERRALS cards is listed although its order
-    is still unanswered (``Report.unsettled``: its late account's result may be missing)."""
+    is still unanswered (``Report.unsettled``: its late account's result may be missing). ``only``: one person's
+    card - only these accounts, one row per account of them in a trade (:func:`trade_rows`); None: every account,
+    one row per trade (their mean)."""
     # Approximate figures: on the card of every trade only, and only for trades older than the first one that has a
     # position with a stored real initial risk (the version that stores it; None: no such trade yet).
     newer_from: int | None = None
@@ -474,7 +502,11 @@ async def build_report(db: Any, start: datetime | None, end: datetime, *, mode: 
                 deferred.append(trade.id)
                 continue
         old = mode == MODE_ALL and (newer_from is None or trade.id < newer_from)
-        row = trade_row(trade, await db.broker_positions(trade.id), approximate=old)
+        positions = await db.broker_positions(trade.id)
+        if only is not None:
+            rows.extend(trade_rows(trade, positions, approximate=old, only=only))
+            continue
+        row = trade_row(trade, positions, approximate=old)
         if row is not None:
             rows.append(row)
     rows.sort(key=lambda row: (row.closed_at, row.trade_id), reverse=mode == MODE_ALL)

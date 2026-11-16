@@ -45,6 +45,13 @@ def fold_ascii(text: str) -> str:
     return " ".join(plain.casefold().split())
 
 
+def is_friend_account(cfg: Any) -> bool:
+    """Is this the owner's friend's account (his catch-up questions, his commands, his report card)? Its
+    ``friend_account``; not written: an optional account is the friend's, every other one the owner's."""
+    flag = getattr(cfg, "friend_account", None)
+    return bool(getattr(cfg, "optional", False)) if flag is None else bool(flag)
+
+
 class TopicRoute(_Base):
     """Which forum topics of the source group to follow, and where their trades go.
 

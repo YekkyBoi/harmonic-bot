@@ -344,7 +344,8 @@ async def test_f6_the_friend_can_answer_nothing_else_and_run_no_command(world: W
         await world.n.handle_message(MsgEvent(text, sender_id=FRIEND))
         await world.settle()
     assert world.client.to(OWNER) == []                      # nothing ran for the owner
-    assert {m.text for m in world.client.to(FRIEND)} == {"Bu bot komutlarını yalnızca sahibi kullanabilir."}
+    assert {m.text for m in world.client.to(FRIEND)} == {
+        "Bu komutu yalnızca bot sahibi kullanabilir. Sizin komutlarınız için /yardim yazın."}
     assert await world.db.get_state("friend_chat_id") == FRIEND
 
 
