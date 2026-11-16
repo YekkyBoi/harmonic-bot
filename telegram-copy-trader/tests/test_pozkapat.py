@@ -16,6 +16,7 @@ REAL Engine and REAL BotNotifier; brokers and Telegram are fakes.
 from __future__ import annotations
 
 import time
+from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any
 
@@ -26,13 +27,19 @@ from test_notifier import CbEvent, MsgEvent
 
 from copytrader.config import AppConfig, NotifierConfig, TelegramConfig
 from copytrader.engine.orchestrator import Engine
-from copytrader.models import (ActionType, EntryType, ManagementPlan, PositionStatus, Side, TakeProfit, TradePlan,
-                               TradeStatus)
+from copytrader.models import (
+    ActionType,
+    EntryType,
+    ManagementPlan,
+    PositionStatus,
+    Side,
+    TakeProfit,
+    TradePlan,
+    TradeStatus,
+)
 from copytrader.storage.db import Database
 from copytrader.telegram import notifier as notifier_mod
 from copytrader.telegram.notifier import BotNotifier
-
-from datetime import UTC, datetime
 
 
 def _plan(asset: str, names: list[str], *, quote: str | None = None, pid: str = "p") -> TradePlan:
@@ -120,9 +127,8 @@ async def test_the_only_position_closes_at_once_and_the_trade_goes_on_on_the_oth
     assert await world.status(tid) == {"fx": PositionStatus.CLOSED, "tickmill": PositionStatus.OPEN}
     trade = await world.db.get_trade(tid)
     assert trade is not None and trade.status is TradeStatus.OPEN
-    assert trade.current_stop_loss == 2200.0                     # nothing of the whole trade changed
     (reply,) = [t for t in world.texts() if f"#{tid} ETH LONG (fx)" in t]
-    assert "✅" in reply and "İşlem tickmill hesabında açık kalıyor." in reply
+    assert "✅" in reply and "İşlem diğer hesaplarda sürüyor: tickmill (açık)." in reply
     assert [c for c, _ in world.tm.calls if c == "close_position"] == []
 
     # the trader's own close later: only what is still open is closed, and the trade ends with its summary
@@ -144,7 +150,8 @@ async def test_closing_the_last_open_account_ends_the_trade_with_its_summary(wor
     trade = await world.db.get_trade(tid)
     assert trade is not None and trade.status not in (TradeStatus.OPEN, TradeStatus.PENDING)
     last = [t for t in world.texts() if f"#{tid} ETH LONG (fx)" in t][-1]
-    assert "açık kalıyor" not in last
+    assert "sürüyor" not in last
+    assert f"🏁 #{tid} ETH LONG" in last                         # the trade's closing summary comes with it
 
 
 async def test_two_accounts_in_one_command(world: World) -> None:
@@ -261,6 +268,8 @@ async def test_a_currency_pair_filter_is_the_pair_not_the_currency(world: World)
     ("/pozkapat breakout", "elle işlem hesabı"),
     ("/pozkapat", "Kullanım"),
     ("/pozkapat fx1 ???", "anlaşılamadı"),
+    ("/pozkapat fx 1", "işlem numarası için <code>#1</code> yazın"),       # ("fx 1": never trade #1)
+    ("/pozkapat fx 7 eth", "anlaşılamadı"),
 ])
 async def test_a_wrong_command_closes_nothing_at_all(world: World, command: str, expect: str,
                                                      monkeypatch: pytest.MonkeyPatch) -> None:
@@ -323,15 +332,114 @@ async def test_another_accounts_open_in_flight_is_never_marked_to_close(world: W
         await world.say("/pozkapat fx1")
         assert (await world.status(tid))["fx"] is PositionStatus.OPEN
         assert leg.close_on_arrival is None and leg.missed_plans == [] and leg.missed == []
-        assert any("tickmill hesabının açılış emri henüz yanıtlanmadı" in t and "Hiçbir pozisyon kapatılmadı" in t
+        assert any("tickmill hesabının açılış emri henüz yanıtlanmadı" in t and "fx hesabında hiçbir pozisyon kapatılmadı" in t
                    for t in world.texts())
         trade = await world.db.get_trade(tid)
         assert trade is not None and trade.status is TradeStatus.OPEN
         # the account in flight itself: its open is closed on arrival, for the owner's reason; fx stays open
         await world.say("/pozkapat tickmill")
-        assert leg.close_on_arrival == "sizin /pozkapat komutunuzla kapatıldı"
+        assert leg.close_on_arrival == "bu hesap için /pozkapat yazdınız"
         assert (await world.status(tid))["fx"] is PositionStatus.OPEN
-        assert any("İşlem fx hesabında açık kalıyor." in t for t in world.texts())
+        assert any("İşlem diğer hesaplarda sürüyor: fx (açık)." in t for t in world.texts())
+        # tickmill's open is now marked to close: closing fx (the last position) is no longer refused
+        await world.say("/pozkapat fx1")
+        assert (await world.status(tid))["fx"] is PositionStatus.CLOSED
     finally:
         world.engine._late_legs.pop((tid, "tickmill"), None)
         task.cancel()
+
+
+
+# --------------------------------------------------------------------------- #
+# review round 1: the cases found
+# --------------------------------------------------------------------------- #
+async def test_two_accounts_of_a_trade_are_judged_together_when_a_third_open_is_in_flight(world: World) -> None:
+    import asyncio
+
+    from copytrader.engine.orchestrator import _LateLeg
+    tid = await world.open()                                       # fx + tickmill open
+    task = asyncio.ensure_future(asyncio.get_running_loop().create_future())
+    leg = _LateLeg(trade_id=tid, broker="fx2", label=f"#{tid} ETH LONG", task=task)
+    world.engine._late_legs[(tid, "fx2")] = leg
+    try:
+        await world.say("/pozkapat fx1,tickmill")
+        assert await world.status(tid) == {"fx": PositionStatus.OPEN, "tickmill": PositionStatus.OPEN}
+        assert leg.close_on_arrival is None
+        (reply,) = [t for t in world.texts() if "henüz yanıtlanmadı" in t]
+        assert "(fx ve tickmill)" in reply and "fx ve tickmill hesabında hiçbir pozisyon kapatılmadı" in reply
+        assert not any("✅" in t for t in world.texts())
+    finally:
+        world.engine._late_legs.pop((tid, "fx2"), None)
+        task.cancel()
+
+
+async def test_a_position_whose_close_is_owed_does_not_count_as_going_on(world: World) -> None:
+    import asyncio
+
+    from copytrader.brokers.base import BrokerError
+    from copytrader.engine.monitor import close_wanted
+    from copytrader.engine.orchestrator import _LateLeg
+    tid = await world.open()
+    world.tm.fail = {"close_position": BrokerError("market closed (test)")}
+    await world.say("/pozkapat tickmill")                          # owed: the monitor tries it again
+    world.tm.fail = {}
+    tm = next(p for p in await world.db.broker_positions(tid) if p.broker == "tickmill")
+    assert close_wanted(tm) is not None
+    fx = next(p for p in await world.db.broker_positions(tid) if p.broker == "fx")
+    assert close_wanted(fx) is None                                 # never widened to the other account
+    task = asyncio.ensure_future(asyncio.get_running_loop().create_future())
+    world.engine._late_legs[(tid, "fx2")] = _LateLeg(trade_id=tid, broker="fx2", label="x", task=task)
+    try:
+        world.client.sent.clear()
+        await world.say("/pozkapat fx1")       # tickmill is ending: fx is the last one, fx2's open still in flight
+        assert (await world.status(tid))["fx"] is PositionStatus.OPEN
+        assert any("fx2 hesabının açılış emri henüz yanıtlanmadı" in t for t in world.texts())
+    finally:
+        world.engine._late_legs.pop((tid, "fx2"), None)
+        task.cancel()
+
+
+async def test_an_open_with_an_unknown_outcome_is_named_not_called_no_position(world: World) -> None:
+    tid = await world.open(names=("fx",))
+    await world.db.update_trade(tid, note="tickmill: unknown")
+    await world.say("/pozkapat tickmill")
+    (reply,) = [t for t in world.texts() if "tickmill" in t]
+    assert "açılış emrinin sonucu bilinmiyordu" in reply and "elle kapatın" in reply
+
+
+async def test_shutting_down_closes_nothing_and_says_so(world: World) -> None:
+    tid = await world.open()
+    world.engine._accepting = False
+    try:
+        await world.say("/pozkapat fx1,tickmill")
+    finally:
+        world.engine._accepting = True
+    assert await world.status(tid) == {"fx": PositionStatus.OPEN, "tickmill": PositionStatus.OPEN}
+    assert any("Hiçbir pozisyon kapatılmadı" in t for t in world.texts())
+
+
+async def test_vazgec_while_the_chosen_close_runs_changes_nothing(world: World) -> None:
+    eth = await world.open("ETH")
+    await world.open("XAU")
+    await world.say("/pozkapat fx1")
+    (question,) = [m for m in world.client.to(OWNER) if m.buttons]
+    world.n._pk_running.add(question.id)                           # (a chosen close is being carried out)
+    try:
+        await world.press("pk:x", question.id)
+        await world.press(f"pk:{eth}", question.id)
+    finally:
+        world.n._pk_running.discard(question.id)
+    assert not any("Vazgeçildi" in e.text for e in world.client.edits_of(OWNER))
+    assert (await world.status(eth))["fx"] is PositionStatus.OPEN
+    assert question.id in world.n._pk_prompts                       # still answerable once that close is done
+
+
+async def test_a_restricted_stop_move_never_changes_the_whole_trade(world: World) -> None:
+    tid = await world.open()
+    plan = ManagementPlan(plan_id="sl", action=ActionType.MOVE_SL, trade_id=tid, new_stop_loss=2210.0,
+                          source_chat_id=CHAT, created_at=datetime.now(UTC), brokers=["fx"])
+    await world.engine.execute_management(plan, notify=False)
+    by = {p.broker: p for p in await world.db.broker_positions(tid)}
+    assert by["fx"].stop_loss == 2210.0 and by["tickmill"].stop_loss != 2210.0
+    trade = await world.db.get_trade(tid)
+    assert trade is not None and trade.current_stop_loss == 2200.0

@@ -141,7 +141,7 @@ def _close_plan(trade_id: int, fraction: float = 1.0) -> Any:
 async def test_sor_keeps_the_question(live: Prod) -> None:
     assert await live.engine.catch_up_command("sor") == (
         "✅ Bağlantı yokken atlanan tickmill işlemleri artık: <b>sor</b> — bağlantı gelince şartlar uygunsa Evet / "
-        "Hayır diye sorulur (arkadaş ayarlıysa ona).")
+        "Hayır diye sorulur (arkadaşınızın hesabıysa ve /arkadas ayarlıysa ona, değilse size).")
     tickmill_down(live)
     await live.say(fx_pair(*EURUSD_LONG), FX, "EUR LONG 1R")
     await reconnect(live)

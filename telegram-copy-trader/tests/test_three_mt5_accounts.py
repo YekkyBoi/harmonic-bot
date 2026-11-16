@@ -128,8 +128,17 @@ async def test_the_friend_still_answers_for_tickmill_when_nothing_is_written(tmp
         await world.owner_says(f"/arkadas {FRIEND}")
         conf = await world.ask_catch_up()
         assert (conf.catch_up or {}).get("decider") == FRIEND
-        world.tm.config.friend_account = True                       # written explicitly: the same
-        assert world.engine._friend_account(world.tm) is True
+    finally:
+        await world.down()
+
+
+async def test_the_friend_answers_when_friend_account_is_written_true(tmp_path: Path) -> None:
+    world = await World(tmp_path).up()
+    try:
+        world.tm.config.friend_account = True
+        await world.owner_says(f"/arkadas {FRIEND}")
+        conf = await world.ask_catch_up()
+        assert (conf.catch_up or {}).get("decider") == FRIEND
     finally:
         await world.down()
 

@@ -409,6 +409,7 @@ class BotNotifier:
         self._closeall_prompt: tuple[int, float] | None = None
         # /pozkapat questions: message id -> (sent at, account, trade ids offered, text, buttons); in memory only
         self._pk_prompts: dict[int, tuple[float, str, list[int], str, Any]] = {}
+        self._pk_running: set[int] = set()          # /pozkapat questions whose chosen close is running
         self._tasks: set[asyncio.Task[Any]] = set()
         self._unreachable_logged = False
         # ---- delivery state (see the module docstring) ----
@@ -856,26 +857,34 @@ class BotNotifier:
 
     # ---- /pozkapat: one account's positions ---------------------------------
     async def _pozkapat_command(self, engine: Any, args: str) -> None:
-        """Each named account: no position -> said; exactly one -> closed at once; more -> asked which (buttons)."""
+        """Each named account: no position -> said; exactly one -> closed at once; more -> asked which (buttons). The
+        accounts closed at once go to the engine in one call (one plan per trade: judged together)."""
         problem, targets = await engine.account_close_request(args)
         if problem:
             await self._send(problem)
             return
-        done: list[str] = []
+        parts: list[str] = []
+        singles: list[tuple[str, int]] = []
+        asks: list[tuple[Any, str]] = []
         for target in targets:
             what = f" ({esc(target.what)})" if target.what else ""
+            parts.extend(target.notes)
             if not target.matches:
-                done.append(f"ℹ️ <b>{esc(target.broker)}</b>{what}: kapatılacak açık pozisyon yok.")
+                parts.append(f"ℹ️ <b>{esc(target.broker)}</b>{what}: kapatılacak açık pozisyon yok.")
             elif len(target.matches) == 1:
-                result = await engine.close_on_account(target.broker, [target.matches[0][0]])
-                if result in _NOT_NOW:
-                    await self._send(result + "\nHiçbir pozisyon kapatılmadı.")
-                    return
-                done.append(result)
+                singles.append((target.broker, target.matches[0][0]))
             else:
-                await self._ask_pozkapat(target, what)
-        if done:
-            await self._send("\n\n".join(done))
+                asks.append((target, what))
+        if singles:
+            result = await engine.close_on_accounts(singles)
+            if result in _NOT_NOW:              # (said before anything was done)
+                await self._send("\n\n".join([*parts, result + "\nHiçbir pozisyon kapatılmadı."]))
+                return
+            parts.append(result)
+        if parts:
+            await self._send("\n\n".join(parts))
+        for target, what in asks:
+            await self._ask_pozkapat(target, what)
 
     async def _ask_pozkapat(self, target: Any, what: str) -> None:
         ids = [tid for tid, _label in target.matches]
@@ -892,6 +901,10 @@ class BotNotifier:
 
     async def _handle_pozkapat(self, event: Any, choice: str) -> None:
         msg_id = getattr(event, "message_id", None)
+        if msg_id is not None and msg_id in self._pk_running:
+            # A choice of this question is being carried out: no other answer, no other text over its result.
+            await self._answer(event, "⏳ Seçtiğiniz kapatma sürüyor; sonuç bu mesaja yazılacak.", alert=True)
+            return
         prompt = self._pk_prompts.get(msg_id) if msg_id is not None else None
         if choice == "x":
             self._pk_prompts.pop(msg_id, None)
@@ -920,13 +933,17 @@ class BotNotifier:
             await self._answer(event, "Sistem henüz hazır değil", alert=True)
             return
         self._pk_prompts.pop(msg_id, None)          # one use only (before any await)
-        await self._answer(event, "⏳ Kapatılıyor…")
-        await self._edit(msg_id, f"⏳ {esc(broker)} hesabında kapatılıyor…")
+        self._pk_running.add(msg_id)
         try:
-            result = await engine.close_on_account(broker, ids)
-        except Exception as exc:
-            log.exception("pozkapat failed")
-            result = f"🚨 Kapatma sırasında hata: <code>{esc(exc)}</code>"
+            await self._answer(event, "⏳ Kapatılıyor…")
+            await self._edit(msg_id, f"⏳ {esc(broker)} hesabında kapatılıyor…")
+            try:
+                result = await engine.close_on_account(broker, ids)
+            except Exception as exc:
+                log.exception("pozkapat failed")
+                result = f"🚨 Kapatma sırasında hata: <code>{esc(exc)}</code>"
+        finally:
+            self._pk_running.discard(msg_id)
         if result in _NOT_NOW:
             # Nothing was done: the question gets its buttons back for the rest of its time.
             self._pk_prompts.setdefault(msg_id, prompt)

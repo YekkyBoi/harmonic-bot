@@ -908,6 +908,7 @@ class AccountCloseTarget:
     broker: str
     matches: list[tuple[int, str]]      # (trade id, label)
     what: str = ""                       # the filter as typed ("" = every position)
+    notes: list[str] = field(default_factory=list)   # HTML: what the bot cannot close there (an unknown open)
 
 
 class _VirtualEntryOps:
@@ -2098,7 +2099,8 @@ class Engine:
         names = _names([b.name for b in self.configured_brokers if self._is_optional(b)]) or "isteğe bağlı hesap"
         what = f"Bağlantı yokken atlanan {names} işlemleri"
         explain = {"otomatik": "bağlantı gelince şartlar uygunsa sormadan açılır",
-                   "sor": "bağlantı gelince şartlar uygunsa Evet / Hayır diye sorulur (arkadaş ayarlıysa ona)"}
+                   "sor": "bağlantı gelince şartlar uygunsa Evet / Hayır diye sorulur (arkadaşınızın hesabıysa ve "
+                          "/arkadas ayarlıysa ona, değilse size)"}
         arg = fold_ascii(args)                          # ("OTOMATİK", "Otomatık", "SOR")
         if not arg:
             try:
@@ -5056,7 +5058,7 @@ class Engine:
         # ``plan.brokers``: only those accounts (the owner's /pozkapat): the trade goes on on the others, so nothing
         # that stands for the whole trade (its stop / targets, the other accounts' late opens) is touched.
         only = frozenset(plan.brokers)
-        why_end = "sizin /pozkapat komutunuzla kapatıldı" if only else "trader işlemi kapattı / iptal etti"
+        why_end = "bu hesap için /pozkapat yazdınız" if only else "trader işlemi kapattı / iptal etti"
         async with self.trade_lock(plan.trade_id):
             trade = await self.db.get_trade(plan.trade_id)
             if trade is None:
@@ -5074,13 +5076,16 @@ class Engine:
             if only and self._ends_trade(plan.action, plan.close_fraction):
                 # Closing these accounts would leave the trade with no position while another account's open is
                 # still unanswered: the trade would count as ended and that open be closed on arrival. Not done.
-                others = [p for p in positions if p.status in ACTIVE_POSITION and p.broker not in only]
-                waiting_open = sorted({leg.broker for leg in self._late_legs_of(trade.id) if leg.broker not in only})
+                # (a position whose close is owed is ending too; an open already marked to close does not count)
+                others = [p for p in positions if p.status in ACTIVE_POSITION and p.broker not in only
+                          and close_wanted(p) is None]
+                waiting_open = sorted({leg.broker for leg in self._late_legs_of(trade.id)
+                                       if leg.broker not in only and not leg.close_on_arrival})
                 if waiting_open and not others:
-                    return (f"⏳ #{trade.id} {esc(trade.plan.base_asset)} {trade.plan.side.value.upper()}: "
-                            f"{_names(waiting_open)} hesabının açılış emri henüz yanıtlanmadı; şimdi kapatılırsa işlem "
-                            f"bitmiş sayılır ve o hesapta da kapatılır. Hiçbir pozisyon kapatılmadı; biraz sonra "
-                            f"tekrar deneyin.")
+                    return (f"⏳ #{trade.id} {esc(trade.plan.base_asset)} {trade.plan.side.value.upper()} "
+                            f"({_names(sorted(only))}): {_names(waiting_open)} hesabının açılış emri henüz "
+                            f"yanıtlanmadı; şimdi kapatılırsa işlem bitmiş sayılır ve o hesapta da kapatılır. "
+                            f"{_names(sorted(only))} hesabında hiçbir pozisyon kapatılmadı; biraz sonra tekrar deneyin.")
             active = [p for p in positions if p.status in ACTIVE_POSITION and (not only or p.broker in only)]
             flow = _OpenFlow()
             answered, waiting = await self._run_manage_legs(plan, trade, active, flow)
@@ -5174,10 +5179,14 @@ class Engine:
             lines = (([f"• {o.text}" for o in outcomes] + late_lines + unknown_lines)
                      or ["• Aktif broker pozisyonu yok."])
             if only:
-                rest = sorted({p.broker for p in merged if p.status in ACTIVE_POSITION and p.broker not in only}
-                              | {leg.broker for leg in self._late_legs_of(trade.id) if leg.broker not in only})
-                if rest:
-                    lines.append(f"• İşlem {_names(rest)} hesabında açık kalıyor.")
+                # Where the trade goes on, as it stands: never a position whose close is owed, never an open that is
+                # to be closed on arrival.
+                still = [f"{esc(p.broker)} ({pos_status_text(p)})" for p in merged
+                         if p.broker not in only and p.status in ACTIVE_POSITION and close_wanted(p) is None]
+                still += [f"{esc(leg.broker)} (açılış emri yanıt bekliyor)" for leg in self._late_legs_of(trade.id)
+                          if leg.broker not in only and not leg.close_on_arrival]
+                if still:
+                    lines.append("• İşlem diğer hesaplarda sürüyor: " + ", ".join(dict.fromkeys(still)) + ".")
             slow = [o.broker for o in outcomes if o.kind == "late"]
             failed = [o for o in outcomes if o.kind in ("error", "partial") and not o.deferred]
             # What still follows (each broker's line below says it too): the headline never reads "uygulandı" alone
@@ -7364,9 +7373,12 @@ class Engine:
         trade_ids: set[int] = set()
         assets: list[tuple[str, str | None]] = []
         for word in words[1:]:
-            if re.fullmatch(r"#?\d+", word):
-                trade_ids.add(int(word.lstrip("#")))
+            if re.fullmatch(r"#\d+", word):
+                trade_ids.add(int(word[1:]))
                 continue
+            if re.fullmatch(r"\d+", word):         # ("fx 2" for "fx2": never taken as trade #2)
+                return (f"<b>{esc(word)}</b> anlaşılamadı (işlem numarası için <code>#{esc(word)}</code> yazın; hesap "
+                        f"adını boşluksuz yazın). Hiçbir pozisyon kapatılmadı.\nHesaplar: {self._accounts_hint()}"), []
             base, quote, _market = normalize_symbol(word)
             if not base or not re.fullmatch(r"[^\W_]+(?:[./:_&-][^\W_]+)*(?:\.P)?", word, re.I) \
                     or not any(ch.isalpha() for ch in word):
@@ -7377,47 +7389,63 @@ class Engine:
         targets: list[AccountCloseTarget] = []
         for broker in accounts:
             matches: list[tuple[int, str]] = []
+            notes: list[str] = []
             for t in trades:
                 if words[1:] and not (t.id in trade_ids or any(
                         canonical_asset(t.plan.base_asset) == base and (q is None or (t.plan.quote_asset or "") == q)
                         for base, q in assets)):
                     continue
-                held = [p for p in await self.db.broker_positions(t.id)
-                        if p.broker == broker.name and p.status in ACTIVE_POSITION]
+                positions = await self.db.broker_positions(t.id)
+                held = [p for p in positions if p.broker == broker.name and p.status in ACTIVE_POSITION]
                 late = any(leg.broker == broker.name for leg in self._late_legs_of(t.id))
                 if not held and not late:
+                    if broker.name in unknown_open_brokers(t, positions)[0]:
+                        notes.append(f"⚠️ #{t.id} {esc(t.plan.base_asset)} {t.plan.side.value.upper()}: "
+                                     f"{esc(broker.name)} hesabında açılış emrinin sonucu bilinmiyordu; bot orada "
+                                     "pozisyon yönetmiyor. Emir açıldıysa pozisyonu elle kapatın.")
                     continue
                 state = pos_status_text(held[0]) if held else "açılış sürüyor"
                 matches.append((t.id, f"#{t.id} {t.plan.base_asset} {t.plan.side.value.upper()} ({state})"))
             what = " ".join(words[1:])
-            targets.append(AccountCloseTarget(broker=broker.name, matches=sorted(matches), what=what))
+            targets.append(AccountCloseTarget(broker=broker.name, matches=sorted(matches), what=what, notes=notes))
         return None, targets
 
     async def close_on_account(self, broker: str, trade_ids: Sequence[int]) -> str:
-        """Close (a pending entry: cancel) ``broker``'s position of each trade, and only that one: the trade goes on
-        on its other accounts (:meth:`execute_management` with ``brokers``). HTML result."""
+        """:meth:`close_on_accounts` for one account."""
+        return await self.close_on_accounts([(broker, tid) for tid in trade_ids])
+
+    async def close_on_accounts(self, pairs: Sequence[tuple[str, int]]) -> str:
+        """Close (a pending entry: cancel) each (account, trade)'s position, and only those: the trade goes on on its
+        other accounts (:meth:`execute_management` with ``brokers``). The accounts of one trade go in ONE plan, so
+        that they are judged together (e.g. none of them is closed while the trade's last other account has not
+        answered its open yet). SHUTDOWN / STARTING text before anything is done. HTML result."""
         if not self._accepting:
             return SHUTDOWN_TEXT
         if self._starting:
             return STARTING_TEXT
+        by_trade: dict[int, list[str]] = {}
+        for broker, trade_id in pairs:
+            names = by_trade.setdefault(int(trade_id), [])
+            if broker not in names:
+                names.append(broker)
         lines: list[str] = []
         now = self._now()
-        for trade_id in dict.fromkeys(trade_ids):
+        for trade_id, brokers in by_trade.items():
             trade = await self.db.get_trade(trade_id)
             if trade is None:
                 lines.append(f"#{trade_id} işlemi bulunamadı.")
                 continue
             plan = ManagementPlan(
                 plan_id=uuid.uuid4().hex[:10], action=ActionType.CLOSE, trade_id=trade_id, close_fraction=1.0,
-                source_chat_id=trade.plan.source_chat_id, summary_tr=f"{broker} hesabında kapatıldı (/pozkapat)",
-                created_at=now, brokers=[broker],
+                source_chat_id=trade.plan.source_chat_id,
+                summary_tr=f"{', '.join(brokers)} hesabında kapatıldı (/pozkapat)", created_at=now, brokers=brokers,
             )
             try:
                 lines.append(await self.execute_management(plan, notify=False))
             except Exception as exc:
-                logger.exception("pozkapat: trade %s on %s", trade_id, broker)
-                lines.append(f"🚨 #{trade_id} ({esc(broker)}): <code>{esc(exc)}</code>")
-        await self._log("pozkapat", {"broker": broker, "trades": list(trade_ids)})
+                logger.exception("pozkapat: trade %s on %s", trade_id, brokers)
+                lines.append(f"🚨 #{trade_id} ({esc(', '.join(brokers))}): <code>{esc(exc)}</code>")
+        await self._log("pozkapat", {"closes": [[b, t] for t, bs in by_trade.items() for b in bs]})
         return "\n\n".join(lines)
 
     async def test_parse(self, text: str) -> str:
