@@ -96,3 +96,85 @@ async def test_the_forex_topic_on_fx_is_unchanged(prod: Prod) -> None:
     (order,) = prod.fx_orders()
     assert order[0] == "BUY_LIMIT" and order[3:] == (1.1610, 1.1590, 1.1650)
     assert prod.ref.calls == []                                             # no Binance offset on the forex topic
+
+
+# --------------------------------------------------------------------------- #
+# the trader manages the signal while fx still waits (management of a non-optional account runs under the trade lock)
+# --------------------------------------------------------------------------- #
+async def _waiting_btc_limit(prod: Prod) -> int:
+    sig = await prod.say(btc(EntryType.LIMIT, 73000.0, 72300.0, 75000.0), KRIPTO, "btc 1R long limit emir")
+    (trade,) = await prod.trades()
+    assert is_virtual_pending((await prod.positions(trade.id))["fx"])
+    return sig
+
+
+def _touch(prod: Prod) -> None:
+    prod.binance.set_price("BTC", 72989.0, 72991.0)
+    prod.terminal.set_price("BTCUSD", 72939.0, 72941.0)
+    prod.tickmill.set_price("BTCUSD", 72939.0, 72941.0)
+
+
+async def test_cancel_while_waiting_ends_the_fx_entry_and_a_later_touch_opens_nothing(prod: Prod) -> None:
+    from copytrader.models import ActionType
+    from test_review1_engine_mgmt import manage
+
+    sig = await _waiting_btc_limit(prod)
+    await prod.say(manage(ActionType.CANCEL, 1, sig, "BTC", summary_tr="emri sildik"), KRIPTO, "Emri sildik",
+                   reply_to=sig)
+    pos = await prod.positions(1)
+    assert pos["fx"].status is PositionStatus.CANCELLED and not is_virtual_pending(pos["fx"])
+    _touch(prod)
+    for _ in range(2):
+        await prod.engine.monitor.run_virtual_once()
+        await prod.engine.monitor.run_once()
+    assert prod.fx_orders() == []
+
+
+async def test_stop_moved_while_waiting_is_the_stop_fx_opens_with_shifted(prod: Prod) -> None:
+    from copytrader.models import ActionType
+    from test_review1_engine_mgmt import manage
+
+    sig = await _waiting_btc_limit(prod)
+    await prod.say(manage(ActionType.MOVE_SL, 1, sig, "BTC", new_stop_loss=72500.0, summary_tr="stop 72500"),
+                   KRIPTO, "stop 72500", reply_to=sig)
+    assert (await prod.positions(1))["fx"].stop_loss == 72500.0
+    _touch(prod)
+    await prod.engine.monitor.run_virtual_once()
+    ((kind, _symbol, _lots, _price, sl, tp),) = prod.fx_orders()
+    assert (kind, sl, tp) == ("BUY", 72450.0, 74950.0)                 # the moved stop, shifted by -50
+
+
+async def test_restart_while_waiting_keeps_the_fx_entry_and_the_touch_opens_it_once(prod: Prod) -> None:
+    from copytrader.engine.orchestrator import Engine
+    from copytrader.engine.prices import PriceOracle
+
+    await _waiting_btc_limit(prod)
+    await prod.engine.stop(grace_sec=1.0)
+    holder: list[Engine] = []
+    oracle = PriceOracle(lambda: holder[0].brokers, prod.cfg.price_source_exchange, cache_ttl_sec=0.0,
+                         public_exchange=prod.binance)
+    prod.engine = Engine(prod.cfg, prod.db, prod.parser, list(prod.brokers.values()), prod.notifier,
+                         price_oracle=oracle, reference_prices=prod.ref)
+    holder.append(prod.engine)
+    await prod.engine.start(monitor=False)
+    assert is_virtual_pending((await prod.positions(1))["fx"])
+    _touch(prod)
+    await prod.engine.monitor.run_virtual_once()
+    await prod.engine.monitor.run_virtual_once()
+    ((kind, _symbol, _lots, _price, sl, tp),) = prod.fx_orders()
+    assert (kind, sl, tp) == ("BUY", 72250.0, 74950.0)
+    assert (await prod.positions(1))["fx"].status is PositionStatus.OPEN
+
+
+async def test_daily_loss_limit_reached_while_waiting_refuses_the_fx_open_at_the_touch(prod: Prod) -> None:
+    await _waiting_btc_limit(prod)
+    fx = next(b for b in prod.cfg.brokers if b.name == "fx")
+    fx.daily_loss_limit_pct = 0.5                       # 50 USD of 10,000: below this trade's own 1R (100 USD)
+    fx.daily_loss_include_open_risk = True
+    _touch(prod)
+    await prod.engine.monitor.run_virtual_once()
+    await prod.engine.monitor.run_virtual_once()
+    assert prod.fx_orders() == []
+    pos = (await prod.positions(1))["fx"]
+    assert not is_virtual_pending(pos) and pos.status is not PositionStatus.OPEN
+    assert any("günlük zarar sınırı" in t and "fx" in t for t in prod.texts())
