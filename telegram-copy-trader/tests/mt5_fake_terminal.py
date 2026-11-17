@@ -29,6 +29,10 @@ TERMINAL_STATE_ENV = "FAKE_TERMINAL_STATE"
 TERMINAL_CONTROL_ENV = "FAKE_TERMINAL_CONTROL"
 TERMINAL_FOLDER_ENV = "FAKE_TERMINAL_FOLDER"
 TERMINAL_COMPANY_ENV = "FAKE_TERMINAL_COMPANY"
+# The account logged in to the terminal: by default of the terminal's own company, on "<first word>-Demo". A terminal
+# installed from metatrader5.com reports company "MetaQuotes Ltd." while its account is the broker's ("BEM Ltd.").
+ACCOUNT_COMPANY_ENV = "FAKE_ACCOUNT_COMPANY"
+ACCOUNT_SERVER_ENV = "FAKE_ACCOUNT_SERVER"
 _KEPT = ("positions", "orders", "history_orders", "deals", "_next")
 BTC_BID, BTC_ASK = 95_000.0, 95_010.0
 FX = {"EURUSD": (1.16195, 1.16205), "GBPUSD": (1.31495, 1.31505)}
@@ -39,15 +43,16 @@ def server_now() -> int:
 
 
 class PersistentFake(FakeMT5):
-    def __init__(self, state: str, control: str, folder: str, company: str) -> None:
+    def __init__(self, state: str, control: str, folder: str, company: str,
+                 account_company: str | None = None, account_server: str | None = None) -> None:
         super().__init__()
         self.state_path = Path(state)
         self.control_path = Path(control)
         self.terminal.path = folder
         self.terminal.company = company
         self.account.login = 7007
-        self.account.server = f"{company.split()[0]}-Demo"
-        self.account.company = company
+        self.account.company = account_company or company
+        self.account.server = account_server or f"{self.account.company.split()[0]}-Demo"
         now = server_now()
         self.symbols["BTCUSD"] = make_symbol("BTCUSD", trade_tick_size=0.01, point=0.01)
         self.ticks["BTCUSD"] = SimpleNamespace(bid=BTC_BID, ask=BTC_ASK, last=0.0, time=now)
@@ -138,4 +143,5 @@ class PersistentFake(FakeMT5):
 def make() -> PersistentFake:
     return PersistentFake(os.environ[TERMINAL_STATE_ENV], os.environ[TERMINAL_CONTROL_ENV],
                           os.environ.get(TERMINAL_FOLDER_ENV, r"C:\Program Files\Tickmill MT5 Terminal"),
-                          os.environ.get(TERMINAL_COMPANY_ENV, "Tickmill Ltd"))
+                          os.environ.get(TERMINAL_COMPANY_ENV, "Tickmill Ltd"),
+                          os.environ.get(ACCOUNT_COMPANY_ENV) or None, os.environ.get(ACCOUNT_SERVER_ENV) or None)

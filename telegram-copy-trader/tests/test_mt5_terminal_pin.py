@@ -17,7 +17,7 @@ from typing import Any
 import pytest
 
 from copytrader.brokers.base import BrokerError
-from copytrader.brokers.mt5_broker import Mt5Broker, TerminalGuard, build_guard, read_pins
+from copytrader.brokers.mt5_broker import Mt5Broker, TerminalGuard, build_guard, read_pins, write_pin
 from copytrader.config import Mt5BrokerConfig, RiskConfig, terminal_key
 from copytrader.models import SymbolInfo
 
@@ -434,3 +434,48 @@ async def test_no_pathless_log_in_while_another_accounts_terminal_is_configured(
     b = await fx(fake, tmp_path, metaapi_guard())
     await b.close()
     assert fake.logins == [(FP, 5001)]
+
+
+# --------------------------------------------------------------------------- #
+# terminals installed from metatrader5.com: every one reports company "MetaQuotes Ltd"
+# --------------------------------------------------------------------------- #
+# The owner's fx (FundingPips) and fx2 (BEM, type mt5_bridge with its own terminal_path) both run in a terminal
+# downloaded from metatrader5.com. Once fx2 is pinned, "MetaQuotes Ltd" is another account's company too: an
+# account that names its terminal (terminal_path) is judged by that terminal's folder, a path-less one still by the
+# company as well.
+BEMF = r"C:\Program Files\BEM MT5"
+GENERIC_CO = "MetaQuotes Ltd"
+
+
+def _generic_fx_and_fx2_pin(pins: Path) -> tuple[TwoTerminals, TerminalGuard]:
+    fake = TwoTerminals()
+    fake.terms[FP]["company"] = GENERIC_CO
+    write_pin(str(pins), "fx2", {"folder": BEMF, "path": BEMF + r"\terminal64.exe", "company": GENERIC_CO,
+                                 "server": "BEM-Server", "login": 9001})
+    fx2 = SimpleNamespace(name="fx2", type="mt5_bridge", terminal_path=BEMF + r"\terminal64.exe", broker_company="BEM")
+    return fake, build_guard("fx", [fx2], str(pins), ["fx", "Demo-Server", ""])
+
+
+async def test_fx_with_its_own_pin_connects_next_to_an_fx2_terminal_of_the_same_maker(tmp_path: Path) -> None:
+    fake, guard = _generic_fx_and_fx2_pin(tmp_path)
+    write_pin(str(tmp_path), "fx", {"folder": FP, "path": FP + r"\terminal64.exe", "company": GENERIC_CO,
+                                    "server": "Demo-Server", "login": 5001})
+    b = await fx(fake, tmp_path, guard)
+    await b.close()
+    assert fake.logins == [(FP, 5001)] and fake.sent == []
+
+
+async def test_fx_with_a_terminal_path_connects_next_to_an_fx2_terminal_of_the_same_maker(tmp_path: Path) -> None:
+    fake, guard = _generic_fx_and_fx2_pin(tmp_path)                  # (no pin of fx's own)
+    b = await fx(fake, tmp_path, guard, terminal_path=FP + r"\terminal64.exe")
+    await b.close()
+    assert fake.logins == [(FP, 5001)]
+    assert read_pins(str(tmp_path))["fx"]["folder"] == FP
+
+
+async def test_a_pathless_fx_without_a_pin_is_still_refused_at_a_terminal_of_fx2s_company(tmp_path: Path) -> None:
+    fake, guard = _generic_fx_and_fx2_pin(tmp_path)                  # fx: no terminal_path, no pin
+    with pytest.raises(BrokerError, match="'fx2' hesabının terminaline bağlandı"):
+        await fx(fake, tmp_path, guard)
+    assert fake.logins == [] and fake.sent == []
+    assert "fx" not in read_pins(str(tmp_path))

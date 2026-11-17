@@ -19,6 +19,8 @@ from typing import Any
 
 import pytest
 from mt5_fake_terminal import (
+    ACCOUNT_COMPANY_ENV,
+    ACCOUNT_SERVER_ENV,
     TERMINAL_COMPANY_ENV,
     TERMINAL_CONTROL_ENV,
     TERMINAL_FOLDER_ENV,
@@ -38,7 +40,7 @@ from test_notifier import CbEvent
 
 from copytrader.brokers import mt5_bridge
 from copytrader.brokers.mt5_bridge import Mt5BridgeBroker, helper_command
-from copytrader.brokers.mt5_broker import build_guard
+from copytrader.brokers.mt5_broker import build_guard, write_pin
 from copytrader.config import (
     AppConfig,
     Mt5BridgeBrokerConfig,
@@ -146,12 +148,15 @@ async def test_the_friend_answers_when_friend_account_is_written_true(tmp_path: 
 # --------------------------------------------------------------------------- #
 # two bridge helpers at the same time
 # --------------------------------------------------------------------------- #
-def _command(term: Terminal, folder: str, company: str):
-    """The helper's start command bound to ONE fake terminal (state file, folder, company)."""
+def _command(term: Terminal, folder: str, company: str, account: tuple[str, str] | None = None):
+    """The helper's start command bound to ONE fake terminal (state file, folder, company; ``account``: the
+    (company, server) of the account logged in to it when that is not the terminal's own company)."""
     def command() -> tuple[list[str], dict[str, str], str]:
         argv, env, cwd = helper_command()
         env.update({TERMINAL_STATE_ENV: str(term.state), TERMINAL_CONTROL_ENV: str(term.control),
                     TERMINAL_FOLDER_ENV: folder, TERMINAL_COMPANY_ENV: company})
+        if account is not None:
+            env.update({ACCOUNT_COMPANY_ENV: account[0], ACCOUNT_SERVER_ENV: account[1]})
         return argv, env, cwd
     return command
 
@@ -172,11 +177,11 @@ def two(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> tuple[Terminal, Term
 
 
 def _bridge(cfg: dict[str, Any], others: list[dict[str, Any]], pins: Path, term: Terminal, folder: str,
-            company: str) -> Mt5BridgeBroker:
+            company: str, account: tuple[str, str] | None = None) -> Mt5BridgeBroker:
     c = Mt5BridgeBrokerConfig(**{k: v for k, v in cfg.items()})
     other_cfgs = [Mt5BridgeBrokerConfig(**o) if o["type"] == "mt5_bridge" else _app([o]).brokers[0] for o in others]
     guard = build_guard(c.name, other_cfgs, str(pins), [c.name, c.broker_company or ""])
-    b = Mt5BridgeBroker(c, pin_dir=str(pins), guard=guard, command=_command(term, folder, company))
+    b = Mt5BridgeBroker(c, pin_dir=str(pins), guard=guard, command=_command(term, folder, company, account))
     b.set_notifier(Notes())
     b.set_risk_config(RiskConfig(include_fees_in_risk=False))
     return b
@@ -240,6 +245,66 @@ async def test_the_new_account_refuses_its_terminal_logged_in_to_another_company
     bem = _bridge(BEM, [FX, TICKMILL], pins, bem_term, BEM_FOLDER, "FundingPips Ltd")
     with pytest.raises(Exception, match="bir BEM hesabı görünmüyor"):
         await asyncio.wait_for(bem.connect(), GUARD)
+    await bem.close()
+
+
+# --------------------------------------------------------------------------- #
+# terminals installed from metatrader5.com: the same company for every account
+# --------------------------------------------------------------------------- #
+# On the owner's computer fx (FundingPips) and fx2 (BEM) both run in a terminal downloaded from metatrader5.com:
+# terminal_info().company is "MetaQuotes Ltd." for both, only the ACCOUNT says whose it is (FundingPips Corp on
+# FundingPips-SIM1, BEM Ltd. on BEM-Server). fx2 names its own terminal (terminal_path): that terminal's folder,
+# not its maker, tells it apart from fx's.
+FP_FOLDER = r"C:\Program Files\MetaTrader 5"
+GENERIC = "MetaQuotes Ltd."
+BEM_ACCOUNT = ("BEM Ltd.", "BEM-Server")
+
+
+def _pin_fx(pins: Path) -> None:
+    write_pin(str(pins), "fx", {"folder": FP_FOLDER, "path": FP_FOLDER + r"\terminal64.exe", "company": GENERIC,
+                                "server": "FundingPips-SIM1", "login": 5001})
+
+
+async def test_fx2_connects_to_its_metaquotes_terminal_next_to_fx_of_the_same_maker(two) -> None:
+    _tm_term, bem_term, pins = two
+    _pin_fx(pins)
+    bem = _bridge(BEM, [FX, TICKMILL], pins, bem_term, BEM_FOLDER, GENERIC, BEM_ACCOUNT)
+    try:
+        await asyncio.wait_for(bem.connect(), GUARD)
+        pinned = json.loads((pins / "mt5_terminal_fx2.json").read_text(encoding="utf-8"))
+        assert (pinned["folder"], pinned["company"], pinned["server"]) == (BEM_FOLDER, GENERIC, "BEM-Server")
+        s = await eth(bem)
+        p = await asyncio.wait_for(
+            bem.open_position(make_req(s, 0.6, make_plan(tps=THREE_TPS), tag="ctbe00000002")), GUARD)
+        assert p.status is PositionStatus.OPEN
+        assert {x.comment.split("-")[0] for x in bem_term.positions().values()} == {"ctbe00000002"}
+        # fx's pin is untouched
+        fx_pin = json.loads((pins / "mt5_terminal_fx.json").read_text(encoding="utf-8"))
+        assert (fx_pin["folder"], fx_pin["company"]) == (FP_FOLDER, GENERIC)
+    finally:
+        await bem.close()
+
+
+async def test_fx2_pointed_at_fxs_pinned_terminal_is_still_refused(two) -> None:
+    _tm_term, bem_term, pins = two
+    _pin_fx(pins)
+    wrong = dict(BEM, terminal_path=FP_FOLDER + r"\terminal64.exe")
+    bem = _bridge(wrong, [FX, TICKMILL], pins, bem_term, FP_FOLDER, GENERIC, ("FundingPips Corp", "FundingPips-SIM1"))
+    with pytest.raises(Exception) as err:
+        await asyncio.wait_for(bem.connect(), GUARD)
+    assert "'fx' hesabının terminaline bağlandı" in str(err.value)
+    assert bem_term.positions() == {}
+    assert not (pins / "mt5_terminal_fx2.json").exists()
+    await bem.close()
+
+
+async def test_fx2s_metaquotes_terminal_logged_in_to_another_broker_is_still_refused(two) -> None:
+    _tm_term, bem_term, pins = two
+    _pin_fx(pins)
+    bem = _bridge(BEM, [FX, TICKMILL], pins, bem_term, BEM_FOLDER, GENERIC, ("FundingPips Corp", "FundingPips-SIM1"))
+    with pytest.raises(Exception, match="bir BEM hesabı görünmüyor"):
+        await asyncio.wait_for(bem.connect(), GUARD)
+    assert not (pins / "mt5_terminal_fx2.json").exists()
     await bem.close()
 
 

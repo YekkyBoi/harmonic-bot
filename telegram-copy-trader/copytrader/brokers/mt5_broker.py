@@ -1847,7 +1847,8 @@ _ACTIVE_LOGINS: dict[int, int] = {}     # id(MetaTrader5 module) -> login: the p
 # into <data_dir>/mt5_terminal_<broker>.json; every later initialize() / re-login uses that terminal's path, and a
 # terminal that is not that one (another folder or company), or that another account of the bot uses, is refused
 # before anything is read or sent (fail closed: the owner is told why). An explicit terminal_path in the config always
-# wins over the pin.
+# wins over the pin. Another account's company (from its pin) only guards a path-less account: terminals installed
+# from metatrader5.com all report "MetaQuotes Ltd.", so for an account with a terminal_path its folder decides.
 PIN_PREFIX = "mt5_terminal_"
 TERMINAL_EXE = "terminal64.exe"
 _MARKER_MIN_LEN = 5          # a broker name / company shorter than this is never used as a marker
@@ -1933,8 +1934,9 @@ def _exe_in(folder: str) -> str:
 @dataclass
 class TerminalGuard:
     """What an account must NOT attach to: the terminals other accounts of the bot use (folder keys: their
-    configured terminal_path, their pins), their companies (from their pins) and marker words (other MetaTrader
-    accounts' names and broker_company: a terminal whose folder or company contains one is someone else's)."""
+    configured terminal_path, their pins), their companies (from their pins; checked only for an account without a
+    terminal_path of its own) and marker words (other MetaTrader accounts' names and broker_company: a terminal whose
+    folder or company contains one is someone else's)."""
 
     folders: dict[str, str] = field(default_factory=dict)       # folder key -> broker name
     companies: dict[str, str] = field(default_factory=dict)     # company (casefold) -> broker name
@@ -2200,7 +2202,11 @@ class Mt5Broker(MetaTraderLegBroker):
                         f"{pin_folder or '?'}, şirket: {pin_company or '?'}). {stop} Terminal gerçekten değiştiyse "
                         f"config.yaml'da bu hesaba terminal_path yazın ya da {where} dosyasını silin.")
         other = self._guard.folders.get(fkey)
-        if other is None and ckey and ckey in self._guard.companies and ckey != str(pin.get("company") or "").casefold():
+        # Another account's company only tells a terminal apart for an account WITHOUT a terminal_path: with one,
+        # the folder was checked above, and two terminals installed from metatrader5.com both report "MetaQuotes
+        # Ltd." (the owner's fx and fx2) - the company would refuse the account's own terminal.
+        if (other is None and not explicit and ckey and ckey in self._guard.companies
+                and ckey != str(pin.get("company") or "").casefold()):
             other = self._guard.companies[ckey]
         if other is None:
             other = next((who for word, who in self._guard.markers.items()
