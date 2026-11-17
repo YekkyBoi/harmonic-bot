@@ -51,9 +51,10 @@ telegram:
   # adın içindeki metin eşleştiği için ayar değiştirmek gerekmez.
   # Boş ([]) = gruptaki bütün mesajlar okunur (konusuz gruplar için).
   # brokers: aşağıdaki "brokers" listesindeki name değerleri; boş = tüm açık brokerlar.
-  # kind: crypto (USDT perpetual) | fx (ör. "EUR" = EURUSD) | any
-  #       Fiyat farkı kaydırması ve sanal tetik (broker ayarı reference_exchange) yalnızca crypto konularında
-  #       uygulanır; fx konularında seviyeler hiç kaydırılmaz.
+  # kind: crypto (USDT perpetual) | fx (ör. "EUR" = EURUSD) | any (kripto, döviz, altın/gümüş, endeks bir arada)
+  #       Fiyat farkı kaydırması ve sanal tetik (broker ayarı reference_exchange) crypto konularında uygulanır;
+  #       fx konularında seviyeler hiç kaydırılmaz. any konusunda sinyale bakılır: kripto sinyali kaydırılır,
+  #       döviz çifti, altın/gümüş, endeks ve petrol sinyallerinin seviyeleri olduğu gibi kullanılır.
   topics: []
   # Örnek:
   # topics:
@@ -66,7 +67,9 @@ telegram:
   #     brokers: [mt5]
   #     kind: fx
   #     # İsteğe bağlı eşikler. fx konusunda boş bırakırsanız aşağıdaki FX değerleri kullanılır (risk
-  #     # bölümündeki genel değerler fx konusunda geçerli değildir), diğerlerinde risk bölümündeki genel değerler:
+  #     # bölümündeki genel değerler fx konusunda geçerli değildir); any konusunda döviz çifti, altın/gümüş,
+  #     # endeks ve petrol sinyallerine FX değerleri, kripto sinyallerine risk bölümündeki genel değerler;
+  #     # crypto konusunda genel değerler. Burada yazdığınız değer konunun her sinyalinde geçerlidir:
   #     # market_entry_tolerance_pct: 0.03   # fx varsayılanı; fiyat girişe bu kadar yakınsa piyasa emri, değilse limit (~3 pip EURUSD)
   #     # market_entry_tolerance_r: 0.25     # fx varsayılanı; fiyat girişe, giriş-stop mesafesinin dörtte biri kadar yakınsa da piyasa emri
   #     # explicit_market_drift: follow      # fx varsayılanı; sinyal "piyasadan" dese de fiyat girişten uzaksa sorulmaz, girişe limit emir konur (ask = size sorulur)
@@ -155,7 +158,9 @@ risk:
 #                    (ör. Binance 73200, CFD brokerı 73400 -> giriş 73200 ise 73400 kullanılır).
 #                    Boş = kapalı (seviyeler olduğu gibi kullanılır). FX/CFD sinyallerine hiç uygulanmaz.
 #                    Kripto olup olmadığına konunun türü karar verir: kind: crypto konusunda uygulanır,
-#                    kind: fx konusunda hiç uygulanmaz (konu yoksa ya da kind: any ise sinyalin türüne bakılır).
+#                    kind: fx konusunda hiç uygulanmaz. kind: any konusunda sinyale bakılır: perpetual ya da
+#                    türü yazılmamış bir coin kaydırılır; döviz, altın/gümüş, endeks, petrol kaydırılmaz.
+#                    Konu ayarı yoksa türü yazılmamış ya da perpetual her sinyal kaydırılır.
 #   offset_mode      additive = fark kadar topla/çıkar (varsayılan) | ratio = broker/referans oranıyla çarp
 #   max_offset_pct   broker ve referans fiyatı arasındaki fark bu yüzdeyi aşarsa (yanlış sembol, eski fiyat)
 #                    işlem AÇILMAZ ve uyarı gelir (varsayılan 1.0). Referans fiyat alınamazsa da işlem

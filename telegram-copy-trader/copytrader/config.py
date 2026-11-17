@@ -17,6 +17,9 @@ from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 import yaml
 from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator
 
+from .models import MarketType
+from .parsing.symbols import fx_like
+
 
 class _Base(BaseModel):
     model_config = ConfigDict(extra="forbid")
@@ -63,12 +66,14 @@ class TopicRoute(_Base):
     brokers: list[str] = Field(default_factory=list)  # broker names to trade this topic on; empty = all enabled brokers
     kind: Literal["crypto", "fx", "any"] = "any"  # hint for reading symbols (fx: "EUR" means EURUSD)
     # Per-route overrides of the global risk.* values (percent of price). Unset: kind "fx" uses the FX defaults
-    # below (a crypto-sized 0.5% is ~54 pips on EURUSD), other kinds use the global values.
+    # below (a crypto-sized 0.5% is ~54 pips on EURUSD), kind "any" the FX defaults for a forex / CFD signal
+    # (currency pair, metal, index: parsing.symbols.fx_like) and the global values for the rest, kind "crypto"
+    # the global values.
     market_entry_tolerance_pct: float | None = Field(None, gt=0)  # auto: market only if price is this close to entry
     max_entry_distance_pct: float | None = Field(None, gt=0)      # entry farther than this from market -> ask / skip
     duplicate_tolerance_pct: float | None = Field(None, gt=0)     # repost check: entries this close are "the same"
-    # Per-route overrides of risk.market_entry_tolerance_r / risk.explicit_market_drift. Unset: kind "fx" uses
-    # FX_MARKET_ENTRY_TOLERANCE_R and "follow", other kinds use the global values.
+    # Per-route overrides of risk.market_entry_tolerance_r / risk.explicit_market_drift. Unset: where the FX
+    # defaults apply (see above) FX_MARKET_ENTRY_TOLERANCE_R and "follow", elsewhere the global values.
     market_entry_tolerance_r: float | None = Field(None, gt=0)    # also market within this fraction of the entry-to-stop distance
     explicit_market_drift: Literal["ask", "follow"] | None = None  # explicit MARKET signal outside the tolerance: ask / follow
 
@@ -80,9 +85,24 @@ FX_DUPLICATE_TOLERANCE_PCT = 0.05
 DEFAULT_DUPLICATE_TOLERANCE_PCT = 0.5
 
 
-def route_thresholds(risk: "RiskConfig", route: "TopicRoute | None") -> tuple[float, float, float]:
-    """(market_entry_tolerance_pct, max_entry_distance_pct, duplicate_tolerance_pct) effective for ``route``."""
-    fx = route is not None and route.kind == "fx"
+def fx_defaults_apply(route: "TopicRoute | None", base: str | None = None,
+                      market_type: MarketType | None = None) -> bool:
+    """Do the FX entry defaults (FX_*) replace the global risk.* values for a signal of ``route`` on the
+    instrument (``base``, ``market_type``)? Kind "fx": always; kind "any": for a forex / CFD instrument
+    (:func:`~copytrader.parsing.symbols.fx_like`; no instrument given: no); kind "crypto" and no route: never."""
+    if route is None:
+        return False
+    if route.kind == "fx":
+        return True
+    return route.kind == "any" and fx_like(base, market_type)
+
+
+def route_thresholds(risk: "RiskConfig", route: "TopicRoute | None", *, base: str | None = None,
+                     market_type: MarketType | None = None) -> tuple[float, float, float]:
+    """(market_entry_tolerance_pct, max_entry_distance_pct, duplicate_tolerance_pct) effective for a signal of
+    ``route`` on the instrument (``base``, ``market_type``): the route's own value, else the FX default where
+    :func:`fx_defaults_apply`, else the global value."""
+    fx = fx_defaults_apply(route, base, market_type)
     def pick(own: float | None, fx_default: float, global_value: float) -> float:
         if route is not None and own is not None:
             return own
@@ -97,14 +117,17 @@ def route_thresholds(risk: "RiskConfig", route: "TopicRoute | None") -> tuple[fl
     )
 
 
-def effective_risk(risk: "RiskConfig", route: "TopicRoute | None") -> "RiskConfig":
-    """``risk`` with the route's entry settings applied (the global object when nothing differs).
+def effective_risk(risk: "RiskConfig", route: "TopicRoute | None", *, base: str | None = None,
+                   market_type: MarketType | None = None) -> "RiskConfig":
+    """``risk`` with the route's entry settings applied for a signal on the instrument (``base``,
+    ``market_type``; it matters for kind "any" only) (the global object when nothing differs).
 
     Percent thresholds: see ``route_thresholds``. ``market_entry_tolerance_r`` / ``explicit_market_drift``: the
-    route's own value wins; otherwise kind "fx" uses FX_MARKET_ENTRY_TOLERANCE_R / "follow" and every other
-    kind the global values."""
-    tol, dist, _dup = route_thresholds(risk, route)
-    fx = route is not None and route.kind == "fx"
+    route's own value wins; otherwise FX_MARKET_ENTRY_TOLERANCE_R / "follow" where the FX defaults apply
+    (:func:`fx_defaults_apply`: kind "fx", or kind "any" and a forex / CFD instrument), else the global values.
+    ``ask_if_limit_marketable`` is off where the FX defaults apply."""
+    tol, dist, _dup = route_thresholds(risk, route, base=base, market_type=market_type)
+    fx = fx_defaults_apply(route, base, market_type)
     tol_r, drift = risk.market_entry_tolerance_r, risk.explicit_market_drift
     if route is not None and route.market_entry_tolerance_r is not None:
         tol_r = route.market_entry_tolerance_r
@@ -194,7 +217,7 @@ class RiskConfig(_Base):
     # "follow" = treat it like a signal without entry type
     explicit_market_drift: Literal["ask", "follow"] = "ask"
     max_entry_distance_pct: float = 10.0          # entry this far from market -> probably misread -> ask
-    ask_if_limit_marketable: bool = True          # a limit entry already at/through the market: ask (False for fx routes: the broker opens it at market)
+    ask_if_limit_marketable: bool = True          # a limit entry already at/through the market: ask (False for fx routes and fx / CFD signals of "any" routes: the broker opens it at market)
     pending_entry_expiry_min: int = 1440          # unfilled limit entries are cancelled after this
     include_fees_in_risk: bool = True             # size so that loss incl. estimated fees ~= 1R
     fee_rate: float = 0.0006                      # assumed taker fee per side when the broker cannot tell

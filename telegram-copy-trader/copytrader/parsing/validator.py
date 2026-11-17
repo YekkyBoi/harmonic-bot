@@ -608,9 +608,9 @@ def build_open_plan(
             )
         if (entry_type is EntryType.LIMIT and _profit_side(side, entry, market)
                 and (risk.ask_if_limit_marketable or dist > risk.max_entry_distance_pct)):
-            # ask_if_limit_marketable=False (fx routes): the broker opens a marketable limit at the market
-            # price, so within max_entry_distance_pct nothing is asked; only a far-away entry (probably a
-            # misread price) is.
+            # ask_if_limit_marketable=False (fx routes, fx / CFD signals of "any" routes): the broker opens a
+            # marketable limit at the market price, so within max_entry_distance_pct nothing is asked; only a
+            # far-away entry (probably a misread price) is.
             where = "üstünde" if side is Side.LONG else "altında"
             issues.warn(
                 "limit_entry_marketable",

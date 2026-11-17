@@ -56,6 +56,19 @@ CFD_QUOTES: dict[str, str] = {
 
 _METALS = frozenset({"XAU", "XAG", "XPT", "XPD"})
 
+
+def fx_like(base: str | None, market_type: MarketType | None) -> bool:
+    """Is the instrument a forex pair or a CFD (metal, index, energy) rather than a coin? Market type forex /
+    cfd: yes; perpetual: no; otherwise (untyped or spot) decided by the base: a currency or a CFD asset
+    (:data:`FIAT_CURRENCIES`, :data:`CFD_QUOTES`). ``base`` is the canonical base asset ("EUR", "XAU")."""
+    if market_type in (MarketType.FOREX, MarketType.CFD):
+        return True
+    if market_type is MarketType.PERP:
+        return False
+    key = (base or "").strip().upper()
+    return key in FIAT_CURRENCIES or key in CFD_QUOTES
+
+
 # Assets whose ticker merely ends with a quote code: never split ("WBTC" is not W/BTC).
 _NO_SPLIT = frozenset({
     "WBTC", "TBTC", "CBBTC", "WETH", "STETH", "WSTETH", "RETH", "CBETH", "BETH", "EETH",

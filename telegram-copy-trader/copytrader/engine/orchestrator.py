@@ -55,7 +55,7 @@ from typing import Any, Literal, TypeVar
 
 from ..brokers.base import (OUTCOME_UNKNOWN_MARK, Broker, BrokerError, BrokerUnavailableError, OrderOutcomeUnknownError,
                             outcome_unknown)
-from ..config import (AppConfig, TopicRoute, effective_risk, fold_ascii, is_friend_account, match_topic,
+from ..config import (AppConfig, RiskConfig, TopicRoute, effective_risk, fold_ascii, is_friend_account, match_topic,
                       route_thresholds)
 from ..errors import ParserError
 from ..interfaces import (
@@ -92,7 +92,7 @@ from ..models import (
     instrument_label,
 )
 from ..parsing import prefilter, validator
-from ..parsing.symbols import FIAT_CURRENCIES, canonical_asset, normalize_symbol
+from ..parsing.symbols import FIAT_CURRENCIES, canonical_asset, fx_like, normalize_symbol
 from ..risk import guards, sizing
 from ..telegram import formatting as fmt
 from ..telegram.formatting import esc, fmt_price
@@ -882,18 +882,23 @@ def pos_status_text(pos: BrokerPosition) -> str:
 def is_crypto_plan(plan: TradePlan, route_kind: str | None = None) -> bool:
     """Is ``plan`` a crypto plan, i.e. one the price offset and the virtual trigger apply to (its levels come
     from a chart of the reference exchange)? Decided by the kind of the plan's forum route (``route_kind``):
-    "fx": never; "crypto": always, unless the plan itself says forex / CFD; no route or kind "any" (None):
-    only an untyped or perpetual plan."""
+    "fx": never; "crypto": always, unless the plan itself says forex / CFD; "any" (a topic of coins, currency
+    pairs, metals and indices): a perpetual plan, or an untyped one whose base is not a currency / metal /
+    index (:func:`fx_like`: an untyped "EUR" or "XAU" uses its levels as they are); no route (None): only an
+    untyped or perpetual plan."""
     if route_kind == "fx":
         return False
     if route_kind == "crypto":
         return plan.market_type not in (MarketType.FOREX, MarketType.CFD)
+    if route_kind == "any":
+        return plan.market_type is MarketType.PERP or (plan.market_type is None
+                                                       and not fx_like(plan.base_asset, None))
     return plan.market_type in (None, MarketType.PERP)
 
 
 def virtual_entry_wanted(broker: Broker, plan: TradePlan, route_kind: str | None = None) -> bool:
     """True when ``plan`` is a crypto LIMIT entry on a broker set to ``entry_trigger: reference_touch``.
-    ``route_kind``: kind of the plan's forum route ("crypto" / "fx"; None: no route or kind "any"), see
+    ``route_kind``: kind of the plan's forum route ("crypto" / "fx" / "any"; None: no route), see
     :func:`is_crypto_plan`."""
     cfg = broker.config
     return (
@@ -1366,8 +1371,20 @@ class Engine:
         return route.kind if route is not None and route.kind != "any" else None
 
     def _plan_kind(self, plan: TradePlan) -> str | None:
-        """Kind of the plan's forum route: "crypto" / "fx"; None without a (known) route or for kind "any"."""
-        return self._topic_kind(self._route_named(plan.route))
+        """Kind of the plan's forum route: "crypto" / "fx" / "any"; None without a (known) route."""
+        route = self._route_named(plan.route)
+        return route.kind if route is not None else None
+
+    def _plan_risk(self, plan: TradePlan) -> RiskConfig:
+        """:func:`effective_risk` of the plan's route for the plan's own instrument (kind "any": the FX entry
+        defaults for a forex / CFD plan, the global values for the rest)."""
+        return effective_risk(self.config.risk, self._route_named(plan.route), base=plan.base_asset,
+                              market_type=plan.market_type)
+
+    def _dup_tolerance(self, plan: TradePlan) -> float:
+        """Repost check: the entry tolerance (percent) of the plan's route for the plan's instrument."""
+        return route_thresholds(self.config.risk, self._route_named(plan.route), base=plan.base_asset,
+                                market_type=plan.market_type)[2]
 
     @staticmethod
     def _in_scope(trade: TradeRecord, route: TopicRoute | None) -> bool:
@@ -2419,7 +2436,7 @@ class Engine:
         entry = trade.plan.entry_price
         if not entry:
             return "sinyalin giriş fiyatı bilinmiyor; fiyat farkı kontrol edilemedi", facts, False
-        risk = effective_risk(self.config.risk, self._route_named(trade.plan.route))
+        risk = self._plan_risk(trade.plan)
         if not near_entry(live_sig, entry, trade.plan.stop_loss, risk):
             tolerance = fmt.fmt_pct(risk.market_entry_tolerance_pct)
             tol_r = getattr(risk, "market_entry_tolerance_r", None)
@@ -3240,7 +3257,8 @@ class Engine:
         base, quote, market_type = asset_of(action)
         market = await self._price(base, quote, market_type, action.symbol)
         plan, issues = validator.build_open_plan(
-            action, risk=effective_risk(self.config.risk, route), llm=self.config.llm, market_price=market,
+            action, risk=effective_risk(self.config.risk, route, base=base, market_type=market_type),
+            llm=self.config.llm, market_price=market,
             source_chat_id=chat_id, now=now,
             route=route.name if route is not None else None,
             broker_names=list(route.brokers) if route is not None else [],
@@ -3257,7 +3275,8 @@ class Engine:
         base, quote, market_type = asset_of(action)
         market = await self._price(base, quote, market_type, action.symbol)
         _plan, issues = validator.build_open_plan(
-            action, risk=effective_risk(self.config.risk, route), llm=self.config.llm, market_price=market,
+            action, risk=effective_risk(self.config.risk, route, base=base, market_type=market_type),
+            llm=self.config.llm, market_price=market,
             source_chat_id=chat_id, now=self._now(),
             route=route.name if route is not None else None,
             broker_names=list(route.brokers) if route is not None else [],
@@ -3290,7 +3309,7 @@ class Engine:
         recent = [t for t in await self.db.recent_trades(now - timedelta(seconds=max(0, risk.duplicate_window_sec)))
                   if self._in_scope(t, route)]
         dup = guards.find_duplicate(plan, recent, window_sec=risk.duplicate_window_sec, now=now,
-                                    entry_tolerance_pct=route_thresholds(risk, route)[2])
+                                    entry_tolerance_pct=self._dup_tolerance(plan))
         if dup is not None:
             out.append(_issue(
                 "duplicate_signal",
@@ -3354,7 +3373,7 @@ class Engine:
         if plan is not None and similar:
             dup = guards.find_duplicate(
                 plan, similar, window_sec=risk.duplicate_window_sec, now=self._now(),
-                entry_tolerance_pct=route_thresholds(risk, self._route_named(plan.route))[2],
+                entry_tolerance_pct=self._dup_tolerance(plan),
             )
             if dup is not None:
                 conf = by_plan[dup.plan.plan_id]
@@ -4554,7 +4573,7 @@ class Engine:
         owner here: its text is always in the caller's report (the open report, a late leg's notice, the end of a
         virtual entry), one message for it."""
         name = broker.name
-        risk = effective_risk(self.config.risk, self._route_named(plan.route))
+        risk = self._plan_risk(plan)
         sent = False                # an order request went to the broker: it may exist there whatever came back
         try:
             sym = await broker.resolve_symbol(plan.base_asset, plan.quote_asset, plan.market_type, raw_symbol)
@@ -5053,7 +5072,7 @@ class Engine:
         if wicked:
             # Only the candle shows the touch; the price has turned back. Enter only if it is still as close to
             # the level as a market entry may be (the validator's tolerance); never chase it.
-            risk = effective_risk(self.config.risk, self._route_named(trade.plan.route))
+            risk = self._plan_risk(trade.plan)
             if not near_entry(px, trigger, stop, risk):
                 if not d.get("virtual_missed"):
                     noted = pos.model_copy(deep=True)
@@ -7766,7 +7785,7 @@ class Engine:
         """Per-broker sizing preview for a plan (read-only: never places orders). Plain text lines.
         Only the plan's route brokers (``plan.broker_names``) when it names any, like execute_open."""
         lines: list[str] = []
-        risk = effective_risk(self.config.risk, self._route_named(plan.route))
+        risk = self._plan_risk(plan)
         brokers = self._plan_brokers(plan)
         if plan.broker_names and not brokers:
             lines.append(f"'{plan.route or '?'}' konusunun brokerı ({', '.join(plan.broker_names)}) bağlı değil; "

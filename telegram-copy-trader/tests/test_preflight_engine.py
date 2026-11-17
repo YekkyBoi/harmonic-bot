@@ -483,6 +483,88 @@ async def test_plan_without_route_or_of_an_any_route_keeps_todays_rule(db: Datab
         await env.engine.stop()
 
 
+@pytest.mark.parametrize("trigger", ["reference_touch", "broker_limit"])
+async def test_any_route_untyped_metal_or_currency_is_not_shifted(db: Database, trigger: str) -> None:
+    # A kind "any" topic also carries gold and currency pairs: an untyped XAU / EUR plan is not crypto there, so
+    # no offset (the reference exchange is not even asked) and no virtual trigger; its levels are used as they are.
+    route = TopicRoute(name="hepsi", title_contains=["İşlemleri"], kind="any")
+    env = await plain_env(db, routes=[route], trigger=trigger)
+    try:
+        broker = env.brokers["tickmill"]
+        broker.quotes.update({"XAU": q(4099.9, 4100.1), "EUR": q(1.16195, 1.16205)})
+
+        async def run(action: ParsedAction) -> TradePlan:
+            ev = await env.engine.evaluate(action.model_copy(update={"used_message_ids": [1]}), CHAT, route=route)
+            assert ev is not None and isinstance(ev.plan, TradePlan) and ev.plan.route == "hepsi", ev
+            assert ev.plan.market_type is None
+            await env.engine.execute_open(ev.plan)
+            return ev.plan
+
+        await run(signal("XAU", "USD", Side.LONG, 4100.0, 4080.0, 4140.0))
+        assert broker.opened[-1].stop_loss == 4080.0 and broker.opened[-1].entry_type is EntryType.MARKET
+        await run(signal("XAU", "USD", Side.LONG, 4095.0, 4075.0, 4140.0, entry_type=EntryType.LIMIT))
+        assert broker.opened[-1].entry_type is EntryType.LIMIT and broker.opened[-1].entry_price == 4095.0
+        await run(signal("EUR", "USD", Side.LONG, 1.1620, 1.1600, 1.1660))
+        assert broker.opened[-1].stop_loss == 1.1600
+        assert len(broker.opened) == 3 and env.ref.calls == []
+        assert not any(is_virtual_pending(p) for _tid, p in await db.active_broker_positions())
+    finally:
+        await env.engine.stop()
+
+
+async def test_any_route_entry_tolerance_follows_the_instrument(db: Database) -> None:
+    # One "any" topic: the coin keeps the global 0.5% market band, the currency pair, gold and the index get the
+    # fx band (0.03% or a quarter of the stop distance). Every entry here is ~0.25% from the market.
+    route = TopicRoute(name="hepsi", title_contains=["İşlemleri"], kind="any")
+    env = await plain_env(db, routes=[route])
+    try:
+        env.oracle.prices["NAS100"] = 20000.0
+        auto: dict[str, Any] = dict(entry_type=None)
+        coin = await env.plan(signal("BTC", "USDT", Side.LONG, 73800.0, 73100.0, 76000.0, **auto), "hepsi")
+        assert coin.entry_type is EntryType.MARKET
+        for action in (
+            signal("EUR", "USD", Side.LONG, 1.1590, 1.1560, 1.1680, **auto),                         # untyped
+            fx_pair("EURUSD", Side.LONG, 1.1590, 1.1560, 1.1680, **auto),
+            signal("XAU", "USD", Side.LONG, 4090.0, 4060.0, 4200.0, market_type=MarketType.CFD, **auto),
+            signal("NAS100", "USD", Side.LONG, 19950.0, 19850.0, 20300.0, market_type=MarketType.CFD, **auto),
+        ):
+            plan = await env.plan(action, "hepsi")
+            assert plan.entry_type is EntryType.LIMIT and plan.entry_price == action.entry_price, action.base_asset
+    finally:
+        await env.engine.stop()
+
+
+def test_is_crypto_plan_of_an_any_route_decides_by_the_instrument() -> None:
+    perp, spot, forex, cfd = MarketType.PERP, MarketType.SPOT, MarketType.FOREX, MarketType.CFD
+
+    def plan(base: str, market_type: MarketType | None, entry_type: EntryType = EntryType.MARKET) -> TradePlan:
+        return plan_of(base, None, Side.LONG, market_type=market_type, entry_type=entry_type)
+
+    # kind "any": a coin stays crypto; an untyped currency / metal / index does not
+    for base in ("BTC", "ETH", "1000PEPE"):
+        assert orch.is_crypto_plan(plan(base, None), "any") and orch.is_crypto_plan(plan(base, perp), "any")
+    for base in ("EUR", "USD", "XAU", "XAG", "NAS100", "GER40", "USOIL"):
+        assert not orch.is_crypto_plan(plan(base, None), "any"), base
+    assert orch.is_crypto_plan(plan("XAU", perp), "any")             # a perpetual stays crypto (XAUUSDT.P)
+    for base in ("BTC", "XAU"):
+        for mt in (spot, forex, cfd):
+            assert not orch.is_crypto_plan(plan(base, mt), "any")    # as before
+    # no route, kind "crypto" / "fx": exactly the old rules, the base is not looked at
+    for base in ("BTC", "EUR", "XAU", "NAS100"):
+        for mt in (None, perp, spot, forex, cfd):
+            assert orch.is_crypto_plan(plan(base, mt)) is orch.is_crypto_plan(plan(base, mt), None) is (
+                mt in (None, perp))
+            assert orch.is_crypto_plan(plan(base, mt), "crypto") is (mt not in (forex, cfd))
+            assert not orch.is_crypto_plan(plan(base, mt), "fx")
+    # the virtual trigger follows
+    broker = FakeBroker("tickmill")
+    broker.config.reference_exchange = "binanceusdm"
+    broker.config.entry_trigger = "reference_touch"              # type: ignore[assignment]
+    assert virtual_entry_wanted(broker, plan("BTC", None, EntryType.LIMIT), "any")
+    assert not virtual_entry_wanted(broker, plan("XAU", None, EntryType.LIMIT), "any")
+    assert virtual_entry_wanted(broker, plan("XAU", None, EntryType.LIMIT), None)     # no route: as before
+
+
 def test_virtual_entry_wanted_keeps_its_signature_and_takes_the_route_kind() -> None:
     broker = FakeBroker("tickmill")
     broker.config.reference_exchange = "binanceusdm"

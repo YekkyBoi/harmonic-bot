@@ -37,6 +37,7 @@ from copytrader.models import (
     TradeStatus,
 )
 from copytrader.parsing import validator
+from copytrader.parsing.symbols import fx_like
 from copytrader.storage.db import Database
 
 from fakes import FakeNotifier, FakeParser
@@ -175,6 +176,80 @@ def test_route_threshold_defaults_and_overrides() -> None:
     assert route_thresholds(risk, anyroute) == (0.5, 3.0, 0.5)
 
 
+FX_THRESHOLDS, GLOBAL_THRESHOLDS = (0.03, 1.0, 0.05), (0.5, 10.0, 0.5)
+ANY_ROUTE = TopicRoute(name="hepsi", title_contains=["x"], kind="any")
+
+
+def test_fx_like_decides_by_the_market_type_then_by_the_base() -> None:
+    for base in ("EUR", "XAU", "NAS100", "BTC"):
+        assert fx_like(base, MarketType.FOREX) and fx_like(base, MarketType.CFD)      # the market type wins
+        assert not fx_like(base, MarketType.PERP)                                     # a perpetual is a coin contract
+    for base in ("EUR", "USD", "JPY", "XAU", "XAG", "NAS100", "GER40", "USOIL", " xau "):
+        assert fx_like(base, None) and fx_like(base, MarketType.SPOT), base
+    for base in ("BTC", "ETH", "1000PEPE", "", None):
+        assert not fx_like(base, None) and not fx_like(base, MarketType.SPOT), base
+
+
+@pytest.mark.parametrize(("base", "market_type"), [
+    ("EUR", MarketType.FOREX), ("XAU", MarketType.CFD), ("NAS100", MarketType.CFD),
+    ("EUR", None), ("XAU", None), ("NAS100", None),
+])
+def test_any_route_forex_and_cfd_signals_get_the_fx_thresholds(base: str, market_type: MarketType | None) -> None:
+    risk = RiskConfig()
+    assert route_thresholds(risk, ANY_ROUTE, base=base, market_type=market_type) == FX_THRESHOLDS
+    eff = effective_risk(risk, ANY_ROUTE, base=base, market_type=market_type)
+    assert eff == effective_risk(risk, TopicRoute(name="fx", title_contains=["x"], kind="fx"))
+    assert (eff.market_entry_tolerance_r, eff.explicit_market_drift, eff.ask_if_limit_marketable) == (
+        0.25, "follow", False)
+    assert risk == RiskConfig()                                  # the global object is untouched
+
+
+@pytest.mark.parametrize(("base", "market_type"), [
+    ("BTC", MarketType.PERP), ("BTC", None), ("ETH", None), ("XAU", MarketType.PERP),
+])
+def test_any_route_crypto_signals_keep_the_global_values(base: str, market_type: MarketType | None) -> None:
+    risk = RiskConfig(market_entry_tolerance_r=0.1)
+    assert route_thresholds(risk, ANY_ROUTE, base=base, market_type=market_type) == GLOBAL_THRESHOLDS
+    assert effective_risk(risk, ANY_ROUTE, base=base, market_type=market_type) is risk
+
+
+def test_any_route_without_an_instrument_keeps_the_global_values() -> None:
+    # callers that do not name the instrument get exactly the old values
+    risk = RiskConfig()
+    assert route_thresholds(risk, ANY_ROUTE) == GLOBAL_THRESHOLDS and effective_risk(risk, ANY_ROUTE) is risk
+
+
+def test_any_route_overrides_still_win() -> None:
+    risk = RiskConfig()
+    route = TopicRoute(name="hepsi", title_contains=["x"], kind="any", market_entry_tolerance_pct=0.2,
+                       duplicate_tolerance_pct=0.1, market_entry_tolerance_r=0.5, explicit_market_drift="ask")
+    # a currency pair: the route's own values, the fx defaults for the rest
+    assert route_thresholds(risk, route, base="EUR", market_type=MarketType.FOREX) == (0.2, 1.0, 0.1)
+    eff = effective_risk(risk, route, base="EUR", market_type=MarketType.FOREX)
+    assert (eff.market_entry_tolerance_pct, eff.max_entry_distance_pct, eff.market_entry_tolerance_r,
+            eff.explicit_market_drift, eff.ask_if_limit_marketable) == (0.2, 1.0, 0.5, "ask", False)
+    # a coin of the same route: the route's own values, the global values for the rest
+    assert route_thresholds(risk, route, base="BTC", market_type=MarketType.PERP) == (0.2, 10.0, 0.1)
+    eff = effective_risk(risk, route, base="BTC", market_type=MarketType.PERP)
+    assert (eff.market_entry_tolerance_pct, eff.max_entry_distance_pct, eff.market_entry_tolerance_r,
+            eff.explicit_market_drift, eff.ask_if_limit_marketable) == (0.2, 10.0, 0.5, "ask", True)
+
+
+@pytest.mark.parametrize(("base", "market_type"), [
+    ("EUR", MarketType.FOREX), ("XAU", MarketType.CFD), ("XAU", None), ("BTC", MarketType.PERP), ("BTC", None),
+])
+def test_crypto_and_fx_routes_and_no_route_ignore_the_instrument(base: str, market_type: MarketType | None) -> None:
+    risk = RiskConfig()
+    crypto = TopicRoute(name="k", title_contains=["x"], kind="crypto")
+    fx = TopicRoute(name="fx", title_contains=["x"], kind="fx")
+    for route in (crypto, fx, None):
+        assert route_thresholds(risk, route, base=base, market_type=market_type) == route_thresholds(risk, route)
+        assert effective_risk(risk, route, base=base, market_type=market_type) == effective_risk(risk, route)
+    assert route_thresholds(risk, fx, base=base, market_type=market_type) == FX_THRESHOLDS
+    assert effective_risk(risk, crypto, base=base, market_type=market_type) is risk
+    assert effective_risk(risk, None, base=base, market_type=market_type) is risk
+
+
 @pytest.mark.parametrize("entry", [1.0840, 1.0830, 1.0800 + 0.0001])
 async def test_fx_route_auto_entry_far_from_market_is_limit_at_signal_entry(entry: float) -> None:
     e = await make()
@@ -210,6 +285,37 @@ async def test_fx_route_entry_within_three_pips_is_market() -> None:
         assert e.sent(MT5.TRADE_ACTION_PENDING) == []
         (deal,) = e.sent(MT5.TRADE_ACTION_DEAL)
         assert deal["type"] == MT5.ORDER_TYPE_BUY
+    finally:
+        await finish(e)
+
+
+@pytest.mark.parametrize("typed", [True, False])
+async def test_any_route_eurusd_entry_20_pips_away_is_a_limit_at_the_entry(typed: bool) -> None:
+    # kind "any": a currency pair gets the FX thresholds there too, not the crypto-sized global 0.5% (~54 pips),
+    # whether the model wrote market_type "forex" or left it empty
+    e = await make(kind="any")
+    try:
+        action = eur(entry=1.0830, sl=1.0800)        # 21 pips under the ask (1.0851), 30-pip stop
+        if not typed:
+            action = action.model_copy(update={"symbol": None, "market_type": None})
+        await e.say(action)
+        assert e.sent(MT5.TRADE_ACTION_DEAL) == []
+        (req,) = e.sent(MT5.TRADE_ACTION_PENDING)
+        assert req["type"] == MT5.ORDER_TYPE_BUY_LIMIT and req["price"] == pytest.approx(1.0830)
+        assert e.notifier.confirmations == []
+    finally:
+        await finish(e)
+
+
+async def test_any_route_marketable_eurusd_limit_opens_at_market_without_question() -> None:
+    # ask_if_limit_marketable follows the instrument too: off for a currency pair of an "any" route
+    e = await make(kind="any")
+    try:
+        e.fake.set_price(1.0829, 1.0830)
+        await e.say(eur(entry=1.0840, sl=1.0800, et=EntryType.LIMIT))
+        assert e.notifier.confirmations == [] and e.sent(MT5.TRADE_ACTION_PENDING) == []
+        (deal,) = e.sent(MT5.TRADE_ACTION_DEAL)
+        assert deal["type"] == MT5.ORDER_TYPE_BUY and deal["sl"] == 1.0800
     finally:
         await finish(e)
 
