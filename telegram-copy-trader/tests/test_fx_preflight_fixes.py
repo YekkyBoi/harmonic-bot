@@ -190,6 +190,22 @@ def test_fx_like_decides_by_the_market_type_then_by_the_base() -> None:
         assert not fx_like(base, None) and not fx_like(base, MarketType.SPOT), base
 
 
+def test_fx_like_a_stablecoin_quote_is_a_crypto_chart_and_a_whole_pair_as_base_is_fx() -> None:
+    for base in ("XAU", "XAG", "EUR", "NAS100"):
+        for quote in ("USDT", "usdc", "FDUSD", " BUSD "):
+            assert not fx_like(base, None, quote) and not fx_like(base, MarketType.SPOT, quote), (base, quote)
+        assert fx_like(base, None, "USD") and fx_like(base, None, None), base
+        assert fx_like(base, MarketType.CFD, "USDT")                                  # a typed plan: the type wins
+    for base in ("XAUUSD", "EURUSD", "EURGBP", "XAGUSD"):
+        assert fx_like(base, None), base
+    for base in ("XAUUSDT", "ETHUSDT", "BTCUSD", "BTC"):
+        assert not fx_like(base, None), base
+    risk = RiskConfig()
+    assert route_thresholds(risk, ANY_ROUTE, base="XAU", quote="USDT") == GLOBAL_THRESHOLDS
+    assert route_thresholds(risk, ANY_ROUTE, base="XAU", quote="USD") == FX_THRESHOLDS
+    assert effective_risk(risk, ANY_ROUTE, base="XAU", quote="USDT") is risk
+
+
 @pytest.mark.parametrize(("base", "market_type"), [
     ("EUR", MarketType.FOREX), ("XAU", MarketType.CFD), ("NAS100", MarketType.CFD),
     ("EUR", None), ("XAU", None), ("NAS100", None),

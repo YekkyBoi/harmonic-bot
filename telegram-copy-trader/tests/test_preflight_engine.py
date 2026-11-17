@@ -472,9 +472,16 @@ async def test_plan_without_route_or_of_an_any_route_keeps_todays_rule(db: Datab
         assert broker.opened[-1].stop_loss == pytest.approx(73150.0)
         calls = len(env.ref.calls)
         await run(btc(MarketType.SPOT).model_copy(update={"stop_loss": 73100.0}))
-        assert broker.opened[-1].stop_loss == 73100.0 and len(env.ref.calls) == calls      # as before: no offset
-        await run(btc(MarketType.SPOT, EntryType.LIMIT))         # as before: a broker limit
-        assert broker.opened[-1].entry_type is EntryType.LIMIT and broker.opened[-1].entry_price == 73000.0
+        if routes:      # kind "any": a coin labelled spot is a coin, as in a crypto topic -> shifted
+            assert broker.opened[-1].stop_loss == pytest.approx(73050.0) and len(env.ref.calls) > calls
+        else:           # no route: as before, no offset
+            assert broker.opened[-1].stop_loss == 73100.0 and len(env.ref.calls) == calls
+        n = len(broker.opened)
+        await run(btc(MarketType.SPOT, EntryType.LIMIT))
+        if routes:      # ... and its limit waits for the reference to touch it (virtual trigger)
+            assert len(broker.opened) == n
+        else:           # as before: a broker limit
+            assert broker.opened[-1].entry_type is EntryType.LIMIT and broker.opened[-1].entry_price == 73000.0
         n = len(broker.opened)
         await run(btc(None, EntryType.LIMIT).model_copy(update={"entry_price": 72900.0}))  # as before: virtual trigger
         assert len(broker.opened) == n
@@ -546,9 +553,20 @@ def test_is_crypto_plan_of_an_any_route_decides_by_the_instrument() -> None:
     for base in ("EUR", "USD", "XAU", "XAG", "NAS100", "GER40", "USOIL"):
         assert not orch.is_crypto_plan(plan(base, None), "any"), base
     assert orch.is_crypto_plan(plan("XAU", perp), "any")             # a perpetual stays crypto (XAUUSDT.P)
+    assert orch.is_crypto_plan(plan("BTC", spot), "any")             # a coin labelled spot is still a coin
+    assert not orch.is_crypto_plan(plan("XAU", spot), "any")
     for base in ("BTC", "XAU"):
-        for mt in (spot, forex, cfd):
+        for mt in (forex, cfd):
             assert not orch.is_crypto_plan(plan(base, mt), "any")    # as before
+    # quoted in a stablecoin: a crypto exchange's chart (Binance XAUUSDT) -> shifted like a coin
+    for base in ("XAU", "XAG", "EUR"):
+        assert orch.is_crypto_plan(plan_of(base, "USDT", Side.LONG), "any"), base
+        assert orch.is_crypto_plan(plan_of(base, "USDT", Side.LONG, market_type=spot), "any"), base
+        assert not orch.is_crypto_plan(plan_of(base, "USD", Side.LONG), "any"), base
+    # a whole forex / CFD pair written as the base is not a coin either
+    for base in ("XAUUSD", "EURUSD", "EURGBP"):
+        assert not orch.is_crypto_plan(plan(base, None), "any"), base
+    assert orch.is_crypto_plan(plan("XAUUSDT", None), "any")
     # no route, kind "crypto" / "fx": exactly the old rules, the base is not looked at
     for base in ("BTC", "EUR", "XAU", "NAS100"):
         for mt in (None, perp, spot, forex, cfd):

@@ -883,16 +883,16 @@ def is_crypto_plan(plan: TradePlan, route_kind: str | None = None) -> bool:
     """Is ``plan`` a crypto plan, i.e. one the price offset and the virtual trigger apply to (its levels come
     from a chart of the reference exchange)? Decided by the kind of the plan's forum route (``route_kind``):
     "fx": never; "crypto": always, unless the plan itself says forex / CFD; "any" (a topic of coins, currency
-    pairs, metals and indices): a perpetual plan, or an untyped one whose base is not a currency / metal /
-    index (:func:`fx_like`: an untyped "EUR" or "XAU" uses its levels as they are); no route (None): only an
-    untyped or perpetual plan."""
+    pairs, metals and indices): a perpetual plan, or an untyped / spot one that is not a currency / metal /
+    index (:func:`fx_like`: an untyped "EUR" or "XAU" uses its levels as they are, "XAU" quoted in USDT comes
+    from a crypto exchange's chart and is shifted); no route (None): only an untyped or perpetual plan."""
     if route_kind == "fx":
         return False
     if route_kind == "crypto":
         return plan.market_type not in (MarketType.FOREX, MarketType.CFD)
     if route_kind == "any":
-        return plan.market_type is MarketType.PERP or (plan.market_type is None
-                                                       and not fx_like(plan.base_asset, None))
+        return plan.market_type is MarketType.PERP or (
+            plan.market_type in (None, MarketType.SPOT) and not fx_like(plan.base_asset, None, plan.quote_asset))
     return plan.market_type in (None, MarketType.PERP)
 
 
@@ -1379,12 +1379,12 @@ class Engine:
         """:func:`effective_risk` of the plan's route for the plan's own instrument (kind "any": the FX entry
         defaults for a forex / CFD plan, the global values for the rest)."""
         return effective_risk(self.config.risk, self._route_named(plan.route), base=plan.base_asset,
-                              market_type=plan.market_type)
+                              market_type=plan.market_type, quote=plan.quote_asset)
 
     def _dup_tolerance(self, plan: TradePlan) -> float:
         """Repost check: the entry tolerance (percent) of the plan's route for the plan's instrument."""
         return route_thresholds(self.config.risk, self._route_named(plan.route), base=plan.base_asset,
-                                market_type=plan.market_type)[2]
+                                market_type=plan.market_type, quote=plan.quote_asset)[2]
 
     @staticmethod
     def _in_scope(trade: TradeRecord, route: TopicRoute | None) -> bool:
@@ -3257,7 +3257,7 @@ class Engine:
         base, quote, market_type = asset_of(action)
         market = await self._price(base, quote, market_type, action.symbol)
         plan, issues = validator.build_open_plan(
-            action, risk=effective_risk(self.config.risk, route, base=base, market_type=market_type),
+            action, risk=effective_risk(self.config.risk, route, base=base, market_type=market_type, quote=quote),
             llm=self.config.llm, market_price=market,
             source_chat_id=chat_id, now=now,
             route=route.name if route is not None else None,
@@ -3275,7 +3275,7 @@ class Engine:
         base, quote, market_type = asset_of(action)
         market = await self._price(base, quote, market_type, action.symbol)
         _plan, issues = validator.build_open_plan(
-            action, risk=effective_risk(self.config.risk, route, base=base, market_type=market_type),
+            action, risk=effective_risk(self.config.risk, route, base=base, market_type=market_type, quote=quote),
             llm=self.config.llm, market_price=market,
             source_chat_id=chat_id, now=self._now(),
             route=route.name if route is not None else None,

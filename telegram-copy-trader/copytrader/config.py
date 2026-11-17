@@ -86,23 +86,23 @@ DEFAULT_DUPLICATE_TOLERANCE_PCT = 0.5
 
 
 def fx_defaults_apply(route: "TopicRoute | None", base: str | None = None,
-                      market_type: MarketType | None = None) -> bool:
+                      market_type: MarketType | None = None, quote: str | None = None) -> bool:
     """Do the FX entry defaults (FX_*) replace the global risk.* values for a signal of ``route`` on the
-    instrument (``base``, ``market_type``)? Kind "fx": always; kind "any": for a forex / CFD instrument
+    instrument (``base``, ``market_type``, ``quote``)? Kind "fx": always; kind "any": for a forex / CFD instrument
     (:func:`~copytrader.parsing.symbols.fx_like`; no instrument given: no); kind "crypto" and no route: never."""
     if route is None:
         return False
     if route.kind == "fx":
         return True
-    return route.kind == "any" and fx_like(base, market_type)
+    return route.kind == "any" and fx_like(base, market_type, quote)
 
 
 def route_thresholds(risk: "RiskConfig", route: "TopicRoute | None", *, base: str | None = None,
-                     market_type: MarketType | None = None) -> tuple[float, float, float]:
+                     market_type: MarketType | None = None, quote: str | None = None) -> tuple[float, float, float]:
     """(market_entry_tolerance_pct, max_entry_distance_pct, duplicate_tolerance_pct) effective for a signal of
     ``route`` on the instrument (``base``, ``market_type``): the route's own value, else the FX default where
     :func:`fx_defaults_apply`, else the global value."""
-    fx = fx_defaults_apply(route, base, market_type)
+    fx = fx_defaults_apply(route, base, market_type, quote)
     def pick(own: float | None, fx_default: float, global_value: float) -> float:
         if route is not None and own is not None:
             return own
@@ -118,7 +118,7 @@ def route_thresholds(risk: "RiskConfig", route: "TopicRoute | None", *, base: st
 
 
 def effective_risk(risk: "RiskConfig", route: "TopicRoute | None", *, base: str | None = None,
-                   market_type: MarketType | None = None) -> "RiskConfig":
+                   market_type: MarketType | None = None, quote: str | None = None) -> "RiskConfig":
     """``risk`` with the route's entry settings applied for a signal on the instrument (``base``,
     ``market_type``; it matters for kind "any" only) (the global object when nothing differs).
 
@@ -126,8 +126,8 @@ def effective_risk(risk: "RiskConfig", route: "TopicRoute | None", *, base: str 
     route's own value wins; otherwise FX_MARKET_ENTRY_TOLERANCE_R / "follow" where the FX defaults apply
     (:func:`fx_defaults_apply`: kind "fx", or kind "any" and a forex / CFD instrument), else the global values.
     ``ask_if_limit_marketable`` is off where the FX defaults apply."""
-    tol, dist, _dup = route_thresholds(risk, route, base=base, market_type=market_type)
-    fx = fx_defaults_apply(route, base, market_type)
+    tol, dist, _dup = route_thresholds(risk, route, base=base, market_type=market_type, quote=quote)
+    fx = fx_defaults_apply(route, base, market_type, quote)
     tol_r, drift = risk.market_entry_tolerance_r, risk.explicit_market_drift
     if route is not None and route.market_entry_tolerance_r is not None:
         tol_r = route.market_entry_tolerance_r

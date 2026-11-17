@@ -57,16 +57,29 @@ CFD_QUOTES: dict[str, str] = {
 _METALS = frozenset({"XAU", "XAG", "XPT", "XPD"})
 
 
-def fx_like(base: str | None, market_type: MarketType | None) -> bool:
+#: Quotes that only a crypto exchange lists: a plan quoted in one ("XAUUSDT") comes from a crypto exchange's chart.
+_CRYPTO_QUOTES = frozenset({"USDT", "USDC", "BUSD", "FDUSD"})
+
+
+def fx_like(base: str | None, market_type: MarketType | None, quote: str | None = None) -> bool:
     """Is the instrument a forex pair or a CFD (metal, index, energy) rather than a coin? Market type forex /
-    cfd: yes; perpetual: no; otherwise (untyped or spot) decided by the base: a currency or a CFD asset
-    (:data:`FIAT_CURRENCIES`, :data:`CFD_QUOTES`). ``base`` is the canonical base asset ("EUR", "XAU")."""
+    cfd: yes; perpetual: no; otherwise (untyped or spot): no when quoted in a stablecoin (``quote`` USDT /
+    USDC...: a crypto exchange's chart, e.g. Binance XAUUSDT), else decided by the base: a currency or a CFD
+    asset (:data:`FIAT_CURRENCIES`, :data:`CFD_QUOTES`), or a whole forex / CFD pair written as the base
+    ("EURUSD", "XAUUSD"). ``base`` is the canonical base asset ("EUR", "XAU")."""
     if market_type in (MarketType.FOREX, MarketType.CFD):
         return True
     if market_type is MarketType.PERP:
         return False
+    if (quote or "").strip().upper() in _CRYPTO_QUOTES:
+        return False
     key = (base or "").strip().upper()
-    return key in FIAT_CURRENCIES or key in CFD_QUOTES
+    if not key:
+        return False
+    if key in FIAT_CURRENCIES or key in CFD_QUOTES:
+        return True
+    _b, s_quote, s_type = normalize_symbol(key)
+    return s_type in (MarketType.FOREX, MarketType.CFD) and s_quote not in _CRYPTO_QUOTES
 
 
 # Assets whose ticker merely ends with a quote code: never split ("WBTC" is not W/BTC).

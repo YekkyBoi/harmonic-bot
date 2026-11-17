@@ -2206,7 +2206,7 @@ class Mt5Broker(MetaTraderLegBroker):
         # the folder was checked above, and two terminals installed from metatrader5.com both report "MetaQuotes
         # Ltd." (the owner's fx and fx2) - the company would refuse the account's own terminal.
         if (other is None and not explicit and ckey and ckey in self._guard.companies
-                and ckey != str(pin.get("company") or "").casefold()):
+                and ckey != str(pin.get("company") or "").strip().casefold()):
             other = self._guard.companies[ckey]
         if other is None:
             other = next((who for word, who in self._guard.markers.items()

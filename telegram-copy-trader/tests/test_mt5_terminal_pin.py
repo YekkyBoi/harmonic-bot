@@ -479,3 +479,13 @@ async def test_a_pathless_fx_without_a_pin_is_still_refused_at_a_terminal_of_fx2
         await fx(fake, tmp_path, guard)
     assert fake.logins == [] and fake.sent == []
     assert "fx" not in read_pins(str(tmp_path))
+
+
+async def test_a_blank_after_the_company_in_fxs_own_pin_does_not_let_fx2s_pin_refuse_fx(tmp_path: Path) -> None:
+    fake, guard = _generic_fx_and_fx2_pin(tmp_path)
+    fake.terms[FP]["company"] = GENERIC_CO + " "
+    write_pin(str(tmp_path), "fx", {"folder": FP, "path": FP + r"\terminal64.exe", "company": GENERIC_CO + " ",
+                                    "server": "Demo-Server", "login": 5001})
+    b = await fx(fake, tmp_path, guard)
+    await b.close()
+    assert fake.logins == [(FP, 5001)] and fake.sent == []
