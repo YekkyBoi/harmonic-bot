@@ -5244,6 +5244,7 @@ class Engine:
         self._virtual_warned.pop((trade_id, f"{broker}:busy"), None)
         self._virtual_warned.pop((trade_id, f"{broker}:refprice"), None)
         self._virtual_warned.pop((trade_id, f"{broker}:refdown"), None)
+        self._virtual_warned.pop((trade_id, f"{broker}:refhistory"), None)
         self._ref_symbols.pop((trade_id, broker), None)
         self._ref_retry_at.pop((trade_id, broker), None)
         self._ref_seen.pop((trade_id, broker), None)
@@ -5612,7 +5613,16 @@ class Engine:
         # fx's worker thread was busy: its history since the previous look was not read. The price now may cancel
         # (stop / first target passed), but it never opens: the window it skipped may hold a stop pass - decided at
         # the next full read (``upto_msc`` stayed at the start).
-        history_pending = bool(seen.get("busy")) and since_msc is not None
+        history_pending = bool(seen.get("busy") or seen.get("unread")) and since_msc is not None
+        if seen.get("unread") and since_msc is not None:
+            warn_key = (trade.id, f"{pos.broker}:refhistory")
+            last = self._virtual_warned.get(warn_key)
+            if last is None or time.monotonic() - last >= VIRTUAL_NOTE_THROTTLE_SEC:
+                self._virtual_warned[warn_key] = time.monotonic()
+                await self._notify(
+                    f"⚠️ {label} {esc(pos.broker)}: {esc(ref)} fiyat geçmişi (tik / dakika mumları) okunamadı; arada "
+                    f"stop geçilmiş olabileceği için {esc(pos.broker)} girişi şimdilik açılmıyor, okunabilince karar "
+                    "verilir.", Severity.WARNING)
         pos = await self._reference_seen(trade, pos, key, seen.get("upto_msc"),
                                          tp_armed_at=(now_msc, True, self._arming_bar(seen, now_msc, long))
                                          if armed_now else None,
@@ -5695,7 +5705,8 @@ class Engine:
             msc, bid, ask = data["now"]
             samples = [(s[0], s[1] / m, s[2] / m, s[3] / m, s[4] / m) for s in data.get("samples") or []]
             out = {"now": (msc, float(bid) / m, float(ask) / m), "samples": samples, "source": data.get("source"),
-                   "upto_msc": data.get("upto_msc"), "busy": bool(data.get("busy"))}
+                   "upto_msc": data.get("upto_msc"), "busy": bool(data.get("busy")),
+                   "unread": bool(data.get("unread"))}
         except (KeyError, IndexError, TypeError, ValueError):
             logger.error("%s: unexpected price_since answer for %s", name, plan.base_asset)
             return None
@@ -7775,6 +7786,8 @@ class Engine:
         if trade.status is TradeStatus.OPENING:
             return (f"{_names(names)} hesabına onay beklenmeden gönderilen emrin yanıtı bekleniyor; açılırsa #{trade.id} "
                     "işlemi normal yönetilir.")
+        if await self._closing(trade):
+            return f"{_names(names)} hesabındaki #{trade.id} işlemi kapanıyor (trader kapattı, kapanışı sürüyor)."
         return (f"{_names(names)} hesabındaki #{trade.id} işlemi açık kalır (onay beklenmeden açılmıştı) ve normal "
                 "yönetilir.")
 
@@ -7837,20 +7850,22 @@ class Engine:
                 return text
             approved = plan             # (as the owner approved it: a re-ask shows this, never the trade's moves)
             size_stop: float | None = None
-            if into is not None:
+            base = into if into is not None else (early if same else None)
+            if base is not None:
                 # The trader moved the trade's stop / targets while the question waited (applied to the early
                 # accounts): the others open with the trade's levels as they are now, like a catch-up open - except
                 # what the owner corrected himself (his value differs from the first reading): that stands. A moved
-                # stop never sizes the position (the signal's own stop does, see _open_on_broker size_stop).
-                first = into.plan
+                # stop never sizes the position (the signal's own stop does, see _open_on_broker size_stop). The same
+                # for a fresh trade of the same idea (the early trade never held it, or only its own rules ended it).
+                first = base.plan
                 update: dict[str, Any] = {}
                 if (_same_price(plan.stop_loss, first.stop_loss)
-                        and not _same_price(into.current_stop_loss, first.stop_loss)):
-                    update["stop_loss"] = into.current_stop_loss
+                        and not _same_price(base.current_stop_loss, first.stop_loss)):
+                    update["stop_loss"] = base.current_stop_loss
                     size_stop = plan.stop_loss
                 if ([tp.price for tp in plan.take_profits] == [tp.price for tp in first.take_profits]
-                        and [tp.price for tp in into.current_take_profits] != [tp.price for tp in first.take_profits]):
-                    update["take_profits"] = list(into.current_take_profits)
+                        and [tp.price for tp in base.current_take_profits] != [tp.price for tp in first.take_profits]):
+                    update["take_profits"] = list(base.current_take_profits)
                 if update:
                     plan = plan.model_copy(update=update)
             note = await self._early_kept_note(conf)

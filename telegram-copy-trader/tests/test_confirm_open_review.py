@@ -500,6 +500,23 @@ async def test_yes_while_the_traders_close_of_the_early_trade_is_still_owed_open
         await env.engine.stop()
 
 
+async def test_no_while_the_close_is_owed_says_it_is_closing_not_open(db: Database) -> None:
+    env = await make_env(db)
+    try:
+        await env.crypto_signal()
+        (conf,) = env.notifier.confirmations
+        env.tm.fail["close_position"] = BrokerError("link down")
+        env.parser.push(result(ParsedAction(action=ActionType.CLOSE, close_fraction=1.0, refers_to_message_id=611,
+                                            base_asset="ETH", side=Side.SHORT, used_message_ids=[613],
+                                            confidence=0.95, summary_tr="kapat")))
+        await env.msg(613, "kapattık", topic=CRYPTO, reply_to=611)
+        await env.engine.on_messages_ready(CHAT, KADIR, CRYPTO)
+        out = await env.engine.handle_confirmation(conf.id, False)
+        assert "kapanıyor" in out and "açık kalır" not in out
+    finally:
+        await env.engine.stop()
+
+
 async def test_a_close_owed_meanwhile_is_found_under_the_lock_too(db: Database) -> None:
     env = await make_env(db)
     try:

@@ -3543,7 +3543,8 @@ class Mt5Broker(MetaTraderLegBroker):
         {"now": (time_msc, bid, ask), "samples": [(time_msc, bid_low, bid_high, ask_low, ask_high)] in time order,
         up to the latest tick, "source": "ticks" | "bars" | None, "upto_msc": what has been looked at (the next look
         starts there), "busy": True when another call came to this terminal meanwhile: the history is not read now
-        (``upto_msc`` stays the start, the next look reads it)}.
+        (``upto_msc`` stays the start, the next look reads it); "unread": True when neither the ticks nor the bars
+        of that time could be read (the same: ``upto_msc`` stays the start)}.
 
         The history: the ticks after ``since_msc`` (copy_ticks_from, at most ``max_ticks``); more than that, or no
         ticks, the 1-minute bars instead (copy_rates_range; the bars are bid prices, the ask is the bid plus the
@@ -3607,8 +3608,11 @@ class Mt5Broker(MetaTraderLegBroker):
                 if bars is not None:
                     out["source"] = "bars"
                 else:
-                    logger.warning("%s: neither ticks nor 1-minute bars of %s since %s could be read; only the "
-                                   "latest price is looked at", self.name, broker_symbol, start)
+                    # Nothing of the time since the previous look could be read: like a busy terminal, that time
+                    # stays unread (the next look reads it) and the answer says so ("unread").
+                    logger.warning("%s: neither ticks nor 1-minute bars of %s since %s could be read; read again "
+                                   "at the next look", self.name, broker_symbol, start)
+                    return {**out, "upto_msc": start, "unread": True}
         samples.sort(key=lambda s: s[0])
         out["samples"] = samples
         return out

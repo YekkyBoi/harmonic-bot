@@ -435,6 +435,31 @@ async def test_bars_a_new_high_after_the_arming_in_the_same_minute_reaches_the_t
         await p.close()
 
 
+async def test_unreadable_history_never_opens_and_is_read_again(unsure) -> None:
+    """Neither fx's ticks nor its bars of the time since the previous look can be read: like a busy look, that time
+    stays unread - the price now at the level does not open; the next readable look sees the stop pass in it."""
+    p, _friend = unsure
+    await _armed_watch(p)                                          # (no tick history in this terminal: bars)
+    minute = -(-T0 // 60) * 60
+    readable = [False]
+
+    def copy_rates_range(symbol: str, timeframe: int, date_from: int, date_to: int) -> Any:
+        if not readable[0]:
+            return None
+        bars = [{"time": minute, "open": 1.1619, "high": 1.1620, "low": 1.15880, "close": 1.1610, "spread": 10}]
+        return [b for b in bars if date_from <= b["time"] <= date_to]
+
+    p.terminal.copy_rates_range = copy_rates_range                  # type: ignore[method-assign]
+    _tick(p, 1.16090, 1.16100, minute + 30)                         # at the level now
+    p.tickmill.set_price("EURUSD", 1.16105, 1.16115)
+    await p.engine.monitor.run_virtual_once()
+    assert p.tickmill_orders() == [] and is_virtual_pending((await p.positions(1))["tickmill"])
+    assert any("fiyat geçmişi" in t and "okunamadı" in t for t in p.texts())
+    readable[0] = True
+    await p.engine.monitor.run_virtual_once()                       # the minute's bar went through the stop 1.1590
+    assert (await p.positions(1))["tickmill"].status is PositionStatus.CANCELLED and p.tickmill_orders() == []
+
+
 async def test_an_ended_entry_forgets_its_fx_down_warning(env) -> None:
     p, _friend = env
     await _eur_limit(p)
