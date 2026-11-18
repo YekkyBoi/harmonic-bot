@@ -22,6 +22,12 @@ Rules (the owner's, one place):
   the result in R = :func:`copytrader.engine.monitor.position_result_r` (the closing notice's own figure); without it
   (a simulated / hand-traded account, an older position) the price move, ``side x (close - entry) / (entry - stop)``,
   times the plan's size in R.
+* **The result box** is drawn to the R the money made (the owner's: "the R is what money actually went into the
+  account, and the chart is drawn to match it"): its profit (or loss) edge, the dashed entry -> exit line and the
+  darker played-out part end at ``fill + side x R x |fill - original stop|``, R = the money's R of the position
+  (:func:`money_r`, the closing notice's figure before the plan's size in R); the exit arrow stays on the close
+  candle and the DURUM chip shows the recorded close price. Without a money R (a hand-traded / simulated account,
+  an older position): the close price, as the price-based R.
 * **Candles**: the chart's bar size from the signal's picture (``plan.chart_timeframe_min``), 15 minutes when it was
   not read or the venue has no such bar size; BARS_BEFORE bars before the entry; the entry card runs on to the latest
   bar (the dotted line is the price now), the result card until the price touches the target or the stop after the
@@ -51,6 +57,7 @@ AFTER_TOUCH_BARS = 10             # ... or until the target / stop is touched af
 TOUCH_SEARCH_BARS = 160           # a touch is looked for this far after the close
 MAX_SLOTS = 240                   # candles one card holds (more: fewer candles before the entry)
 END_ROOM_BARS = 6                 # a result card whose candles end at the close keeps this much room after it
+WINDOW_SLACK = 1.25               # a market that closes: this much more market time is asked for before the entry
 FOOTER = "İngiltere saati"
 MINUS = "−"
 EVENT_KINDS = ("order_send", "entry_filled", "manage_done", "manage_late_done", "pozkapat", "close_all")
@@ -325,6 +332,16 @@ def read_records(trade: TradeRecord, pos: BrokerPosition, closed_at: datetime | 
     return rec
 
 
+def money_r(trade: TradeRecord, pos: BrokerPosition) -> float | None:
+    """The R the money made on this position, per position: ``realized_pnl`` / its real initial risk
+    (:func:`position_result_r` with size 1, i.e. BEFORE the plan's size in R). Only when the card's hero is that money
+    figure too (:func:`result_r` takes the closing notice's own R): a hand-traded / simulated account, a position
+    without its stored initial risk or one the plan's size in R does not fit: None (the price-based box)."""
+    if _simulated(pos) or position_result_r(pos, trade.plan.risk_r) is None:
+        return None
+    return position_result_r(pos, 1.0)
+
+
 def result_r(trade: TradeRecord, pos: BrokerPosition, fill: float, stop: float, exit_price: float | None
              ) -> float | None:
     """The result in R: the closing notice's own figure (:func:`position_result_r`); a simulated (hand-traded)
@@ -439,6 +456,7 @@ def card_data(
         raise CardProblem("girişin mumu okunamadı (mumlar girişten sonra başlıyor)")
     ix: int | None = None
     exit_price: float | None = None
+    played_to: float | None = None
     if kind == "result":
         exit_price = rec.exit_price         # (only a recorded one: never worked back from the result)
         r_out = result_r(trade, pos, fill, stop, exit_price)
@@ -449,6 +467,16 @@ def card_data(
         ix = _bar_index(bars, rec.closed)
         if ix is None or ix < ie:
             ix = ie
+        # Where the box's result side, the dashed line and the played-out part end: the money's R (see the module
+        # text). With the plan's size in R != 1 the hero is this R times that size (a 0.5R signal that made its 2R
+        # target: the box reaches the target, the hero reads +1.00R): the box shows the price move the money made,
+        # the hero the result counted in the plan's R. No money R: the recorded close price (price-based).
+        per_position = money_r(trade, pos)
+        played_to = exit_price
+        if per_position is not None:
+            edge = fill + sign * per_position * risk
+            if math.isfinite(edge) and edge > 0:
+                played_to = edge
     else:
         r_out = None
 
@@ -552,10 +580,12 @@ def card_data(
         "fill": fill,
         "stop": stop,
         "target": target,
-        "exit": exit_price,
-        # the box's profit side: the result card's reaches the close price - when the close made a profit; a loss
-        # (or break-even) has no profit side, only the stop zone and the darker played-out part entry -> close
-        "box_far": (exit_price if exit_price is not None and sign * (exit_price - fill) > 0 else None)
+        "exit": exit_price,                 # the recorded close price (the DURUM chip)
+        "played_to": played_to,             # the result's edge: where the dashed line and the played-out part end
+        # the box's profit side: the result card's reaches the result's edge - when the result is a profit; a loss
+        # (or break-even) has no profit side, only the stop zone (to the original stop) and the darker played-out
+        # part entry -> the result's edge (beyond the stop for a loss of more than 1R)
+        "box_far": (played_to if played_to is not None and sign * (played_to - fill) > 0 else None)
         if kind == "result" else target,
         "last_price": drawn[-1][4],
         "digits": digits,
@@ -574,13 +604,31 @@ def caption(trade: TradeRecord, account: str, kind: str) -> str:
             f"#{trade.id} · {what}")
 
 
+def _weekend(moment: datetime) -> bool:
+    """A moment of the weekend closure of a market that closes (taken wide: Friday 20:00 to Sunday 23:00 UTC; the
+    forex and index markets are closed within it whatever their broker's clock and daylight saving time)."""
+    day, hour = moment.weekday(), moment.hour
+    return (day == 4 and hour >= 20) or day == 5 or (day == 6 and hour < 23)
+
+
 def window(anchor: datetime, end: datetime, tf_min: int, *, closed_market: bool) -> tuple[datetime, datetime]:
-    """The candles to ask the venue for: enough before ``anchor`` (a market that closes for the weekend: at least
-    four days before, so that BARS_BEFORE candles are there), up to ``end``."""
+    """The candles to ask the venue for: BARS_BEFORE (+ 4) candles before ``anchor``, up to ``end`` - only what the
+    card draws (after the close: what the touch search reads). A market that closes (MetaTrader): that much market
+    time before ``anchor`` (+ WINDOW_SLACK for a daily break or a holiday), the weekend closure not counted (so an
+    entry just after the weekend open still has its candles before it, from Friday)."""
     before = timedelta(minutes=tf_min * (BARS_BEFORE + 4))
+    start = as_utc(anchor) - before
     if closed_market:
-        before = max(before, timedelta(days=4))
-    return as_utc(anchor) - before, as_utc(end)
+        step = timedelta(minutes=min(int(tf_min), 60))
+        need = before * WINDOW_SLACK
+        start, counted = as_utc(anchor), timedelta(0)
+        for _ in range(200_000):                       # (a bound: 77 days of D1 bars are about 1,900 steps)
+            if counted >= need:
+                break
+            start -= step
+            if not _weekend(start):
+                counted += step
+    return start, as_utc(end)
 
 
 def search_end(closed: datetime, tf_min: int, now: datetime) -> datetime:
@@ -589,6 +637,6 @@ def search_end(closed: datetime, tf_min: int, now: datetime) -> datetime:
 
 
 __all__ = ["BARS_BEFORE", "DEFAULT_TIMEFRAME_MIN", "EVENT_KINDS", "CardProblem", "Deal", "Records", "caption",
-           "card_data", "card_target", "entry_price", "fmt_num", "fmt_r", "list_label", "listed", "original_stop",
-           "price_digits", "read_records", "result_r", "search_end", "shown_symbol", "timeframe_of", "venue_price",
-           "week_start", "window"]
+           "card_data", "card_target", "entry_price", "fmt_num", "fmt_r", "list_label", "listed", "money_r",
+           "original_stop", "price_digits", "read_records", "result_r", "search_end", "shown_symbol", "timeframe_of",
+           "venue_price", "week_start", "window"]

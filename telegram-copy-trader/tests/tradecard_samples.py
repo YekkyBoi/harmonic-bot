@@ -169,3 +169,16 @@ def sol_short_pending() -> dict[str, Any]:
                          data={"entry_created_ms": int(created.timestamp() * 1000)})
     rec = tc.Records(placed=created + timedelta(seconds=2))
     return {"trade": t, "pos": pos, "rec": rec, "bars": bars, "account": "binance"}
+
+
+def btc_long_money_r() -> dict[str, Any]:
+    """The BTC long of the sample, its target 92,200 hit: the price moved 2.00R (1,200 / 600), the money made 1.97R
+    (118.20 on an initial risk of 60.00: fees, the lot's rounding). The card's box is drawn to the money's 1.97R."""
+    sample = btc_long_result()
+    pos = sample["pos"].model_copy(deep=True)
+    pos.realized_pnl = 118.2
+    sample["pos"] = pos
+    rec = sample["rec"]
+    sample["rec"] = tc.Records(placed=rec.placed, filled=rec.filled, closed=rec.closed, exit_price=92200.0,
+                               reason="tp", moves=list(rec.moves))
+    return sample

@@ -12,10 +12,16 @@ the RESULT card once it is closed (see :mod:`.tradecard` for what the card says)
   meant for a card must never close a position). ``/binancekart 2`` picks from that account's list explicitly.
 * **Never in the way of trading.** Database reads only; candles from the public exchange (ccxt) or - read only - from
   the account's own MetaTrader terminal through the adapter's worker thread with its time limit
-  (``trade_chart``); the picture is drawn by ANOTHER process (:mod:`.render`: time limit, below normal priority,
-  killed on overrun); the upload through the notifier's bounded file request (paused while the trading path is
-  busy). The command answers at once; the card is made by a task of this service, one card at a time. Every failure
-  is a short text for the owner; nothing raises into the bot. :meth:`stop` ends within STOP_WAIT_SEC.
+  (``trade_chart``). That worker thread is the one order_send uses, so the MetaTrader read is made only while the
+  trading path is idle (``busy``, :func:`copytrader.telegram.group_mirror.trading_path_busy`: open / management
+  flows, late legs, monitor syncs - virtual entries fire inside them -, owner commands, the listener), waited for
+  at most CHART_IDLE_WAIT_SEC (the owner's own number is still being answered when the card starts), else the owner
+  is told BUSY_TRADING; it asks only for the candles the card draws (:func:`.tradecard.window`) and stops as soon as
+  the terminal gets another call (``trade_chart``'s "busy"). The picture is drawn by ANOTHER process
+  (:mod:`.render`: time limit, below normal priority, killed on overrun); the upload through the notifier's bounded
+  file request (paused while the trading path is busy). The command answers at once; the card is made by a task of
+  this service, one card at a time. Every failure is a short text for the owner; nothing raises into the bot.
+  :meth:`stop` ends within STOP_WAIT_SEC.
 """
 
 from __future__ import annotations
@@ -45,6 +51,8 @@ COMMAND_SUFFIX = "kart"            # /<account>kart
 TEMP_DIR = "kart"                  # under data_dir: the card's temporary files (removed after each card)
 STOP_WAIT_SEC = 5.0
 CANDLE_TIMEOUT_SEC = 60.0          # one candle read (the MetaTrader adapter's own limits are inside it)
+CHART_IDLE_WAIT_SEC = 10.0         # a MetaTrader read waits at most this long for an idle trading path, then refused
+CHART_IDLE_POLL_SEC = 0.2
 LIST_MAX = 60                      # rows of one list (a week of one account: never near it)
 # ccxt's bar sizes the card may use (minutes -> ccxt timeframe); MetaTrader's: brokers.mt5_broker.TIMEFRAMES
 CCXT_TIMEFRAMES = {1: "1m", 3: "3m", 5: "5m", 15: "15m", 30: "30m", 60: "1h", 120: "2h", 240: "4h", 360: "6h",
@@ -64,6 +72,11 @@ NO_PICTURE = "⚠️ Kart görseli hazırlanamadı ({why})."
 NOT_SENT = "⚠️ Kart gönderilemedi ({why})."
 NO_PILLOW = "ℹ️ Kart görseli için Pillow paketi kurulu değil (karne ile aynı paket); kart gönderilemedi."
 CANDLES_FAILED = "mumlar okunamadı"
+BUSY_TRADING = "⏳ Şu an hesapta işlem yürütülüyor, kartı birazdan tekrar isteyin."
+
+
+class _TradingBusy(Exception):
+    """The MetaTrader read was not made: the trading path is working (the owner reads BUSY_TRADING)."""
 
 
 class TradeCardService:
@@ -84,13 +97,15 @@ class TradeCardService:
         renderer: Callable[..., Awaitable[RenderResult]] = render_card,
         pillow: Callable[[], bool] = pillow_installed,
         monotonic: Callable[[], float] = time.monotonic,
+        idle_wait_sec: float = CHART_IDLE_WAIT_SEC,
     ) -> None:
         """``accounts``: the owner's accounts a card is made for, in the order they are shown (never the friend's);
         ``aliases``: their other names (config ``aliases``); ``sources``: where each one's candles come from -
         ("ccxt", exchange id) or ("mt5", None) (the adapter's own read-only ``trade_chart``); ``broker(name)``: the
         live adapter of an account; ``oracle``: the engine's ReferencePriceOracle (public candles); ``manual``: the
         hand-traded accounts (no stop on a broker); ``busy``: true while the trading path is working (the upload
-        pauses). The rest replaces the outside world in tests."""
+        pauses; a MetaTrader read waits for it at most ``idle_wait_sec``, then is refused). The rest replaces the
+        outside world in tests."""
         self._db = db
         self._notifier = notifier
         self._folder = Path(data_dir) / TEMP_DIR
@@ -105,6 +120,7 @@ class TradeCardService:
         self._renderer = renderer
         self._pillow = pillow
         self._monotonic = monotonic
+        self._idle_wait = float(idle_wait_sec)
         # the owner's numbered list: (made at, account, [(trade id, label)]); in memory only, one use
         self._list: tuple[float, str, list[tuple[int, str]]] | None = None
         self._job: asyncio.Task[None] | None = None
@@ -246,6 +262,8 @@ class TradeCardService:
         try:
             data, caption = await self.build(account, trade_id)
             await self._draw_and_send(data, caption)
+        except _TradingBusy:
+            await self._tell(BUSY_TRADING)
         except tc.CardProblem as exc:
             await self._tell(FAILED.format(why=str(exc)))
         except asyncio.CancelledError:
@@ -320,7 +338,11 @@ class TradeCardService:
         start, end = self._span(plain, pos, tf, now, closed_market=True)
         tickets = [leg.get("ticket") for leg in (pos.data or {}).get("legs") or []
                    if isinstance(leg, dict) and float(leg.get("filled") or 0.0) > 0]
-        anchor = plain.filled or plain.placed
+        # The bot's own UTC record of the FILL only (its notice of a limit fill, a market order's send): the time a
+        # limit order was placed may be hours before it filled and would give the server's clock wrong by hours.
+        anchor = plain.filled
+        await self._wait_idle()
+        # (the read follows the look at once; an order that comes after it: trade_chart stops before its next call)
         try:
             answer = await asyncio.wait_for(
                 chart(pos.broker_symbol, tf, start.timestamp(), end.timestamp(), tickets,
@@ -330,6 +352,9 @@ class TradeCardService:
         except Exception as exc:      # noqa: BLE001 - the terminal's answer: the owner reads why
             logger.warning("Trade card: %s candles could not be read: %s", account, exc)
             raise tc.CardProblem(f"{CANDLES_FAILED}: {esc(str(exc) or type(exc).__name__)}") from exc
+        if isinstance(answer, dict) and answer.get("busy"):
+            logger.info("Trade card: %s's terminal got another call during the card's read; not read", account)
+            raise _TradingBusy()
         offset = answer.get("offset") if isinstance(answer, dict) else None
         if not isinstance(offset, (int, float)):
             raise tc.CardProblem("MetaTrader sunucusunun saati belirlenemedi (piyasa kapalı ve giriş kaydı yok)")
@@ -342,6 +367,28 @@ class TradeCardService:
         if not bars:
             raise tc.CardProblem(CANDLES_FAILED)
         return bars, rec
+
+    def _path_busy(self) -> bool:
+        if self._busy is None:
+            return False
+        try:
+            return bool(self._busy())
+        except Exception:      # noqa: BLE001 - what cannot be looked at counts as busy
+            return True
+
+    async def _wait_idle(self) -> None:
+        """Return when the trading path is idle (at once when it is); raise _TradingBusy when it stays busy for
+        ``idle_wait_sec``."""
+        deadline = time.monotonic() + self._idle_wait
+        while self._path_busy():
+            if self._stopping:
+                raise tc.CardProblem("bot kapanıyor")
+            left = deadline - time.monotonic()
+            if left <= 0:
+                logger.info("Trade card: the trading path stayed busy for %.0f s; the terminal was not read",
+                            self._idle_wait)
+                raise _TradingBusy()
+            await asyncio.sleep(min(CHART_IDLE_POLL_SEC, left))
 
     async def _draw_and_send(self, data: dict[str, Any], caption: str) -> None:
         if not self._pillow():
@@ -379,4 +426,5 @@ class TradeCardService:
                 await tell(text)
 
 
-__all__ = ["CARD_LIST_TTL_SEC", "CCXT_TIMEFRAMES", "COMMAND_SUFFIX", "MT5_TIMEFRAMES", "TradeCardService"]
+__all__ = ["BUSY_TRADING", "CARD_LIST_TTL_SEC", "CCXT_TIMEFRAMES", "COMMAND_SUFFIX", "MT5_TIMEFRAMES",
+           "TradeCardService"]

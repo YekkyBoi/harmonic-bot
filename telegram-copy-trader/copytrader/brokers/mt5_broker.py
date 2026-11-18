@@ -3432,28 +3432,33 @@ class Mt5Broker(MetaTraderLegBroker):
         {"offset": the trade server's clock minus UTC in seconds (a whole number of hours) or None when it cannot be
         told, "bars": [(open time, open, high, low, close)], "deals": [{"time", "time_msc", "price", "volume",
         "entry": "in" | "out", "reason": "sl" | "tp" | "stop_out" | "manual", "position"}]} - the times in the TRADE
-        SERVER's clock as MetaTrader keeps them (the card turns them into UTC with ``offset``).
+        SERVER's clock as MetaTrader keeps them (the card turns them into UTC with ``offset``); with "busy": True
+        (and nothing else read) when another call came to this terminal meanwhile (below).
 
-        The offset: from a fresh tick (its time is server time, see :meth:`_tick_is_stale`); with a closed market
-        (no fresh tick), from the first opening deal of ``tickets`` against ``anchor_utc`` (the bot's own UTC record
-        of that fill), rounded to whole hours. Neither: offset None and no bars (nothing is guessed). Every call goes
-        through the adapter's own worker thread with its time limit (:meth:`_call`): the event loop never waits for
-        the terminal. Raises BrokerError when the terminal does not answer."""
+        The offset: from the first opening deal of ``tickets`` against ``anchor_utc`` (the bot's own UTC record of
+        that fill) when the two are a whole number of hours apart, give or take how late the bot noted the fill
+        (TRADE_CHART_RECORD_LATE_SEC / _EARLY_SEC); else from a
+        fresh tick (its time is server time, see :meth:`_tick_is_stale`; a tick 50-70 minutes old passes that test
+        and would be an hour off, which is why the deals come first); else from the deal, rounded to whole hours.
+        None of them: offset None and no bars (nothing is guessed).
+
+        Never in the way of an order: every call goes through the adapter's own worker thread with its time limit
+        (:meth:`_call`) - the one order_send uses - and before each of its calls this read looks whether the worker
+        thread has anything else to do (a sync, an order): if so it stops there and answers "busy" (no further call
+        of it is queued in front of trading). Raises BrokerError when the terminal does not answer."""
         self._require()
         name = TIMEFRAMES.get(int(timeframe_min))
         if name is None:
             raise BrokerError(f"MT5 {timeframe_min} dakikalık mum desteklemiyor")
-        offset: int | None = None
-        res, _err = await self._call("symbol_info_tick", broker_symbol)
-        tick_time = int(_f(getattr(res, "time", 0))) if res is not None else 0
-        if tick_time > 0 and not self._tick_is_stale(tick_time):
-            offset = int(round((tick_time - self._now_epoch()) / 3600.0)) * 3600
+        busy = {"offset": None, "bars": [], "deals": [], "busy": True}
         deals: list[dict[str, Any]] = []
         for ticket in dict.fromkeys(t for t in tickets if t is not None):
             try:
                 position = int(ticket)
             except (TypeError, ValueError):
                 continue
+            if self._oldest_call() is not None:
+                return busy
             for d in await self._get_list("history_deals_get", position=position, what="işlem geçmişi"):
                 if int(getattr(d, "type", -1)) not in (MT5.DEAL_TYPE_BUY, MT5.DEAL_TYPE_SELL):
                     continue
@@ -3470,17 +3475,34 @@ class Mt5Broker(MetaTraderLegBroker):
                     "position": position,
                 })
         deals.sort(key=lambda d: (d["time_msc"] or d["time"] * 1000, d["entry"] != "in"))
-        if offset is None and anchor_utc is not None:
-            ins = [d["time"] for d in deals if d["entry"] == "in" and d["time"] > 0]
-            if ins:
-                guess = round((min(ins) - float(anchor_utc)) / 3600.0)
-                if -14 <= guess <= 14:
-                    offset = int(guess) * 3600
+        offset: int | None = None
+        from_deal: int | None = None          # the deal's offset that is not a whole number of hours (last resort)
+        ins = [d["time"] for d in deals if d["entry"] == "in" and d["time"] > 0]
+        if ins and anchor_utc is not None:
+            apart = min(ins) - float(anchor_utc)          # = the offset minus how late the bot's record is
+            hours = round(apart / 3600.0)
+            if -14 <= hours <= 14:
+                late = hours * 3600.0 - apart                 # how late the bot's record is with that offset
+                if -TRADE_CHART_RECORD_EARLY_SEC <= late <= TRADE_CHART_RECORD_LATE_SEC:
+                    offset = int(hours) * 3600
+                else:
+                    from_deal = int(hours) * 3600
+        if offset is None:
+            if self._oldest_call() is not None:
+                return busy
+            res, _err = await self._call("symbol_info_tick", broker_symbol)
+            tick_time = int(_f(getattr(res, "time", 0))) if res is not None else 0
+            if tick_time > 0 and not self._tick_is_stale(tick_time):
+                offset = int(round((tick_time - self._now_epoch()) / 3600.0)) * 3600
+        if offset is None:
+            offset = from_deal
         if offset is None:
             return {"offset": None, "bars": [], "deals": deals}
         frame = getattr(self._mt5, f"TIMEFRAME_{name}", None)
         if not isinstance(frame, int):
             frame = TIMEFRAME_VALUES[name]
+        if self._oldest_call() is not None:
+            return busy
         rates, err = await self._call("copy_rates_range", broker_symbol, frame, int(start) + offset,
                                       int(end) + offset)
         if rates is None:
@@ -3492,6 +3514,15 @@ class Mt5Broker(MetaTraderLegBroker):
             except (KeyError, IndexError, TypeError, ValueError):
                 continue
         return {"offset": offset, "bars": bars, "deals": deals}
+
+
+# The trade card's server clock from the first opening deal against the bot's own UTC record of that fill: trusted
+# when, with a whole number of hours as the offset, the bot's record is at most TRADE_CHART_RECORD_LATE_SEC after the
+# deal (a limit fill: noted when the monitor sees it, normally seconds later) or TRADE_CHART_RECORD_EARLY_SEC before
+# it (a market order: noted as it is sent; the clocks' drift). A record further off is used only when no fresh tick
+# tells the offset either (as before).
+TRADE_CHART_RECORD_LATE_SEC = 600
+TRADE_CHART_RECORD_EARLY_SEC = 120
 
 
 # MetaTrader's bar sizes the trade card may ask for (minutes -> the package's TIMEFRAME_<name>), with the package's

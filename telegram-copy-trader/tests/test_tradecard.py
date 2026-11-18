@@ -289,7 +289,9 @@ async def test_a_closed_position_gets_the_result_card(world: World) -> None:
     data = world.renderer.data[-1]
     assert data["card"] == "trade" and data["kind"] == "result" and data["no"] == ids["a"]
     assert data["stop"] == 90400.0 and data["target"] == 92200.0      # the ORIGINAL stop, the LAST target
-    assert data["exit"] == pytest.approx(92000.0) and data["box_far"] == pytest.approx(92000.0)
+    assert data["exit"] == pytest.approx(92000.0)                     # the recorded close (the chip)
+    # the box is drawn to the money's R (118 / 60 = 1.967R from the fill), not to the close price (1.667R)
+    assert data["box_far"] == data["played_to"] == pytest.approx(91000.0 + 118.0 / 60.0 * 600.0)
     assert data["box_end"] == data["k_exit"]
     assert data["hero"] == "+1.97R"                                    # position_result_r: 118 / 60
     assert [s[1] for s in data["timeline"]] == ["Giriş · piyasa emri", "Stop girişe çekildi", "Hedef · +1.97R"]
@@ -376,7 +378,8 @@ async def test_the_card_goes_to_the_subprocess_renderer(world: World, monkeypatc
     assert seen == [("trade", svc_mod.TEMP_DIR, {})] and "çizim hatası" in world.notes.lines[-1]
 
 
-async def test_a_metatrader_account_reads_its_own_terminal_and_server_time_becomes_uk_time(world: World) -> None:
+async def nas_on_fx2(world: World, *, fill_noted: bool = True) -> int:
+    """The NAS100 short of the sample on fx2 (MetaTrader, server = UTC+2), its terminal's answer ready."""
     sample = S.nas_short_result()
     offset = 7200
     t = sample["trade"]
@@ -385,8 +388,9 @@ async def test_a_metatrader_account_reads_its_own_terminal_and_server_time_becom
                           closed=datetime(2026, 11, 17, 9, 24, tzinfo=UTC), status=TradeStatus.CLOSED)
     world.clock.now = datetime(2026, 11, 17, 5, 51, 30, tzinfo=UTC)
     await world.db.log_event("order_send", {"trade_id": tid, "broker": "fx2"})
-    world.clock.now = datetime(2026, 11, 17, 7, 56, tzinfo=UTC)
-    await world.db.log_event("entry_filled", {"trade_id": tid, "broker": "fx2"})
+    if fill_noted:
+        world.clock.now = datetime(2026, 11, 17, 7, 56, tzinfo=UTC)
+        await world.db.log_event("entry_filled", {"trade_id": tid, "broker": "fx2"})
     world.clock.now = datetime(2026, 11, 17, 9, 4, tzinfo=UTC)
     await world.db.log_event("manage_done", {"trade_id": tid, "action": "move_sl", "plan": {"move_sl_to_entry": True},
                                              "outcomes": [{"broker": "fx2", "kind": "ok"}]})
@@ -401,6 +405,11 @@ async def test_a_metatrader_account_reads_its_own_terminal_and_server_time_becom
                                    "reason": "manual"},
                                   {"time": out_srv, "price": 27055.1, "volume": 1.0, "entry": "out",
                                    "reason": "manual"}]}
+    return tid
+
+
+async def test_a_metatrader_account_reads_its_own_terminal_and_server_time_becomes_uk_time(world: World) -> None:
+    await nas_on_fx2(world)
     await world.svc.command("fx2")
     await world.svc.pick("1")
     await world.settle()
@@ -414,11 +423,118 @@ async def test_a_metatrader_account_reads_its_own_terminal_and_server_time_becom
     assert data["stop"] == 27444.06 and data["exit"] == pytest.approx(27055.1)
     assert data["chips"][3][1:3] == ["Kapatıldı", "çıkış 27.055,10"]
     assert data["subtitle"].startswith("US100.cash  ·  15 dakika  ·  17.11.2026")
+    assert (start, end) == tuple(t.timestamp() for t in tc.window(
+        datetime(2026, 11, 17, 7, 56, tzinfo=UTC), tc.search_end(datetime(2026, 11, 17, 9, 24, tzinfo=UTC), 15, NOW),
+        15, closed_market=True))
     world.fx2.answer = {"offset": None, "bars": [], "deals": []}
     await world.svc.command("fx2")
     await world.svc.pick("1")
     await world.settle()
     assert "saati belirlenemedi" in world.notes.lines[-1]
+
+
+async def test_only_the_bots_record_of_the_fill_tells_the_terminal_its_clock(world: World) -> None:
+    await nas_on_fx2(world, fill_noted=False)       # a limit whose fill notice is not on record: only its placing
+    await world.svc.command("fx2")
+    await world.svc.pick("1")
+    await world.settle()
+    assert world.fx2.calls[-1][5] is None            # never the time it was placed (two hours before the fill)
+
+
+# =========================================================================== #
+# The MetaTrader read never in the way of trading
+# =========================================================================== #
+async def test_the_metatrader_read_is_refused_while_the_trading_path_is_busy(world: World) -> None:
+    await nas_on_fx2(world)
+    world.svc._busy = lambda: True
+    world.svc._idle_wait = 0.3
+    await world.svc.command("fx2")
+    assert await world.svc.pick("1") == svc_mod.STARTED
+    await world.settle()
+    assert world.notes.lines == [svc_mod.BUSY_TRADING] == ["⏳ Şu an hesapta işlem yürütülüyor, kartı birazdan tekrar "
+                                                            "isteyin."]
+    assert world.fx2.calls == [] and not world.renderer.data              # the terminal was not asked at all
+
+    def broken() -> bool:
+        raise RuntimeError("cannot look")
+
+    world.svc._busy = broken                                              # what cannot be looked at counts as busy
+    await world.svc.command("fx2")
+    await world.svc.pick("1")
+    await world.settle()
+    assert world.notes.lines[-1] == svc_mod.BUSY_TRADING and world.fx2.calls == []
+
+
+async def test_the_metatrader_read_waits_a_moment_for_the_trading_path(world: World) -> None:
+    await nas_on_fx2(world)
+    looks: list[bool] = []
+
+    def busy() -> bool:                    # busy for the first looks (e.g. the owner's own number being answered)
+        looks.append(len(looks) < 3)
+        return looks[-1]
+
+    world.svc._busy = busy
+    await world.svc.command("fx2")
+    await world.svc.pick("1")
+    await world.settle()
+    assert not world.notes.lines and world.renderer.data and len(world.fx2.calls) == 1
+    assert looks == [True, True, True, False]
+
+
+async def test_a_public_candles_card_is_made_while_the_trading_path_is_busy(world: World) -> None:
+    await world.week()
+    world.svc._busy = lambda: True
+    world.svc._idle_wait = 0.0
+    await world.svc.command("binance")
+    await world.svc.pick("2")
+    await world.settle()
+    assert not world.notes.lines and world.renderer.data[-1]["kind"] == "result"
+
+
+async def test_the_terminal_busy_with_another_call_refuses_the_card(world: World) -> None:
+    await nas_on_fx2(world)
+    world.fx2.answer = {"offset": None, "bars": [], "deals": [], "busy": True}
+    await world.svc.command("fx2")
+    await world.svc.pick("1")
+    await world.settle()
+    assert world.notes.lines == [svc_mod.BUSY_TRADING] and not world.renderer.data
+
+
+async def test_the_owners_own_number_does_not_refuse_his_card(chat: Any, monkeypatch: pytest.MonkeyPatch) -> None:
+    """Through the real notifier: the number's handler is still sending "Kart hazırlanıyor" (a slow Telegram) when
+    the card starts; the read waits for it instead of refusing."""
+    world = chat.world
+    await nas_on_fx2(world)
+    looks: list[bool] = []
+
+    def busy() -> bool:
+        looks.append(chat.n.trading_busy())
+        return looks[-1]
+
+    world.svc._busy = busy
+    sent = chat.client.send_message
+    looked_while_reading: list[bool] = []
+
+    async def slow_send(entity: Any, message: Any, **kw: Any) -> Any:
+        if message == svc_mod.STARTED:
+            await asyncio.sleep(0.6)
+        return await sent(entity, message, **kw)
+
+    async def trade_chart(*args: Any) -> Any:
+        looked_while_reading.append(chat.n.trading_busy())
+        world.fx2.calls.append(args)
+        return world.fx2.answer
+
+    monkeypatch.setattr(chat.client, "send_message", slow_send)
+    world.fx2.trade_chart = trade_chart
+    await chat.n._on_message_event(MsgEvent("/fx2kart", sender_id=OWNER))
+    await chat.n.drain(5)
+    await chat.n._on_message_event(MsgEvent("1", sender_id=OWNER))       # handled in a task of the notifier
+    await asyncio.sleep(0.05)
+    await world.settle()
+    await chat.n.drain(5)
+    assert True in looks                    # the owner's own handler was still running when the card began
+    assert looked_while_reading == [False] and world.renderer.data and svc_mod.BUSY_TRADING not in world.notes.lines
 
 
 # =========================================================================== #
@@ -433,10 +549,12 @@ def test_the_original_stop_stays_when_the_stop_was_moved() -> None:
     assert data["timeline"][2] == ["09:04", "Stop girişe çekildi"]
 
 
-def test_the_result_box_ends_at_the_close_and_reaches_the_close_price() -> None:
+def test_the_result_box_ends_at_the_close_and_reaches_the_moneys_r() -> None:
     data = S.data_of(S.nas_short_result())
     assert data["kind"] == "result" and data["box_end"] == data["k_exit"]
-    assert data["box_far"] == data["exit"] == 27055.10 and data["target"] == 27010.25
+    # the money's R (170 / 100 = 1.70R) from the fill, short: 27300 - 1.70 x 144.06; the close price stays the chip's
+    assert data["box_far"] == data["played_to"] == pytest.approx(27300.0 - 1.70 * 144.06)
+    assert data["exit"] == 27055.10 and data["chips"][3][2] == "çıkış 27.055,10" and data["target"] == 27010.25
     assert data["hero"] == "+1.70R"
     k_fill = data["k_entry"]
     bar = data["bars"][k_fill]
@@ -448,10 +566,54 @@ def test_a_losing_result_has_no_profit_side_and_keeps_the_original_stop_line() -
     data = S.data_of(S.nas_short_stopped())
     assert data["hero"] == "−1.02R" and data["chips"][3][1] == "Stop"
     assert data["box_far"] is None and data["exit"] == 27446.0 and data["stop"] == 27444.06
+    # the played-out part ends at the money's −1.02R (102 / 100), a little beyond the original stop
+    assert data["played_to"] == pytest.approx(27300.0 + 1.02 * 144.06) and data["played_to"] > data["stop"]
     assert data["timeline"][-1][1] == "Stop · −1.02R"
     loss = S.data_of(S.btc_long_closed_at_a_loss())
     assert loss["hero"] == "−0.50R" and loss["box_far"] is None and loss["box_end"] == loss["k_exit"]
     assert loss["timeline"][-1][1] == "Elle kapatıldı · −0.50R" and loss["chips"][3][2] == "çıkış 90.700,0"
+
+
+def test_the_box_is_drawn_to_the_moneys_r_not_to_the_price_move() -> None:
+    sample = S.btc_long_money_r()
+    data = S.data_of(sample)
+    # price: (92200 - 91000) / 600 = 2.00R; money: 118.20 / 60 = 1.97R - the hero, the box and the line all 1.97R
+    assert tc.result_r(sample["trade"], sample["pos"], 91000.0, 90400.0, 92200.0) == pytest.approx(1.97)
+    assert data["hero"] == "+1.97R" and data["timeline"][-1][1] == "Hedef · +1.97R"
+    assert data["box_far"] == data["played_to"] == pytest.approx(91000.0 + 1.97 * 600.0)     # 92,182
+    assert data["exit"] == 92200.0 and data["target"] == 92200.0 and data["chips"][3][1] == "Hedef ✓"
+    k_close = next(k for k, b in enumerate(data["bars"]) if b[0] <= sample["rec"].closed.timestamp() < b[0] + 900
+                   and k >= data["k_entry"])
+    assert data["k_exit"] == data["box_end"] == k_close                    # the exit arrow: the close candle
+    # a 0.5R signal: the hero counts in the plan's R (0.985R), the box still shows the money's move per position
+    half = dict(sample, trade=sample["trade"].model_copy(deep=True))
+    half["trade"].plan.risk_r = 0.5
+    halved = S.data_of(half)
+    assert halved["hero"] == tc.fmt_r(118.2 * 0.5 / 60.0)
+    assert halved["box_far"] == halved["played_to"] == pytest.approx(91000.0 + 1.97 * 600.0)
+
+
+def test_a_loss_is_drawn_to_the_moneys_r_too() -> None:
+    sample = S.btc_long_closed_at_a_loss()
+    sample["pos"].realized_pnl = -31.8                      # money: -0.53R; price: (90700 - 91000) / 600 = -0.50R
+    data = S.data_of(sample)
+    assert data["hero"] == "−0.53R" and data["box_far"] is None
+    assert data["played_to"] == pytest.approx(91000.0 - 0.53 * 600.0)          # 90,682
+    assert data["exit"] == 90700.0 and data["chips"][3][2] == "çıkış 90.700,0" and data["stop"] == 90400.0
+
+
+def test_without_the_moneys_r_the_box_is_drawn_to_the_close_price() -> None:
+    for change in ({"simulated": True}, {"initial_risk": None}):
+        sample = S.btc_long_money_r()
+        sample["pos"].data.update(change)
+        data = S.data_of(sample)
+        assert tc.money_r(sample["trade"], sample["pos"]) is None
+        assert data["hero"] == "+2.00R"                                     # the price move
+        assert data["box_far"] == data["played_to"] == data["exit"] == 92200.0
+    loss = S.btc_long_closed_at_a_loss()
+    loss["pos"].data["simulated"] = True
+    data = S.data_of(loss)
+    assert data["box_far"] is None and data["played_to"] == data["exit"] == 90700.0
 
 
 def test_no_recorded_close_price_is_no_card() -> None:
@@ -650,6 +812,115 @@ async def test_mt5_trade_chart_with_a_closed_market(mt5_clock: None, monkeypatch
             await b.trade_chart("ETHUSD", 7, 0, 1)
     finally:
         await b.close()
+
+
+@pytest.mark.parametrize("age_min", [55, 60, 65])
+async def test_mt5_trade_chart_takes_the_offset_from_the_deals_not_an_hour_old_tick(
+        mt5_clock: None, monkeypatch: pytest.MonkeyPatch, age_min: int) -> None:
+    """A tick 50-70 minutes old passes the staleness test and would put the server's clock an hour off (UTC+1
+    instead of UTC+2); the opening deal against the bot's own record of the fill says UTC+2."""
+    fake = FakeMT5()
+    b = await connected(fake)
+    try:
+        utc_now = SERVER_TIME - 7200 + age_min * 60                  # the newest tick is age_min minutes old
+        monkeypatch.setattr(Mt5Broker, "_now_epoch", staticmethod(lambda: float(utc_now)))
+        assert not b._tick_is_stale(SERVER_TIME)                      # (the trap: it looks fresh)
+        assert round((SERVER_TIME - utc_now) / 3600.0) * 3600 == 3600  # (and says UTC+1)
+        deal_srv = SERVER_TIME - 3600
+        fake.deals.append(SimpleNamespace(ticket=1, order=9, time=deal_srv, time_msc=0, type=1,
+                                          entry=MT5.DEAL_ENTRY_IN, position_id=77, reason=3, volume=1.0,
+                                          price=2230.0))
+        fake.calls.clear()
+        answer = await b.trade_chart("ETHUSD", 15, utc_now - 3600 * 5, utc_now, [77],
+                                     anchor_utc=deal_srv - 7200 + 25)   # the bot noted the fill 25 s later
+        assert answer["offset"] == 7200 and answer["bars"]
+        assert not [c for c in fake.calls if c[0] == "symbol_info_tick"]    # not even asked: one call less
+        sent = [c for c in fake.calls if c[0] == "copy_rates_range"][-1]
+        assert sent[1][2] == int(utc_now - 3600 * 5) + 7200
+        # no deals (or no record of the fill): the tick, as before
+        fake.deals.clear()
+        assert (await b.trade_chart("ETHUSD", 15, utc_now - 3600, utc_now, [77],
+                                    anchor_utc=deal_srv - 7200 + 25))["offset"] == 3600
+    finally:
+        await b.close()
+
+
+async def test_mt5_trade_chart_trusts_only_a_record_close_to_the_fill(mt5_clock: None) -> None:
+    fake = FakeMT5()
+    b = await connected(fake)
+    try:
+        deal_srv = SERVER_TIME - 3600
+        fake.deals.append(SimpleNamespace(ticket=1, order=9, time=deal_srv, time_msc=0, type=1,
+                                          entry=MT5.DEAL_ENTRY_IN, position_id=77, reason=3, volume=1.0,
+                                          price=2230.0))
+        utc_now = SERVER_TIME - 7200
+        # noted 55 minutes after the fill (the bot was down): an hour off by the deal alone - the fresh tick says
+        late = await b.trade_chart("ETHUSD", 15, utc_now - 3600, utc_now, [77], anchor_utc=deal_srv - 7200 + 55 * 60)
+        assert late["offset"] == 7200 and [c for c in fake.calls if c[0] == "symbol_info_tick"]
+        # a market order noted as it was sent, 30 s before its deal: trusted
+        fake.calls.clear()
+        early = await b.trade_chart("ETHUSD", 15, utc_now - 3600, utc_now, [77], anchor_utc=deal_srv - 7200 - 30)
+        assert early["offset"] == 7200 and not [c for c in fake.calls if c[0] == "symbol_info_tick"]
+    finally:
+        await b.close()
+
+
+async def test_mt5_trade_chart_stops_when_the_terminal_gets_another_call(mt5_clock: None,
+                                                                        monkeypatch: pytest.MonkeyPatch) -> None:
+    fake = FakeMT5()
+    b = await connected(fake)
+    try:
+        fake.deals.append(SimpleNamespace(ticket=1, order=9, time=SERVER_TIME - 3600, time_msc=0, type=1,
+                                          entry=MT5.DEAL_ENTRY_IN, position_id=77, reason=3, volume=1.0,
+                                          price=2230.0))
+        real = b._oldest_call
+        other = SimpleNamespace(what="order_send", timed_out=False, running_for=lambda: 0.0,   # (not stuck)
+                                stuck_after=lambda: 1e9, relinking=lambda: False)
+        for free_looks in (0, 1):                  # busy at once / an order came while the deals were read
+            looks: list[int] = []
+
+            def oldest(free_looks: int = free_looks, looks: list[int] = looks) -> Any:
+                looks.append(1)
+                return real() if len(looks) <= free_looks else other
+
+            monkeypatch.setattr(b, "_oldest_call", oldest)
+            fake.calls.clear()
+            utc_now = SERVER_TIME - 7200
+            answer = await b.trade_chart("ETHUSD", 15, utc_now - 3600, utc_now, [77])
+            assert answer == {"offset": None, "bars": [], "deals": [], "busy": True}
+            names = [c[0] for c in fake.calls]
+            assert "copy_rates_range" not in names and "symbol_info_tick" not in names
+            assert names.count("history_deals_get") == free_looks
+        monkeypatch.setattr(b, "_oldest_call", real)
+        assert "busy" not in await b.trade_chart("ETHUSD", 15, SERVER_TIME - 10800, SERVER_TIME - 7200, [77])
+    finally:
+        await b.close()
+
+
+def test_the_metatrader_window_holds_only_the_candles_drawn() -> None:
+    # midweek: BARS_BEFORE + 4 candles of market time (+ WINDOW_SLACK) before the fill, no four-day floor
+    wed = datetime(2026, 11, 18, 12, 0, tzinfo=UTC)
+    start, end = tc.window(wed, wed + timedelta(hours=3), 15, closed_market=True)
+    need = timedelta(minutes=15 * (tc.BARS_BEFORE + 4))
+    assert wed - need * tc.WINDOW_SLACK - timedelta(minutes=15) < start <= wed - need * tc.WINDOW_SLACK
+    assert end == wed + timedelta(hours=3)
+    assert tc.window(wed, wed, 15, closed_market=False)[0] == wed - need       # (the public candles: as before)
+    # just after the weekend open: Friday's candles before it, still far less than four days
+    for fill in (datetime(2026, 11, 15, 22, 5, tzinfo=UTC), datetime(2026, 11, 16, 0, 5, tzinfo=UTC)):
+        start, _end = tc.window(fill, fill, 15, closed_market=True)
+        assert fill - start < timedelta(days=3)
+        market = [t for t in (start + timedelta(minutes=15 * k) for k in range(400)) if t < fill
+                  and not (t.weekday() == 4 and t.hour >= 21 or t.weekday() == 5
+                           or t.weekday() == 6 and t.hour < 22)]
+        assert len(market) >= tc.BARS_BEFORE
+        bars = [(t.timestamp(), 1.0, 1.1, 0.9, 1.0) for t in market]
+        assert tc._bar_index(bars, fill) == len(bars) - 1
+    # a daily bar size: (BARS_BEFORE + 4) x WINDOW_SLACK days of market time back, the (wide) weekends not counted
+    start, _end = tc.window(wed, wed, 1440, closed_market=True)
+    market_days = 62 * tc.WINDOW_SLACK
+    assert timedelta(days=market_days) < wed - start <= timedelta(days=market_days * 168 / 117 + 2)
+    weekdays = sum(1 for k in range((wed - start).days) if (start + timedelta(days=k)).weekday() < 5)
+    assert weekdays >= tc.BARS_BEFORE
 
 
 def test_the_helper_lets_the_bot_call_only_the_read(monkeypatch: pytest.MonkeyPatch) -> None:
@@ -862,7 +1133,8 @@ async def test_real_cards_through_the_drawing_process(tmp_path: Path) -> None:
     keep = os.environ.get("TRADECARD_OUT")
     for name, sample in (("short_result", S.nas_short_result()), ("long_result", S.btc_long_result()),
                          ("entry", S.eth_long_entry()), ("short_stopped", S.nas_short_stopped()),
-                         ("long_loss_close", S.btc_long_closed_at_a_loss()), ("pending_entry", S.sol_short_pending())):
+                         ("long_loss_close", S.btc_long_closed_at_a_loss()), ("pending_entry", S.sol_short_pending()),
+                         ("long_moneyR", S.btc_long_money_r())):
         started = time.monotonic()
         result = await render_card(S.data_of(sample), tmp_path / "kart")
         took = time.monotonic() - started

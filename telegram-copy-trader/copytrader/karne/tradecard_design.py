@@ -253,6 +253,9 @@ def render(T: dict[str, Any], out: str) -> None:
     fill, stop = float(T["fill"]), float(T["stop"])
     target = T.get("target")
     box_far = T.get("box_far")
+    # the result's edge (tradecard.card_data: the money's R; else the close price): the dashed line and the darker
+    # played-out part end there, the exit arrow stays on the close candle
+    played_to = T.get("played_to", T.get("exit"))
 
     cv = Canvas()
     L, R = 56, W - 56
@@ -303,7 +306,7 @@ def render(T: dict[str, Any], out: str) -> None:
     px0, py0, px1, py1 = L, 310, R, 886
     cv.glass((px0, py0, px1, py1), radius=28, a=0.045)
     gx0, gx1, gy0, gy1 = px0 + 26, px1 - 122, py0 + 34, py1 - 54
-    levels = [fill, stop, *(float(v) for v in (target, box_far, T.get("exit")) if v is not None)]
+    levels = [fill, stop, *(float(v) for v in (target, box_far, played_to) if v is not None)]
     lo_raw = min(min(b[3] for b in bars), *levels)
     hi_raw = max(max(b[2] for b in bars), *levels)
     span = max(hi_raw - lo_raw, abs(hi_raw) * 1e-6, 1e-12)
@@ -353,8 +356,8 @@ def render(T: dict[str, Any], out: str) -> None:
     if box_far is not None:
         d.line((cv.p(xe), cv.p(yt), cv.p(xr), cv.p(yt)), fill=rgba(TARGET_Z, 0.85), width=max(2, cv.p(1.6)))
     cv.put(lay)
-    if result and kx is not None and T.get("exit") is not None:
-        k_end, p_end = int(kx), float(T["exit"])
+    if result and kx is not None and played_to is not None:
+        k_end, p_end = int(kx), float(played_to)
         sgn = 1 if long_ else -1
         x_exit = X(k_end) + bw / 2
         yx = Y(p_end)
