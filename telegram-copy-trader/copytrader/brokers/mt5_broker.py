@@ -54,7 +54,7 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, TypeVar
 
-from ..config import Mt5BrokerConfig, RiskConfig, terminal_key
+from ..config import Mt5BrokerConfig, RiskConfig, fees_in_risk, terminal_key
 from ..models import (
     BrokerPosition,
     EntryType,
@@ -68,7 +68,7 @@ from ..models import (
     TakeProfit,
 )
 from ..parsing.symbols import CFD_QUOTES, FIAT_CURRENCIES
-from ..risk.sizing import SizingError, compute_lot_size, floor_to_step, round_to_tick
+from ..risk.sizing import SizingError, compute_lot_size, floor_to_step, round_to_tick, up_refused_warning
 from .base import Broker, BrokerError, OrderOutcomeUnknownError
 
 logger = logging.getLogger(__name__)
@@ -621,9 +621,14 @@ class MetaTraderLegBroker(Broker, ABC):
 
     # ---- sizing ------------------------------------------------------------
     def _lot_rounding(self) -> str:
-        """The broker's ``lot_rounding`` ("down" unless the config says "nearest")."""
+        """The broker's ``lot_rounding`` ("down" unless the config says "nearest" or "up")."""
         value = str(getattr(self.config, "lot_rounding", "down") or "down")
-        return value if value in ("down", "nearest") else "down"
+        return value if value in ("down", "nearest", "up") else "down"
+
+    def _lot_max_over(self) -> float | None:
+        """The broker's ``lot_rounding_max_over`` (lot_rounding "up"; None: the default)."""
+        value = getattr(self.config, "lot_rounding_max_over", None)
+        return float(value) if isinstance(value, (int, float)) else None
 
     def _fee_per_lot(self, loss_per_lot: float, entry: float, stop: float) -> float:
         """MT brokers do not report commission up front: optional buffer.
@@ -631,10 +636,11 @@ class MetaTraderLegBroker(Broker, ABC):
         Only ``commission_per_lot`` from the broker config is used (round trip,
         account currency). The crypto-style ``risk.fee_rate`` on notional is NOT
         applied here: on forex/CFD it would massively undersize trades (a 0.06%
-        fee on a 20-pip EURUSD stop is a ~66% buffer).
+        fee on a 20-pip EURUSD stop is a ~66% buffer). The broker's own
+        ``fees_in_risk`` (when written) overrides risk.include_fees_in_risk.
         """
         commission = getattr(self.config, "commission_per_lot", None)
-        if commission is None or not self.risk_config.include_fees_in_risk:
+        if commission is None or not fees_in_risk(self.config, self.risk_config):
             return 0.0
         return max(0.0, float(commission))
 
@@ -657,17 +663,24 @@ class MetaTraderLegBroker(Broker, ABC):
             max_lot=symbol.max_qty,
             allow_min_qty_round_up=rc.allow_min_qty_round_up,
             rounding=self._lot_rounding(),
+            max_over=self._lot_max_over(),
         )
         warnings: list[str] = []
         est = lots * per_lot
         exact = risk_amount / per_lot
         if symbol.max_qty and exact > symbol.max_qty + _EPS:
             warnings.append(f"Lot brokerın azami lotuyla ({_num(symbol.max_qty)}) sınırlandı; risk hedefin altında.")
+        refused = up_refused_warning(exact, lots, symbol.qty_step, self._lot_rounding(), risk_amount, per_lot,
+                                     self._lot_max_over())
+        if refused and not (symbol.max_qty and exact > symbol.max_qty + _EPS):
+            warnings.append(refused)
         if est > risk_amount * (1 + 1e-6):
             if floor_to_step(exact, symbol.qty_step) >= max(symbol.min_qty, symbol.qty_step) - _EPS:
-                # lot_rounding "nearest": the next step up was nearer (at most LOT_ROUNDING_MAX_OVERSHOOT x the target)
-                warnings.append(f"Lot en yakın adıma yukarı yuvarlandı ({_num(round(exact, 6))} -> {_num(lots)}); "
-                                f"stopta kayıp ~{est:.2f} (hedef {risk_amount:.2f}).")
+                if self._lot_rounding() != "up":
+                    # lot_rounding "nearest": the next step up was nearer (at most LOT_ROUNDING_MAX_OVERSHOOT x the
+                    # target). ("up" rounds up every time, by design: not a warning.)
+                    warnings.append(f"Lot en yakın adıma yukarı yuvarlandı ({_num(round(exact, 6))} -> {_num(lots)}); "
+                                    f"stopta kayıp ~{est:.2f} (hedef {risk_amount:.2f}).")
             else:
                 warnings.append(f"Lot minimum lota yükseltildi; stopta kayıp ~{est:.2f} (hedef {risk_amount:.2f}).")
 

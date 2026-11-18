@@ -37,7 +37,7 @@ import ccxt.async_support as ccxt_async
 from ccxt.base import errors as cx
 from ccxt.base.decimal_to_precision import DECIMAL_PLACES, SIGNIFICANT_DIGITS, TICK_SIZE
 
-from ..config import CcxtBrokerConfig, RiskConfig
+from ..config import CcxtBrokerConfig, RiskConfig, fees_in_risk
 from ..models import (
     BrokerPosition,
     EntryType,
@@ -768,9 +768,10 @@ class CcxtBroker(Broker):
             max_qty=symbol.max_qty,
             min_notional=symbol.min_notional,
             fee_rate=self._taker_fee(symbol),
-            include_fees=risk.include_fees_in_risk,
+            include_fees=fees_in_risk(self.config, risk),
             allow_min_qty_round_up=risk.allow_min_qty_round_up,
             rounding=str(getattr(self.config, "lot_rounding", "down") or "down"),
+            max_over=getattr(self.config, "lot_rounding_max_over", None),
         )
         free = await self.get_free_margin()
         frac = abs(entry_price - stop_loss) / entry_price
@@ -799,7 +800,7 @@ class CcxtBroker(Broker):
     def _loss_per_unit(self, symbol: SymbolInfo, entry: float, stop: float) -> float:
         """Money lost at the stop per 1 quantity (the formula of compute_linear_size)."""
         loss = abs(entry - stop) * symbol.contract_size
-        if self._risk().include_fees_in_risk:
+        if fees_in_risk(self.config, self._risk()):
             loss += self._taker_fee(symbol) * (entry + stop) * symbol.contract_size
         return loss
 

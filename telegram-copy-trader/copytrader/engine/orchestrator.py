@@ -672,6 +672,17 @@ def rounding_headroom(broker: Broker) -> float:
     return 1.0
 
 
+def max_rounded_risk(broker: Broker, amount: float) -> float:
+    """The most a size of ``broker`` sized for ``amount`` may lose at the stop through its lot rounding: ``amount``
+    for "down", x LOT_ROUNDING_MAX_OVERSHOOT for "nearest", + lot_rounding_max_over for "up"."""
+    if str(getattr(broker.config, "lot_rounding", "down") or "down") == "up":
+        over = getattr(broker.config, "lot_rounding_max_over", None)
+        over = float(over) if isinstance(over, (int, float)) and math.isfinite(over) and over >= 0 \
+            else sizing.DEFAULT_LOT_ROUNDING_MAX_OVER
+        return amount + over
+    return amount * rounding_headroom(broker)
+
+
 def market_sizing_entry(
     side: Side, live_entry: float, stop: float, signal_entry: float | None,
     max_multiple: Any = DEFAULT_MAX_SIZE_MULTIPLE,
@@ -4757,9 +4768,9 @@ class Engine:
                     # stay within the limit (guards.position_open_risk says what "at risk" covers).
                     at_risk = guards.open_risk(p for tid, p in await self.db.active_broker_positions()
                                                if p.broker == name and tid != trade.id)
-                    # (lot_rounding "nearest" may round the size UP: at most LOT_ROUNDING_MAX_OVERSHOOT x the target
-                    # is at the stop then, and that is what is counted before the size is known)
-                    wanted = broker_risk_amount(broker, equity, plan) * rounding_headroom(broker)
+                    # (lot_rounding "nearest" / "up" may round the size UP: the most that may then be at the stop
+                    # is what is counted before the size is known, see max_rounded_risk)
+                    wanted = max_rounded_risk(broker, broker_risk_amount(broker, equity, plan))
                     if guards.daily_loss_would_exceed(realized, at_risk, wanted, equity, loss_limit):
                         total = guards.daily_loss_with_open_risk(realized, at_risk, wanted)
                         limit_text, total_text, excess_text = _over_limit_figures(equity * loss_limit / 100.0, total)

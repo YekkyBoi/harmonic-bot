@@ -48,6 +48,15 @@ def fold_ascii(text: str) -> str:
     return " ".join(plain.casefold().split())
 
 
+def fees_in_risk(cfg: Any, risk: Any) -> bool:
+    """Does a broker (config ``cfg``) count its fees in the loss at the stop when it sizes? Its own ``fees_in_risk``
+    when written, else ``risk.include_fees_in_risk`` (True when neither says)."""
+    own = getattr(cfg, "fees_in_risk", None)
+    if own is not None:
+        return bool(own)
+    return bool(getattr(risk, "include_fees_in_risk", True)) if risk is not None else True
+
+
 def is_friend_account(cfg: Any) -> bool:
     """Is this the owner's friend's account (his catch-up questions, his commands, his report card)? Its
     ``friend_account``; not written: an optional account is the friend's, every other one the owner's."""
@@ -284,7 +293,15 @@ class _BrokerBase(_Base):
     # How the sized quantity is rounded to the broker's lot / quantity step: "down" (never more than the target
     # risk; the default, every account of the owner) or "nearest" (0.125 -> 0.13), falling back to "down" when the
     # nearest step would lose more than LOT_ROUNDING_MAX_OVERSHOOT times the target at the stop.
-    lot_rounding: Literal["down", "nearest"] = "down"
+    # "up": rounded UP to the next step, so the loss at the stop is never below the target, as long as that loses at
+    # most ``lot_rounding_max_over`` (account currency) more than the target; beyond it rounded down (the open notice
+    # says so). An exact multiple of the step stays as it is.
+    lot_rounding: Literal["down", "nearest", "up"] = "down"
+    lot_rounding_max_over: float = Field(10.0, ge=0)
+    # Whether this broker's size counts its fees (an MT broker: commission_per_lot; an exchange: its taker fee) in the
+    # loss at the stop. None (default): risk.include_fees_in_risk decides, as for every account. False: sized on the
+    # price loss at the stop only (the commission is paid on top). True: always counted.
+    fees_in_risk: bool | None = None
 
     @model_validator(mode="after")
     def _touch_needs_reference(self) -> "_BrokerBase":

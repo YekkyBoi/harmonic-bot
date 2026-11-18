@@ -200,6 +200,16 @@ def _risk_text(config: AppConfig) -> str:
         else:
             pct = config.risk.risk_per_r_pct * float(getattr(b, "risk_multiplier", 1.0) or 1.0)
             parts.append(f"{b.name} bakiyenin %{pct:g} kadarı")
+        notes = []      # (only the settings that differ from the default are named)
+        if getattr(b, "lot_rounding", "down") == "up":
+            notes.append(f"lot yukarı yuvarlanır, stopta hedefin en çok {getattr(b, 'lot_rounding_max_over', 10.0):g} "
+                         "üstü")
+        if getattr(b, "fees_in_risk", None) is False:
+            notes.append("komisyon riske katılmaz")
+        elif getattr(b, "fees_in_risk", None) is True and not config.risk.include_fees_in_risk:
+            notes.append("komisyon riske katılır")
+        if notes:
+            parts[-1] += f" ({'; '.join(notes)})"
     return ", ".join(parts) or "—"
 
 

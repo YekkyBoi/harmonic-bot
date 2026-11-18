@@ -23,7 +23,10 @@ _MAX_ROUND_UP_RISK_MULT = 2.0
 # lot_rounding "nearest" (a broker setting): the quantity is rounded to the NEAREST step only while the loss at the
 # stop stays within this multiple of the target risk; above it the quantity is rounded down as usual.
 LOT_ROUNDING_MAX_OVERSHOOT = 1.15
-LOT_ROUNDINGS = ("down", "nearest")
+# lot_rounding "up": the quantity is rounded UP while the loss at the stop stays at most this much (account currency)
+# above the target (the broker's lot_rounding_max_over); above it the quantity is rounded down as usual.
+DEFAULT_LOT_ROUNDING_MAX_OVER = 10.0
+LOT_ROUNDINGS = ("down", "nearest", "up")
 
 
 class SizingError(BrokerError):
@@ -52,14 +55,26 @@ def _quantize_steps(value: float, step: float, rounding: str) -> float:
 
 
 def round_quantity(raw: float, step: float, rounding: str = "down", *, risk_amount: float | None = None,
-                   loss_per_unit: float | None = None) -> float:
+                   loss_per_unit: float | None = None, max_over: float | None = None) -> float:
     """``raw`` (the exact size for the target risk) on the broker's ``step``: rounded DOWN (``rounding`` "down", the
     default and any unknown value), or to the NEAREST step ("nearest": 0.125 -> 0.13, 0.124 -> 0.12) as long as
-    that size loses at most LOT_ROUNDING_MAX_OVERSHOOT x ``risk_amount`` at the stop (``loss_per_unit`` per unit);
-    above that, or without both figures, rounded down. The one rounding rule of every sizing function here."""
+    that size loses at most LOT_ROUNDING_MAX_OVERSHOOT x ``risk_amount`` at the stop (``loss_per_unit`` per unit),
+    or UP ("up": 0.4691 -> 0.47, never below the target) as long as that size loses at most ``max_over`` (account
+    currency; None: DEFAULT_LOT_ROUNDING_MAX_OVER) more than ``risk_amount``; above that, or without both figures,
+    rounded down. An exact multiple of the step stays as it is. The one rounding rule of every sizing function
+    here."""
     down = floor_to_step(raw, step)
-    if rounding != "nearest" or step <= 0 or not math.isfinite(raw):
+    if rounding not in ("nearest", "up") or step <= 0 or not math.isfinite(raw):
         return down
+    if rounding == "up":
+        up = ceil_to_step(raw, step)
+        if up <= down:
+            return down
+        if risk_amount is None or loss_per_unit is None or not (risk_amount > 0 and loss_per_unit > 0):
+            return down
+        if up * loss_per_unit > (risk_amount + _max_over(max_over)) * (1 + 1e-12):
+            return down
+        return up
     nearest = _quantize_steps(raw, step, ROUND_HALF_UP)
     if nearest <= down:
         return down
@@ -68,6 +83,26 @@ def round_quantity(raw: float, step: float, rounding: str = "down", *, risk_amou
     if nearest * loss_per_unit > risk_amount * LOT_ROUNDING_MAX_OVERSHOOT * (1 + 1e-12):
         return down
     return nearest
+
+
+def _max_over(max_over: float | None) -> float:
+    if max_over is None or not math.isfinite(float(max_over)):
+        return DEFAULT_LOT_ROUNDING_MAX_OVER
+    return max(0.0, float(max_over))
+
+
+def up_refused_warning(raw: float, quantity: float, step: float, rounding: str, risk_amount: float,
+                       loss_per_unit: float, max_over: float | None) -> str | None:
+    """lot_rounding "up" that had to round DOWN (the next step would lose more than ``max_over`` above the target):
+    the short Turkish warning for the open notice; None otherwise."""
+    if rounding != "up" or step <= 0 or not (quantity > 0 and math.isfinite(raw)):
+        return None
+    up = ceil_to_step(raw, step)
+    if up <= quantity:
+        return None
+    return (f"Lot yukarı yuvarlanamadı ({_fmt(quantity)} -> {_fmt(up)}: stopta kayıp ~{up * loss_per_unit:.2f}, "
+            f"hedef {risk_amount:.2f} + en çok {_max_over(max_over):.2f}); aşağı yuvarlandı, stopta kayıp "
+            f"~{quantity * loss_per_unit:.2f}.")
 
 
 def risk_amount(equity: float, risk_pct: float, multiplier: float = 1.0) -> float:
@@ -123,10 +158,12 @@ def compute_linear_size(
     include_fees: bool = True,
     allow_min_qty_round_up: bool = False,
     rounding: str = "down",
+    max_over: float | None = None,
 ) -> SizingResult:
     """Size for linear instruments (USDT-margined perps, spot, paper).
 
-    ``rounding``: the broker's ``lot_rounding`` (see :func:`round_quantity`; "down" unless the broker says so).
+    ``rounding``: the broker's ``lot_rounding`` (see :func:`round_quantity`; "down" unless the broker says so);
+    ``max_over``: its ``lot_rounding_max_over`` ("up": a size rounded down instead is told in the warnings).
 
     loss_per_unit = |entry - stop| * contract_size
                     + (fee_rate * (entry + stop) * contract_size if include_fees)
@@ -155,7 +192,11 @@ def compute_linear_size(
 
     warnings: list[str] = []
     quantity = round_quantity(risk_amount / loss_per_unit, qty_step, rounding, risk_amount=risk_amount,
-                              loss_per_unit=loss_per_unit)
+                              loss_per_unit=loss_per_unit, max_over=max_over)
+    refused = up_refused_warning(risk_amount / loss_per_unit, quantity, qty_step, rounding, risk_amount,
+                                 loss_per_unit, max_over)
+    if refused:
+        warnings.append(refused)
     if max_qty is not None and quantity > max_qty:
         capped = floor_to_step(max_qty, qty_step)
         warnings.append(
@@ -220,6 +261,7 @@ def compute_lot_size(
     max_lot: float | None = None,
     allow_min_qty_round_up: bool = False,
     rounding: str = "down",
+    max_over: float | None = None,
 ) -> float:
     """Lots for MT4/MT5-style instruments where the broker reports the money lost per 1 lot at the stop.
 
@@ -233,7 +275,7 @@ def compute_lot_size(
         _require_positive(max_lot=max_lot)
 
     lots = round_quantity(risk_amount / loss_per_lot, lot_step, rounding, risk_amount=risk_amount,
-                          loss_per_unit=loss_per_lot)
+                          loss_per_unit=loss_per_lot, max_over=max_over)
     if max_lot is not None and lots > max_lot:
         logger.warning("Lot size %s capped at broker max %s", lots, max_lot)
         lots = floor_to_step(max_lot, lot_step)
