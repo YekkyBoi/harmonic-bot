@@ -5472,14 +5472,12 @@ class Engine:
         since = self._ref_seen.get(key) or d.get("ref_seen_msc")
         try:
             since_msc = int(since) if since is not None else None
+            armed_msc = int(d["ref_armed_msc"]) if d.get("ref_armed_msc") is not None else None
         except (TypeError, ValueError):
-            since_msc = None
-        try:
-            created = utc(datetime.fromisoformat(str(d.get("virtual_created_at"))))
-        except (TypeError, ValueError):
-            created = utc(trade.created_at)
+            since_msc = armed_msc = None
+        # (the first look: the watch starts at that account's latest tick - its server clock is never converted)
         seen = await self._reference_prices(ref, trade.plan, d.get("raw_symbol"), key, since_msc,
-                                            created.timestamp())
+                                            armed_msc if since_msc is not None else None)
         if seen is None:
             self._ref_retry_at[key] = time.monotonic() + REFERENCE_PRICE_RETRY_SEC
             warn_key = (trade.id, f"{pos.broker}:refprice")
@@ -5561,7 +5559,7 @@ class Engine:
 
     async def _reference_prices(
         self, name: str, plan: TradePlan, raw_symbol: str | None, key: tuple[int, str], since_msc: int | None,
-        since_utc: float,
+        armed_msc: int | None,
     ) -> dict[str, Any] | None:
         """What a waiting entry that watches the account ``name``'s price needs from it, read only, in the signal's
         scale: its adapter's ``price_since`` (MetaTrader: the latest tick and every price since the previous look,
@@ -5585,7 +5583,7 @@ class Engine:
                 if sym is None:
                     return None
                 self._ref_symbols[key] = sym
-            data = await reader(sym.broker_symbol, since_msc, since_utc)
+            data = await reader(sym.broker_symbol, since_msc, armed_msc)
         except asyncio.CancelledError:
             if not stray_cancel():
                 raise
@@ -5616,7 +5614,8 @@ class Engine:
                               upto_msc: Any, armed: bool | None) -> BrokerPosition:
         """The reference account's prices up to ``upto_msc`` (its server's clock) have been looked at: the next look
         starts there (kept in memory; stored at most once a minute, so that a restart also looks at the time the bot
-        was down). ``armed``: the first-target rule now counts (stored at once)."""
+        was down). ``armed``: the first-target rule now counts (stored at once). The first look's ``upto_msc`` is
+        also when the watch started (``ref_armed_msc``, stored at once: no bar of an earlier minute is read)."""
         try:
             upto = int(upto_msc) if upto_msc is not None else None
         except (TypeError, ValueError):
@@ -5627,10 +5626,13 @@ class Engine:
             stored = int(pos.data.get("ref_seen_msc") or 0)
         except (TypeError, ValueError):
             stored = 0
-        due = upto is not None and (stored == 0 or upto - stored >= _MINUTE_MS)
+        first = upto is not None and pos.data.get("ref_armed_msc") is None
+        due = upto is not None and (first or stored == 0 or upto - stored >= _MINUTE_MS)
         if not due and armed is None:
             return pos
         new = pos.model_copy(deep=True)
+        if first:
+            new.data["ref_armed_msc"] = upto
         if due:
             new.data["ref_seen_msc"] = upto
         if armed is not None:
@@ -7610,6 +7612,17 @@ class Engine:
         info = conf.early or {}
         return [str(n) for n in (info.get("done") or [])]
 
+    async def _early_ended_alone(self, trade: TradeRecord) -> bool:
+        """Did the early accounts' trade end only because their own waiting entries ended by their own rules (expiry,
+        the price passed the stop or reached the first target before the entry, a refusal at the touch) - never
+        filled, and not by the trader (a cancel, "stop girişe")? Then nothing of the trade was played out by the
+        trader: an approval opens the other accounts as a fresh trade, with its own price check."""
+        rows = await self.db.broker_positions(trade.id)
+        return bool(rows) and all(
+            p.status in (PositionStatus.CANCELLED, PositionStatus.FAILED) and not reference_leg_filled(p)
+            and (p.data or {}).get("virtual_end") not in (None, "stop girişe çekildi")
+            for p in rows)
+
     async def _early_kept_note(self, conf: PendingConfirmation) -> str:
         """HTML sentence: the early accounts' trade stays (empty when there is none, or it has ended)."""
         if not conf.early:
@@ -7643,7 +7656,8 @@ class Engine:
             early = await self._early_trade(conf) if conf.early else None
             skip = self._early_done(conf) if conf.early else []
             into = early if early is not None and early.status in ACTIVE_TRADE else None
-            if early is not None and early.status in (TradeStatus.CLOSED, TradeStatus.CANCELLED):
+            if (early is not None and early.status in (TradeStatus.CLOSED, TradeStatus.CANCELLED)
+                    and not await self._early_ended_alone(early)):
                 how = "kapandı" if early.status is TradeStatus.CLOSED else "iptal edildi"
                 names = skip or [str(n) for n in ((conf.early or {}).get("brokers") or [])]
                 text = (f"⛔ #{early.id} işlemi ({_names(names)}) onay beklerken {how}; diğer hesaplarda işlem "

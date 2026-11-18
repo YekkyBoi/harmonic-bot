@@ -496,6 +496,49 @@ async def test_without_tick_history_the_one_minute_bars_show_the_touch(unsure) -
     assert asked == [("EURUSD", 1, first, first + 30)]        # M1, from the first whole minute after the look
 
 
+async def test_bars_two_looks_inside_one_minute_see_the_wick_of_that_minute(unsure) -> None:
+    """Without ticks, looks a couple of seconds apart re-read the bar of the minute they are in (it grows): a wick
+    inside that minute is seen at the next look, not only after the minute has ended."""
+    p, _friend = unsure
+    await _armed_watch(p)
+    minute = -(-T0 // 60) * 60                                # the first whole minute after the watch started
+    low = [1.16150]                                           # that minute's low so far
+
+    def copy_rates_range(symbol: str, timeframe: int, date_from: int, date_to: int) -> list[dict[str, Any]]:
+        bars = [{"time": minute - 60, "open": 1.1619, "high": 1.1620, "low": 1.1600, "close": 1.1619, "spread": 10},
+                {"time": minute, "open": 1.1619, "high": 1.1620, "low": low[0], "close": 1.1615, "spread": 10}]
+        return [b for b in bars if date_from <= b["time"] <= date_to]
+
+    p.terminal.copy_rates_range = copy_rates_range            # type: ignore[method-assign]
+    _tick(p, 1.16150, 1.16160, minute + 10)
+    await p.engine.monitor.run_virtual_once()
+    assert p.tickmill_orders() == []                          # (the minute before the watch never counts: low 1.1600)
+    low[0] = 1.16085                                          # a wick between the two looks, inside the same minute
+    _tick(p, 1.16110, 1.16120, minute + 12)
+    p.tickmill.set_price("EURUSD", 1.16125, 1.16135)
+    await p.engine.monitor.run_virtual_once()
+    (order,) = p.tickmill_orders()
+    assert order[0] == "market_buy"
+
+
+async def test_yes_after_tickmill_entry_ended_by_its_own_rule_opens_fx_as_usual(unsure) -> None:
+    """tickmill's waiting entry ended by its own rule (fx reached the first target before the entry): that is no
+    decision of the trader's - Evet still opens fx as today; tickmill is not sent anything."""
+    p, _friend = unsure
+    _history(p, [(T0 + 0.5, 1.16505, 1.16515)])
+    await _armed_watch(p)
+    _tick(p, 1.16195, 1.16205, T0 + 1.5)
+    await p.engine.monitor.run_virtual_once()
+    assert (await p.positions(1))["tickmill"].status is PositionStatus.CANCELLED
+    await p.engine.monitor.run_once()                          # (the trade rolls up)
+    (trade,) = await p.trades()
+    assert trade.status is TradeStatus.CANCELLED               # (the case the approval must not take for the trader's)
+    (conf,) = p.notifier.confirmations
+    out = await p.engine.handle_confirmation(conf.id, True)
+    assert "onay beklerken" not in out
+    assert p.fx_orders() == [("BUY_LIMIT", "EURUSD", 0.5, ENTRY, STOP, TP)] and p.tickmill_orders() == []
+
+
 async def test_fx_reaching_the_first_target_before_the_entry_cancels_the_waiting_entry(unsure) -> None:
     p, _friend = unsure
     _history(p, [(T0 + 0.5, 1.16505, 1.16515)])               # bid 1.16505 >= TP 1.1650, the entry never touched

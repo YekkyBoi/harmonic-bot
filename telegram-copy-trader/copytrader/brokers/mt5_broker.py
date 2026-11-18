@@ -3531,28 +3531,27 @@ class Mt5Broker(MetaTraderLegBroker):
                 continue
         return {"offset": offset, "bars": bars, "deals": deals}
 
-    async def price_since(self, broker_symbol: str, since_msc: int | None, since_utc: float | None = None,
+    async def price_since(self, broker_symbol: str, since_msc: int | None, armed_msc: int | None = None,
                           max_ticks: int = PRICE_SINCE_MAX_TICKS) -> dict[str, Any]:
         """READ ONLY, for a waiting entry of another account that watches this account's price (the engine's
         ``reference_broker``): the latest tick of ``broker_symbol`` and every price it had since ``since_msc`` (the
-        ``upto_msc`` an earlier answer gave: the trade server's own millisecond clock, as MetaTrader keeps tick
-        times, so no clock conversion is involved), so that a touch between two looks is not missed.
-
-        ``since_msc`` None (the first look): from ``since_utc`` (UTC epoch seconds, when the entry was set),
-        turned into the server's clock by the whole-hour offset of a fresh tick (:meth:`_tick_is_stale`); without a
-        fresh tick, from the latest tick on.
+        ``upto_msc`` an earlier answer gave), so that a touch between two looks is not missed. Every time here is
+        the trade server's own millisecond clock, as MetaTrader keeps tick times: no clock conversion is involved.
+        ``since_msc`` None (the first look): only the latest tick (the watch starts there). ``armed_msc``: when the
+        watch started (the first look's ``upto_msc``): no bar of a minute that began before it is read.
 
         {"now": (time_msc, bid, ask), "samples": [(time_msc, bid_low, bid_high, ask_low, ask_high)] in time order,
-        after the start and up to the latest tick, "source": "ticks" | "bars" | None, "upto_msc": what has been
-        looked at (the next look starts there), "busy": True when another call came to this terminal meanwhile:
-        the history is not read now (``upto_msc`` stays the start, the next look reads it)}.
+        up to the latest tick, "source": "ticks" | "bars" | None, "upto_msc": what has been looked at (the next look
+        starts there), "busy": True when another call came to this terminal meanwhile: the history is not read now
+        (``upto_msc`` stays the start, the next look reads it)}.
 
-        The history: the ticks (copy_ticks_from, at most ``max_ticks``); more than that, or no ticks, the 1-minute
-        bars instead (copy_rates_range; the bars are bid prices, the ask is the bid plus the bar's spread; only the
-        minutes that began after the start count, the minute it began in also holds earlier prices). Like
-        :meth:`trade_chart` it stays out of an order's way: every call goes through the worker thread with its time
-        limit, and before each history call it looks whether that thread has anything else to do. Raises
-        BrokerError when there is no price now."""
+        The history: the ticks after ``since_msc`` (copy_ticks_from, at most ``max_ticks``); more than that, or no
+        ticks, the 1-minute bars instead (copy_rates_range; the bars are bid prices, the ask is the bid plus the
+        bar's spread), from the minute ``since_msc`` is in (that bar grows between two looks a few seconds apart:
+        a wick inside the minute shows in it) but never a minute that began before ``armed_msc`` (it also holds
+        prices from before the watch). Like :meth:`trade_chart` it stays out of an order's way: every call goes
+        through the worker thread with its time limit, and before each history call it looks whether that thread
+        has anything else to do. Raises BrokerError when there is no price now."""
         self._require()
         tick, err = await self._call("symbol_info_tick", broker_symbol)
         bid, ask = (_f(getattr(tick, "bid", 0.0)), _f(getattr(tick, "ask", 0.0))) if tick is not None else (0.0, 0.0)
@@ -3563,9 +3562,6 @@ class Mt5Broker(MetaTraderLegBroker):
         out: dict[str, Any] = {"now": (t_msc, bid, ask), "samples": [], "source": None, "upto_msc": t_msc,
                                "busy": False}
         start = since_msc
-        if start is None and since_utc is not None and t_sec > 0 and not self._tick_is_stale(t_sec):
-            offset = int(round((t_sec - self._now_epoch()) / 3600.0)) * 3600
-            start = int((float(since_utc) + offset) * 1000)
         if start is None or start >= t_msc:
             return out
         busy = {**out, "busy": True, "upto_msc": start}
@@ -3592,7 +3588,9 @@ class Mt5Broker(MetaTraderLegBroker):
                 return busy
             info, _err = await self._call("symbol_info", broker_symbol)
             point = _f(getattr(info, "point", 0.0)) if info is not None else 0.0
-            first = -(-int(start // 1000) // 60) * 60                  # the first minute that began after the start
+            first = int(start // 1000) // 60 * 60                         # the minute the previous look was in
+            if armed_msc is not None:
+                first = max(first, -(-int(armed_msc // 1000) // 60) * 60)  # never before the watch started
             if first <= t_sec:
                 if self._oldest_call() is not None:
                     return busy
@@ -3606,7 +3604,11 @@ class Mt5Broker(MetaTraderLegBroker):
                         continue
                     if open_sec >= first and low > 0 and high > 0:
                         samples.append((open_sec * 1000, low, high, low + spread, high + spread))
-                out["source"] = "bars" if bars is not None else None
+                if bars is not None:
+                    out["source"] = "bars"
+                else:
+                    logger.warning("%s: neither ticks nor 1-minute bars of %s since %s could be read; only the "
+                                   "latest price is looked at", self.name, broker_symbol, start)
         samples.sort(key=lambda s: s[0])
         out["samples"] = samples
         return out
