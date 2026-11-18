@@ -17,8 +17,10 @@ Rules (the owner's, one place):
   the entry = the position's fill price (pending: its limit price); the stop = the signal's ORIGINAL stop (the
   plan's ``stop_loss``, which a stop move never changes: moves appear only in the timeline); the target = the LAST of
   the plan's take profits (none: no target zone).
-* **Result**: the close price = the volume-weighted price of the position's exits (MetaTrader: its closing deals;
-  none on record: no card);
+* **Result**: the close price = the volume-weighted price of the position's exits (MetaTrader: its closing deals);
+  a ccxt position closed by hand on the exchange (no exit of the bot's on record): the volume-weighted price of the
+  account's own close-side fills on the exchange (:func:`venue_close`: in the position's time, oldest first, until
+  they cover its filled quantity; less than VENUE_COVER of it: no card); none known: no card;
   the result in R = :func:`copytrader.engine.monitor.position_result_r` (the closing notice's own figure); without it
   (a simulated / hand-traded account, an older position) the price move, ``side x (close - entry) / (entry - stop)``,
   times the plan's size in R.
@@ -60,6 +62,9 @@ END_ROOM_BARS = 6                 # a result card whose candles end at the close
 WINDOW_SLACK = 1.25               # a market that closes: this much more market time is asked for before the entry
 FOOTER = "İngiltere saati"
 MINUS = "−"
+VENUE_COVER = 0.95                # a close read from the exchange's fills must cover this much of the filled quantity
+VENUE_CLOSE_MARGIN = timedelta(minutes=10)    # ... fills up to this long after the bot saw the position end
+CLOSED_ON_VENUE = "venue"         # Records.close_by: closed on the exchange, outside the bot (by hand)
 EVENT_KINDS = ("order_send", "entry_filled", "manage_done", "manage_late_done", "pozkapat", "close_all")
 _TP_WORDS = frozenset({"tp", "take_profit"})
 _STOP_WORDS = frozenset({"sl", "stop", "stop_out", "stop_replaced"})
@@ -230,7 +235,7 @@ class Records:
     exit_price: float | None = None   # volume-weighted price of the exits
     reason: str | None = None         # "tp" | "stop" | "close": how the position ended (its LAST exit)
     moves: list[tuple[datetime, str]] = field(default_factory=list)      # stop moves (timeline)
-    close_by: str | None = None       # who closed it: "group" | "owner" | "all" | None
+    close_by: str | None = None       # who closed it: "group" | "owner" | "all" | CLOSED_ON_VENUE | None
 
 
 def _reason_word(raw: object) -> str:
@@ -330,6 +335,83 @@ def read_records(trade: TradeRecord, pos: BrokerPosition, closed_at: datetime | 
     if rec.closed is not None:
         rec.moves = [m for m in rec.moves if m[0] <= rec.closed]
     return rec
+
+
+def _own_order_ids(data: Mapping[str, Any]) -> set[str]:
+    """The ccxt adapter's orders of this position (as its ``_realized_pnl`` collects them)."""
+    ids = {str(x) for x in [data.get("entry_order_id"), data.get("sl_order_id"), *(data.get("other_order_ids") or [])]
+           if x}
+    ids |= {str(t["id"]) for t in data.get("tp_order_ids") or [] if isinstance(t, dict) and t.get("id")}
+    ids |= {str(e["order_id"]) for e in data.get("exits") or [] if isinstance(e, dict) and e.get("order_id")}
+    ids |= {str(x) for x in data.get("linked_order_ids") or [] if x}
+    return ids
+
+
+def venue_opened(pos: BrokerPosition, rec: Records) -> datetime | None:
+    """The time the position opened (the ccxt adapter's ``opened_at``, else the recorded fill)."""
+    return _ms_time((pos.data or {}).get("opened_at")) or rec.filled
+
+
+def venue_close(pos: BrokerPosition, rec: Records, trades: Sequence[Mapping[str, Any]], now: datetime
+                ) -> Records | None:
+    """The close of a ccxt position the bot booked no exit price for (closed by hand on the exchange), from the
+    account's own fills of its symbol (ccxt ``fetch_my_trades``): the close-side fills from the position's open time
+    up to the time the bot saw it end + VENUE_CLOSE_MARGIN (no such time: now), oldest first, until they cover its
+    filled quantity (the last one only for the part needed: one order may close it and open the other side); a
+    hedge-mode fill of the other side's position is not one of them. The close price is their volume-weighted price,
+    the close time the last one used. None: no open time, nothing filled, or the fills cover less than VENUE_COVER of
+    the quantity. ``rec`` is not changed (a copy is returned)."""
+    opened = venue_opened(pos, rec)
+    try:
+        need = float(pos.filled_quantity or 0.0)
+    except (TypeError, ValueError):
+        return None
+    if opened is None or not (math.isfinite(need) and need > 0):
+        return None
+    start = as_utc(opened).timestamp() * 1000.0
+    end = (as_utc(rec.closed) + VENUE_CLOSE_MARGIN if rec.closed is not None else as_utc(now)).timestamp() * 1000.0
+    close_side = "sell" if pos.side is Side.LONG else "buy"
+    own_side = "LONG" if pos.side is Side.LONG else "SHORT"
+    fills: list[tuple[float, float, float, str]] = []
+    for t in trades:
+        if not isinstance(t, Mapping) or t.get("side") != close_side:
+            continue
+        info = t.get("info") if isinstance(t.get("info"), Mapping) else {}
+        side_of_position = str(info.get("positionSide") or "").upper()
+        if side_of_position in ("LONG", "SHORT") and side_of_position != own_side:
+            continue                  # (hedge mode: the other side's position)
+        try:
+            at, price, amount = float(t.get("timestamp")), float(t.get("price")), float(t.get("amount"))
+        except (TypeError, ValueError):
+            continue
+        if not all(math.isfinite(v) for v in (at, price, amount)) or price <= 0 or amount <= 0:
+            continue
+        if start <= at <= end:
+            fills.append((at, price, amount, str(t.get("order") or "")))
+    fills.sort(key=lambda f: f[0])
+    used: list[tuple[float, float]] = []
+    left, last_at, orders = need, None, set()
+    for at, price, amount, order in fills:
+        if left <= need * 1e-9:
+            break
+        take = min(amount, left)
+        used.append((price, take))
+        left -= take
+        last_at = at
+        orders.add(order)
+    covered = need - left
+    price = _weighted(used)
+    if price is None or last_at is None or covered < need * VENUE_COVER:
+        return None
+    closed = _ms_time(last_at)
+    if closed is None:
+        return None
+    out = Records(placed=rec.placed, filled=rec.filled, closed=closed, exit_price=price, reason=rec.reason or "close",
+                  moves=[m for m in rec.moves if m[0] <= closed], close_by=rec.close_by)
+    data = pos.data or {}
+    if out.close_by is None and not data.get("exits") and not (orders & _own_order_ids(data)):
+        out.close_by = CLOSED_ON_VENUE
+    return out
 
 
 def money_r(trade: TradeRecord, pos: BrokerPosition) -> float | None:
@@ -548,8 +630,8 @@ def card_data(
     if kind == "result":
         assert rec.closed is not None and r_out is not None
         word = {"tp": "Hedef", "stop": "Stop"}.get(rec.reason or "", None) or {
-            "group": "Grup kapattı", "owner": "Elle kapatıldı", "all": "Hepsi kapatıldı"}.get(rec.close_by or "",
-                                                                                             "Kapatıldı")
+            "group": "Grup kapattı", "owner": "Elle kapatıldı", "all": "Hepsi kapatıldı",
+            CLOSED_ON_VENUE: "Elle kapatıldı (borsada)"}.get(rec.close_by or "", "Kapatıldı")
         steps.append([f"{to_uk(rec.closed):%H:%M}", f"{word} · {fmt_r(r_out)}"])
     elif pending:
         steps.append(["", "Giriş bekleniyor"])
@@ -636,7 +718,8 @@ def search_end(closed: datetime, tf_min: int, now: datetime) -> datetime:
     return min(as_utc(now), as_utc(closed) + timedelta(minutes=tf_min * (TOUCH_SEARCH_BARS + 1)))
 
 
-__all__ = ["BARS_BEFORE", "DEFAULT_TIMEFRAME_MIN", "EVENT_KINDS", "CardProblem", "Deal", "Records", "caption",
+__all__ = ["BARS_BEFORE", "CLOSED_ON_VENUE", "DEFAULT_TIMEFRAME_MIN", "EVENT_KINDS", "VENUE_COVER", "CardProblem",
+           "Deal", "Records", "caption",
            "card_data", "card_target", "entry_price", "fmt_num", "fmt_r", "list_label", "listed", "money_r",
            "original_stop", "price_digits", "read_records", "result_r", "search_end", "shown_symbol", "timeframe_of",
-           "venue_price", "week_start", "window"]
+           "venue_close", "venue_opened", "venue_price", "week_start", "window"]

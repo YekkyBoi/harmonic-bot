@@ -10,7 +10,7 @@ the RESULT card once it is closed (see :mod:`.tradecard` for what the card says)
   answers it. A number is never taken from it while a correction is awaited (the number is the correction), and
   never while a /pozkapat list is waiting too (the bot then asks for ``/pozkapat 2`` or ``/binancekart 2``: a number
   meant for a card must never close a position). ``/binancekart 2`` picks from that account's list explicitly.
-* **Never in the way of trading.** Database reads only; candles from the public exchange (ccxt) or - read only - from
+* **Never in the way of trading.** Database reads; candles from the public exchange (ccxt) or - read only - from
   the account's own MetaTrader terminal through the adapter's worker thread with its time limit
   (``trade_chart``). That worker thread is the one order_send uses, so the MetaTrader read is made only while the
   trading path is idle (``busy``, :func:`copytrader.telegram.group_mirror.trading_path_busy`: open / management
@@ -22,6 +22,11 @@ the RESULT card once it is closed (see :mod:`.tradecard` for what the card says)
   file request (paused while the trading path is busy). The command answers at once; the card is made by a task of
   this service, one card at a time. Every failure is a short text for the owner; nothing raises into the bot.
   :meth:`stop` ends within STOP_WAIT_SEC.
+* **A ccxt position closed by hand on the exchange** (closed, no exit price of the bot's on record): its close is
+  read - read only, within FILLS_TIMEOUT_SEC - from the account's own fills of the symbol (the live adapter's
+  exchange, ``fetch_my_trades``; :func:`.tradecard.venue_close`), for the card only (the bot's own records, its
+  result, the report card and the closing notice stay as they are). Not found or not readable: the card is not made
+  (the owner reads why), never a guessed price.
 """
 
 from __future__ import annotations
@@ -53,6 +58,8 @@ STOP_WAIT_SEC = 5.0
 CANDLE_TIMEOUT_SEC = 60.0          # one candle read (the MetaTrader adapter's own limits are inside it)
 CHART_IDLE_WAIT_SEC = 10.0         # a MetaTrader read waits at most this long for an idle trading path, then refused
 CHART_IDLE_POLL_SEC = 0.2
+FILLS_TIMEOUT_SEC = 20.0           # one read of a ccxt account's own fills (a close made by hand on the exchange)
+FILLS_SINCE_SLACK_MS = 60_000      # the fills are asked for from this long before the position's open (as the adapter)
 LIST_MAX = 60                      # rows of one list (a week of one account: never near it)
 # ccxt's bar sizes the card may use (minutes -> ccxt timeframe); MetaTrader's: brokers.mt5_broker.TIMEFRAMES
 CCXT_TIMEFRAMES = {1: "1m", 3: "3m", 5: "5m", 15: "15m", 30: "30m", 60: "1h", 120: "2h", 240: "4h", 360: "6h",
@@ -296,11 +303,40 @@ class TradeCardService:
             bars, rec = await self._mt5_candles(account, trade, pos, closed_at, events, tf, now)
         elif source[0] == "ccxt" and source[1]:
             rec = tc.read_records(trade, pos, closed_at, events)
+            if not active and rec.exit_price is None:
+                rec = await self._closed_on_venue(account, pos, rec, now)
             bars = await self._ccxt_candles(str(source[1]), pos.broker_symbol, rec, pos, tf, now)
         else:
             raise tc.CardProblem("bu hesabın mumları okunamıyor")
         data = tc.card_data(trade, pos, account, rec, bars, tf, manual=account in self._manual, now=now)
         return data, tc.caption(trade, account, data["kind"])
+
+    async def _closed_on_venue(self, account: str, pos: Any, rec: tc.Records, now: datetime) -> tc.Records:
+        """A closed position of a ccxt account with no exit price on record (closed by hand on the exchange): the
+        records with the close read from the account's own fills (tradecard.venue_close); ``rec`` as it is when the
+        account is not a live ccxt one, the position not real money, or the fills do not tell (the card then says the
+        close price is not on record). Read only, bounded; never raises (but CancelledError)."""
+        broker = self._broker(account)
+        if getattr(broker, "kind", None) != "ccxt" or pos.dry_run or (pos.data or {}).get("simulated"):
+            return rec
+        fetch = getattr(getattr(broker, "exchange", None), "fetch_my_trades", None)
+        opened = tc.venue_opened(pos, rec)
+        if not callable(fetch) or opened is None:
+            return rec
+        try:
+            since = int(as_utc(opened).timestamp() * 1000) - FILLS_SINCE_SLACK_MS
+            trades = await asyncio.wait_for(fetch(pos.broker_symbol, since), FILLS_TIMEOUT_SEC)
+            found = tc.venue_close(pos, rec, list(trades or []), now)
+        except asyncio.CancelledError:
+            raise
+        except Exception as exc:      # noqa: BLE001 - the card is refused as before (no close price on record)
+            logger.warning("Trade card: %s's fills of %s could not be read: %s", account, pos.broker_symbol,
+                           str(exc) or type(exc).__name__)
+            return rec
+        if found is None:
+            logger.info("Trade card: %s's fills of %s do not cover the closed position", account, pos.broker_symbol)
+            return rec
+        return found
 
     def _span(self, rec: tc.Records, pos: Any, tf: int, now: datetime, *, closed_market: bool
               ) -> tuple[datetime, datetime]:

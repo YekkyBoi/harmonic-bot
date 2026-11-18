@@ -25,6 +25,8 @@ from typing import Any
 
 import pytest
 import tradecard_samples as S
+from ccxt.base import errors as cx
+from test_ccxt_broker import make_broker
 from test_mt5_broker import SERVER_TIME, FakeMT5, connected
 from test_notifier import FakeBotClient, FakeEngine, MsgEvent
 
@@ -376,6 +378,168 @@ async def test_the_card_goes_to_the_subprocess_renderer(world: World, monkeypatc
     await world.svc.pick("2")
     await world.settle()
     assert seen == [("trade", svc_mod.TEMP_DIR, {})] and "çizim hatası" in world.notes.lines[-1]
+
+
+# =========================================================================== #
+# A ccxt position closed by hand on the exchange: the close from the account's own fills
+# =========================================================================== #
+def binance_on(world: World) -> Any:
+    """binance's live adapter: a real CcxtBroker on the fake exchange (its fills: ``fake.trades``)."""
+    broker, fake = make_broker()
+    world.svc._broker = lambda name: broker if name == "binance" else (world.fx2 if name == "fx2" else None)
+    return fake
+
+
+async def hand_closed_btc(world: World) -> dict[str, Any]:
+    """The BTC long (0.1 at 91,000) closed by hand on Binance: the adapter found it flat (no exit of its own, no
+    result) four minutes after the close; the only trade of binance this week."""
+    t = world.long["trade"]
+    start = datetime.fromtimestamp(world.long["bars"][0][0], tz=UTC)
+    created = start + timedelta(minutes=15 * 58 + 3)
+    fill = created + timedelta(seconds=20)
+    seen_flat = start + timedelta(minutes=15 * 83 + 11)
+    pos = world.long["pos"].model_copy(deep=True, update={"realized_pnl": None})
+    pos.remaining_quantity = 0.0
+    pos.data.update(opened_at=ms(fill), closed_at=ms(seen_flat), closed_reason="flat_on_exchange",
+                    closed_outside=0.1, exits=[], entry_order_id="E1", sl_order_id="S1")
+    tid = await add_trade(world.db, world.clock, t, pos, created=created, closed=seen_flat, status=TradeStatus.CLOSED)
+    return {"id": tid, "start": start, "fill": fill, "seen_flat": seen_flat}
+
+
+def fill_of(side: str, amount: float, price: float, at: datetime, order: str = "H1", **info: Any) -> dict[str, Any]:
+    return {"order": order, "side": side, "amount": amount, "price": price, "timestamp": ms(at), "info": dict(info)}
+
+
+async def card_of_first(world: World) -> dict[str, Any] | None:
+    n = len(world.renderer.data)
+    await world.svc.command("binance")
+    assert await world.svc.pick("1") == svc_mod.STARTED
+    await world.settle()
+    return world.renderer.data[-1] if len(world.renderer.data) > n else None
+
+
+async def test_a_close_made_by_hand_on_binance_is_read_from_its_own_fills(world: World) -> None:
+    fake = binance_on(world)
+    h = await hand_closed_btc(world)
+    close1 = h["start"] + timedelta(minutes=15 * 83 + 2)
+    close2 = h["start"] + timedelta(minutes=15 * 83 + 7)
+    fake.trades = [
+        fill_of("sell", 0.1, 90000.0, h["fill"] - timedelta(seconds=30), order="OLD"),   # an earlier trade's close
+        fill_of("buy", 0.1, 91000.0, h["fill"], order="E1"),                               # the entry
+        fill_of("sell", 0.04, 92050.0, close2),                                            # (out of time order)
+        fill_of("sell", 0.06, 91950.0, close1),
+        fill_of("sell", 0.2, 91500.0, close2 + timedelta(minutes=1), order="REV"),         # a short opened after it
+        fill_of("sell", 0.5, 91000.0, h["seen_flat"] + timedelta(minutes=30), order="LATE"),
+    ]
+    data = await card_of_first(world)
+    assert data is not None, world.notes.lines
+    vwap = (0.06 * 91950.0 + 0.04 * 92050.0) / 0.1                                         # 91,990
+    assert data["kind"] == "result" and data["exit"] == pytest.approx(vwap)
+    # no money R (the result is not known): the price-based R, and the box drawn to that same close price
+    assert data["hero"] == tc.fmt_r((vwap - 91000.0) / 600.0) == "+1.65R"
+    assert data["played_to"] == data["box_far"] == pytest.approx(vwap)
+    assert data["timeline"][-1] == [f"{tc.to_uk(close2):%H:%M}", "Elle kapatıldı (borsada) · +1.65R"]
+    assert data["chips"][3][1] == "Kapatıldı" and data["chips"][3][2] == "çıkış 91.990,0"
+    k_close = next(k for k, b in enumerate(data["bars"]) if b[0] <= close2.timestamp() < b[0] + 900)
+    assert data["k_exit"] == data["box_end"] == k_close                                    # the last fill's candle
+    assert ("fetch_my_trades", ("BTC/USDT:USDT", ms(h["fill"]) - 60_000)) in fake.calls
+    # only a read: nothing was sent, and the bot's own record of the position is as it was
+    assert fake.names() == ["fetch_my_trades"]
+    rows = await world.db.account_trades("binance", NOW, trade_id=h["id"])
+    assert rows[0][1].data["exits"] == [] and rows[0][1].realized_pnl is None
+
+
+async def test_fills_that_do_not_cover_the_position_make_no_card(world: World) -> None:
+    fake = binance_on(world)
+    h = await hand_closed_btc(world)
+    fake.trades = [fill_of("sell", 0.09, 91950.0, h["start"] + timedelta(minutes=15 * 83 + 2))]       # 90 %
+    assert await card_of_first(world) is None
+    assert world.notes.lines[-1] == svc_mod.FAILED.format(why="kapanış fiyatı kayıtlarda yok")
+    assert not world.notes.photos and "fetch_my_trades" in fake.names()
+
+
+async def test_fills_that_cannot_be_read_make_no_card(world: World, monkeypatch: pytest.MonkeyPatch) -> None:
+    fake = binance_on(world)
+    h = await hand_closed_btc(world)
+    fake.trades = [fill_of("sell", 0.1, 91950.0, h["start"] + timedelta(minutes=15 * 83 + 2))]
+    refusal = svc_mod.FAILED.format(why="kapanış fiyatı kayıtlarda yok")
+    fake.fail_when(lambda method, _args: method == "fetch_my_trades", cx.NetworkError("binance down"))
+    assert await card_of_first(world) is None and world.notes.lines[-1] == refusal
+
+    async def never(*_args: Any, **_kw: Any) -> Any:
+        await asyncio.sleep(30)
+
+    monkeypatch.setattr(svc_mod, "FILLS_TIMEOUT_SEC", 0.05)
+    monkeypatch.setattr(fake, "fetch_my_trades", never)
+    assert await card_of_first(world) is None and world.notes.lines[-1] == refusal        # bounded
+    monkeypatch.undo()
+    # a dry-run (simulated) account's adapter is no live ccxt one: its exchange's fills are not this position's
+    calls = len(fake.calls)
+    world.svc._broker = lambda name: SimpleNamespace(kind="dry-run:ccxt", exchange=fake)
+    assert await card_of_first(world) is None and world.notes.lines[-1] == refusal
+    assert len(fake.calls) == calls and not world.notes.photos
+
+
+async def test_the_bots_own_exits_and_an_open_position_read_no_fills(world: World) -> None:
+    world.oracle.bars = world.long["bars"]
+    fake = binance_on(world)
+    fake.trades = [fill_of("sell", 0.1, 80000.0, NOW - timedelta(days=2))]
+    await world.week()
+    await world.svc.command("binance")
+    await world.svc.pick("2")                                               # #a: closed by its TPs (booked)
+    await world.settle()
+    data = world.renderer.data[-1]
+    assert data["exit"] == pytest.approx(92000.0) and data["hero"] == "+1.97R"
+    assert data["timeline"][-1][1] == "Hedef · +1.97R"
+    world.oracle.bars = S.walk(datetime(2026, 11, 11, 18, 0, tzinfo=UTC), 640, 3090.0, seed=5)
+    await world.svc.command("binance")
+    await world.svc.pick("1")                                               # #b: open
+    await world.settle()
+    assert world.renderer.data[-1]["kind"] == "entry"
+    assert "fetch_my_trades" not in fake.names()
+
+
+def test_the_close_from_the_fills_takes_only_this_positions_close() -> None:
+    sample = S.btc_long_result()
+    pos = sample["pos"].model_copy(deep=True)
+    opened = sample["rec"].filled
+    pos.data.update(opened_at=ms(opened), exits=[])
+    rec = tc.Records(placed=sample["rec"].placed, filled=opened, closed=opened + timedelta(hours=3), reason="close",
+                     moves=[(opened + timedelta(hours=1), "Stop taşındı"), (opened + timedelta(hours=2, minutes=59),
+                                                                             "Stop taşındı")])
+    at = opened + timedelta(hours=2)
+    trades = [
+        fill_of("sell", 0.3, 91600.0, opened + timedelta(minutes=30), positionSide="SHORT"),   # hedge: the short's
+        fill_of("sell", 0.04, 91500.0, at, positionSide="LONG"),
+        fill_of("sell", 0.25, 91800.0, at + timedelta(minutes=5), positionSide="LONG"),         # a flip: 0.06 of it
+        {"order": "X", "side": "sell", "amount": 0.1, "price": None, "timestamp": ms(at)},       # unreadable
+    ]
+    out = tc.venue_close(pos, rec, trades, NOW)
+    assert out is not None and out is not rec and rec.exit_price is None
+    assert out.exit_price == pytest.approx((0.04 * 91500.0 + 0.06 * 91800.0) / 0.1)
+    assert out.closed == at + timedelta(minutes=5) and out.close_by == tc.CLOSED_ON_VENUE
+    assert [m[0] for m in out.moves] == [opened + timedelta(hours=1)]       # (none after the real close)
+    # one of the bot's own orders (its stop, not booked): the price, but not "by hand"
+    pos.data["sl_order_id"] = "S1"
+    own = tc.venue_close(pos, rec, [fill_of("sell", 0.1, 90400.0, at, order="S1")], NOW)
+    assert own is not None and own.exit_price == 90400.0 and own.close_by is None
+    # a close of the group's on record stays the group's
+    grouped = tc.venue_close(pos, tc.Records(filled=opened, closed=rec.closed, close_by="group"),
+                             [fill_of("sell", 0.1, 91000.0, at)], NOW)
+    assert grouped is not None and grouped.close_by == "group"
+    # 95 % covers; no open time, nothing filled or nothing in time: none
+    assert tc.venue_close(pos, rec, [fill_of("sell", 0.095, 91000.0, at)], NOW) is not None
+    assert tc.venue_close(pos, rec, [fill_of("sell", 0.1, 91000.0, rec.closed + timedelta(minutes=11))], NOW) is None
+    assert tc.venue_close(pos, rec, [fill_of("buy", 0.1, 91000.0, at)], NOW) is None
+    bare = pos.model_copy(deep=True)
+    bare.data.pop("opened_at")
+    assert tc.venue_close(bare, tc.Records(closed=rec.closed), [fill_of("sell", 0.1, 91000.0, at)], NOW) is None
+    assert tc.venue_close(pos.model_copy(update={"filled_quantity": 0.0}), rec,
+                          [fill_of("sell", 0.1, 91000.0, at)], NOW) is None
+    # no close time on record: fills up to now
+    late = tc.venue_close(pos, tc.Records(filled=opened), [fill_of("sell", 0.1, 91000.0, NOW - timedelta(minutes=1))],
+                          NOW)
+    assert late is not None and late.closed == NOW - timedelta(minutes=1)
 
 
 async def nas_on_fx2(world: World, *, fill_noted: bool = True) -> int:
