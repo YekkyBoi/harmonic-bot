@@ -148,6 +148,13 @@ risk:
 #                    bir yeniden bağlanmayı dener; bağlanınca haber verir. Çalışırken çıkan hatalar da diğer
 #                    hesapların kopyalarını engellemez. Varsayılan false: bağlanamayan broker bugünkü gibi
 #                    ERROR ile bildirilir. Örnek: config.tickmill.example.yaml
+#   confirm_open     false = bot bir sinyalden emin olamayıp "... AÇAYIM MI?" diye sorduğunda (düşük güven,
+#                    hedef yok, okuma şüphesi) bu hesapta işlem BEKLEMEDEN, okunduğu gibi açılır; soru konunun
+#                    diğer hesapları için aynen sorulur. Evet: diğerleri aynı işleme eklenir (bu hesap ikinci kez
+#                    açılmaz). Hayır / süre dolması: diğerleri açılmaz, bu hesaptaki işlem açık kalır ve normal
+#                    yönetilir. Stopsuz / işlem yapılamaz sinyal, mevcut işlemle ilgili şüphe (tekrar paylaşım, aynı
+#                    mesaj) ve hesabın kendi kuralları (günlük zarar, no_hedge, allowed_assets) yine geçerlidir.
+#                    LIMIT girişte hesabın giriş ayarı (entry_trigger) aynen uygulanır. Varsayılan true (önce sorulur).
 #   symbol_map       sembol eşleme, ör: {ETH: ETHUSD, XAU: GOLD}. Döviz paritesini parite adıyla yazın,
 #                    ör: {EURJPY: EURJPY.x} (EUR diye yazmayın: bütün EUR paritelerini değiştirir)
 #   allowed_assets   boş = tüm varlıklar; ör: [BTC, ETH] = sadece bunlar (PEPE yazmak 1000PEPE'yi de kapsar)
@@ -175,6 +182,31 @@ risk:
 #                    süre dolarsa da iptal olur. Bekleyen tetikler yeniden başlatmada korunur ve /pozisyonlar'da
 #                    "bekleyen (sanal tetik)" görünür. Referans fiyat alınamazsa bekler (uyarı gelir), farksız açmaz.
 #   virtual_trigger_max_hours  sanal tetik bu kadar saat içinde tetiklenmezse iptal edilir (varsayılan 48)
+#   lot_rounding     hesaplanan miktar lot adımına nasıl yuvarlanır: down (varsayılan: stopta kayıp hedefi hiç
+#                    aşmaz) | nearest (0.125 -> 0.13; stopta kayıp hedefi %15'ten fazla aşacaksa aşağı) |
+#                    up (0.4699 -> 0.47: stopta kayıp hedefin ALTINA hiç düşmez; hedefi lot_rounding_max_over'dan
+#                    fazla aşacaksa aşağı yuvarlanır ve açılış bildiriminde söylenir). Tam katlar aynen kalır.
+#   lot_rounding_max_over  up için: stopta kaybın hedefi en çok ne kadar aşabileceği, hesap para biriminde
+#                    (varsayılan 10)
+#   fees_in_risk     bu hesapta komisyon 1R'nin içine sayılsın mı: boş = risk.include_fees_in_risk ne diyorsa;
+#                    false = lot yalnızca stoptaki fiyat kaybına göre hesaplanır (commission_per_lot / komisyon
+#                    1R'nin üstüne ödenir); true = her zaman sayılır
+#   reference_broker (isteğe bağlı) LIMIT girişli FOREX/CFD sinyallerinde (kripto olmayan; konunun türüne
+#                    göre, yukarıdaki kural) bu hesapta limit emir HİÇ KONMAZ: burada adı yazılan BAŞKA bir
+#                    MetaTrader hesabı (type mt5 / mt5_bridge, etkin) referans olur. O hesabın bu işlemde bekleyen
+#                    girişi varsa o giriş dolunca; girişi yoksa (onay bekliyor, bir kural atladı, reddedildi, bağlı
+#                    değil) o hesabın kendi canlı fiyatı giriş seviyesine gelince (LONG: satış fiyatı <= giriş,
+#                    SHORT: alış fiyatı >= giriş) bu hesapta MARKET emir açılır. Stop ve hedefler o an ölçülen
+#                    farkla (bu hesabın fiyatı - o hesabın fiyatı; offset_mode, max_offset_pct) kaydırılır;
+#                    fiyatlardan biri okunamazsa ya da fark max_offset_pct'yi aşarsa açılmaz. Teknik sınırlar kalır
+#                    (stop ya da ilk hedef geçilmişse, fiyat girişten max_entry_distance_pct'den uzaksa açılmaz).
+#                    Referans hesabın fiyatı okunamazsa bekler (uyarı gelir; virtual_trigger_max_hours sonra iptal),
+#                    limit emre dönmez. İki kontrol arasındaki kısa dokunuş o hesabın tik geçmişinden (yoksa
+#                    1 dakikalık mumlarından) görülür; fiyat o arada çok uzaklaştıysa kovalanmaz, seviyeye dönerse
+#                    açılır. Fiyat girişe değmeden stopu ya da ilk hedefi geçerse bekleyen giriş iptal edilir
+#                    (kripto sanal tetikteki kural). O hesabın girişi dolmadan biterse (süresi doldu, iptal) bekleyen
+#                    giriş de iptal edilir. Piyasa emirli sinyaller ve kripto (reference_exchange / entry_trigger) aynen
+#                    kalır. Boş = kapalı (varsayılan). Örnek:  reference_broker: fx
 #
 # Bir brokerı açtıktan sonra MUTLAKA 'python -m copytrader check' çalıştırın:
 # API anahtarı yanlış/eksikse burada görünür.

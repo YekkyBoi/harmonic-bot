@@ -54,7 +54,7 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, TypeVar
 
-from ..config import Mt5BrokerConfig, RiskConfig, terminal_key
+from ..config import Mt5BrokerConfig, RiskConfig, fees_in_risk, terminal_key
 from ..models import (
     BrokerPosition,
     EntryType,
@@ -68,7 +68,7 @@ from ..models import (
     TakeProfit,
 )
 from ..parsing.symbols import CFD_QUOTES, FIAT_CURRENCIES
-from ..risk.sizing import SizingError, compute_lot_size, floor_to_step, round_to_tick
+from ..risk.sizing import SizingError, compute_lot_size, floor_to_step, round_to_tick, up_refused_warning
 from .base import Broker, BrokerError, OrderOutcomeUnknownError
 
 logger = logging.getLogger(__name__)
@@ -153,6 +153,7 @@ class MT5:
 
 
 _STALE_TICK_SEC = 600           # a tick older than this = market closed (no expiration is set)
+PRICE_SINCE_MAX_TICKS = 5000    # price_since: at most this many ticks per look (more: the 1-minute bars instead)
 _EMPTY_TICK_WAITS = 10          # waits (of tick_wait_sec, 0.3 s) for a tick with a bid and an ask: about 3 s
 _NEW_POSITION_POLLS = 10        # look-ups (one per tick_wait_sec) for the position of an accepted market order: ~3 s
 _METAL_BASES = frozenset({"XAU", "XAG", "XPT", "XPD"})
@@ -621,9 +622,14 @@ class MetaTraderLegBroker(Broker, ABC):
 
     # ---- sizing ------------------------------------------------------------
     def _lot_rounding(self) -> str:
-        """The broker's ``lot_rounding`` ("down" unless the config says "nearest")."""
+        """The broker's ``lot_rounding`` ("down" unless the config says "nearest" or "up")."""
         value = str(getattr(self.config, "lot_rounding", "down") or "down")
-        return value if value in ("down", "nearest") else "down"
+        return value if value in ("down", "nearest", "up") else "down"
+
+    def _lot_max_over(self) -> float | None:
+        """The broker's ``lot_rounding_max_over`` (lot_rounding "up"; None: the default)."""
+        value = getattr(self.config, "lot_rounding_max_over", None)
+        return float(value) if isinstance(value, (int, float)) else None
 
     def _fee_per_lot(self, loss_per_lot: float, entry: float, stop: float) -> float:
         """MT brokers do not report commission up front: optional buffer.
@@ -631,10 +637,11 @@ class MetaTraderLegBroker(Broker, ABC):
         Only ``commission_per_lot`` from the broker config is used (round trip,
         account currency). The crypto-style ``risk.fee_rate`` on notional is NOT
         applied here: on forex/CFD it would massively undersize trades (a 0.06%
-        fee on a 20-pip EURUSD stop is a ~66% buffer).
+        fee on a 20-pip EURUSD stop is a ~66% buffer). The broker's own
+        ``fees_in_risk`` (when written) overrides risk.include_fees_in_risk.
         """
         commission = getattr(self.config, "commission_per_lot", None)
-        if commission is None or not self.risk_config.include_fees_in_risk:
+        if commission is None or not fees_in_risk(self.config, self.risk_config):
             return 0.0
         return max(0.0, float(commission))
 
@@ -657,17 +664,24 @@ class MetaTraderLegBroker(Broker, ABC):
             max_lot=symbol.max_qty,
             allow_min_qty_round_up=rc.allow_min_qty_round_up,
             rounding=self._lot_rounding(),
+            max_over=self._lot_max_over(),
         )
         warnings: list[str] = []
         est = lots * per_lot
         exact = risk_amount / per_lot
         if symbol.max_qty and exact > symbol.max_qty + _EPS:
             warnings.append(f"Lot brokerın azami lotuyla ({_num(symbol.max_qty)}) sınırlandı; risk hedefin altında.")
+        refused = up_refused_warning(exact, lots, symbol.qty_step, self._lot_rounding(), risk_amount, per_lot,
+                                     self._lot_max_over())
+        if refused and not (symbol.max_qty and exact > symbol.max_qty + _EPS):
+            warnings.append(refused)
         if est > risk_amount * (1 + 1e-6):
             if floor_to_step(exact, symbol.qty_step) >= max(symbol.min_qty, symbol.qty_step) - _EPS:
-                # lot_rounding "nearest": the next step up was nearer (at most LOT_ROUNDING_MAX_OVERSHOOT x the target)
-                warnings.append(f"Lot en yakın adıma yukarı yuvarlandı ({_num(round(exact, 6))} -> {_num(lots)}); "
-                                f"stopta kayıp ~{est:.2f} (hedef {risk_amount:.2f}).")
+                if self._lot_rounding() != "up":
+                    # lot_rounding "nearest": the next step up was nearer (at most LOT_ROUNDING_MAX_OVERSHOOT x the
+                    # target). ("up" rounds up every time, by design: not a warning.)
+                    warnings.append(f"Lot en yakın adıma yukarı yuvarlandı ({_num(round(exact, 6))} -> {_num(lots)}); "
+                                    f"stopta kayıp ~{est:.2f} (hedef {risk_amount:.2f}).")
             else:
                 warnings.append(f"Lot minimum lota yükseltildi; stopta kayıp ~{est:.2f} (hedef {risk_amount:.2f}).")
 
@@ -3516,6 +3530,110 @@ class Mt5Broker(MetaTraderLegBroker):
             except (KeyError, IndexError, TypeError, ValueError):
                 continue
         return {"offset": offset, "bars": bars, "deals": deals}
+
+    async def price_since(self, broker_symbol: str, since_msc: int | None, armed_msc: int | None = None,
+                          max_ticks: int = PRICE_SINCE_MAX_TICKS) -> dict[str, Any]:
+        """READ ONLY, for a waiting entry of another account that watches this account's price (the engine's
+        ``reference_broker``): the latest tick of ``broker_symbol`` and every price it had since ``since_msc`` (the
+        ``upto_msc`` an earlier answer gave), so that a touch between two looks is not missed. Every time here is
+        the trade server's own millisecond clock, as MetaTrader keeps tick times: no clock conversion is involved.
+        ``since_msc`` None (the first look): only the latest tick (the watch starts there). ``armed_msc``: when the
+        watch started (the first look's ``upto_msc``): no bar of a minute that began before it is read.
+
+        {"now": (time_msc, bid, ask), "samples": [(time_msc, bid_low, bid_high, ask_low, ask_high)] in time order,
+        up to the latest tick, "source": "ticks" | "bars" | None, "upto_msc": what has been looked at (the next look
+        starts there), "busy": True when another call came to this terminal meanwhile: the history is not read now
+        (``upto_msc`` stays the start, the next look reads it); "unread": True when neither the ticks nor the bars
+        of that time could be read (the same: ``upto_msc`` stays the start); "partial": the bar of the minute the
+        watch started in, when the ticks could not be read and the previous look was in that minute (it also holds
+        prices from before the watch: for the stop only)}.
+
+        The history: the ticks after ``since_msc`` (copy_ticks_from, at most ``max_ticks``); more than that, or no
+        ticks, the 1-minute bars instead (copy_rates_range; the bars are bid prices, the ask is the bid plus the
+        bar's spread), from the minute ``since_msc`` is in (that bar grows between two looks a few seconds apart:
+        a wick inside the minute shows in it) but never a minute that began before ``armed_msc`` (it also holds
+        prices from before the watch). Like :meth:`trade_chart` it stays out of an order's way: every call goes
+        through the worker thread with its time limit, and before each history call it looks whether that thread
+        has anything else to do. Raises BrokerError when there is no price now."""
+        self._require()
+        tick, err = await self._call("symbol_info_tick", broker_symbol)
+        bid, ask = (_f(getattr(tick, "bid", 0.0)), _f(getattr(tick, "ask", 0.0))) if tick is not None else (0.0, 0.0)
+        if tick is None or bid <= 0 or ask <= 0:
+            raise BrokerError(f"MT5 {broker_symbol} fiyatı alınamadı: {_err_text(err) if tick is None else 'fiyat yok'}")
+        t_sec = int(_f(getattr(tick, "time", 0)))
+        t_msc = int(_f(getattr(tick, "time_msc", 0))) or t_sec * 1000
+        out: dict[str, Any] = {"now": (t_msc, bid, ask), "samples": [], "source": None, "upto_msc": t_msc,
+                               "busy": False}
+        start = since_msc
+        if start is None or start >= t_msc:
+            return out
+        busy = {**out, "busy": True, "upto_msc": start}
+        if self._oldest_call() is not None:
+            return busy
+        samples: list[tuple[int, float, float, float, float]] = []
+        rows: Any = None
+        if hasattr(self._mt5, "copy_ticks_from"):
+            flags = getattr(self._mt5, "COPY_TICKS_INFO", 1)
+            rows, _err = await self._call("copy_ticks_from", broker_symbol, int(start // 1000), int(max_ticks) + 1,
+                                          flags)
+        if rows is not None and len(rows) <= max_ticks:
+            for r in rows:
+                try:
+                    msc = int(r["time_msc"]) or int(r["time"]) * 1000
+                    b, a = float(r["bid"]), float(r["ask"])
+                except (KeyError, IndexError, TypeError, ValueError):
+                    continue
+                if start < msc <= t_msc and b > 0 and a > 0:
+                    samples.append((msc, b, b, a, a))
+            out["source"] = "ticks"
+        else:
+            if self._oldest_call() is not None:
+                return busy
+            info, _err = await self._call("symbol_info", broker_symbol)
+            point = _f(getattr(info, "point", 0.0)) if info is not None else 0.0
+            first = int(start // 1000) // 60 * 60                         # the minute the previous look was in
+            # The previous look was still in the minute the watch started in: that minute's bar also holds prices
+            # from before the watch. It is read too, but only as "partial" (the engine uses it for the stop alone).
+            partial_from = first
+            if armed_msc is not None:
+                first = max(first, -(-int(armed_msc // 1000) // 60) * 60)  # never before the watch started
+            if first > t_sec:
+                # The ticks could not be read and no bar may be read yet (still the minute the watch started in,
+                # whose bar also holds earlier prices): that time stays unread, like a busy terminal.
+                logger.warning("%s: the ticks of %s since %s could not be read and no whole minute has passed since "
+                               "the watch started; read again at the next look", self.name, broker_symbol, start)
+                return {**out, "upto_msc": start, "unread": True}
+            if first <= t_sec:
+                if self._oldest_call() is not None:
+                    return busy
+                frame = getattr(self._mt5, "TIMEFRAME_M1", TIMEFRAME_VALUES["M1"])
+                bars, _err = await self._call("copy_rates_range", broker_symbol, frame, min(partial_from, first), t_sec)
+                partial: list[tuple[int, float, float, float, float]] = []
+                for r in bars if bars is not None else ():
+                    try:
+                        open_sec, low, high = int(r["time"]), float(r["low"]), float(r["high"])
+                        spread = float(r["spread"]) * point
+                    except (KeyError, IndexError, TypeError, ValueError):
+                        continue
+                    if low <= 0 or high <= 0:
+                        continue
+                    if open_sec >= first:
+                        samples.append((open_sec * 1000, low, high, low + spread, high + spread))
+                    elif partial_from < first and open_sec == partial_from:
+                        partial.append((open_sec * 1000, low, high, low + spread, high + spread))
+                if partial:
+                    out["partial"] = partial
+                if bars is not None:
+                    out["source"] = "bars"
+                else:
+                    # Nothing of the time since the previous look could be read: like a busy terminal, that time
+                    # stays unread (the next look reads it) and the answer says so ("unread").
+                    logger.warning("%s: neither ticks nor 1-minute bars of %s since %s could be read; read again "
+                                   "at the next look", self.name, broker_symbol, start)
+                    return {**out, "upto_msc": start, "unread": True}
+        samples.sort(key=lambda s: s[0])
+        out["samples"] = samples
+        return out
 
 
 # The trade card's server clock from the first opening deal against the bot's own UTC record of that fill: trusted

@@ -323,6 +323,9 @@ class Evaluation:
     market_price: float | None = None
     trade: TradeRecord | None = None
     ignored: str | None = None     # management for a trade that is already over: why it is ignored (Turkish)
+    # open: every issue is a doubt about the signal's own reading (low confidence, no target...), none about existing
+    # trades or questions (a repost, the same message): an account set to confirm_open: false may take it at once
+    reading_doubt_only: bool = False
 
     @property
     def automatic(self) -> bool:
@@ -366,6 +369,34 @@ class _OpenFlow:
 
     released: bool = False
     blocked: set[str] = field(default_factory=set)
+
+
+class _IntoEnded(Exception):
+    """An approval was to add the other accounts to the early accounts' trade (confirm_open: false), and that trade has
+    ended meanwhile (found under its lock, right before the orders): nothing was sent."""
+
+    def __init__(self, trade: TradeRecord | None) -> None:
+        super().__init__(f"trade {trade.id if trade is not None else '?'} ended")
+        self.trade = trade
+
+
+@dataclass
+class _Fire:
+    """Why a waiting virtual entry is sent now (:meth:`Engine._virtual_fire`), and its texts for the owner (HTML).
+    ``mode``: "touch" (the reference exchange touched the level), "reference" (the reference account's leg
+    filled), "price" (the reference account has no waiting entry in the trade: its own live price reached the
+    level)."""
+
+    mode: str
+    what: str               # what happened ("tetik seviyesine gelindi (Binance 73000)"): the paused notice
+    busy_what: str          # ... in the notice that the account is still busy with another order
+    busy_tail: str          # what happens once it has answered
+    done: str               # start of the "not opened" / "answer lost" notices
+    seen: str               # start of the "account unreachable, tried again" notice
+    retry_tail: str         # how it is tried again
+    head: str               # the "opened" headline after "—"
+    ref_price: float | None = None      # the reference exchange's reading it triggered on (touch)
+    log: dict[str, Any] = field(default_factory=dict)
 
 
 @dataclass
@@ -669,6 +700,17 @@ def rounding_headroom(broker: Broker) -> float:
     return 1.0
 
 
+def max_rounded_risk(broker: Broker, amount: float) -> float:
+    """The most a size of ``broker`` sized for ``amount`` may lose at the stop through its lot rounding: ``amount``
+    for "down", x LOT_ROUNDING_MAX_OVERSHOOT for "nearest", + lot_rounding_max_over for "up"."""
+    if str(getattr(broker.config, "lot_rounding", "down") or "down") == "up":
+        over = getattr(broker.config, "lot_rounding_max_over", None)
+        over = float(over) if isinstance(over, (int, float)) and math.isfinite(over) and over >= 0 \
+            else sizing.DEFAULT_LOT_ROUNDING_MAX_OVER
+        return amount + over
+    return amount * rounding_headroom(broker)
+
+
 def market_sizing_entry(
     side: Side, live_entry: float, stop: float, signal_entry: float | None,
     max_multiple: Any = DEFAULT_MAX_SIZE_MULTIPLE,
@@ -866,6 +908,9 @@ def tp_progress(trade: TradeRecord, positions: list[BrokerPosition]) -> tuple[li
 
 _REF_LABELS = {"binanceusdm": "Binance", "binance": "Binance", "bybit": "Bybit", "okx": "OKX", "bitget": "Bitget"}
 VIRTUAL_NOTE_THROTTLE_SEC = 1800.0     # same reference-outage warning is not repeated within this
+# A reference_broker account's price that could not be read (not connected, no such symbol, no quote) is not read
+# again for this long by the same waiting entry (the owner's own account: no call into it on every 2 s look then)
+REFERENCE_PRICE_RETRY_SEC = 60.0
 
 
 def ref_label(ref_id: str) -> str:
@@ -908,6 +953,48 @@ def virtual_entry_wanted(broker: Broker, plan: TradePlan, route_kind: str | None
         and bool(plan.entry_price)
         and is_crypto_plan(plan, route_kind)
     )
+
+
+def broker_virtual_wanted(broker: Broker, plan: TradePlan, route_kind: str | None = None) -> bool:
+    """True when ``plan`` is a forex / CFD LIMIT entry (not a crypto plan for its route, :func:`is_crypto_plan`) on a
+    broker with ``reference_broker``: no broker order; the entry waits for that other account's leg of the trade to
+    fill (a virtual entry carrying ``data["reference_broker"]``)."""
+    cfg = broker.config
+    return (
+        bool(getattr(cfg, "reference_broker", None))
+        and plan.entry_type is EntryType.LIMIT
+        and bool(plan.entry_price)
+        and not is_crypto_plan(plan, route_kind)
+    )
+
+
+def reference_leg_filled(pos: BrokerPosition) -> bool:
+    """A leg of the reference account (``reference_broker``) whose entry has filled: open, a part of it filled, or
+    closed after a fill."""
+    return (pos.status is PositionStatus.OPEN or pos.filled_quantity > 0
+            or (pos.status is PositionStatus.CLOSED and pos.avg_entry_price is not None))
+
+
+def reference_leg_never_placed(pos: BrokerPosition, ref: str) -> bool:
+    """A position of the reference account ``ref`` that ended FAILED with nothing filled: that account never held the
+    trade (its order was refused / could not be completed), i.e. it has no leg in it."""
+    return pos.broker == ref and pos.status is PositionStatus.FAILED and not reference_leg_filled(pos)
+
+
+def waiting_entry_text(pos: BrokerPosition, *, owner: bool) -> str:
+    """What a waiting virtual entry waits for (HTML, one phrase for /pozisyonlar). ``owner`` False (the friend's view
+    of his account): the reference account is never named."""
+    d = pos.data or {}
+    mult = price_multiplier(d)
+    trig = d.get("trigger_price")
+    level = fmt_price(trig / mult if trig else None)
+    ref_id = str(d.get("reference_exchange") or "")
+    if ref_id:
+        return f"{esc(ref_label(ref_id))} fiyatı {level} seviyesine değince"
+    ref = str(d.get("reference_broker") or "")
+    where = (f"{esc(ref)} hesabındaki giriş dolunca (emri yoksa {esc(ref)} fiyatı seviyeye gelince)" if owner
+             else "referans hesaptaki giriş dolunca ya da fiyat seviyeye gelince")
+    return f"giriş {level} · {where}"
 
 
 OPEN_UNKNOWN = "open_unknown"     # position data: its open order's answer was lost (it may be open at the broker)
@@ -1151,6 +1238,11 @@ class Engine:
         self.monitor.rollup_deferred = self._late_manage_queued
         self.monitor.owed_hook = self._owed_tick
         self._virtual_warned: dict[tuple[int, str], float] = {}   # (trade, broker) -> monotonic time of last outage warning
+        # A waiting reference_broker entry that watches that account's price: (trade, broker) -> the instrument there
+        # (resolved once, not on every look) / monotonic time before which a failed read is not tried again
+        self._ref_symbols: dict[tuple[int, str], Any] = {}
+        self._ref_retry_at: dict[tuple[int, str], float] = {}
+        self._ref_seen: dict[tuple[int, str], int] = {}       # ... -> the server ms its prices were looked at up to
         self._monitor_task: asyncio.Task[None] | None = None
         self._accepting = True                     # False once shutdown began: no new work is started
         self._brokers_closed = False
@@ -3219,14 +3311,16 @@ class Engine:
     # ------------------------------------------------------------------ evaluation
     async def evaluate(
         self, action: ParsedAction, chat_id: int, *, reply_to: StoredMessage | None = None,
-        exclude_conf: str | None = None, route: TopicRoute | None = None,
+        exclude_conf: str | None = None, route: TopicRoute | None = None, exclude_trade: int | None = None,
     ) -> Evaluation | None:
         """Validate one action without side effects. None for NONE actions.
         ``exclude_conf``: the confirmation being corrected / re-read (not a conflict with itself).
         ``route``: forum topic route of the messages (a new trade goes to its brokers; management only sees
-        its trades); None = no routing."""
+        its trades); None = no routing. ``exclude_trade``: an open's own trade that a confirm_open: false account
+        already took (see :meth:`_open_early`): not a conflict with itself."""
         if action.action is ActionType.OPEN:
-            return await self._evaluate_open(action, chat_id, exclude_conf=exclude_conf, route=route)
+            return await self._evaluate_open(action, chat_id, exclude_conf=exclude_conf, route=route,
+                                             exclude_trade=exclude_trade)
         if action.action is ActionType.INCOMPLETE:
             return await self._evaluate_incomplete(
                 action, chat_id, "Sinyal eksik: varlık, yön veya stop bilgisi tamamlanmadı.", route=route
@@ -3251,7 +3345,7 @@ class Engine:
 
     async def _evaluate_open(
         self, action: ParsedAction, chat_id: int, *, exclude_conf: str | None = None,
-        route: TopicRoute | None = None,
+        route: TopicRoute | None = None, exclude_trade: int | None = None,
     ) -> Evaluation:
         now = self._now()
         base, quote, market_type = asset_of(action)
@@ -3265,9 +3359,13 @@ class Engine:
             **self._open_plan_extras(route),
         )
         issues = merge_issues(issues, validator.low_confidence_issues(action, self.config.llm))
+        portfolio: list[ValidationIssue] = []
         if plan is not None:
-            issues = merge_issues(issues, await self._portfolio_issues(plan, chat_id, exclude_conf=exclude_conf))
-        return Evaluation("open", action, plan, issues, market)
+            portfolio = await self._portfolio_issues(plan, chat_id, exclude_conf=exclude_conf,
+                                                     exclude_trade=exclude_trade)
+        doubt_only = plan is not None and not portfolio and not any(i.blocking for i in issues)
+        return Evaluation("open", action, plan, merge_issues(issues, portfolio), market,
+                          reading_doubt_only=doubt_only)
 
     async def _evaluate_incomplete(
         self, action: ParsedAction, chat_id: int, reason: str, *, route: TopicRoute | None = None
@@ -3286,28 +3384,30 @@ class Engine:
                           market)
 
     async def _portfolio_issues(
-        self, plan: TradePlan, chat_id: int, *, exclude_conf: str | None = None
+        self, plan: TradePlan, chat_id: int, *, exclude_conf: str | None = None, exclude_trade: int | None = None,
     ) -> list[ValidationIssue]:
         """Everything that makes a NEW trade doubtful beyond the signal itself: existing trades
         (duplicate / opposite / same message), pending confirmations of the same messages or a similar
         signal, and earlier confirmation outcomes of its messages."""
         return merge_issues(
-            await self._trade_issues(plan, chat_id),
+            await self._trade_issues(plan, chat_id, exclude_trade=exclude_trade),
             await self._pending_issues(plan, chat_id, exclude_conf),
             await self._outcome_issues(chat_id, plan.source_message_ids, exclude_conf),
         )
 
-    async def _trade_issues(self, plan: TradePlan, chat_id: int) -> list[ValidationIssue]:
+    async def _trade_issues(self, plan: TradePlan, chat_id: int, *,
+                            exclude_trade: int | None = None) -> list[ValidationIssue]:
         """Conflicts with trades that exist (re-checked at approval time). With forum routes a repost is
         looked for among the same route's trades only; an opposite trade counts when it is on the same
         instrument (:meth:`_same_instrument`: USDJPY long vs USDCAD short is no conflict) and is of the same
-        route or may sit on one of the same broker accounts (one-way netting)."""
+        route or may sit on one of the same broker accounts (one-way netting). ``exclude_trade``: the signal's own
+        trade that a confirm_open: false account already took (:meth:`_open_early`): never a conflict with it."""
         now = self._now()
         risk = self.config.risk
         route = self._route_named(plan.route)
         out: list[ValidationIssue] = []
         recent = [t for t in await self.db.recent_trades(now - timedelta(seconds=max(0, risk.duplicate_window_sec)))
-                  if self._in_scope(t, route)]
+                  if self._in_scope(t, route) and t.id != exclude_trade]
         dup = guards.find_duplicate(plan, recent, window_sec=risk.duplicate_window_sec, now=now,
                                     entry_tolerance_pct=self._dup_tolerance(plan))
         if dup is not None:
@@ -3334,7 +3434,7 @@ class Engine:
             ))
         for mid in plan.source_message_ids:
             t = await self.db.find_trade_by_message(chat_id, mid)
-            if t is not None and t.status not in (TradeStatus.FAILED, TradeStatus.CANCELLED):
+            if t is not None and t.id != exclude_trade and t.status not in (TradeStatus.FAILED, TradeStatus.CANCELLED):
                 out.append(_issue("message_already_traded", f"Bu mesajdan zaten işlem açılmış (#{t.id})."))
                 break
         return out
@@ -3812,10 +3912,116 @@ class Engine:
                                                           "active": [t.id for t in active]})
                 return
             if not ev.automatic:
+                early = self._early_brokers(ev)
+                if early:
+                    await self._open_early(ev, chat_id, early)
+                    return
                 await self._ask_eval(ev, chat_id)
                 return
             assert isinstance(ev.plan, TradePlan)
             await self.execute_open(ev.plan, raw_symbol=action.symbol)
+
+    # ------------------------------------------------------------------ confirm_open: false accounts
+    @staticmethod
+    def _confirms_open(broker: Broker) -> bool:
+        return bool(getattr(broker.config, "confirm_open", True))
+
+    def _early_brokers(self, ev: Evaluation) -> list[Broker]:
+        """The connected accounts of ``ev``'s plan set to ``confirm_open: false`` that take it at once, without the
+        owner's answer: only when the open would be asked about for doubts of the signal's own reading (low
+        confidence, no target...; :attr:`Evaluation.reading_doubt_only`), never for a plan that cannot be traded or a
+        doubt about existing trades / questions. An account that is not connected, or whose allowed_assets does not
+        list the asset, waits for the answer as before (empty list: everything as before)."""
+        plan = ev.plan
+        if ev.kind != "open" or not isinstance(plan, TradePlan) or not ev.reading_doubt_only:
+            return []
+        if self.config.telegram.topics and not plan.route:
+            return []           # (no route: execute_open refuses it anyway; the question explains it)
+        return [b for b in self._plan_brokers(plan)
+                if not self._confirms_open(b) and b.accepts_asset(plan.base_asset)]
+
+    def _asked_names(self, plan: TradePlan, early: Collection[str]) -> list[str]:
+        """The configured accounts of ``plan`` (its route's; every enabled one without a route) that wait for the
+        owner's answer: all but the ``early`` ones."""
+        names = list(plan.broker_names) or [b.name for b in self.configured_brokers]
+        return [n for n in names if n not in early]
+
+    @staticmethod
+    def _early_state(o: BrokerOutcome) -> str:
+        pos = o.position
+        if o.kind == "late":
+            return "emri gönderildi, yanıtı bekleniyor"
+        if o.unknown:
+            return "emri gönderildi, sonucu bilinmiyor"
+        if pos is not None and pos.status is PositionStatus.PENDING:
+            return "sanal tetiği kuruldu" if is_virtual_pending(pos) else "limit emri yerleştirildi"
+        if pos is not None and pos.status is PositionStatus.OPEN:
+            return "işleme girdi"
+        return "işleme girmedi (nedeni ayrı mesajda)"
+
+    async def _open_early(self, ev: Evaluation, chat_id: int, early: list[Broker]) -> None:
+        """Open lock held. ``ev`` would be asked about; the ``early`` accounts (confirm_open: false) take it now, as
+        read (their own rules - daily loss, no_hedge, duplicates of their own positions - apply as for any open),
+        and the owner is asked as before for the route's other accounts. The question carries the trade: its "Evet"
+        adds the other accounts to that trade while it is the same trade idea (see :meth:`_approve_open`; an early
+        account whose order went out is never sent the signal twice, one that a rule of its own refused is tried
+        again - the question says which), its "Hayır" or expiry leaves the early accounts' positions as they are,
+        managed like any trade's."""
+        plan = ev.plan
+        assert isinstance(plan, TradePlan)
+        names = [b.name for b in early]
+        conf_id = await self._new_conf_id()
+        asked = self._asked_names(plan, names)
+        tag = (f"⚡ {_names(names)} için onay beklenmedi (confirm_open: false); "
+               + (f"diğer hesaplar için onay soruldu (#{conf_id})." if asked else "başka hesap yok, soru sorulmadı."))
+        try:
+            _text, trade, outcomes = await self._critical_section(
+                self._execute_open(plan, ev.action.symbol, only=frozenset(names), early_tag=tag),
+                f"open-{plan.plan_id}")
+        except Exception as exc:
+            # (its order may have gone out: the early accounts are never sent this signal again on approval; the
+            # trade it may have created is found again by its message, so that an approval adds to it - never a
+            # second trade of the same message)
+            logger.exception("The early open of %s failed", plan.plan_id)
+            await self._notify(f"🚨 {_names(names)}: onay beklenmeden açılış hata verdi (<code>{esc(exc)}</code>); "
+                               "hesapta elle kontrol edin.", Severity.ERROR)
+            made = await self._trade_of_plan(plan)
+            await self._ask_eval(ev, chat_id, conf_id=conf_id, early={
+                "trade_id": made.id if made is not None else None, "brokers": names, "done": names,
+                "line": f"⚠️ {_names(names)}: onay beklenmeden açılış hata verdi"
+                        + (f" (#{made.id})" if made is not None else "")
+                        + "; onaylarsanız bu hesaba tekrar gönderilmez (elle kontrol edin)."})
+            return
+        if trade is None:       # (the early accounts went away meanwhile: nothing was sent, asked as before)
+            await self._ask_eval(ev, chat_id, conf_id=conf_id)
+            return
+        await self._log("open_early", {"trade_id": trade.id, "brokers": names, "conf": conf_id if asked else None,
+                                       "issues": [i.code for i in ev.issues]})
+        if not asked:
+            return
+        states = "; ".join(f"{esc(o.broker)}: {self._early_state(o)}" for o in outcomes) or "—"
+        # never sent again on approval: whatever went out (or may have), or is still on its way
+        done = [o.broker for o in outcomes if o.position is not None or o.sent or o.kind == "late"]
+        again = [n for n in names if n not in done]       # (a rule of its own refused it: nothing was sent)
+        info = {
+            "trade_id": trade.id, "brokers": names, "done": done,
+            "line": f"⚡ <b>#{trade.id}</b> onay beklenmeden açılışa gönderildi — {states}. Bu soru "
+                    + (f"{_names(asked)} için; onaylarsanız {_names(again)} hesabı da yeniden denenir (ilk denemede emir "
+                       "gönderilmedi)." if again else f"yalnızca {_names(asked)} için."),
+        }
+        await self._ask_eval(ev, chat_id, conf_id=conf_id, early=info)
+
+    async def _trade_of_plan(self, plan: TradePlan) -> TradeRecord | None:
+        """The trade created for ``plan`` (found by its source messages and plan id), if any."""
+        for mid in plan.source_message_ids:
+            try:
+                found = await self.db.find_trade_by_message(plan.source_chat_id, mid)
+            except Exception:
+                logger.exception("Could not look up the trade of message %s", mid)
+                return None
+            if found is not None and found.plan.plan_id == plan.plan_id:
+                return found
+        return None
 
     @staticmethod
     def _limit_filled_by(active: list[TradeRecord]) -> str:
@@ -3829,44 +4035,81 @@ class Engine:
         return ("Sınırı dolduran işlemler: " + ", ".join(items) + ". Yer açmak için bunlardan birini kapatın veya "
                 "iptal edin (bekleyen girişler de sayılır); sınır config.yaml'daki risk.max_open_trades değeridir.")
 
-    async def execute_open(self, plan: TradePlan, *, raw_symbol: str | None = None) -> str:
+    async def execute_open(self, plan: TradePlan, *, raw_symbol: str | None = None,
+                           skip: Collection[str] = (), into: TradeRecord | None = None,
+                           size_stop: float | None = None) -> str:
         """Open ``plan`` on every broker that can trade it (only ``plan.broker_names`` when it names any:
         a forum topic's brokers). Returns an HTML result text.
         Runs as a critical section: never interrupted half-way by a cancelled caller or shutdown.
         It returns at the latest LEG_DEADLINE_SEC after the orders went out: a broker that has not answered by
-        then is reported as late and its result follows in a separate message (see :meth:`_late_leg_done`)."""
-        return await self._critical_section(self._execute_open(plan, raw_symbol), f"open-{plan.plan_id}")
+        then is reported as late and its result follows in a separate message (see :meth:`_late_leg_done`).
+        ``skip``: brokers that already took this signal without waiting (confirm_open: false, see
+        :meth:`_open_early`): never sent it again, never told "skipped" or remembered as missed. ``into``: their
+        trade, still active: the other brokers' positions are added to it (no second trade)."""
+        text, _trade, _outcomes = await self._critical_section(
+            self._execute_open(plan, raw_symbol, skip=frozenset(skip), into=into, size_stop=size_stop),
+            f"open-{plan.plan_id}")
+        return text
 
-    async def _execute_open(self, plan: TradePlan, raw_symbol: str | None) -> str:
+    async def _execute_open(
+        self, plan: TradePlan, raw_symbol: str | None, *, only: frozenset[str] | None = None,
+        skip: frozenset[str] = frozenset(), into: TradeRecord | None = None, early_tag: str | None = None,
+        size_stop: float | None = None,
+    ) -> tuple[str, TradeRecord | None, list[BrokerOutcome]]:
+        """(report, trade, outcomes). ``only``: the confirm_open: false accounts that take the signal before the
+        owner's answer (:meth:`_open_early`; ``early_tag``: a line its report carries): the others are neither
+        sent it nor told skipped here (their question follows); none of those accounts connected now -> no trade
+        (None). ``skip`` / ``into``: see :meth:`execute_open`."""
         if self.config.telegram.topics and not plan.route:
             # Topics route every trade to specific brokers; without a route we would open everywhere.
             text = (f"🚨 <b>{esc(plan.base_asset)} {plan.side.value.upper()}</b>: sinyalin konusu (topic) "
                     "belirlenemediği için işlem AÇILMADI (yanlış brokerda açılmasın diye).")
             await self._notify(text, Severity.ERROR)
             await self._log("open_refused_no_route", {"plan": plan.model_dump(mode="json")})
-            return text
-        trade = await self.db.create_trade(plan)
+            return text, None, []
         # ONE look at the connected brokers decides both who is told "skipped" and who takes the trade: a broker that
         # connects in between (an optional one connecting in the background after a restart) does not take a trade
         # the owner was just told it skips.
-        routed = self._plan_brokers(plan)
+        routed = [b for b in self._plan_brokers(plan) if b.name not in skip and (only is None or b.name in only)]
+        if only is not None and not routed:
+            return "", None, []
+        if into is not None and not routed:
+            # (the early accounts' trade stays as it is: never FAILED because the others are not connected)
+            label = f"#{into.id} {esc(plan.base_asset)} {plan.side.value.upper()}"
+            text = (f"🚨 <b>{label}</b>: {_names(self._asked_names(plan, skip))} bağlı değil; bu işlem o "
+                    f"hesaplarda AÇILMADI ({_names(sorted(skip))} hesabındaki işlem sürüyor).")
+            await self._notify(text, Severity.ERROR)
+            await self._log("open_others_not_connected", {"trade_id": into.id, "skip": sorted(skip)})
+            return text, into, []
+        trade = into if into is not None else await self.db.create_trade(plan)
         if plan.broker_names and not routed:
             async with self.trade_lock(trade.id):
-                return await self._no_route_broker(trade)
-        # (the optional brokers the notice below tells "skipped": remembered for a catch-up once they are back)
-        down = self._skipped_optional(plan, routed)
-        await self._optional_skip_notice(plan, routed=routed)
+                return await self._no_route_broker(trade), trade, []
+        down: list[tuple[str, str]] = []
+        if only is None:
+            # (the optional brokers the notice below tells "skipped": remembered for a catch-up once they are back)
+            down = [(n, why) for n, why in self._skipped_optional(plan, routed) if n not in skip]
+            await self._optional_skip_notice(plan, routed=routed, skip=skip)
         label = f"#{trade.id} {esc(plan.base_asset)} {plan.side.value.upper()}"
         late: list[_LateLeg] = []
         async with self.trade_lock(trade.id):
-            await self._log("open_start", {"trade_id": trade.id, "plan": plan.model_dump(mode="json")})
+            if into is not None:
+                # (looked at again under its lock: the trader may have closed it while the approval was checked)
+                fresh = await self.db.get_trade(into.id)
+                if fresh is None or fresh.status not in ACTIVE_TRADE or await self._closing(fresh):
+                    raise _IntoEnded(fresh)     # (closed, or its close owed / on its way: over for the trader)
+            await self._log("open_start", {"trade_id": trade.id, "plan": plan.model_dump(mode="json"),
+                                           **({"only": sorted(only)} if only is not None else {}),
+                                           **({"skip": sorted(skip)} if skip else {})})
             brokers = [b for b in routed if b.accepts_asset(plan.base_asset)]
             flow = _OpenFlow()
             # While this flow waits for a slower broker, the fast check protects what the other legs have saved
             # (a resting exchange limit that fills gets its stop at once, not when the flow ends).
             self.monitor.lend(trade.id)
             try:
-                answered, waiting = await self._run_open_legs(brokers, plan, trade, raw_symbol, flow)
+                # (an early flow waits only an optional account's short grace: the owner's question comes after it)
+                answered, waiting = await self._run_open_legs(brokers, plan, trade, raw_symbol, flow,
+                                                              short=only is not None, size_stop=size_stop)
             finally:
                 protected = await self.monitor.unlend(trade.id, timeout=LEG_DEADLINE_SEC)
             # In route order. A broker of the route whose allowed_assets does not list the asset is named too.
@@ -3886,6 +4129,9 @@ class Engine:
                         o.text += f" → şimdi {pos_status_text(now_pos)}"
                         o.position = now_pos
             positions = [o.position for o in outcomes if o.position is not None]
+            if into is not None:        # (the early accounts' positions belong to this trade too)
+                flowed = {o.broker for o in outcomes}
+                positions += [p for p in await self.db.broker_positions(trade.id) if p.broker not in flowed]
             status = rollup_status(positions)
             if waiting and status not in ACTIVE_TRADE:
                 # Nothing is open yet but a broker has not answered: the trade is still being sent. Its late
@@ -3894,6 +4140,8 @@ class Engine:
             # (an order sent whose answer was lost is kept as "unknown": a late leg booked later must not call the
             # trade "açılamadı" on every broker while it may exist there, see _book_late_leg)
             notes = "; ".join(f"{o.broker}: {_note_kind(o)}" for o in outcomes if o.kind != "ok") or None
+            if into is not None and notes and into.note:
+                notes = f"{into.note}; {notes}"
             trade = await self.db.update_trade(trade.id, status=status, note=notes)
             for o in outcomes:              # (his account without a position from this open: he is told why)
                 if (o.position is None and o.kind != "late") or o.unknown:
@@ -3905,12 +4153,25 @@ class Engine:
                 await self._late_state(add=late)
             flow.released = True        # from here on a late leg takes the trade lock itself to write its position
 
+        extra: list[str] = []
+        if into is not None and skip:
+            extra.append(f"• {_names(sorted(skip))}: onay beklenmeden önceden işleme alınmıştı; tekrar gönderilmedi")
+        if early_tag:
+            extra.append(early_tag)
+        suffix = "".join(f"\n{e}" for e in extra)
+
+        async def say(text: str, severity: Severity) -> None:
+            await self._notify(text + suffix, severity)
+
+        # (an early flow speaks of its own accounts only: the others are asked next)
+        where = f"{_names(sorted(only))} hesabında" if only is not None else "hiçbir brokerda"
         try:
             lines = [f"• {o.text}" for o in outcomes]
-            if not outcomes or all(o.kind in ("unsupported", "filtered") for o in outcomes):
-                head = f"⚠️ <b>{label}: hiçbir broker bu varlığı işlemiyor</b>; sinyal kopyalanamadı."
+            if into is None and (not outcomes or all(o.kind in ("unsupported", "filtered") for o in outcomes)):
+                head = (f"⚠️ <b>{label}: {_names(sorted(only))} bu varlığı işlemiyor</b>." if only is not None
+                        else f"⚠️ <b>{label}: hiçbir broker bu varlığı işlemiyor</b>; sinyal kopyalanamadı.")
                 named = "\n" + "\n".join(lines) if any(o.kind == "filtered" for o in outcomes) else ""
-                await self._notify(f"{head}\n{esc(plan.summary_tr)}{named}", Severity.WARNING)
+                await say(f"{head}\n{esc(plan.summary_tr)}{named}", Severity.WARNING)
             elif status is TradeStatus.OPENING:
                 unknown, maybe = _unknown_of(outcomes)
                 if unknown:
@@ -3918,18 +4179,18 @@ class Engine:
                     head = (f"⏳ <b>{label}: {_unknown_open_text(unknown, maybe)}</b>; yanıt vermeyen broker "
                             "bekleniyor.")
                 else:
-                    head = f"⏳ <b>{label}: henüz hiçbir brokerda açılmadı</b>; yanıt vermeyen broker bekleniyor."
-                await self._notify(head + "\n" + "\n".join(lines), Severity.WARNING)
+                    head = f"⏳ <b>{label}: henüz {where} açılmadı</b>; yanıt vermeyen broker bekleniyor."
+                await say(head + "\n" + "\n".join(lines), Severity.WARNING)
             elif status is TradeStatus.FAILED and all(o.benign for o in outcomes):
                 head = f"ℹ️ <b>{label} açılmadı</b> (hedging yasağı)"
-                await self._notify(head + "\n" + "\n".join(lines), Severity.WARNING)
+                await say(head + "\n" + "\n".join(lines), Severity.WARNING)
             elif status is TradeStatus.FAILED and any(o.unknown for o in outcomes):
                 # An order went out and its answer was lost: it may exist there. Never "açılamadı".
                 head = f"🚨 <b>{label}: {_unknown_open_text(*_unknown_of(outcomes))}</b>"
-                await self._notify(head + "\n" + "\n".join(lines), Severity.ERROR)
+                await say(head + "\n" + "\n".join(lines), Severity.ERROR)
             elif status is TradeStatus.FAILED:
-                head = f"🚨 <b>{label} hiçbir brokerda açılamadı</b>"
-                await self._notify(head + "\n" + "\n".join(lines), Severity.ERROR)
+                head = f"🚨 <b>{label} {where} açılamadı</b>"
+                await say(head + "\n" + "\n".join(lines), Severity.ERROR)
             else:
                 # An account of the owner (a broker that is not optional) left this trade out: a rule (the prop
                 # account's daily loss limit, the hedging ban...), an error, a symbol it does not trade. The trade is
@@ -3967,13 +4228,15 @@ class Engine:
                     head += " <i>(dry-run: gerçek emir yok)</i>"
                 # A broker of the route that did not take the trade (or has not answered yet) is always reported,
                 # whatever notify_on_execution says: "all opened" and "one was left out" must never look the same.
-                if self.config.notifier.notify_on_execution or any(o.kind in _NOT_OPENED for o in outcomes):
-                    await self._notify(f"{head}\n{fmt.format_plan(plan)}\n\n" + "\n".join(lines),
+                # (an early open is always told: the owner has not approved it)
+                if (self.config.notifier.notify_on_execution or only is not None
+                        or any(o.kind in _NOT_OPENED for o in outcomes)):
+                    await say(f"{head}\n{fmt.format_plan(plan)}\n\n" + "\n".join(lines),
                                        Severity.WARNING if missed else Severity.INFO)
                 elif any(o.size_capped for o in outcomes):
                     # Execution reports are off; a size the bot limited (less than 1R at risk) is told all the same.
                     dry = " <i>(dry-run: gerçek emir yok)</i>" if self.config.dry_run else ""
-                    await self._notify(
+                    await say(
                         f"⚠️ <b>{title}</b>{dry}: miktar sınırlandı, gerçek risk hedefin altında\n"
                         + "\n".join(f"• {o.text}" for o in outcomes if o.size_capped), Severity.WARNING)
             await self._log("open_done", {
@@ -3988,11 +4251,12 @@ class Engine:
         finally:
             for leg in late:
                 leg.announced.set()     # the late results may be reported now (always after this report)
-        return "\n".join([head, *lines])
+        return "\n".join([head, *lines, *extra]), trade, outcomes
 
     # ------------------------------------------------------------------ broker legs of an open flow
     async def _run_open_legs(
-        self, brokers: list[Broker], plan: TradePlan, trade: TradeRecord, raw_symbol: str | None, flow: _OpenFlow
+        self, brokers: list[Broker], plan: TradePlan, trade: TradeRecord, raw_symbol: str | None, flow: _OpenFlow,
+        *, short: bool = False, size_stop: float | None = None,
     ) -> tuple[dict[str, BrokerOutcome], dict[str, asyncio.Task[BrokerOutcome]]]:
         """Send ``plan`` to every broker at once, each in its own task, and wait until all have answered, but
         never longer than LEG_DEADLINE_SEC; an optional broker only OPTIONAL_LEG_GRACE_SEC (see
@@ -4000,18 +4264,20 @@ class Engine:
         broker, still running leg task per broker): a broker that has not answered gets the "late" outcome and
         its task keeps running (never cancelled: its order may already be at the broker). This also takes the
         wait of an optional broker for its own earlier unanswered order (:meth:`_open_leg`) out of the flow:
-        that wait goes on inside its leg task."""
+        that wait goes on inside its leg task. ``short``: a flow of optional brokers only waits their grace
+        (OPTIONAL_LEG_GRACE_SEC), not LEG_DEADLINE_SEC (an early open: the owner's question waits for it)."""
         if not brokers:
             return {}, {}
         started = asyncio.get_running_loop().time()
         tasks: dict[str, asyncio.Task[BrokerOutcome]] = {}
         for b in brokers:
-            task = asyncio.ensure_future(self._open_leg(b, plan, trade, raw_symbol, flow))
+            extra = {"size_stop": size_stop} if size_stop is not None else {}
+            task = asyncio.ensure_future(self._open_leg(b, plan, trade, raw_symbol, flow, **extra))
             task.set_name(f"open-{plan.plan_id}-{b.name}")
             tasks[b.name] = task
         optional = {b.name for b in brokers if self._is_optional(b)}
         await self._wait_legs(tasks, optional, started, required_sec=LEG_DEADLINE_SEC,
-                              all_optional_sec=LEG_DEADLINE_SEC, blocked=flow.blocked)
+                              all_optional_sec=None if short else LEG_DEADLINE_SEC, blocked=flow.blocked)
         outcomes: dict[str, BrokerOutcome] = {}
         waiting: dict[str, asyncio.Task[BrokerOutcome]] = {}
         for name, task in tasks.items():
@@ -4469,12 +4735,14 @@ class Engine:
         return (text + "\n• Bu emir yanıt beklerken işlemde yapılan değişiklikler bu pozisyona şimdi uygulanıyor; "
                 "sonuç ayrıca bildirilecek."), severity
 
-    async def _optional_skip_notice(self, plan: TradePlan, *, routed: list[Broker] | None = None) -> None:
+    async def _optional_skip_notice(self, plan: TradePlan, *, routed: list[Broker] | None = None,
+                                    skip: Collection[str] = ()) -> None:
         """Once per signal: tell the owner which brokers of the route are not connected and therefore skip this
         trade (optional ones: a short notice; the others: an error). The trade is never queued for them; the
         other brokers are not affected. ``routed``: the connected brokers the open flow sends the trade to (the
-        snapshot the caller took; default: as connected now) - a broker in it is never told as skipped."""
-        connected = {b.name for b in (routed if routed is not None else self.brokers)}
+        snapshot the caller took; default: as connected now) - a broker in it is never told as skipped; neither is
+        one in ``skip`` (it took the signal earlier, without waiting for the owner)."""
+        connected = {b.name for b in (routed if routed is not None else self.brokers)} | set(skip)
         names = [n for n in (plan.broker_names or list(self.optional_down))
                  if n in self.optional_down and n not in connected]
         for name in names:
@@ -4525,33 +4793,91 @@ class Engine:
         return text
 
     async def _compute_price_offset(
-        self, broker: Broker, plan: TradePlan, quote: Quote, mult: float, *, ref_price: float | None = None
+        self, broker: Broker, plan: TradePlan, quote: Quote, mult: float, *, ref_price: float | None = None,
+        ref_broker: str | None = None, raw_symbol: str | None = None,
     ) -> tuple[dict[str, Any] | None, str | None]:
         """(offset, problem). Offset brokers only (``reference_exchange`` set, crypto plan: see
         :func:`is_crypto_plan`): compares the broker's mid with the reference exchange's mid (scaled like the
-        signal) and returns the shift to apply.
-        Fails closed: unavailable reference or a too big difference -> a problem text and no offset."""
+        signal) and returns the shift to apply. ``ref_broker``: a waiting forex / CFD entry of ``reference_broker``
+        fires - the reference is that account's mid (``ref_price`` when the caller just read it, else read now,
+        next to this broker's own quote).
+        Fails closed: unavailable reference or a too big difference -> a problem text and no offset. (The texts for
+        ``ref_broker`` never name that account: the friend may be told them.)"""
         cfg = broker.config
-        ref_id = getattr(cfg, "reference_exchange", None)
-        if not ref_id or not is_crypto_plan(plan, self._plan_kind(plan)):
-            return None, None
-        ref = ref_price     # a virtual trigger passes the fresh reading it just triggered on
-        if ref is None:
-            ref = await self._reference_mid(ref_id, plan.base_asset)
+        if ref_broker:
+            ref_id = ""
+            ref = ref_price if ref_price is not None else await self._reference_broker_mid(ref_broker, plan, raw_symbol)
+        else:
+            ref_id = getattr(cfg, "reference_exchange", None)
+            if not ref_id or not is_crypto_plan(plan, self._plan_kind(plan)):
+                return None, None
+            ref = ref_price     # a virtual trigger passes the fresh reading it just triggered on
+            if ref is None:
+                ref = await self._reference_mid(ref_id, plan.base_asset)
         broker_mid = (quote.bid + quote.ask) / 2.0
         if ref is None or not (math.isfinite(ref) and ref > 0) or not (math.isfinite(broker_mid) and broker_mid > 0):
+            if ref_broker:
+                return None, ("referans hesabın fiyatı alınamadı; fiyat farkı hesaplanamadığı için işlem güvenlik "
+                              "gereği açılmadı")
             return None, (f"referans fiyat ({esc(ref_id)}) alınamadı; fiyat farkı hesaplanamadığı için "
                           "işlem güvenlik gereği açılmadı")
         ref_mid = float(ref) * mult
         diff_pct = abs(broker_mid - ref_mid) / ref_mid * 100.0
         max_pct = float(getattr(cfg, "max_offset_pct", 1.0))
         if diff_pct > max_pct:
-            return None, (f"broker fiyatı ({fmt_price(broker_mid)}) ile {esc(ref_id)} fiyatı ({fmt_price(ref_mid)}) "
+            source = "referans hesabın fiyatı" if ref_broker else f"{esc(ref_id)} fiyatı"
+            return None, (f"broker fiyatı ({fmt_price(broker_mid)}) ile {source} ({fmt_price(ref_mid)}) "
                           f"arasındaki fark {fmt.fmt_pct(diff_pct)} (sınır {fmt.fmt_pct(max_pct)}); "
                           "yanlış sembol veya eski fiyat olabilir, işlem açılmadı")
         if getattr(cfg, "offset_mode", "additive") == "ratio":
             return {"mode": "ratio", "value": broker_mid / ref_mid}, None
         return {"mode": "additive", "value": broker_mid - ref_mid}, None
+
+    async def _reference_broker_quote(self, name: str, plan: TradePlan, raw_symbol: str | None, *,
+                                      cache: tuple[int, str] | None = None) -> Quote | None:
+        """The live quote of the plan's instrument on the account ``name`` (a ``reference_broker``: the owner's own
+        account, read only - nothing is ever sent to it from here), in the signal's scale. None when the account is
+        not connected, does not list the instrument, gives no valid price or fails (the caller then fails closed /
+        waits). A MetaTrader adapter answers it from its own worker thread (the event loop is not held).
+        ``cache``: a waiting entry that looks again and again: the instrument is resolved once and kept."""
+        ref = self._broker(name)
+        if ref is None:
+            return None
+        try:
+            sym = self._ref_symbols.get(cache) if cache is not None else None
+            if sym is None:
+                sym = await ref.resolve_symbol(plan.base_asset, plan.quote_asset, plan.market_type, raw_symbol)
+                if sym is None:
+                    return None
+                if cache is not None:
+                    self._ref_symbols[cache] = sym
+            quote = await ref.get_quote(sym)
+        except asyncio.CancelledError:
+            if not stray_cancel():
+                raise
+            logger.error("%s: the reference price read was cancelled without a cancel request", name)
+            return None
+        except BrokerError as exc:      # (expected now and then - not connected, market closed: no traceback)
+            if cache is not None:
+                self._ref_symbols.pop(cache, None)
+            logger.warning("%s: the reference price of %s could not be read: %s", name, plan.base_asset, exc)
+            return None
+        except Exception:
+            if cache is not None:
+                self._ref_symbols.pop(cache, None)
+            logger.exception("%s: the reference price of %s could not be read", name, plan.base_asset)
+            return None
+        mid = (quote.bid + quote.ask) / 2.0
+        if not (quote.bid > 0 and quote.ask > 0 and math.isfinite(mid)):
+            return None
+        m = price_multiplier(sym.extra)
+        return Quote(bid=quote.bid / m, ask=quote.ask / m, last=mid / m)
+
+    async def _reference_broker_mid(self, name: str, plan: TradePlan, raw_symbol: str | None) -> float | None:
+        """Mid price of the plan's instrument on the account ``name`` (a ``reference_broker``), in the signal's scale
+        (see :meth:`_reference_broker_quote`)."""
+        quote = await self._reference_broker_quote(name, plan, raw_symbol)
+        return None if quote is None else (quote.bid + quote.ask) / 2.0
 
     async def _open_on_broker(
         self, broker: Broker, plan: TradePlan, trade: TradeRecord, raw_symbol: str | None,
@@ -4559,7 +4885,8 @@ class Engine:
         flow: _OpenFlow | None = None, mute_errors: bool = False, size_stop: float | None = None,
     ) -> BrokerOutcome:
         """``virtual``: the waiting virtual entry that just triggered (open it as a MARKET order with its stored
-        stop / take-profits, the offset measured now from ``ref_price``).
+        stop / take-profits, the offset measured now from ``ref_price``; for an entry that waits for a
+        ``reference_broker``, from that account's mid: ``ref_price`` when the caller just read it, else read here).
         ``size_stop``: another stop (signal scale) the size may be computed from: the farther of it and the plan's
         stop from the entry (a catch-up open with the trade's current stop after the trader moved it: never larger
         than the size of the signal's own stop). The order carries the plan's stop.
@@ -4585,8 +4912,13 @@ class Engine:
             conflict = await self._hedge_conflict(broker, plan, trade, sym.broker_symbol)
             if conflict:
                 return BrokerOutcome(name, "skipped", f"{esc(name)}: {conflict}", benign=True)
-            if virtual is None and virtual_entry_wanted(broker, plan, self._plan_kind(plan)):
+            kind = self._plan_kind(plan)
+            if virtual is None and virtual_entry_wanted(broker, plan, kind):
                 return await self._register_virtual(broker, plan, trade, sym, raw_symbol, flow)
+            if virtual is None and broker_virtual_wanted(broker, plan, kind):
+                # (never a broker limit on this account: it waits for the reference account's fill or price)
+                return await self._register_virtual(broker, plan, trade, sym, raw_symbol, flow,
+                                                    ref_broker=str(broker.config.reference_broker))
             entry_type = EntryType.MARKET if virtual is not None else plan.entry_type
             equity = await broker.get_equity()
             ccy = self._currency.get(name, "")
@@ -4607,9 +4939,9 @@ class Engine:
                     # stay within the limit (guards.position_open_risk says what "at risk" covers).
                     at_risk = guards.open_risk(p for tid, p in await self.db.active_broker_positions()
                                                if p.broker == name and tid != trade.id)
-                    # (lot_rounding "nearest" may round the size UP: at most LOT_ROUNDING_MAX_OVERSHOOT x the target
-                    # is at the stop then, and that is what is counted before the size is known)
-                    wanted = broker_risk_amount(broker, equity, plan) * rounding_headroom(broker)
+                    # (lot_rounding "nearest" / "up" may round the size UP: the most that may then be at the stop
+                    # is what is counted before the size is known, see max_rounded_risk)
+                    wanted = max_rounded_risk(broker, broker_risk_amount(broker, equity, plan))
                     if guards.daily_loss_would_exceed(realized, at_risk, wanted, equity, loss_limit):
                         total = guards.daily_loss_with_open_risk(realized, at_risk, wanted)
                         limit_text, total_text, excess_text = _over_limit_figures(equity * loss_limit / 100.0, total)
@@ -4636,7 +4968,10 @@ class Engine:
                 stop = virtual.stop_loss if virtual.stop_loss is not None else stop
                 tps = [TakeProfit(price=tp.price, close_fraction=tp.close_fraction) for tp in virtual.take_profits]
             signal_entry = plan.entry_price * mult if plan.entry_price else None
-            offset, offset_problem = await self._compute_price_offset(broker, plan, quote, mult, ref_price=ref_price)
+            ref_broker = (str((virtual.data or {}).get("reference_broker") or "") or None
+                          if virtual is not None else None)
+            offset, offset_problem = await self._compute_price_offset(
+                broker, plan, quote, mult, ref_price=ref_price, ref_broker=ref_broker, raw_symbol=raw_symbol)
             if offset_problem:
                 text = f"{esc(name)}: {offset_problem}"
                 return BrokerOutcome(name, "skipped", text)
@@ -4725,6 +5060,7 @@ class Engine:
                 pos.data["virtual_fired"] = {
                     "trigger_price": virtual.data.get("trigger_price"), "ref_price": ref_price,
                     "at": self._now().isoformat(),
+                    **({"reference_broker": ref_broker} if ref_broker else {}),
                 }
             await self._save_leg_position(trade.id, pos, flow)
             if pos.status is PositionStatus.FAILED:
@@ -4800,12 +5136,14 @@ class Engine:
     # ------------------------------------------------------------------ virtual (reference-touch) entries
     async def _register_virtual(
         self, broker: Broker, plan: TradePlan, trade: TradeRecord, sym: Any, raw_symbol: str | None,
-        flow: _OpenFlow | None = None,
+        flow: _OpenFlow | None = None, *, ref_broker: str | None = None,
     ) -> BrokerOutcome:
         """``entry_trigger: reference_touch``: no order on the broker. A PENDING position carrying
-        ``data["virtual_trigger"]`` is stored (it survives a restart); the monitor watches the reference price."""
+        ``data["virtual_trigger"]`` is stored (it survives a restart); the monitor watches the reference price.
+        ``ref_broker`` (``reference_broker``, a forex / CFD plan): the stored entry carries ``data["reference_broker"]``
+        instead and waits for that account's waiting entry of the trade to fill, or - while that account has none -
+        for that account's own price to reach the level (:meth:`_reference_broker_check`). Never a broker limit."""
         name = broker.name
-        ref_id = str(broker.config.reference_exchange)
         mult = price_multiplier(sym.extra)
         entry = float(plan.entry_price or 0.0) * mult
         hours = self._virtual_max_hours(float(getattr(broker.config, "virtual_trigger_max_hours", 48.0)))
@@ -4815,6 +5153,7 @@ class Engine:
         # between the entry and today's price): there, and when the price is not known now, the rule starts
         # to count once the reference price has been seen between the two (see _virtual_check). The price is
         # the one the signal was just judged with (no reference reading: the offset is measured at the touch).
+        # (A ``reference_broker`` entry: the same rule on that account's price, see _reference_broker_check.)
         tp_armed = True
         if plan.take_profits:
             tp1 = plan.take_profits[0].price
@@ -4823,6 +5162,31 @@ class Engine:
                 tp_armed = False
             else:
                 tp_armed = not (price >= tp1 if plan.side is Side.LONG else price <= tp1)
+        if ref_broker:
+            pos = BrokerPosition(
+                broker=name, broker_symbol=sym.broker_symbol, side=plan.side, status=PositionStatus.PENDING,
+                quantity=0.0, remaining_quantity=0.0,
+                stop_loss=plan.stop_loss * mult, take_profits=scaled_take_profits(plan.take_profits, mult),
+                dry_run=self.config.dry_run,
+                data={
+                    "virtual_trigger": True, "virtual_state": "waiting", "trigger_price": entry,
+                    "reference_broker": ref_broker, "price_multiplier": mult, "raw_symbol": raw_symbol,
+                    "virtual_created_at": self._now().isoformat(), "virtual_max_hours": hours,
+                    "virtual_tp_armed": tp_armed,
+                },
+            )
+            await self._save_leg_position(trade.id, pos, flow)
+            # (the owner's texts only: this outcome has a position, so it is never forwarded to the friend)
+            text = (f"{esc(name)}: sanal tetik kuruldu (limit emir konmadı): {esc(ref_broker)} hesabındaki giriş emri "
+                    f"dolunca, orada emir yoksa {esc(ref_broker)} fiyatı {fmt_price(plan.entry_price)} seviyesine "
+                    f"gelince {esc(name)}'da piyasa emriyle açılacak (en çok {fmt.fmt_number(hours)} saat beklenir)")
+            if not self.config.notifier.notify_on_execution:
+                await self._notify(f"🧭 #{trade.id} {esc(plan.base_asset)} {plan.side.value.upper()}: {text}",
+                                   Severity.INFO)
+            await self._log("virtual_registered", {"trade_id": trade.id, "broker": name, "trigger": entry,
+                                                    "reference_broker": ref_broker})
+            return BrokerOutcome(name, "ok", text, pos)
+        ref_id = str(broker.config.reference_exchange)
         pos = BrokerPosition(
             broker=name, broker_symbol=sym.broker_symbol, side=plan.side, status=PositionStatus.PENDING,
             quantity=0.0, remaining_quantity=0.0,
@@ -4878,6 +5242,12 @@ class Engine:
         self._virtual_seen.pop((trade_id, broker), None)
         self._virtual_warned.pop((trade_id, broker), None)
         self._virtual_warned.pop((trade_id, f"{broker}:busy"), None)
+        self._virtual_warned.pop((trade_id, f"{broker}:refprice"), None)
+        self._virtual_warned.pop((trade_id, f"{broker}:refdown"), None)
+        self._virtual_warned.pop((trade_id, f"{broker}:refhistory"), None)
+        self._ref_symbols.pop((trade_id, broker), None)
+        self._ref_retry_at.pop((trade_id, broker), None)
+        self._ref_seen.pop((trade_id, broker), None)
 
     async def _virtual_tick(self, trade: TradeRecord, pos: BrokerPosition, now: datetime) -> BrokerPosition:
         """One look at a waiting virtual entry (monitor hook, trade lock held): expire / gap-cancel / trigger.
@@ -4984,8 +5354,13 @@ class Engine:
         # The trade is over on the other accounts: a filled position there has closed and none is left (the
         # trader's trade has been played out), or every entry there ended without a fill (expired, cancelled,
         # failed). This entry must not open the trade later on its account alone.
-        real = [p for p in await self.db.broker_positions(trade.id)
-                if p.broker != pos.broker and not is_virtual_pending(p)]
+        rows = await self.db.broker_positions(trade.id)
+        ref_name = str(d.get("reference_broker") or "")
+        if ref_name:
+            # (a leg of the reference account that never got onto that account - failed, nothing filled - is no leg:
+            # it does not end the trade; the entry then waits for that account's price, see _reference_broker_check)
+            rows = [p for p in rows if not reference_leg_never_placed(p, ref_name)]
+        real = [p for p in rows if p.broker != pos.broker and not is_virtual_pending(p)]
         if real and not any(p.status in ACTIVE_POSITION for p in real):
             if any(p.status is PositionStatus.CLOSED for p in real):
                 return await self._virtual_end(
@@ -4997,6 +5372,8 @@ class Engine:
                 "işlemin diğer hesaplardaki girişleri dolmadan sona erdi (süresi doldu, iptal edildi ya da "
                 "açılamadı); bekleyen sanal giriş de iptal edildi, bu hesapta işlem AÇILMADI.", Severity.INFO)
         broker = self._broker(pos.broker)       # None: not connected right now (the levels are still watched)
+        if d.get("reference_broker"):
+            return await self._reference_broker_check(trade, pos, broker, label, rows)
         ref_id = str(d.get("reference_exchange") or "")
         if not ref_id:
             return pos
@@ -5088,11 +5465,333 @@ class Engine:
                         "sanal giriş iptal edilir.", Severity.WARNING)
                     pos = noted
                 return await self._virtual_seen_now(trade, pos, now) if candles_read else pos
+        seen = (f"{esc(ref_label(ref_id))} fiyatı kısa süreliğine {fmt_price(worst / mult)} seviyesine geldi, şimdi "
+                f"{fmt_price(px / mult)}" if wicked else f"{esc(ref_label(ref_id))} fiyatı {fmt_price(px / mult)}")
+        at = f"{esc(ref_label(ref_id))} {fmt_price(px / mult)}"
+        return await self._virtual_fire(trade, pos, broker, label, _Fire(
+            mode="touch", what=f"tetik seviyesine gelindi ({at})", busy_what="tetik seviyesine gelindi",
+            busy_tail="Yanıt geldiğinde fiyat hâlâ seviyedeyse açılır.", done=f"tetiklendi ({at})",
+            seen=f"tetiklendi ({seen})", retry_tail="Fiyat seviyede kaldıkça sonraki kontrollerde en çok "
+            f"{VIRTUAL_RETRY_MAX} kez daha denenecek.",
+            head=f"sanal tetik tetiklendi ({seen}, seviye {fmt_price(trigger / mult)})",
+            ref_price=float(ref), log={"ref_price": ref}))
+
+    async def _reference_broker_check(
+        self, trade: TradeRecord, pos: BrokerPosition, broker: Broker | None, label: str, rows: list[BrokerPosition]
+    ) -> BrokerPosition:
+        """A waiting forex / CFD entry of a ``reference_broker`` account (the three rules every waiting entry has -
+        an interrupted fire, the expiry, the other accounts ended - have been applied, to ``rows``: the trade's
+        positions as this look read them; the same reading decides here, so that a reference leg that has closed
+        meanwhile is never taken for a fill the other rule did not see). Never a broker limit on this account:
+          * the reference account's leg of the trade has filled -> MARKET here, levels shifted by the offset read now;
+          * it has a waiting entry (its own limit order) -> this one waits for that order to fill;
+          * it has no waiting entry in the trade (its owner's answer is awaited, a rule skipped it, it was refused, it
+            ended unfilled while the trade goes on) -> the reference account's own live price (read only) decides:
+            long: ask <= the entry, short: bid >= the entry -> MARKET here; no price readable (not connected, no such
+            symbol there) -> it waits, the owner told (throttled); virtual_trigger_max_hours still ends it."""
+        d = pos.data
+        ref = str(d.get("reference_broker") or "")
+        legs = [p for p in rows if p.broker == ref]
+        filled = any(reference_leg_filled(p) for p in legs)
+        mult = price_multiplier(d)
+        level_px = float(d.get("trigger_price") or 0.0) / mult           # the signal's scale
+        level = fmt_price(level_px)
+        if filled:
+            if not any(p.status in ACTIVE_POSITION for p in legs):
+                # That account's position of the trade has already ended (stopped out / closed) before this entry
+                # was sent: the trade has played out there - never opened here afterwards on its own.
+                return await self._virtual_end(
+                    trade, pos, PositionStatus.CANCELLED, "referans hesaptaki pozisyon kapandı",
+                    f"{esc(ref)} hesabındaki giriş dolmuş ama pozisyon bu arada kapanmış (stop / kapanış); bekleyen "
+                    "sanal giriş iptal edildi, bu hesapta işlem AÇILMADI.", Severity.INFO)
+            if broker is None:
+                return pos          # not connected right now: decided again once it is back
+            what = f"{esc(ref)} hesabındaki giriş doldu"
+            return await self._virtual_fire(trade, pos, broker, label, _Fire(
+                mode="reference", what=what, busy_what=what, busy_tail="Yanıt geldiğinde açılır.", done=what,
+                seen=what, retry_tail=f"Sonraki kontrollerde en çok {VIRTUAL_RETRY_MAX} kez daha denenecek.",
+                head=f"{what} (seviye {level}), piyasa emriyle açıldı", log={"reference_broker": ref}))
+        if any(p.status in ACTIVE_POSITION for p in legs):
+            # its own order waits: its fill decides (never also the price: one trigger)
+            if self._broker(ref) is None:
+                warn_key = (trade.id, f"{pos.broker}:refdown")
+                last = self._virtual_warned.get(warn_key)
+                if last is None or time.monotonic() - last >= VIRTUAL_NOTE_THROTTLE_SEC:
+                    self._virtual_warned[warn_key] = time.monotonic()
+                    await self._notify(
+                        f"⚠️ {label} {esc(pos.broker)}: {esc(ref)} bağlı değil; {esc(ref)} hesabındaki bekleyen giriş "
+                        f"emrinin dolup dolmadığı görülemiyor. {esc(pos.broker)} girişi beklemeye devam ediyor, limit "
+                        "emir KONMAZ.", Severity.WARNING)
+            return pos
+        key = (trade.id, pos.broker)
+        if time.monotonic() < self._ref_retry_at.get(key, 0.0):
+            return pos              # (its last read failed: not tried again on every look)
+        since = self._ref_seen.get(key) or d.get("ref_seen_msc")
+        try:
+            since_msc = int(since) if since is not None else None
+            armed_msc = int(d["ref_armed_msc"]) if d.get("ref_armed_msc") is not None else None
+            tp_from = int(d["ref_tp_msc"]) if d.get("ref_tp_msc") is not None else None
+        except (TypeError, ValueError):
+            since_msc = armed_msc = tp_from = None
+        # (the first look: the watch starts at that account's latest tick - its server clock is never converted)
+        seen = await self._reference_prices(ref, trade.plan, d.get("raw_symbol"), key, since_msc,
+                                            armed_msc if since_msc is not None else None)
+        if seen is None:
+            self._ref_retry_at[key] = time.monotonic() + REFERENCE_PRICE_RETRY_SEC
+            warn_key = (trade.id, f"{pos.broker}:refprice")
+            last = self._virtual_warned.get(warn_key)
+            if last is None or time.monotonic() - last >= VIRTUAL_NOTE_THROTTLE_SEC:
+                self._virtual_warned[warn_key] = time.monotonic()
+                await self._notify(
+                    f"⚠️ {label} {esc(pos.broker)}: {esc(ref)} fiyatı okunamıyor ({esc(ref)} bağlı değil, sembolü yok "
+                    f"ya da fiyat gelmiyor); {esc(pos.broker)} girişi {level} seviyesi için beklemeye devam ediyor, "
+                    "limit emir KONMAZ.", Severity.WARNING)
+            return pos
+        self._ref_retry_at.pop(key, None)
+        long = pos.side is Side.LONG
+        now_msc, now_bid, now_ask = seen["now"]
+        stop = pos.stop_loss / mult if pos.stop_loss is not None else None
+        tp1 = pos.take_profits[0].price / mult if pos.take_profits else None
+        # The whole window - the prices since the previous look and the latest one - is judged at once, like the
+        # crypto watch's candles: by its extremes, never by the order inside it (a bar has none). A long enters on
+        # the ask and leaves on the bid (its stop and targets), a short the other way round - as that account's own
+        # orders would. The stop and the first target are judged before the entry: passed anywhere in the window,
+        # the waiting entry is cancelled, whatever else the window holds.
+        window = [*seen["samples"], (now_msc, now_bid, now_bid, now_ask, now_ask)]
+        # (``partial``: the bar of the minute the watch started in, read because the ticks could not be: it also holds
+        # prices from before the watch - counted for the stop alone, never for a touch or the first target)
+        stop_window = [*window, *(seen.get("partial") or [])]
+        exit_worst = min(s[1] for s in stop_window) if long else max(s[4] for s in stop_window)  # towards the stop
+        entry_best = min(s[3] for s in window) if long else max(s[2] for s in window)    # towards the entry
+        gap: str | None = None
+        if stop is not None and ((long and exit_worst <= stop) or (not long and exit_worst >= stop)):
+            gap = f"{esc(ref)} fiyatı ({fmt_price(exit_worst)}) stop seviyesini ({fmt_price(stop)}) geçti"
+        armed = d.get("virtual_tp_armed", True) is not False
+        armed_now = False
+        if gap is None and tp1 is not None:
+            # "The price ran to the first target without touching the entry: the trade idea is played out" - the
+            # crypto rule: it counts once the price has been BETWEEN the entry and that target (a pullback limit
+            # starts beyond its first target and has to come back through it first), and only for the prices after
+            # that moment (``ref_tp_msc``, that account's server clock, stored at once: a window read again - after
+            # a busy look, a restart, the bar of the current minute - never counts what came before it).
+            counted = [s for s in window if tp_from is None or (s[0] is not None and s[0] > tp_from)]
+            # Bars cannot be split: the bar of the minute the rule armed in also holds the prices before it. Like
+            # the crypto watch, that bar does not count - except a new extreme it made after the arming (beyond the
+            # one it had when the rule armed, ``ref_tp_bar``): that part came after it.
+            bar = d.get("ref_tp_bar")
+            if isinstance(bar, dict) and seen.get("source") == "bars":
+                for s in window:
+                    try:
+                        if s[0] == int(bar["msc"]) and ((long and s[2] > float(bar["hi"]))
+                                                         or (not long and s[1] < float(bar["lo"]))):
+                            counted.append(s)
+                    except (KeyError, TypeError, ValueError):
+                        break
+            if not armed:
+                if any((long and s[1] < tp1) or (not long and s[4] > tp1) for s in counted):
+                    armed = armed_now = True
+                    counted = [window[-1]]            # in this very look only the price right now comes after it
+                else:
+                    counted = []
+            if counted:
+                reached = max(s[2] for s in counted) if long else min(s[3] for s in counted)
+                if (long and reached >= tp1) or (not long and reached <= tp1):
+                    gap = f"{esc(ref)} fiyatı ({fmt_price(reached)}) ilk hedefi ({fmt_price(tp1)}) geçti"
+        if gap:
+            return await self._virtual_end(
+                trade, pos, PositionStatus.CANCELLED, "fiyat stop/hedefi geçti",
+                f"sanal tetik iptal edildi: {gap}; giriş tetiklenmeden fiyat uzaklaştı, işlem AÇILMADI.")
+        # A touch that could not be acted on at an earlier look (this account not connected / busy, its order not
+        # sent) is kept on the entry (``ref_touch``) until it is: decided again now, with the price now.
+        try:
+            kept = float(d["ref_touch"]) if d.get("ref_touch") is not None else None
+        except (TypeError, ValueError):
+            kept = None
+        if kept is not None:
+            entry_best = min(entry_best, kept) if long else max(entry_best, kept)
+        touched = level_px > 0 and ((long and entry_best <= level_px) or (not long and entry_best >= level_px))
+        now_px = now_ask if long else now_bid
+        at_level = (long and now_px <= level_px) or (not long and now_px >= level_px)
+        near = touched and (at_level or near_entry(now_px, level_px, stop, self._plan_risk(trade.plan)))
+        # fx's worker thread was busy: its history since the previous look was not read. The price now may cancel
+        # (stop / first target passed), but it never opens: the window it skipped may hold a stop pass - decided at
+        # the next full read (``upto_msc`` stayed at the start).
+        history_pending = bool(seen.get("busy") or seen.get("unread")) and since_msc is not None
+        if seen.get("unread") and since_msc is not None:
+            warn_key = (trade.id, f"{pos.broker}:refhistory")
+            last = self._virtual_warned.get(warn_key)
+            if last is None or time.monotonic() - last >= VIRTUAL_NOTE_THROTTLE_SEC:
+                self._virtual_warned[warn_key] = time.monotonic()
+                await self._notify(
+                    f"⚠️ {label} {esc(pos.broker)}: {esc(ref)} fiyat geçmişi (tik / dakika mumları) okunamadı; arada "
+                    f"stop geçilmiş olabileceği için {esc(pos.broker)} girişi şimdilik açılmıyor, okunabilince karar "
+                    "verilir.", Severity.WARNING)
+        pos = await self._reference_seen(trade, pos, key, seen.get("upto_msc"),
+                                         tp_armed_at=(now_msc, True, self._arming_bar(seen, now_msc, long))
+                                         if armed_now else None,
+                                         touch=(entry_best if near and not history_pending else None, near))
+        d = pos.data
+        if not touched or history_pending:
+            return pos
+        if not near:
+            # Only the history shows the touch; the price has turned back further than a market entry may be
+            # from the level (the validator's tolerance): never chase it, as the crypto watch does.
+            if not d.get("virtual_missed"):
+                noted = pos.model_copy(deep=True)
+                noted.data["virtual_missed"] = {"at": self._now().isoformat(), "extreme": entry_best,
+                                                "price": now_px}
+                await self.db.save_broker_position(trade.id, noted)
+                await self._log("virtual_missed", {"trade_id": trade.id, "broker": pos.broker,
+                                                   "extreme": entry_best, "price": now_px, "reference_broker": ref})
+                await self._notify(
+                    f"🧭 {label} {esc(pos.broker)}: tetik seviyesi görüldü ama fiyat uzaklaştı; "
+                    f"{esc(pos.broker)}'da açılmadı. {esc(ref)} fiyatı kısa süreliğine {fmt_price(entry_best)} "
+                    f"seviyesine geldi (tetik {level}), şimdi {fmt_price(now_px)}. Fiyat seviyeye dönerse açılır; "
+                    "stop veya ilk hedef geçilirse sanal giriş iptal edilir.", Severity.WARNING)
+                pos = noted
+            return pos
+        if broker is None:
+            return pos              # (touched while this account is not connected: decided again once it is back)
+        at = (f"{esc(ref)} {fmt_price(now_px)}" if at_level
+              else f"{esc(ref)} kısa süreliğine {fmt_price(entry_best)}, şimdi {fmt_price(now_px)}")
+        what = f"{esc(ref)} fiyatı giriş seviyesine geldi ({at})"
+        return await self._virtual_fire(trade, pos, broker, label, _Fire(
+            mode="price", what=what, busy_what=what, busy_tail="Yanıt geldiğinde fiyat hâlâ seviyedeyse açılır.",
+            done=what, seen=what,
+            retry_tail=f"Fiyat seviyede kaldıkça sonraki kontrollerde en çok {VIRTUAL_RETRY_MAX} kez daha denenecek.",
+            head=f"{what}, seviye {level}; piyasa emriyle açıldı",
+            ref_price=(now_bid + now_ask) / 2.0,
+            log={"reference_broker": ref, "ref_bid": now_bid, "ref_ask": now_ask, "source": seen.get("source")}))
+
+    async def _reference_prices(
+        self, name: str, plan: TradePlan, raw_symbol: str | None, key: tuple[int, str], since_msc: int | None,
+        armed_msc: int | None,
+    ) -> dict[str, Any] | None:
+        """What a waiting entry that watches the account ``name``'s price needs from it, read only, in the signal's
+        scale: its adapter's ``price_since`` (MetaTrader: the latest tick and every price since the previous look,
+        see Mt5Broker.price_since) - or, for an adapter without it, the latest quote alone. None when nothing can be
+        read (not connected, no such symbol, no price now)."""
+        ref = self._broker(name)
+        if ref is None:
+            return None
+        reader = getattr(ref, "price_since", None)
+        if reader is None:
+            reader = getattr(getattr(ref, "inner", None), "price_since", None)     # (a dry-run wrapper)
+        if reader is None:
+            quote = await self._reference_broker_quote(name, plan, raw_symbol, cache=key)
+            if quote is None:
+                return None
+            return {"now": (None, quote.bid, quote.ask), "samples": [], "source": None, "upto_msc": None}
+        try:
+            sym = self._ref_symbols.get(key)
+            if sym is None:
+                sym = await ref.resolve_symbol(plan.base_asset, plan.quote_asset, plan.market_type, raw_symbol)
+                if sym is None:
+                    return None
+                self._ref_symbols[key] = sym
+            data = await reader(sym.broker_symbol, since_msc, armed_msc)
+        except asyncio.CancelledError:
+            if not stray_cancel():
+                raise
+            logger.error("%s: the reference price read was cancelled without a cancel request", name)
+            return None
+        except BrokerError as exc:      # (expected now and then - not connected, market closed: no traceback)
+            self._ref_symbols.pop(key, None)
+            logger.warning("%s: the reference prices of %s could not be read: %s", name, plan.base_asset, exc)
+            return None
+        except Exception:
+            self._ref_symbols.pop(key, None)
+            logger.exception("%s: the reference prices of %s could not be read", name, plan.base_asset)
+            return None
+        m = price_multiplier(sym.extra)
+        try:
+            msc, bid, ask = data["now"]
+            samples = [(s[0], s[1] / m, s[2] / m, s[3] / m, s[4] / m) for s in data.get("samples") or []]
+            partial = [(s[0], s[1] / m, s[2] / m, s[3] / m, s[4] / m) for s in data.get("partial") or []]
+            out = {"now": (msc, float(bid) / m, float(ask) / m), "samples": samples, "source": data.get("source"),
+                   "upto_msc": data.get("upto_msc"), "busy": bool(data.get("busy")),
+                   "unread": bool(data.get("unread")), "partial": partial}
+        except (KeyError, IndexError, TypeError, ValueError):
+            logger.error("%s: unexpected price_since answer for %s", name, plan.base_asset)
+            return None
+        if not (out["now"][1] > 0 and out["now"][2] > 0):
+            return None
+        return out
+
+    @staticmethod
+    def _arming_bar(seen: dict[str, Any], now_msc: Any, long: bool) -> dict[str, Any] | None:
+        """The bar of the minute the first-target rule arms in (bars only), with the extreme it has at that moment
+        towards the target, on the bid side as bars are kept (a long: its high, a short: its low - the ask moves with
+        the bar's spread); see the bar rule in _reference_broker_check."""
+        if seen.get("source") != "bars" or now_msc is None:
+            return None
+        minute = int(now_msc) // _MINUTE_MS * _MINUTE_MS
+        for s in seen.get("samples") or []:
+            if s[0] == minute:
+                return {"msc": minute, "hi": s[2], "lo": s[1]}
+        return None
+
+    async def _reference_seen(self, trade: TradeRecord, pos: BrokerPosition, key: tuple[int, str],
+                              upto_msc: Any, *, tp_armed_at: tuple[Any, bool, Any] | None = None,
+                              touch: tuple[float | None, bool] | None = None) -> BrokerPosition:
+        """The reference account's prices up to ``upto_msc`` (its server's clock) have been looked at: the next look
+        starts there (kept in memory; stored at most once a minute, so that a restart also looks at the time the bot
+        was down). The first look's ``upto_msc`` is also when the watch started (``ref_armed_msc``, stored at once:
+        no bar of an earlier minute is read). ``tp_armed_at``: (server ms, True, the bar of that minute or None) - the
+        first-target rule counts from that moment on (``ref_tp_msc`` / ``ref_tp_bar``, stored at once). ``touch``:
+        (price, True) a touch near the level to keep until it is acted on (``ref_touch``, stored at once);
+        (None, False) the price is far from the level now: a kept touch is dropped (never chased)."""
+        try:
+            upto = int(upto_msc) if upto_msc is not None else None
+        except (TypeError, ValueError):
+            upto = None
+        if upto is not None:
+            self._ref_seen[key] = upto
+        try:
+            stored = int(pos.data.get("ref_seen_msc") or 0)
+        except (TypeError, ValueError):
+            stored = 0
+        first = upto is not None and pos.data.get("ref_armed_msc") is None
+        due = upto is not None and (first or stored == 0 or upto - stored >= _MINUTE_MS)
+        keep, near = touch if touch is not None else (None, True)
+        touch_change = (keep is not None and pos.data.get("ref_touch") != keep) or (
+            not near and pos.data.get("ref_touch") is not None)
+        if not due and tp_armed_at is None and not touch_change:
+            return pos
+        new = pos.model_copy(deep=True)
+        if first:
+            new.data["ref_armed_msc"] = upto
+        if due:
+            new.data["ref_seen_msc"] = upto
+        if tp_armed_at is not None:
+            at, armed, bar = tp_armed_at
+            new.data["virtual_tp_armed"] = armed
+            if at is not None:
+                new.data["ref_tp_msc"] = int(at)
+            else:
+                new.data.pop("ref_tp_msc", None)
+            if bar is not None:
+                new.data["ref_tp_bar"] = bar
+            else:
+                new.data.pop("ref_tp_bar", None)
+        if keep is not None:
+            new.data["ref_touch"] = keep
+        elif not near:
+            new.data.pop("ref_touch", None)
+        await self.db.save_broker_position(trade.id, new)
+        return new
+
+    async def _virtual_fire(
+        self, trade: TradeRecord, pos: BrokerPosition, broker: Broker, label: str, fire: _Fire
+    ) -> BrokerPosition:
+        """Send the order of a waiting virtual entry - the one fire path of every kind of waiting entry. At most one
+        order is ever sent for it: its state "firing" is stored before the order goes out (a restart in between ends
+        it, never sends it again) and the account counts as busy for new signals until it is answered."""
+        d = pos.data
         if await self._is_paused():
             return await self._virtual_end(
                 trade, pos, PositionStatus.CANCELLED, "bot duraklatılmış",
-                f"tetik seviyesine gelindi ({esc(ref_label(ref_id))} {fmt_price(px / mult)}) ama yeni işlem açma "
-                "duraklatılmış (/durdur); sanal giriş iptal edildi, işlem AÇILMADI.")
+                f"{fire.what} ama yeni işlem açma duraklatılmış (/durdur); sanal giriş iptal edildi, işlem AÇILMADI.")
         running = self._leg_running.get(pos.broker)
         if running is not None and not running.done():
             # Another signal's open is in flight on this account: no second open at the same time (its hedge /
@@ -5105,9 +5804,9 @@ class Engine:
                     and (last is None or time.monotonic() - last >= VIRTUAL_NOTE_THROTTLE_SEC)):
                 self._virtual_warned[busy_key] = time.monotonic()
                 await self._notify(
-                    f"🧭 {label} {esc(pos.broker)}: tetik seviyesine gelindi ama {esc(pos.broker)} önceki bir emrine "
+                    f"🧭 {label} {esc(pos.broker)}: {fire.busy_what} ama {esc(pos.broker)} önceki bir emrine "
                     f"hâlâ yanıt vermedi; yanıt gelene kadar {esc(pos.broker)} hesabına yeni emir gönderilmiyor. "
-                    "Yanıt geldiğinde fiyat hâlâ seviyedeyse açılır.", Severity.WARNING)
+                    f"{fire.busy_tail}", Severity.WARNING)
             return pos
 
         # Touched: from here on at most one order may ever be sent (state saved BEFORE sending).
@@ -5119,13 +5818,12 @@ class Engine:
         self._leg_running[pos.broker] = marker
         try:
             outcome = await self._open_on_broker(
-                broker, trade.plan, trade, d.get("raw_symbol"), virtual=fired, ref_price=float(ref), mute_errors=True)
+                broker, trade.plan, trade, d.get("raw_symbol"), virtual=fired, ref_price=fire.ref_price,
+                mute_errors=True)
         finally:
             if self._leg_running.get(pos.broker) is marker:
                 del self._leg_running[pos.broker]
             marker.set_result(None)
-        seen = (f"{esc(ref_label(ref_id))} fiyatı kısa süreliğine {fmt_price(worst / mult)} seviyesine geldi, şimdi "
-                f"{fmt_price(px / mult)}" if wicked else f"{esc(ref_label(ref_id))} fiyatı {fmt_price(px / mult)}")
         if outcome.position is None:
             if outcome.kind == "error" and not outcome.sent:
                 # Nothing was sent to the broker (its symbol, balance or price could not be read): the entry is
@@ -5140,9 +5838,8 @@ class Engine:
                                                       "failures": failures, "text": outcome.text})
                     if failures == 1:
                         await self._notify(
-                            f"🧭 {label}: tetiklendi ({seen}) ama {esc(pos.broker)} hesabına ulaşılamadı, emir "
-                            f"gönderilmedi: {outcome.text}\nFiyat seviyede kaldıkça sonraki kontrollerde en çok "
-                            f"{VIRTUAL_RETRY_MAX} kez daha denenecek.", Severity.WARNING)
+                            f"🧭 {label}: {fire.seen} ama {esc(pos.broker)} hesabına ulaşılamadı, emir "
+                            f"gönderilmedi: {outcome.text}\n{fire.retry_tail}", Severity.WARNING)
                     return again        # the touch stays "unseen": the next pass looks at it again
             if outcome.kind == "error":
                 await self._notify(outcome.text, Severity.ERROR)     # (muted in _open_on_broker)
@@ -5152,13 +5849,11 @@ class Engine:
                 # sent again (the entry ends here).
                 return await self._virtual_end(
                     trade, pos, status, outcome.kind,
-                    f"tetiklendi ({esc(ref_label(ref_id))} {fmt_price(px / mult)}); "
-                    f"{_unknown_open_text([pos.broker])}. Emir tekrar gönderilmeyecek, sanal giriş sona erdi: "
-                    f"{outcome.text}", Severity.ERROR, unknown=True)
+                    f"{fire.done}; {_unknown_open_text([pos.broker])}. Emir tekrar gönderilmeyecek, sanal giriş sona "
+                    f"erdi: {outcome.text}", Severity.ERROR, unknown=True)
             return await self._virtual_end(
                 trade, pos, status, outcome.kind,
-                f"tetiklendi ({esc(ref_label(ref_id))} {fmt_price(px / mult)}) ama işlem açılmadı, sanal giriş "
-                f"iptal edildi: {outcome.text}")
+                f"{fire.done} ama işlem açılmadı, sanal giriş iptal edildi: {outcome.text}")
         new = outcome.position
         self._virtual_forget(trade.id, pos.broker)
         icon = "✅" if outcome.kind == "ok" else "⚠️"
@@ -5173,10 +5868,9 @@ class Engine:
                     + esc("; ".join(queued)) + "); sonucu ayrıca bildirilecek.")
         # The headline names the account: only this broker's entry was waiting (the others are not touched here).
         await self._notify(
-            f"{icon} <b>{label} {esc(pos.broker)} hesabında {word}</b> — sanal tetik tetiklendi ({seen}, seviye "
-            f"{fmt_price(trigger / mult)})\n• {outcome.text}{then}",
+            f"{icon} <b>{label} {esc(pos.broker)} hesabında {word}</b> — {fire.head}\n• {outcome.text}{then}",
             Severity.INFO if outcome.kind == "ok" else Severity.ERROR)
-        await self._log("virtual_fired", {"trade_id": trade.id, "broker": pos.broker, "ref_price": ref,
+        await self._log("virtual_fired", {"trade_id": trade.id, "broker": pos.broker, **fire.log,
                                           "status": new.status.value, "kind": outcome.kind})
         return new
 
@@ -6558,6 +7252,13 @@ class Engine:
                     # the entry and it is found out again, from now on (see _virtual_check).
                     new.data["virtual_tp_armed"] = False
                     new.data["virtual_tp_ms"] = int(self._now().timestamp() * 1000)
+                    if new.data.get("reference_broker"):
+                        # (that account's prices are kept in its server's clock: only those after the ones looked
+                        # at so far count for the new target, see _reference_broker_check)
+                        upto = self._ref_seen.get((trade.id, pos.broker)) or new.data.get("ref_seen_msc")
+                        if upto is not None:
+                            new.data["ref_tp_msc"] = int(upto)
+                        new.data.pop("ref_tp_bar", None)
                 text = f"{esc(name)}: TP " + " / ".join(fmt_price(tp.price) for tp in tps)
                 if len(levels) < len(plan.take_profits):
                     text += " (gerçekleşen hedef tekrar konmadı)"
@@ -6886,9 +7587,10 @@ class Engine:
             if conf_id not in self._conf_locks and await self._get_confirmation(conf_id) is None:
                 return conf_id
 
-    async def _ask_eval(self, ev: Evaluation, chat_id: int, *, conf_id: str | None = None) -> PendingConfirmation:
+    async def _ask_eval(self, ev: Evaluation, chat_id: int, *, conf_id: str | None = None,
+                        early: dict[str, Any] | None = None) -> PendingConfirmation:
         return await self._ask(ev.kind, ev.action, ev.plan, ev.issues, ev.market_price, chat_id,
-                               ev.action.used_message_ids, conf_id=conf_id)
+                               ev.action.used_message_ids, conf_id=conf_id, early=early)
 
     async def _ask(
         self,
@@ -6901,13 +7603,17 @@ class Engine:
         source_ids: list[int],
         *,
         conf_id: str | None = None,
+        early: dict[str, Any] | None = None,
     ) -> PendingConfirmation:
+        """``early``: the accounts that took this open without waiting (:meth:`_open_early`); a question built on
+        another one (a correction, an edit, a re-ask) carries it on, so an approval never sends them it again."""
         now = self._now()
         conf_id = conf_id or await self._new_conf_id()
         conf = PendingConfirmation(
             id=conf_id, kind=kind, action=action, plan=plan, issues=list(issues), market_price=market_price,
             source_chat_id=chat_id, source_message_ids=list(source_ids), created_at=now,
             expires_at=now + timedelta(seconds=self.config.notifier.confirm_timeout_sec),
+            early=dict(early) if early else None,
         )
         await self._post_question(conf)
         await self._log("confirmation_asked", {
@@ -6962,6 +7668,8 @@ class Engine:
             await self._record_confirmation_outcome(conf)
             if conf.kind == "catch_up":
                 text = f"⌛ Süre doldu; {esc((conf.catch_up or {}).get('broker') or '?')} hesabında işlem açılmadı."
+            elif conf.early and conf.kind != "manage":
+                text = "⌛ Süre doldu; " + await self._early_kept_text(conf)
             else:
                 text = ("⌛ Süre doldu, değişiklik uygulanmadı." if conf.kind == "manage"
                         else "⌛ Süre doldu, işlem açılmadı.")
@@ -7006,6 +7714,8 @@ class Engine:
                 return f"Bu onay artık geçerli değil ({_CONF_STATUS_TR.get(conf.status, conf.status.value)})."
             if utc(conf.expires_at) <= self._now():
                 text = "⌛ Bu onayın süresi dolmuş; işlem yapılmadı."
+                note = await self._early_kept_note(conf) if conf.kind != "manage" else ""
+                text += f" {note}" if note else ""
                 await self._finish(conf, ConfirmationStatus.EXPIRED, text)
                 return text
             if conf.kind == "catch_up":
@@ -7024,7 +7734,8 @@ class Engine:
                     return text
                 return await self._approve_catch_up(conf, who=who, approval=approval)
             if not approved:
-                text = "❌ İptal edildi; işlem yapılmadı."
+                text = ("❌ İptal edildi; " + await self._early_kept_text(conf)
+                        if conf.early and conf.kind != "manage" else "❌ İptal edildi; işlem yapılmadı.")
                 await self._finish(conf, ConfirmationStatus.REJECTED, text)
                 return text
             if conf.plan is None:
@@ -7033,32 +7744,156 @@ class Engine:
                 return await self._approve_open(conf, conf.plan)
             return await self._approve_management(conf, conf.plan)
 
+    @staticmethod
+    def _early_trade_id(conf: PendingConfirmation) -> int | None:
+        try:
+            return int((conf.early or {}).get("trade_id"))  # type: ignore[arg-type]
+        except (TypeError, ValueError):
+            return None
+
+    async def _early_trade(self, conf: PendingConfirmation) -> TradeRecord | None:
+        """The trade the confirm_open: false accounts opened for ``conf`` before the answer (None: none / unknown)."""
+        trade_id = self._early_trade_id(conf)
+        return await self.db.get_trade(trade_id) if trade_id is not None else None
+
+    @staticmethod
+    def _early_done(conf: PendingConfirmation) -> list[str]:
+        """The accounts that are never sent ``conf``'s signal again: they took it (or may have) before the answer."""
+        info = conf.early or {}
+        return [str(n) for n in (info.get("done") or [])]
+
+    async def _early_ended_alone(self, trade: TradeRecord) -> bool:
+        """Did the early accounts' trade end only because their own waiting entries ended by their own rules (expiry,
+        the price passed the stop or reached the first target before the entry, a refusal at the touch) - never
+        filled, and not by the trader (a cancel, "stop girişe")? Then nothing of the trade was played out by the
+        trader: an approval opens the other accounts as a fresh trade, with its own price check - what an "Evet" did
+        before confirm_open existed (on every route, with or without reference_broker)."""
+        rows = await self.db.broker_positions(trade.id)
+        return bool(rows) and all(
+            p.status in (PositionStatus.CANCELLED, PositionStatus.FAILED) and not reference_leg_filled(p)
+            and (p.data or {}).get("virtual_end") not in (None, "stop girişe çekildi")
+            for p in rows)
+
+    @staticmethod
+    def _same_signal(a: TradePlan, b: TradePlan) -> bool:
+        """The same trade idea: asset / pair, side and route (a correction or an edit may have changed one)."""
+        return same_pair(a, b) and a.side is b.side and (a.route or None) == (b.route or None)
+
+    async def _early_kept_note(self, conf: PendingConfirmation) -> str:
+        """HTML sentence: the early accounts' trade stays (empty when there is none, or it has ended); while their
+        order is still unanswered (the trade is being sent), it says so instead of calling it open."""
+        if not conf.early:
+            return ""
+        names = [str(n) for n in (conf.early.get("brokers") or [])]
+        trade = await self._early_trade(conf)
+        if trade is None or trade.status not in ACTIVE_TRADE:
+            return ""
+        if trade.status is TradeStatus.OPENING:
+            return (f"{_names(names)} hesabına onay beklenmeden gönderilen emrin yanıtı bekleniyor; açılırsa #{trade.id} "
+                    "işlemi normal yönetilir.")
+        if await self._closing(trade):
+            return f"{_names(names)} hesabındaki #{trade.id} işlemi kapanıyor (trader kapattı, kapanışı sürüyor)."
+        return (f"{_names(names)} hesabındaki #{trade.id} işlemi açık kalır (onay beklenmeden açılmıştı) ve normal "
+                "yönetilir.")
+
+    async def _early_kept_text(self, conf: PendingConfirmation) -> str:
+        """HTML, after "❌ İptal edildi; " / "⌛ Süre doldu; ": the others do not open, the early trade stays."""
+        note = await self._early_kept_note(conf)
+        return "diğer hesaplarda işlem açılmadı." + (f" {note}" if note else "")
+
     async def _approve_open(self, conf: PendingConfirmation, plan: TradePlan) -> str:
+        """``conf.early``: accounts set to confirm_open: false took the signal before this answer (:meth:`_open_early`).
+        Those of them whose early attempt sent an order (or may have: ``done``) are never sent it again; one whose
+        early attempt sent nothing (a rule of its own refused it) is tried again with the others, as the question
+        said. The other accounts are added to the early trade while it is active and is the same trade idea (asset,
+        side, route); the levels the owner did not correct take the trade's current ones (the trader may have moved
+        them meanwhile), sized from the signal's own stop. A correction / edit that changed the idea opens the others
+        as a trade of their own, the early accounts left out. A same-idea early trade that the trader closed or
+        cancelled meanwhile is not opened on the others; one that only its own waiting-entry rules ended is no
+        decision of the trader's: the others open as a fresh trade, as an "Evet" always did."""
         if await self._is_paused():
             text = "⏸ Sistem duraklatılmış; işlem açılmadı. (/devam yazıp sinyali tekrar değerlendirin.)"
+            note = await self._early_kept_note(conf)
+            text += f"\n{note}" if note else ""
             await self._finish(conf, ConfirmationStatus.REJECTED, text, refused="sistem duraklatılmıştı")
             return text
         async with self._holding_open_lock(plan.summary_tr or "onaylanan sinyal"):
             if not self._accepting:
                 return SHUTDOWN_TEXT
+            early = await self._early_trade(conf) if conf.early else None
+            early_names = [str(n) for n in ((conf.early or {}).get("brokers") or [])]
+            skip = self._early_done(conf) if conf.early else []
+            same = early is not None and self._same_signal(plan, early.plan)
+            apart = ""
+            if early is not None and not same:
+                # The owner's correction (or the trader's edit) made it another trade idea: the early accounts that
+                # took (or may have taken) the first reading are never sent this one too; one whose early attempt
+                # sent nothing takes this one like any account. The first reading's trade stays apart: the trader's
+                # later replies to the signal reach the newest trade of the message (this one), so it is named.
+                held = [n for n in early_names if n in skip]
+                if held:
+                    apart = (f"• {_names(held)}: onay beklenmeden açılan #{early.id} işlemi ilk okumayla "
+                             f"({esc(early.plan.base_asset)} {early.plan.side.value.upper()}) açılmıştı; bu onay ayrı "
+                             f"bir işlem olarak açıldı, {_names(held)} hesabına gönderilmedi. #{early.id} ayrı kalır: "
+                             "sinyale gelen sonraki talimatlar yeni işleme uygulanır, gerekirse #"
+                             f"{early.id} işlemini elle yönetin (/pozkapat).")
+            into = early if same and early is not None and early.status in ACTIVE_TRADE else None
+            if (same and early is not None and early.status in (TradeStatus.CLOSED, TradeStatus.CANCELLED)
+                    and not await self._early_ended_alone(early)):
+                how = "kapandı" if early.status is TradeStatus.CLOSED else "iptal edildi"
+                text = (f"⛔ #{early.id} işlemi ({_names(skip or early_names)}) onay beklerken {how}; diğer hesaplarda "
+                        "işlem açılmadı.")
+                await self._finish(conf, ConfirmationStatus.REJECTED, text,
+                                   refused=f"#{early.id} işlemi onay beklerken {how}")
+                return text
+            if into is not None and await self._closing(into):
+                # The trader closed it and the bot's close of it is still owed / on its way: it is over.
+                text = (f"⛔ #{into.id} işlemi ({_names(skip or early_names)}) onay beklerken kapanıyor (trader "
+                        "kapattı, kapanışı sürüyor); diğer hesaplarda işlem açılmadı.")
+                await self._finish(conf, ConfirmationStatus.REJECTED, text,
+                                   refused=f"#{into.id} işlemi onay beklerken kapanıyordu")
+                return text
+            approved = plan             # (as the owner approved it: a re-ask shows this, never the trade's moves)
+            size_stop: float | None = None
+            base = into if into is not None else (early if same else None)
+            if base is not None:
+                # The trader moved the trade's stop / targets while the question waited (applied to the early
+                # accounts): the others open with the trade's levels as they are now, like a catch-up open - except
+                # what the owner corrected himself (his value differs from the first reading): that stands. A moved
+                # stop never sizes the position (the signal's own stop does, see _open_on_broker size_stop). The same
+                # for a fresh trade of the same idea (the early trade never held it, or only its own rules ended it).
+                first = base.plan
+                update: dict[str, Any] = {}
+                if (_same_price(plan.stop_loss, first.stop_loss)
+                        and not _same_price(base.current_stop_loss, first.stop_loss)):
+                    update["stop_loss"] = base.current_stop_loss
+                    size_stop = plan.stop_loss
+                if ([tp.price for tp in plan.take_profits] == [tp.price for tp in first.take_profits]
+                        and [tp.price for tp in base.current_take_profits] != [tp.price for tp in first.take_profits]):
+                    update["take_profits"] = list(base.current_take_profits)
+                if update:
+                    plan = plan.model_copy(update=update)
+            note = await self._early_kept_note(conf)
             limit = self.config.risk.max_open_trades
-            active = await self.db.active_trades()
+            # (the early accounts' trade is this signal itself: it never counts against its own approval)
+            active = [t for t in await self.db.active_trades() if into is None or t.id != into.id]
             if guards.max_open_trades_reached(active, limit):
                 text = (f"⛔ Açık işlem sınırına ({limit}) ulaşıldı; işlem açılmadı.\n"
-                        f"{self._limit_filled_by(active)}")
+                        f"{self._limit_filled_by(active)}" + (f"\n{note}" if note else ""))
                 await self._finish(conf, ConfirmationStatus.REJECTED, text,
                                    refused=f"açık işlem sınırı ({limit}) doluydu")
                 return text
             # Re-check existing trades like the automatic path does: since the question was asked, the
             # same signal may have been executed (a repost, or a reply built on the same message).
             known = {(i.code, i.message_tr) for i in conf.issues}
-            fresh = [i for i in await self._trade_issues(plan, conf.source_chat_id)
+            fresh = [i for i in await self._trade_issues(plan, conf.source_chat_id,
+                                                         exclude_trade=early.id if early is not None else None)
                      if (i.code, i.message_tr) not in known]
             if fresh:
-                return await self._reask_open(conf, plan, fresh)
+                return await self._reask_open(conf, approved, fresh)
             problem = await self._approval_price_problem(plan, conf.action.symbol)
             if problem:
-                text = f"⛔ {esc(problem)} — işlem açılmadı."
+                text = f"⛔ {esc(problem)} — işlem açılmadı." + (f"\n{note}" if note else "")
                 await self._finish(conf, ConfirmationStatus.REJECTED, text, refused=problem[:1].lower() + problem[1:])
                 return text
             # Mark first: a crash during execution must never leave it approvable again.
@@ -7067,10 +7902,31 @@ class Engine:
             await self.db.save_confirmation(conf)
             self._disarm_expiry(conf.id)
             try:
-                result = await self.execute_open(plan, raw_symbol=conf.action.symbol)
+                try:
+                    result = await self.execute_open(plan, raw_symbol=conf.action.symbol, skip=skip, into=into,
+                                                     size_stop=size_stop)
+                except _IntoEnded as ended:
+                    # The trader closed / cancelled it while this approval was being checked (found under its lock).
+                    gone = ended.trade
+                    if gone is not None and (gone.status is TradeStatus.FAILED
+                                             or await self._early_ended_alone(gone)):
+                        # (never held by the early accounts, or only their own waiting-entry rules ended it: as at
+                        # the top of this approval, the others open as a fresh trade)
+                        result = await self.execute_open(plan, raw_symbol=conf.action.symbol, skip=skip,
+                                                         size_stop=size_stop)
+                    else:
+                        how = ("kapanıyor" if gone is not None and gone.status in ACTIVE_TRADE
+                               else "kapandı" if gone is not None and gone.status is TradeStatus.CLOSED
+                               else "iptal edildi")
+                        text = (f"⛔ #{into.id if into is not None else '?'} işlemi ({_names(skip or early_names)}) "
+                                f"onay beklerken {how}; diğer hesaplarda işlem açılmadı.")
+                        await self._finish(conf, ConfirmationStatus.REJECTED, text, refused=f"işlem onay beklerken {how}")
+                        return text
             except Exception as exc:
                 logger.exception("execute_open failed for confirmation %s", conf.id)
                 result = f"🚨 İşlem açılırken hata: <code>{esc(exc)}</code>"
+            if apart:
+                result += f"\n{apart}"
         await self._finish(conf, ConfirmationStatus.APPROVED, result)
         return result
 
@@ -7088,7 +7944,7 @@ class Engine:
         ev = Evaluation("open", conf.action, plan, merge_issues(fresh, kept, pending),
                         market if market is not None else conf.market_price)
         await self._ask(ev.kind, ev.action, ev.plan, ev.issues, ev.market_price, conf.source_chat_id,
-                        list(conf.source_message_ids), conf_id=new_id)
+                        list(conf.source_message_ids), conf_id=new_id, early=conf.early)
         await self._log("approval_reasked", {"id": conf.id, "new_id": new_id, "issues": [i.code for i in fresh]})
         return text
 
@@ -7190,13 +8046,15 @@ class Engine:
             actions = [a for a in result.actions if a.action is not ActionType.NONE]
             if not actions:
                 out = "❌ Düzeltmeye göre işlem talimatı yok; işlem yapılmadı."
+                note = await self._early_kept_note(conf) if conf.kind != "manage" else ""
+                out += f" {note}" if note else ""
                 await self._finish(conf, ConfirmationStatus.REJECTED, out)
                 return out
             action = actions[0]
             if not action.used_message_ids:
                 action = action.model_copy(update={"used_message_ids": list(conf.source_message_ids)})
             ev = await self.evaluate(action, conf.source_chat_id, reply_to=reply_to, exclude_conf=conf.id,
-                                     route=route)
+                                     route=route, exclude_trade=self._early_trade_id(conf))
             assert ev is not None
             ev.issues = merge_issues(ev.issues, self._topic_unknown_issues(ev, route))
             if len(actions) > 1:
@@ -7204,7 +8062,8 @@ class Engine:
                                         "Düzeltmede birden fazla talimat var; yalnızca ilki gösteriliyor."))
             new_id = await self._new_conf_id()
             await self._finish(conf, ConfirmationStatus.SUPERSEDED, f"♻️ Düzeltildi → yeni onay #{new_id}")
-        new = await self._ask_eval(ev, conf.source_chat_id, conf_id=new_id)
+        # (asked, never opened at once: the early accounts' trade, if any, is carried on - never sent it again)
+        new = await self._ask_eval(ev, conf.source_chat_id, conf_id=new_id, early=conf.early)
         if new.plan is None:
             return f"♻️ Düzeltme işlendi ama hâlâ eksik bilgi var (onay #{new.id}). ✏️ Düzelt ile tekrar yazın."
         return f"♻️ Düzeltme işlendi; yeni onay gönderildi (#{new.id}). Doğruysa ✅ Onayla'ya basın."
@@ -7231,6 +8090,12 @@ class Engine:
             if trade is not None:
                 if trade.status in ACTIVE_TRADE:
                     await self._edited_trade_signal(trade, current)
+                # A question still open for the other accounts of a trade that confirm_open: false accounts took
+                # before the answer is read again too (its "Evet" must open what the message says now).
+                for conf in await self.db.pending_confirmations():
+                    if (conf.early and self._early_trade_id(conf) == trade.id
+                            and conf.source_chat_id == msg.chat_id and msg.message_id in conf.source_message_ids):
+                        await self._edited_confirmation(conf.id)
                 return
             for conf in await self.db.pending_confirmations():
                 if conf.source_chat_id == msg.chat_id and msg.message_id in conf.source_message_ids:
@@ -7423,20 +8288,22 @@ class Engine:
                 return
             actions = [a for a in result.actions if a.action is not ActionType.NONE]
             if not actions:
+                note = await self._early_kept_note(conf) if conf.kind != "manage" else ""
                 await self._finish(conf, ConfirmationStatus.SUPERSEDED,
-                                   "♻️ Mesaj düzenlendi; artık işlem talimatı görünmüyor — işlem yapılmadı.")
+                                   "♻️ Mesaj düzenlendi; artık işlem talimatı görünmüyor — işlem yapılmadı."
+                                   + (f" {note}" if note else ""))
                 return
             action = actions[0]
             if not action.used_message_ids:
                 action = action.model_copy(update={"used_message_ids": list(conf.source_message_ids)})
             ev = await self.evaluate(action, conf.source_chat_id, reply_to=reply_to, exclude_conf=conf.id,
-                                     route=route)
+                                     route=route, exclude_trade=self._early_trade_id(conf))
             assert ev is not None
             ev.issues = merge_issues([_issue("signal_edited", "Sinyal mesajı düzenlendi.")], ev.issues,
                                      self._topic_unknown_issues(ev, route))
             new_id = await self._new_conf_id()
             await self._finish(conf, ConfirmationStatus.SUPERSEDED, f"♻️ Mesaj düzenlendi → yeni onay #{new_id}")
-        await self._ask_eval(ev, conf.source_chat_id, conf_id=new_id)
+        await self._ask_eval(ev, conf.source_chat_id, conf_id=new_id, early=conf.early)
 
     # ------------------------------------------------------------------ owner commands
     async def status_text(self) -> str:
@@ -7492,11 +8359,7 @@ class Engine:
                 if accounts is not None and p.broker not in accounts:
                     continue
                 if is_virtual_pending(p):
-                    ref_id = str(p.data.get("reference_exchange") or "")
-                    trig = p.data.get("trigger_price")
-                    mult = price_multiplier(p.data)
-                    bits = [f"• {esc(p.broker)}: {pos_status_text(p)}",
-                            f"{esc(ref_label(ref_id))} fiyatı {fmt_price(trig / mult if trig else None)} seviyesine değince"]
+                    bits = [f"• {esc(p.broker)}: {pos_status_text(p)}", waiting_entry_text(p, owner=accounts is None)]
                 else:
                     bits = [f"• {esc(p.broker)}: {_POS_STATUS_TR.get(p.status, p.status.value)}",
                             f"{_qty(p.remaining_quantity if p.status is PositionStatus.OPEN else p.quantity)}"]

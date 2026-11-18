@@ -128,10 +128,17 @@ ENV = {
 SECRETS = [v for v in ENV.values() if "SECRET" in v]
 KNOWS_OPEN_RISK = "daily_loss_include_open_risk" in _BrokerBase.model_fields
 KNOWS_LOT_ROUNDING = "lot_rounding" in _BrokerBase.model_fields
+# The friend's second round (step 9): confirm_open / fees_in_risk / lot_rounding "up" / reference_broker.
+KNOWS_STEP9 = all(k in _BrokerBase.model_fields for k in ("confirm_open", "fees_in_risk", "reference_broker"))
+LOT_ROUNDING = "up" if KNOWS_STEP9 else "nearest"
+# The lines the update adds to the tickmill block of the production replica (risk_usd 45 -> 50 is replaced in place).
+TICKMILL_ADDED = (["confirm_open: false", "fees_in_risk: false", "lot_rounding: up", "reference_broker: fx"]
+                  if KNOWS_STEP9 else ["lot_rounding: nearest"] if KNOWS_LOT_ROUNDING else [])
+N_TICKMILL = (1 if KNOWS_LOT_ROUNDING else 0) + len(TICKMILL_ADDED)
 # Settings the production replica needs: binance x2, notifier x2, risk x2, the kripto topic (+ fx open risk)
-# (+ tickmill: risk_usd 45 -> 50 and lot_rounding: nearest; no Tickmill terminal on the test machine: it stays on
+# (+ tickmill: risk_usd 45 -> 50 and the TICKMILL_ADDED lines; no Tickmill terminal on the test machine: it stays on
 # MetaApi, see tests/test_mt5_bridge_migrate.py).
-N_CHANGES = (8 if KNOWS_OPEN_RISK else 7) + (2 if KNOWS_LOT_ROUNDING else 0)
+N_CHANGES = (8 if KNOWS_OPEN_RISK else 7) + N_TICKMILL
 # The production text as the friend's 1R change leaves it (the only value replaced in place in the tickmill block).
 PROD_AFTER = PROD_YAML.replace("    risk_usd: 45\n", "    risk_usd: 50\n") if KNOWS_LOT_ROUNDING else PROD_YAML
 PLACEHOLDER = re.compile(r"\$\{[^}]*\}")
@@ -197,7 +204,7 @@ def test_migrate_prod_replica_changes_only_the_wanted_keys(tmp_path: Path) -> No
         ["explicit_market_drift: follow", "notify_on_execution: true", "notify_on_ignored: true",
          "daily_loss_limit_pct: 0", "no_hedge: true", "risk:", "max_open_trades: 25", "allow_min_qty_round_up: true"]
         + (["daily_loss_include_open_risk: true"] if KNOWS_OPEN_RISK else [])
-        + (["lot_rounding: nearest"] if KNOWS_LOT_ROUNDING else []))
+        + TICKMILL_ADDED)
     # the two binance settings sit at the end of the binance block, in the block's own indentation
     assert "    max_leverage: 125\n    daily_loss_limit_pct: 0\n    no_hedge: true\n  - name: breakout\n" in new_text
     # placeholders byte for byte, no secret written
@@ -252,8 +259,8 @@ def test_migrate_existing_keys_with_other_values_are_changed_in_place(tmp_path: 
     assert "  notify_on_execution: true    # her işlemi bildir\n" in new and "  notify_on_ignored: true\n" in new
     assert "  max_open_trades: 25 # eski\n" in new and "  allow_min_qty_round_up: true\n" in new
     assert "      explicit_market_drift: follow\n" in new
-    assert len(new.splitlines()) == len(text.splitlines()) + (1 if KNOWS_OPEN_RISK else 0) + (
-        1 if KNOWS_LOT_ROUNDING else 0)                                   # nothing else added
+    assert len(new.splitlines()) == len(text.splitlines()) + (1 if KNOWS_OPEN_RISK else 0) + len(
+        TICKMILL_ADDED)                                                   # nothing else added
     assert new.count("\nrisk:") == 1                                      # the existing section was used, no second one
 
 
@@ -267,7 +274,7 @@ def test_migrate_leaves_alone_what_is_already_as_wanted(tmp_path: Path) -> None:
                         if KNOWS_OPEN_RISK else "    daily_loss_limit_pct: 3\n")
     text += "risk:\n  max_open_trades: 40\n  allow_min_qty_round_up: true\n"
     if KNOWS_LOT_ROUNDING:      # (lot_rounding already there: the friend's 45 is a value written by hand, it stays)
-        text = text.replace("    risk_usd: 45\n", "    risk_usd: 45\n    lot_rounding: nearest\n")
+        text = text.replace("    risk_usd: 45\n", "    risk_usd: 45\n" + "".join(f"    {line}\n" for line in TICKMILL_ADDED))
     path = prod_file(tmp_path, text)
     assert m.migrate_config(path) == []
     assert path.read_text(encoding="utf-8") == text
@@ -283,7 +290,10 @@ def test_migrate_config_without_fx_and_binance_brokers(tmp_path: Path) -> None:
     path = prod_file(tmp_path, yaml.safe_dump(data, sort_keys=False, allow_unicode=True))
     notes: list[str] = []
     lines = m.migrate_config(path, notes=notes)
-    assert len(lines) == 5 + (2 if KNOWS_LOT_ROUNDING else 0)          # (+ the two tickmill settings)
+    # (+ the tickmill settings; without an fx account no reference_broker, said in a note)
+    assert len(lines) == 5 + N_TICKMILL - (1 if KNOWS_STEP9 else 0)
+    if KNOWS_STEP9:
+        assert any("reference_broker yazılmadı" in n for n in notes)
     assert not any(line.startswith(("binance", "fx")) for line in lines)
     assert any("'fx' adlı broker yok" in n for n in notes) and any("'binance' adlı broker yok" in n for n in notes)
     cfg = load_config(path)
@@ -299,7 +309,7 @@ def test_migrate_skips_a_key_the_installed_config_model_does_not_know(tmp_path: 
     path = prod_file(tmp_path)
     notes: list[str] = []
     lines = m.migrate_config(path, notes=notes)
-    assert len(lines) == 7 + (2 if KNOWS_LOT_ROUNDING else 0)
+    assert len(lines) == 7 + N_TICKMILL
     assert "daily_loss_include_open_risk" not in path.read_text(encoding="utf-8")
     assert any("daily_loss_include_open_risk" in n and "tanımıyor" in n for n in notes)
     load_config(path)                                                    # still a valid file
@@ -2205,7 +2215,7 @@ def test_the_guide_lists_every_setting_the_update_changes() -> None:
     for change in changes:
         row = next((ln for ln in table.splitlines() if f"`{change.key}`" in ln), None)
         assert row is not None, change.key
-        shown = "true" if change.value is True else str(change.value)
+        shown = "true" if change.value is True else "false" if change.value is False else str(change.value)
         assert f"| `{shown}` |" in row, (change.key, row)
 
 
@@ -2425,8 +2435,8 @@ def test_migrate_switches_tickmill_to_the_tickmill_terminal_and_keeps_every_othe
             "yazmanız yeterli (eski bir sürüme dönüş yalnızca guncelle.py --geri-al ile)"
             ) in lines
     assert "tickmill: 1R riski 45 → 50 USD (risk_usd: 50)" in lines
-    assert ("tickmill: lot en yakın adıma yuvarlanacak (0.125 → 0.13; stopta kayıp hedefi %15'ten fazla aşacaksa "
-            "aşağı yuvarlanır) (lot_rounding: nearest)") in lines
+    assert any(line.startswith("tickmill: lot ") and line.endswith(f"(lot_rounding: {LOT_ROUNDING})")
+               for line in lines)
     assert len(lines) == N_CHANGES + 1                                    # one line for the switch (3 keys)
     new_text = path.read_text(encoding="utf-8")
     assert "    type: mt5_bridge\n" in new_text and "    type: metaapi\n" not in new_text
@@ -2434,7 +2444,7 @@ def test_migrate_switches_tickmill_to_the_tickmill_terminal_and_keeps_every_othe
     cfg = load_config(path)
     t = tickmill_block(cfg)
     assert (t.type, t.terminal_path, t.broker_company, t.risk_usd, t.lot_rounding) == (
-        "mt5_bridge", exe, "Tickmill", 50, "nearest")
+        "mt5_bridge", exe, "Tickmill", 50, LOT_ROUNDING)
     old = yaml.safe_load(PROD_YAML)["brokers"][3]
     new = yaml.safe_load(new_text)["brokers"][3]
     assert {k: v for k, v in new.items() if k in old and k not in ("type", "risk_usd")} == {
@@ -2465,7 +2475,7 @@ def test_migrate_without_a_tickmill_terminal_leaves_metaapi_and_says_so_in_one_l
                     "\"<terminal64.exe yolu>\"' ile ya da COPYTRADER_TICKMILL_TERMINAL ortam değişkeniyle yapın.")
     t = tickmill_block(load_config(path))
     assert t.type == "metaapi" and t.terminal_path is None
-    assert t.risk_usd == 50 and t.lot_rounding == "nearest"               # the friend's two requests all the same
+    assert t.risk_usd == 50 and t.lot_rounding == LOT_ROUNDING            # the friend's requests all the same
 
 
 def test_tickmill_terminal_search_and_its_override(tmp_path: Path) -> None:
@@ -2508,8 +2518,65 @@ def test_migrate_raises_tickmill_risk_only_from_exactly_45_and_only_once(tmp_pat
     assert m.migrate_config(path, terminal=none) == []
     assert tickmill_block(load_config(path)).risk_usd == 45
     # a lot_rounding chosen by hand is never changed either
-    path.write_text(text.replace("    lot_rounding: nearest\n", "    lot_rounding: down\n"), encoding="utf-8")
+    path.write_text(text.replace(f"    lot_rounding: {LOT_ROUNDING}\n", "    lot_rounding: down\n"), encoding="utf-8")
     assert m.migrate_config(path, terminal=none) == [] and tickmill_block(load_config(path)).lot_rounding == "down"
+
+
+@pytest.mark.skipif(not KNOWS_STEP9, reason="this version has no confirm_open / fees_in_risk / reference_broker")
+def test_migrate_step_9_after_an_earlier_update_turns_nearest_into_up_and_adds_the_rest(tmp_path: Path) -> None:
+    """A config an earlier update already changed (risk_usd 50, lot_rounding: nearest): step 9 turns "nearest" into
+    "up" and adds the three new keys; the risk stays 50 (step 8 is done); a second run changes nothing."""
+    m = migrate_mod()
+    none = (None, None)
+    text = PROD_YAML.replace("    risk_usd: 45\n", "    risk_usd: 50\n    lot_rounding: nearest\n")
+    path = prod_file(tmp_path, text)
+    lines = m.migrate_config(path, terminal=none)
+    tick = [line for line in lines if line.startswith("tickmill:")]
+    assert len(tick) == 4 and not any("risk_usd" in line for line in tick)
+    assert any(line.endswith("(lot_rounding: up) — önceki ayar: nearest") for line in tick)
+    new = path.read_text(encoding="utf-8")
+    assert "    lot_rounding: up\n" in new and "lot_rounding: nearest" not in new          # replaced in place
+    assert "lot_rounding_max_over" not in new                                          # its default (10) stands
+    t = tickmill_block(load_config(path))
+    assert (t.risk_usd, t.lot_rounding, t.confirm_open, t.fees_in_risk, t.reference_broker) == (
+        50, "up", False, False, "fx")
+    assert t.lot_rounding_max_over == 10.0
+    fx = broker_of(load_config(path), "fx")
+    assert (fx.confirm_open, fx.fees_in_risk, fx.lot_rounding, fx.reference_broker) == (True, None, "down", None)
+    assert m.migrate_config(path, terminal=none) == []                                 # idempotent
+
+
+@pytest.mark.skipif(not KNOWS_STEP9, reason="this version has no confirm_open / fees_in_risk / reference_broker")
+def test_migrate_step_9_leaves_every_value_written_by_hand(tmp_path: Path) -> None:
+    m = migrate_mod()
+    none = (None, None)
+    text = PROD_YAML.replace("    risk_usd: 45\n", "    risk_usd: 45\n    lot_rounding: down\n    confirm_open: true\n"
+                             "    fees_in_risk: true\n    reference_broker: fx\n")
+    path = prod_file(tmp_path, text)
+    lines = m.migrate_config(path, terminal=none)
+    assert not any(line.startswith("tickmill:") for line in lines)
+    t = tickmill_block(load_config(path))
+    assert (t.risk_usd, t.lot_rounding, t.confirm_open, t.fees_in_risk) == (45, "down", True, True)
+
+
+@pytest.mark.skipif(not KNOWS_STEP9, reason="this version has no confirm_open / fees_in_risk / reference_broker")
+@pytest.mark.parametrize("fx_change", ["disabled", "not_metatrader"])
+def test_migrate_step_9_reference_broker_only_with_an_enabled_metatrader_fx(tmp_path: Path, fx_change: str) -> None:
+    m = migrate_mod()
+    none = (None, None)
+    if fx_change == "disabled":
+        text = PROD_YAML.replace("  - name: fx\n    type: mt5\n", "  - name: fx\n    type: mt5\n    enabled: false\n")
+    else:                       # (fx as a paper account: not a MetaTrader account)
+        text = PROD_YAML.replace(
+            "  - name: fx\n    type: mt5\n    login: ${MT5_LOGIN}\n    password: ${MT5_PASSWORD}\n    server: ${MT5_SERVER}\n",
+            "  - name: fx\n    type: paper\n")
+    path = prod_file(tmp_path, text)
+    notes: list[str] = []
+    lines = m.migrate_config(path, notes=notes, terminal=none)
+    assert not any("reference_broker" in line for line in lines)
+    assert any("reference_broker yazılmadı" in n for n in notes)
+    t = tickmill_block(load_config(path))
+    assert t.reference_broker is None and t.confirm_open is False and t.lot_rounding == "up"
 
 
 def test_update_hands_the_tickmill_terminal_option_to_step_6(g: Any, tmp_path: Path,

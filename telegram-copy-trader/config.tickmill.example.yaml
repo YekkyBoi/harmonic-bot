@@ -33,6 +33,11 @@ brokers:
     # LIMIT girişte brokerda emir bekletme. Binance fiyatı seviyeye değince farkı o an ölç ve MARKET aç:
     entry_trigger: reference_touch
     virtual_trigger_max_hours: 48       # tetiklenmezse 48 saat sonra iptal
+    # FX konusundaki LIMIT girişlerde de brokerda emir bekletmemek için (isteğe bağlı): sizin MetaTrader hesabınızın
+    # (type mt5 / mt5_bridge) adını yazın. Tickmill'e limit emir HİÇ konmaz: o hesaptaki giriş emri dolunca, o
+    # hesapta emir yoksa (onay bekliyor, atlandı) o hesabın fiyatı giriş seviyesine gelince Tickmill'de MARKET açılır;
+    # stop / hedefler o anki fiyat farkıyla kaydırılır.
+    # reference_broker: fx
     # YER TUTUCU: arkadaşınızın MT5 "Market Watch" listesindeki TAM sembol adlarını yazın.
     # Tickmill'de kripto CFD adları ve sonekleri farklı olabilir (ör. BTCUSD, ETHUSD).
     symbol_map: {BTC: BTCUSD, ETH: ETHUSD}
@@ -40,6 +45,8 @@ brokers:
     allowed_assets: [BTC, ETH, EUR, GBP, XAU]
     no_hedge: true                      # aynı sembolde (ör. EURUSD) ters yönlü işlem açma
     daily_loss_limit_pct: 3             # günlük zarar %3'ü geçerse bu hesapta yeni işlem açılmaz
+    # İsteğe bağlı: bot "AÇAYIM MI?" diye sorduğunda bu hesapta beklemeden aç (soru diğer hesaplar için kalır):
+    # confirm_open: false
 
 # ---------------------------------------------------------------------
 # 2) telegram.topics: sizin MEVCUT konularınız, sadece "tickmill" eklenmiş hali.
@@ -67,4 +74,6 @@ telegram:
 #    token / account_id satırları kalır: bu sürümde MetaApi'ye dönmek için "type: metaapi" yazmanız yeterli.
 #    Eski bir sürüme dönüş yalnızca guncelle.py --geri-al ile (o zamanki config.yaml da geri gelir).
 #    İsteğe bağlı: lot_rounding: nearest  (0.125 -> 0.13; stopta kayıp hedefi %15'ten fazla aşacaksa aşağı)
+#    ya da: lot_rounding: up  +  lot_rounding_max_over: 10  (stopta kayıp 1R'nin altına hiç düşmez, en çok 10 üstü)
+#    İsteğe bağlı: fees_in_risk: false  (lot yalnızca stoptaki fiyat kaybına göre; komisyon 1R'nin üstüne ödenir)
 # ---------------------------------------------------------------------

@@ -124,6 +124,7 @@ class ManualBroker(PaperBroker):
             qty_step=symbol.qty_step, min_qty=0.0, max_qty=None, min_notional=None,
             fee_rate=0.0, include_fees=False, allow_min_qty_round_up=False,
             rounding=str(getattr(self.config, "lot_rounding", "down") or "down"),
+            max_over=getattr(self.config, "lot_rounding_max_over", None),
         )
         return result
 

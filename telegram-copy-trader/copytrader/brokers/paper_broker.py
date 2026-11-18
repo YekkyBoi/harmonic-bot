@@ -29,7 +29,7 @@ from typing import Any
 import ccxt.async_support as ccxt_async
 from ccxt.base import errors as cx
 
-from ..config import PaperBrokerConfig, RiskConfig
+from ..config import PaperBrokerConfig, RiskConfig, fees_in_risk
 from ..models import (
     BrokerPosition,
     EntryType,
@@ -581,9 +581,10 @@ class PaperBroker(Broker):
             max_qty=symbol.max_qty,
             min_notional=symbol.min_notional,
             fee_rate=self.cfg.fee_rate,
-            include_fees=risk.include_fees_in_risk,
+            include_fees=fees_in_risk(self.config, risk),
             allow_min_qty_round_up=risk.allow_min_qty_round_up,
             rounding=str(getattr(self.config, "lot_rounding", "down") or "down"),
+            max_over=getattr(self.config, "lot_rounding_max_over", None),
         )
         # Leverage is informational on paper: the smallest that fits the balance.
         equity = max(await self.get_equity(), 1e-9)
