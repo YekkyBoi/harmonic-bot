@@ -360,3 +360,57 @@ async def test_correction_carries_the_early_trade(db: Database) -> None:
         assert len(await db.recent_trades(now() - timedelta(hours=1))) == 1
     finally:
         await env.engine.stop()
+
+
+async def test_stop_moved_while_asking_then_yes_opens_others_with_the_trades_stop(db: Database) -> None:
+    env = await make_env(db)
+    try:
+        await env.crypto_signal()
+        (conf,) = env.notifier.confirmations
+        env.parser.push(result(ParsedAction(action=ActionType.MOVE_SL, new_stop_loss=2245.0, refers_to_message_id=611,
+                                            used_message_ids=[612], confidence=0.95, summary_tr="stop 2245")))
+        await env.msg(612, "stop 2245", topic=CRYPTO, reply_to=611)
+        await env.engine.on_messages_ready(CHAT, KADIR, CRYPTO)
+        assert env.tm.calls_of("update_stop_loss") and env.binance.opened == []
+        await env.engine.handle_confirmation(conf.id, True)
+        (req,) = env.binance.opened
+        assert req.stop_loss == 2245.0 and len(env.tm.opened) == 1
+    finally:
+        await env.engine.stop()
+
+
+async def test_slow_tickmill_is_late_then_yes_never_sends_it_twice(db: Database, monkeypatch: Any) -> None:
+    import asyncio
+
+    from copytrader.engine import orchestrator
+
+    monkeypatch.setattr(orchestrator, "OPTIONAL_LEG_GRACE_SEC", 0.05)
+    env = await make_env(db)
+    gate = asyncio.Event()
+    real_open = env.tm.open_position
+
+    async def slow_open(req: Any) -> Any:
+        await gate.wait()
+        return await real_open(req)
+
+    env.tm.open_position = slow_open      # type: ignore[method-assign]
+    try:
+        await env.crypto_signal()
+        (conf,) = env.notifier.confirmations
+        assert conf.early is not None and conf.early["done"] == ["tickmill"]
+        assert "yanıtı bekleniyor" in conf.early["line"]
+        trade = await db.find_trade_by_message(CHAT, 611)
+        assert trade is not None and trade.status is TradeStatus.OPENING
+        gate.set()
+        for _ in range(100):
+            await asyncio.sleep(0.01)
+            if "tickmill" in await env.positions(trade.id):
+                break
+        await env.engine.handle_confirmation(conf.id, True)
+        assert len(env.tm.opened) == 1 and len(env.binance.opened) == 1
+        assert set(await env.positions(trade.id)) == {"binance", "tickmill"}
+        after = await db.get_trade(trade.id)
+        assert after is not None and after.status is TradeStatus.OPEN
+    finally:
+        gate.set()
+        await env.engine.stop()

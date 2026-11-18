@@ -118,6 +118,16 @@ async def test_metatrader_commission_and_rounding() -> None:
     assert any("aşağı yuvarlandı" in w for w in strict.warnings)  # type: ignore[attr-defined]
 
 
+def test_bridge_config_hands_the_settings_to_its_helper() -> None:
+    """The tickmill helper builds its adapter from the bridge config's dump (mt5_bridge._hello -> mt5_helper._run)."""
+    cfg = Mt5BridgeBrokerConfig(type="mt5_bridge", name="tickmill", terminal_path=r"C:\T\terminal64.exe",
+                                broker_company="Tickmill", lot_rounding="up", lot_rounding_max_over=10,
+                                fees_in_risk=False, commission_per_lot=7.0)
+    again = Mt5BridgeBrokerConfig.model_validate(
+        cfg.model_dump(mode="python", exclude={"token", "account_id", "region"}))
+    assert (again.lot_rounding, again.lot_rounding_max_over, again.fees_in_risk) == ("up", 10.0, False)
+
+
 def test_make_symbol_is_the_one_lot_loss_used_above() -> None:
     assert make_symbol("ETHUSD").trade_contract_size == 1.0
     assert abs(ENTRY - STOP) == pytest.approx(106.4)

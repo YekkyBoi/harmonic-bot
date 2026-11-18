@@ -7128,7 +7128,7 @@ class Engine:
             await self._record_confirmation_outcome(conf)
             if conf.kind == "catch_up":
                 text = f"⌛ Süre doldu; {esc((conf.catch_up or {}).get('broker') or '?')} hesabında işlem açılmadı."
-            elif conf.early:
+            elif conf.early and conf.kind != "manage":
                 text = "⌛ Süre doldu; " + await self._early_kept_text(conf)
             else:
                 text = ("⌛ Süre doldu, değişiklik uygulanmadı." if conf.kind == "manage"
@@ -7192,8 +7192,8 @@ class Engine:
                     return text
                 return await self._approve_catch_up(conf, who=who, approval=approval)
             if not approved:
-                text = ("❌ İptal edildi; " + await self._early_kept_text(conf) if conf.early
-                        else "❌ İptal edildi; işlem yapılmadı.")
+                text = ("❌ İptal edildi; " + await self._early_kept_text(conf)
+                        if conf.early and conf.kind != "manage" else "❌ İptal edildi; işlem yapılmadı.")
                 await self._finish(conf, ConfirmationStatus.REJECTED, text)
                 return text
             if conf.plan is None:
@@ -7261,6 +7261,13 @@ class Engine:
                 await self._finish(conf, ConfirmationStatus.REJECTED, text,
                                    refused=f"#{early.id} işlemi onay beklerken {how}")
                 return text
+            if into is not None and (not _same_price(into.current_stop_loss, into.plan.stop_loss)
+                                     or [tp.price for tp in into.current_take_profits]
+                                     != [tp.price for tp in into.plan.take_profits]):
+                # The trader moved the trade's stop / targets while the question waited (applied to the early
+                # accounts): the others open with the trade's levels as they are now, like a catch-up open.
+                plan = plan.model_copy(update={"stop_loss": into.current_stop_loss,
+                                               "take_profits": list(into.current_take_profits)})
             note = await self._early_kept_note(conf)
             limit = self.config.risk.max_open_trades
             # (the early accounts' trade is this signal itself: it never counts against its own approval)
