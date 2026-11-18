@@ -899,6 +899,9 @@ def tp_progress(trade: TradeRecord, positions: list[BrokerPosition]) -> tuple[li
 
 _REF_LABELS = {"binanceusdm": "Binance", "binance": "Binance", "bybit": "Bybit", "okx": "OKX", "bitget": "Bitget"}
 VIRTUAL_NOTE_THROTTLE_SEC = 1800.0     # same reference-outage warning is not repeated within this
+# A reference_broker account's price that could not be read (not connected, no such symbol, no quote) is not read
+# again for this long by the same waiting entry (the owner's own account: no call into it on every 2 s look then)
+REFERENCE_PRICE_RETRY_SEC = 60.0
 
 
 def ref_label(ref_id: str) -> str:
@@ -1226,6 +1229,10 @@ class Engine:
         self.monitor.rollup_deferred = self._late_manage_queued
         self.monitor.owed_hook = self._owed_tick
         self._virtual_warned: dict[tuple[int, str], float] = {}   # (trade, broker) -> monotonic time of last outage warning
+        # A waiting reference_broker entry that watches that account's price: (trade, broker) -> the instrument there
+        # (resolved once, not on every look) / monotonic time before which a failed read is not tried again
+        self._ref_symbols: dict[tuple[int, str], Any] = {}
+        self._ref_retry_at: dict[tuple[int, str], float] = {}
         self._monitor_task: asyncio.Task[None] | None = None
         self._accepting = True                     # False once shutdown began: no new work is started
         self._brokers_closed = False
@@ -4787,25 +4794,38 @@ class Engine:
             return {"mode": "ratio", "value": broker_mid / ref_mid}, None
         return {"mode": "additive", "value": broker_mid - ref_mid}, None
 
-    async def _reference_broker_quote(self, name: str, plan: TradePlan, raw_symbol: str | None) -> Quote | None:
+    async def _reference_broker_quote(self, name: str, plan: TradePlan, raw_symbol: str | None, *,
+                                      cache: tuple[int, str] | None = None) -> Quote | None:
         """The live quote of the plan's instrument on the account ``name`` (a ``reference_broker``: the owner's own
         account, read only - nothing is ever sent to it from here), in the signal's scale. None when the account is
         not connected, does not list the instrument, gives no valid price or fails (the caller then fails closed /
-        waits). A MetaTrader adapter answers it from its own worker thread."""
+        waits). A MetaTrader adapter answers it from its own worker thread (the event loop is not held).
+        ``cache``: a waiting entry that looks again and again: the instrument is resolved once and kept."""
         ref = self._broker(name)
         if ref is None:
             return None
         try:
-            sym = await ref.resolve_symbol(plan.base_asset, plan.quote_asset, plan.market_type, raw_symbol)
+            sym = self._ref_symbols.get(cache) if cache is not None else None
             if sym is None:
-                return None
+                sym = await ref.resolve_symbol(plan.base_asset, plan.quote_asset, plan.market_type, raw_symbol)
+                if sym is None:
+                    return None
+                if cache is not None:
+                    self._ref_symbols[cache] = sym
             quote = await ref.get_quote(sym)
         except asyncio.CancelledError:
             if not stray_cancel():
                 raise
             logger.error("%s: the reference price read was cancelled without a cancel request", name)
             return None
+        except BrokerError as exc:      # (expected now and then - not connected, market closed: no traceback)
+            if cache is not None:
+                self._ref_symbols.pop(cache, None)
+            logger.warning("%s: the reference price of %s could not be read: %s", name, plan.base_asset, exc)
+            return None
         except Exception:
+            if cache is not None:
+                self._ref_symbols.pop(cache, None)
             logger.exception("%s: the reference price of %s could not be read", name, plan.base_asset)
             return None
         mid = (quote.bid + quote.ask) / 2.0
@@ -5181,6 +5201,9 @@ class Engine:
         self._virtual_seen.pop((trade_id, broker), None)
         self._virtual_warned.pop((trade_id, broker), None)
         self._virtual_warned.pop((trade_id, f"{broker}:busy"), None)
+        self._virtual_warned.pop((trade_id, f"{broker}:refprice"), None)
+        self._ref_symbols.pop((trade_id, broker), None)
+        self._ref_retry_at.pop((trade_id, broker), None)
 
     async def _virtual_tick(self, trade: TradeRecord, pos: BrokerPosition, now: datetime) -> BrokerPosition:
         """One look at a waiting virtual entry (monitor hook, trade lock held): expire / gap-cancel / trigger.
@@ -5439,17 +5462,22 @@ class Engine:
                 head=f"{what} (seviye {level}), piyasa emriyle açıldı", log={"reference_broker": ref}))
         if any(p.status in ACTIVE_POSITION for p in legs):
             return pos              # its own order waits: its fill decides (never also the price: one trigger)
-        quote = await self._reference_broker_quote(ref, trade.plan, d.get("raw_symbol"))
+        key = (trade.id, pos.broker)
+        if time.monotonic() < self._ref_retry_at.get(key, 0.0):
+            return pos              # (its last read failed: not tried again on every look)
+        quote = await self._reference_broker_quote(ref, trade.plan, d.get("raw_symbol"), cache=key)
         if quote is None:
+            self._ref_retry_at[key] = time.monotonic() + REFERENCE_PRICE_RETRY_SEC
             warn_key = (trade.id, f"{pos.broker}:refprice")
             last = self._virtual_warned.get(warn_key)
             if last is None or time.monotonic() - last >= VIRTUAL_NOTE_THROTTLE_SEC:
                 self._virtual_warned[warn_key] = time.monotonic()
                 await self._notify(
-                    f"⚠️ {label} {esc(pos.broker)}: {esc(ref)} fiyatı okunamıyor ({esc(ref)} bağlı değil ya da "
-                    f"sembolü yok); {esc(pos.broker)} girişi {level} seviyesi için beklemeye devam ediyor, limit "
-                    "emir KONMAZ.", Severity.WARNING)
+                    f"⚠️ {label} {esc(pos.broker)}: {esc(ref)} fiyatı okunamıyor ({esc(ref)} bağlı değil, sembolü yok "
+                    f"ya da fiyat gelmiyor); {esc(pos.broker)} girişi {level} seviyesi için beklemeye devam ediyor, "
+                    "limit emir KONMAZ.", Severity.WARNING)
             return pos
+        self._ref_retry_at.pop(key, None)
         long = pos.side is Side.LONG
         touched = level_px > 0 and ((long and quote.ask <= level_px) or (not long and quote.bid >= level_px))
         if not touched or broker is None:

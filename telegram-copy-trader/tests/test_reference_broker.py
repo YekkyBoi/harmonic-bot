@@ -374,6 +374,44 @@ async def test_an_fx_leg_that_failed_without_a_fill_is_no_leg_tickmill_follows_f
     _friend_clean(friend.texts)
 
 
+async def test_fx_price_watch_reads_lightly_and_backs_off_after_a_failed_read(unsure, caplog) -> None:
+    """The owner's own fx account is only read: the instrument once, the quote on each look; a read that fails (no
+    price - market closed, terminal trouble) is not tried again for REFERENCE_PRICE_RETRY_SEC and logs no
+    traceback."""
+    import logging
+
+    p, _friend = unsure
+    await _unsure_eur_limit(p)
+    fx = p.brokers["fx"]
+    calls = {"resolve": 0, "quote": 0}
+    real_resolve, real_quote = fx.resolve_symbol, fx.get_quote
+
+    async def resolve(*a: Any, **k: Any) -> Any:
+        calls["resolve"] += 1
+        return await real_resolve(*a, **k)
+
+    async def quote(*a: Any, **k: Any) -> Any:
+        calls["quote"] += 1
+        return await real_quote(*a, **k)
+
+    fx.resolve_symbol, fx.get_quote = resolve, quote                    # type: ignore[method-assign]
+    for _ in range(3):
+        await p.engine.monitor.run_virtual_once()
+    assert calls == {"resolve": 1, "quote": 3} and p.tickmill_orders() == []
+    p.terminal.set_price("EURUSD", 0.0, 0.0)                            # no price from fx now
+    with caplog.at_level(logging.WARNING):
+        for _ in range(3):
+            await p.engine.monitor.run_virtual_once()
+    assert calls["quote"] == 4                                          # one failed read, then the back-off
+    assert not any(r.exc_info for r in caplog.records if "reference price" in r.getMessage())
+    assert len([t for t in p.texts() if "fx fiyatı okunamıyor" in t]) == 1
+    p.engine._ref_retry_at.clear()                                      # (the back-off is over)
+    _fx_at_entry(p)
+    await p.engine.monitor.run_virtual_once()
+    (order,) = p.tickmill_orders()
+    assert order[0] == "market_buy"
+
+
 async def test_a_short_fires_on_fx_bid_at_or_above_the_entry(unsure) -> None:
     p, _friend = unsure
     action = fx_pair("EURUSD", Side.SHORT, 1.1630, 1.1650, 1.1590, entry_type=EntryType.LIMIT).model_copy(
