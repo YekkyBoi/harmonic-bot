@@ -485,6 +485,55 @@ async def test_ticks_unreadable_in_the_watchs_first_minute_never_open(unsure) ->
     assert (await p.positions(1))["tickmill"].status is PositionStatus.CANCELLED and p.tickmill_orders() == []
 
 
+async def test_ticks_unreadable_past_the_first_minute_a_stop_pass_in_it_still_cancels(unsure) -> None:
+    """The ticks stay unreadable into the next minute: the stretch of the watch's first minute can only be seen in
+    that minute's bar, which also holds prices from before the watch. It is used for the stop only (a pass there
+    cancels - never a touch: it never opens)."""
+    p, _friend = unsure
+    await _armed_watch(p)                                          # watch starts at T0 (20 s into a minute)
+    minute = -(-T0 // 60) * 60
+
+    def copy_ticks_from(symbol: str, date_from: int, count: int, flags: int) -> Any:
+        return None
+
+    stop_in_first = [True]
+
+    def copy_rates_range(symbol: str, timeframe: int, date_from: int, date_to: int) -> list[dict[str, Any]]:
+        first_low = 1.15880 if stop_in_first[0] else 1.16190
+        bars = [{"time": minute - 60, "open": 1.1620, "high": 1.1621, "low": first_low, "close": 1.1619, "spread": 10},
+                {"time": minute, "open": 1.1619, "high": 1.1620, "low": 1.16150, "close": 1.1616, "spread": 10}]
+        return [b for b in bars if date_from <= b["time"] <= date_to]
+
+    p.terminal.copy_ticks_from = copy_ticks_from                    # type: ignore[attr-defined]
+    p.terminal.copy_rates_range = copy_rates_range                  # type: ignore[method-assign]
+    _tick(p, 1.16090, 1.16100, minute + 5)                          # the next minute, at the level now
+    p.tickmill.set_price("EURUSD", 1.16105, 1.16115)
+    await p.engine.monitor.run_virtual_once()
+    assert p.tickmill_orders() == []
+    assert (await p.positions(1))["tickmill"].status is PositionStatus.CANCELLED
+
+
+async def test_ticks_unreadable_past_the_first_minute_its_bar_never_opens_by_itself(unsure) -> None:
+    p, _friend = unsure
+    await _armed_watch(p)
+    minute = -(-T0 // 60) * 60
+
+    def copy_ticks_from(symbol: str, date_from: int, count: int, flags: int) -> Any:
+        return None
+
+    def copy_rates_range(symbol: str, timeframe: int, date_from: int, date_to: int) -> list[dict[str, Any]]:
+        # the first minute's bar went down to the level (maybe before the watch), the next one stayed above it
+        bars = [{"time": minute - 60, "open": 1.1620, "high": 1.1621, "low": 1.16090, "close": 1.1619, "spread": 10},
+                {"time": minute, "open": 1.1619, "high": 1.1620, "low": 1.16180, "close": 1.1619, "spread": 10}]
+        return [b for b in bars if date_from <= b["time"] <= date_to]
+
+    p.terminal.copy_ticks_from = copy_ticks_from                    # type: ignore[attr-defined]
+    p.terminal.copy_rates_range = copy_rates_range                  # type: ignore[method-assign]
+    _tick(p, 1.16185, 1.16195, minute + 5)                          # above the level now (within ~10 pips: no)
+    await p.engine.monitor.run_virtual_once()
+    assert p.tickmill_orders() == [] and is_virtual_pending((await p.positions(1))["tickmill"])
+
+
 async def test_bars_a_short_arming_bar_is_judged_by_its_bid_low_not_its_moving_spread(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
@@ -521,6 +570,27 @@ async def test_bars_a_short_arming_bar_is_judged_by_its_bid_low_not_its_moving_s
         assert (await p.positions(1))["tickmill"].status is PositionStatus.CANCELLED
     finally:
         await p.close()
+
+
+def test_the_live_config_after_this_update_has_the_friends_settings(tmp_path: Path,
+                                                                    monkeypatch: pytest.MonkeyPatch) -> None:
+    """The server's config (LIVE_YAML) migrated by this version: it loads, the tickmill block carries the four
+    settings (and the earlier 45 -> 50), the owner's accounts are untouched; a second run changes nothing."""
+    from copytrader import migrate
+    from copytrader.config import load_config
+
+    tps.load_prod_config(tmp_path, monkeypatch, "live")             # (writes config.yaml, sets the variables)
+    path = tmp_path / "config.yaml"
+    lines = migrate.migrate_config(path, terminal=(None, None))
+    assert sum(1 for line in lines if line.startswith("tickmill:")) == 5
+    cfg = load_config(path)
+    t = next(b for b in cfg.brokers if b.name == "tickmill")
+    assert (t.confirm_open, t.fees_in_risk, t.lot_rounding, t.lot_rounding_max_over, t.reference_broker,
+            t.risk_usd) == (False, False, "up", 10.0, "fx", 50)
+    for name in ("binance", "fx"):
+        b = next(x for x in cfg.brokers if x.name == name)
+        assert (b.confirm_open, b.fees_in_risk, b.lot_rounding, b.reference_broker) == (True, None, "down", None)
+    assert migrate.migrate_config(path, terminal=(None, None)) == []
 
 
 async def test_an_ended_entry_forgets_its_fx_down_warning(env) -> None:

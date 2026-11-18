@@ -3544,7 +3544,9 @@ class Mt5Broker(MetaTraderLegBroker):
         up to the latest tick, "source": "ticks" | "bars" | None, "upto_msc": what has been looked at (the next look
         starts there), "busy": True when another call came to this terminal meanwhile: the history is not read now
         (``upto_msc`` stays the start, the next look reads it); "unread": True when neither the ticks nor the bars
-        of that time could be read (the same: ``upto_msc`` stays the start)}.
+        of that time could be read (the same: ``upto_msc`` stays the start); "partial": the bar of the minute the
+        watch started in, when the ticks could not be read and the previous look was in that minute (it also holds
+        prices from before the watch: for the stop only)}.
 
         The history: the ticks after ``since_msc`` (copy_ticks_from, at most ``max_ticks``); more than that, or no
         ticks, the 1-minute bars instead (copy_rates_range; the bars are bid prices, the ask is the bid plus the
@@ -3590,6 +3592,9 @@ class Mt5Broker(MetaTraderLegBroker):
             info, _err = await self._call("symbol_info", broker_symbol)
             point = _f(getattr(info, "point", 0.0)) if info is not None else 0.0
             first = int(start // 1000) // 60 * 60                         # the minute the previous look was in
+            # The previous look was still in the minute the watch started in: that minute's bar also holds prices
+            # from before the watch. It is read too, but only as "partial" (the engine uses it for the stop alone).
+            partial_from = first
             if armed_msc is not None:
                 first = max(first, -(-int(armed_msc // 1000) // 60) * 60)  # never before the watch started
             if first > t_sec:
@@ -3602,15 +3607,22 @@ class Mt5Broker(MetaTraderLegBroker):
                 if self._oldest_call() is not None:
                     return busy
                 frame = getattr(self._mt5, "TIMEFRAME_M1", TIMEFRAME_VALUES["M1"])
-                bars, _err = await self._call("copy_rates_range", broker_symbol, frame, first, t_sec)
+                bars, _err = await self._call("copy_rates_range", broker_symbol, frame, min(partial_from, first), t_sec)
+                partial: list[tuple[int, float, float, float, float]] = []
                 for r in bars if bars is not None else ():
                     try:
                         open_sec, low, high = int(r["time"]), float(r["low"]), float(r["high"])
                         spread = float(r["spread"]) * point
                     except (KeyError, IndexError, TypeError, ValueError):
                         continue
-                    if open_sec >= first and low > 0 and high > 0:
+                    if low <= 0 or high <= 0:
+                        continue
+                    if open_sec >= first:
                         samples.append((open_sec * 1000, low, high, low + spread, high + spread))
+                    elif partial_from < first and open_sec == partial_from:
+                        partial.append((open_sec * 1000, low, high, low + spread, high + spread))
+                if partial:
+                    out["partial"] = partial
                 if bars is not None:
                     out["source"] = "bars"
                 else:

@@ -5558,7 +5558,10 @@ class Engine:
         # orders would. The stop and the first target are judged before the entry: passed anywhere in the window,
         # the waiting entry is cancelled, whatever else the window holds.
         window = [*seen["samples"], (now_msc, now_bid, now_bid, now_ask, now_ask)]
-        exit_worst = min(s[1] for s in window) if long else max(s[4] for s in window)    # towards the stop
+        # (``partial``: the bar of the minute the watch started in, read because the ticks could not be: it also holds
+        # prices from before the watch - counted for the stop alone, never for a touch or the first target)
+        stop_window = [*window, *(seen.get("partial") or [])]
+        exit_worst = min(s[1] for s in stop_window) if long else max(s[4] for s in stop_window)  # towards the stop
         entry_best = min(s[3] for s in window) if long else max(s[2] for s in window)    # towards the entry
         gap: str | None = None
         if stop is not None and ((long and exit_worst <= stop) or (not long and exit_worst >= stop)):
@@ -5704,9 +5707,10 @@ class Engine:
         try:
             msc, bid, ask = data["now"]
             samples = [(s[0], s[1] / m, s[2] / m, s[3] / m, s[4] / m) for s in data.get("samples") or []]
+            partial = [(s[0], s[1] / m, s[2] / m, s[3] / m, s[4] / m) for s in data.get("partial") or []]
             out = {"now": (msc, float(bid) / m, float(ask) / m), "samples": samples, "source": data.get("source"),
                    "upto_msc": data.get("upto_msc"), "busy": bool(data.get("busy")),
-                   "unread": bool(data.get("unread"))}
+                   "unread": bool(data.get("unread")), "partial": partial}
         except (KeyError, IndexError, TypeError, ValueError):
             logger.error("%s: unexpected price_since answer for %s", name, plan.base_asset)
             return None

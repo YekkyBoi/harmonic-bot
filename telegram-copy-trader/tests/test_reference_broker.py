@@ -493,7 +493,8 @@ async def test_without_tick_history_the_one_minute_bars_show_the_touch(unsure) -
     await p.engine.monitor.run_virtual_once()
     (order,) = p.tickmill_orders()                            # low 1.16085 + spread 0.00010 -> ask 1.16095 <= 1.1610
     assert order[0] == "market_buy"
-    assert asked == [("EURUSD", 1, first, first + 30)]        # M1, from the first whole minute after the look
+    # M1, from the minute the watch started in (that bar for the stop alone, see price_since "partial")
+    assert asked == [("EURUSD", 1, first - 60, first + 30)]
 
 
 async def test_bars_two_looks_inside_one_minute_see_the_wick_of_that_minute(unsure) -> None:
