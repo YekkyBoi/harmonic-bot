@@ -191,6 +191,19 @@ risk:
 #   fees_in_risk     bu hesapta komisyon 1R'nin içine sayılsın mı: boş = risk.include_fees_in_risk ne diyorsa;
 #                    false = lot yalnızca stoptaki fiyat kaybına göre hesaplanır (commission_per_lot / komisyon
 #                    1R'nin üstüne ödenir); true = her zaman sayılır
+#   reference_broker (isteğe bağlı) LIMIT girişli FOREX/CFD sinyallerinde (kripto olmayan; konunun türüne
+#                    göre, yukarıdaki kural) bu hesapta limit emir HİÇ KONMAZ: burada adı yazılan BAŞKA bir
+#                    MetaTrader hesabı (type mt5 / mt5_bridge, etkin) referans olur. O hesabın bu işlemde bekleyen
+#                    girişi varsa o giriş dolunca; girişi yoksa (onay bekliyor, bir kural atladı, reddedildi, bağlı
+#                    değil) o hesabın kendi canlı fiyatı giriş seviyesine gelince (LONG: satış fiyatı <= giriş,
+#                    SHORT: alış fiyatı >= giriş) bu hesapta MARKET emir açılır. Stop ve hedefler o an ölçülen
+#                    farkla (bu hesabın fiyatı - o hesabın fiyatı; offset_mode, max_offset_pct) kaydırılır;
+#                    fiyatlardan biri okunamazsa ya da fark max_offset_pct'yi aşarsa açılmaz. Teknik sınırlar kalır
+#                    (stop ya da ilk hedef geçilmişse, fiyat girişten max_entry_distance_pct'den uzaksa açılmaz).
+#                    Referans hesabın fiyatı okunamazsa bekler (uyarı gelir; virtual_trigger_max_hours sonra iptal),
+#                    limit emre dönmez. O hesabın girişi dolmadan biterse (süresi doldu, iptal) bekleyen giriş de
+#                    iptal edilir. Piyasa emirli sinyaller ve kripto (reference_exchange / entry_trigger) aynen
+#                    kalır. Boş = kapalı (varsayılan). Örnek:  reference_broker: fx
 #
 # Bir brokerı açtıktan sonra MUTLAKA 'python -m copytrader check' çalıştırın:
 # API anahtarı yanlış/eksikse burada görünür.

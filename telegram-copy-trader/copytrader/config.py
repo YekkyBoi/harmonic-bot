@@ -290,6 +290,17 @@ class _BrokerBase(_Base):
     # then measures the offset right then and opens a MARKET order with the shifted SL/TPs.
     entry_trigger: Literal["broker_limit", "reference_touch"] = "broker_limit"
     virtual_trigger_max_hours: float = Field(48.0, gt=0)   # a virtual entry not triggered within this is cancelled
+    # Forex / CFD LIMIT entries (plans that are not crypto for their route's kind): the name of ANOTHER enabled
+    # MetaTrader account (type mt5 / mt5_bridge) that decides the entry here. Never a broker limit order on this
+    # account: while that account has a waiting entry of the same trade, this one waits for it to fill; while it has
+    # none (its owner's answer awaited, skipped by a rule, refused, not connected), this one waits for that account's
+    # own live price to reach the entry (long: ask <= entry, short: bid >= entry). Then a MARKET order here, the stop
+    # and every target shifted by (this account's mid - that account's mid) read right then (offset_mode,
+    # max_offset_pct; a price that cannot be read or a too big difference: not opened). A price that cannot be read
+    # keeps it waiting (the owner is told; virtual_trigger_max_hours still ends it). When that account's entry ends
+    # without a fill, the waiting entry is cancelled. Crypto plans: reference_exchange / entry_trigger as above.
+    # None = off (every entry as before).
+    reference_broker: str | None = None
     # How the sized quantity is rounded to the broker's lot / quantity step: "down" (never more than the target
     # risk; the default, every account of the owner) or "nearest" (0.125 -> 0.13), falling back to "down" when the
     # nearest step would lose more than LOT_ROUNDING_MAX_OVERSHOOT times the target at the stop.
@@ -302,6 +313,12 @@ class _BrokerBase(_Base):
     # loss at the stop. None (default): risk.include_fees_in_risk decides, as for every account. False: sized on the
     # price loss at the stop only (the commission is paid on top). True: always counted.
     fees_in_risk: bool | None = None
+
+    @field_validator("reference_broker")
+    @classmethod
+    def _blank_reference_broker(cls, v: str | None) -> str | None:
+        name = (v or "").strip()
+        return name or None
 
     @model_validator(mode="after")
     def _touch_needs_reference(self) -> "_BrokerBase":
@@ -495,6 +512,23 @@ class AppConfig(_Base):
                         f"broker '{b.name}': terminal_path, '{own_paths[key]}' hesabının "
                         "terminaliyle aynı; her hesap kendi MetaTrader terminalini kullanmalı")
                 own_paths[key] = b.name     # two mt5_bridge accounts: never the same terminal either
+        by_name = {b.name: b for b in self.brokers}
+        for b in self.brokers:
+            ref = getattr(b, "reference_broker", None)
+            if not ref or not b.enabled:
+                continue
+            target = by_name.get(ref)
+            if ref == b.name:
+                raise ValueError(f"broker '{b.name}': reference_broker hesabın kendisi olamaz; başka bir MetaTrader "
+                                 "hesabının adını yazın")
+            if target is None:
+                raise ValueError(f"broker '{b.name}': reference_broker '{ref}' bilinmeyen broker adı (brokers "
+                                 "listesindeki 'name' ile aynı olmalı)")
+            if target.type not in ("mt5", "mt5_bridge"):
+                raise ValueError(f"broker '{b.name}': reference_broker '{ref}' bir MetaTrader hesabı olmalı "
+                                 f"(type mt5 ya da mt5_bridge; '{ref}' type {target.type})")
+            if not target.enabled:
+                raise ValueError(f"broker '{b.name}': reference_broker '{ref}' etkin değil (enabled: false)")
         taken: dict[str, str] = {fold_ascii(b.name): b.name for b in self.brokers}
         for b in self.brokers:
             for alias in b.aliases:

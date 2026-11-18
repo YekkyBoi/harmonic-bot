@@ -129,6 +129,11 @@ Notlar:
   her zamanki gibi). Soru sizin hesaplarınız için aynen gelir; Evet derseniz onlar aynı işleme eklenir,
   Tickmill ikinci kez açılmaz. Hayır derseniz Tickmill'deki işlem açık kalır ve normal yönetilir.
   Bu satırı ancak bu özelliği içeren sürüme güncelledikten SONRA ekleyin (eski sürüm bilinmeyen ayarı reddeder).
+- İsteğe bağlı: `reference_broker: fx` satırı eklenirse FX konusundaki LIMIT sinyallerde Tickmill'e limit emir
+  hiç konmaz. Sizin fx hesabınızdaki giriş emri dolunca Tickmill'de piyasa emriyle açılır; fx'te emir yoksa
+  (onayınızı bekliyor, atlandı, reddedildi) fx hesabının kendi fiyatı giriş seviyesine gelince açılır. fx'in
+  fiyatı okunamazsa (bağlı değil) bekler ve size uyarı gelir; limit emre dönmez. Kripto ve piyasa emirli
+  sinyaller aynen kalır. Bu satır da güncellemeden SONRA eklenir.
 
 ### 3b. Konu yollarına `tickmill` ekle
 

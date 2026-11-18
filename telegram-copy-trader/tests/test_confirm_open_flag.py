@@ -310,8 +310,9 @@ async def test_crypto_virtual_trigger_fires_while_binance_waits(db: Database) ->
 
 
 async def test_fx_route_limit_rests_on_tickmill_while_fx_waits(db: Database) -> None:
-    """The fx route has no reference trigger in this version: tickmill takes the fx LIMIT signal as a resting
-    broker limit order at once (no FundingPips fill is waited for), while fx waits for the owner's answer."""
+    """Without ``reference_broker`` (the default) the fx route has no reference trigger: tickmill takes the fx LIMIT
+    signal as a resting broker limit order at once, while fx waits for the owner's answer. (With it:
+    tests/test_reference_broker.py.)"""
     env = await make_env(db, virtual=True)
     try:
         await env.fx_signal()

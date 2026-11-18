@@ -372,6 +372,25 @@ class _OpenFlow:
 
 
 @dataclass
+class _Fire:
+    """Why a waiting virtual entry is sent now (:meth:`Engine._virtual_fire`), and its texts for the owner (HTML).
+    ``mode``: "touch" (the reference exchange touched the level), "reference" (the reference account's leg
+    filled), "price" (the reference account has no waiting entry in the trade: its own live price reached the
+    level)."""
+
+    mode: str
+    what: str               # what happened ("tetik seviyesine gelindi (Binance 73000)"): the paused notice
+    busy_what: str          # ... in the notice that the account is still busy with another order
+    busy_tail: str          # what happens once it has answered
+    done: str               # start of the "not opened" / "answer lost" notices
+    seen: str               # start of the "account unreachable, tried again" notice
+    retry_tail: str         # how it is tried again
+    head: str               # the "opened" headline after "—"
+    ref_price: float | None = None      # the reference exchange's reading it triggered on (touch)
+    log: dict[str, Any] = field(default_factory=dict)
+
+
+@dataclass
 class _LateLeg:
     """One broker's part of an open flow that had not answered by its deadline (LEG_DEADLINE_SEC; an optional
     broker: OPTIONAL_LEG_GRACE_SEC)."""
@@ -922,6 +941,48 @@ def virtual_entry_wanted(broker: Broker, plan: TradePlan, route_kind: str | None
         and bool(plan.entry_price)
         and is_crypto_plan(plan, route_kind)
     )
+
+
+def broker_virtual_wanted(broker: Broker, plan: TradePlan, route_kind: str | None = None) -> bool:
+    """True when ``plan`` is a forex / CFD LIMIT entry (not a crypto plan for its route, :func:`is_crypto_plan`) on a
+    broker with ``reference_broker``: no broker order; the entry waits for that other account's leg of the trade to
+    fill (a virtual entry carrying ``data["reference_broker"]``)."""
+    cfg = broker.config
+    return (
+        bool(getattr(cfg, "reference_broker", None))
+        and plan.entry_type is EntryType.LIMIT
+        and bool(plan.entry_price)
+        and not is_crypto_plan(plan, route_kind)
+    )
+
+
+def reference_leg_filled(pos: BrokerPosition) -> bool:
+    """A leg of the reference account (``reference_broker``) whose entry has filled: open, a part of it filled, or
+    closed after a fill."""
+    return (pos.status is PositionStatus.OPEN or pos.filled_quantity > 0
+            or (pos.status is PositionStatus.CLOSED and pos.avg_entry_price is not None))
+
+
+def reference_leg_never_placed(pos: BrokerPosition, ref: str) -> bool:
+    """A position of the reference account ``ref`` that ended FAILED with nothing filled: that account never held the
+    trade (its order was refused / could not be completed), i.e. it has no leg in it."""
+    return pos.broker == ref and pos.status is PositionStatus.FAILED and not reference_leg_filled(pos)
+
+
+def waiting_entry_text(pos: BrokerPosition, *, owner: bool) -> str:
+    """What a waiting virtual entry waits for (HTML, one phrase for /pozisyonlar). ``owner`` False (the friend's view
+    of his account): the reference account is never named."""
+    d = pos.data or {}
+    mult = price_multiplier(d)
+    trig = d.get("trigger_price")
+    level = fmt_price(trig / mult if trig else None)
+    ref_id = str(d.get("reference_exchange") or "")
+    if ref_id:
+        return f"{esc(ref_label(ref_id))} fiyatı {level} seviyesine değince"
+    ref = str(d.get("reference_broker") or "")
+    where = (f"{esc(ref)} hesabındaki giriş dolunca (emri yoksa {esc(ref)} fiyatı seviyeye gelince)" if owner
+             else "referans hesaptaki giriş dolunca ya da fiyat seviyeye gelince")
+    return f"giriş {level} · {where}"
 
 
 OPEN_UNKNOWN = "open_unknown"     # position data: its open order's answer was lost (it may be open at the broker)
@@ -4686,33 +4747,78 @@ class Engine:
         return text
 
     async def _compute_price_offset(
-        self, broker: Broker, plan: TradePlan, quote: Quote, mult: float, *, ref_price: float | None = None
+        self, broker: Broker, plan: TradePlan, quote: Quote, mult: float, *, ref_price: float | None = None,
+        ref_broker: str | None = None, raw_symbol: str | None = None,
     ) -> tuple[dict[str, Any] | None, str | None]:
         """(offset, problem). Offset brokers only (``reference_exchange`` set, crypto plan: see
         :func:`is_crypto_plan`): compares the broker's mid with the reference exchange's mid (scaled like the
-        signal) and returns the shift to apply.
-        Fails closed: unavailable reference or a too big difference -> a problem text and no offset."""
+        signal) and returns the shift to apply. ``ref_broker``: a waiting forex / CFD entry of ``reference_broker``
+        fires - the reference is that account's mid (``ref_price`` when the caller just read it, else read now,
+        next to this broker's own quote).
+        Fails closed: unavailable reference or a too big difference -> a problem text and no offset. (The texts for
+        ``ref_broker`` never name that account: the friend may be told them.)"""
         cfg = broker.config
-        ref_id = getattr(cfg, "reference_exchange", None)
-        if not ref_id or not is_crypto_plan(plan, self._plan_kind(plan)):
-            return None, None
-        ref = ref_price     # a virtual trigger passes the fresh reading it just triggered on
-        if ref is None:
-            ref = await self._reference_mid(ref_id, plan.base_asset)
+        if ref_broker:
+            ref_id = ""
+            ref = ref_price if ref_price is not None else await self._reference_broker_mid(ref_broker, plan, raw_symbol)
+        else:
+            ref_id = getattr(cfg, "reference_exchange", None)
+            if not ref_id or not is_crypto_plan(plan, self._plan_kind(plan)):
+                return None, None
+            ref = ref_price     # a virtual trigger passes the fresh reading it just triggered on
+            if ref is None:
+                ref = await self._reference_mid(ref_id, plan.base_asset)
         broker_mid = (quote.bid + quote.ask) / 2.0
         if ref is None or not (math.isfinite(ref) and ref > 0) or not (math.isfinite(broker_mid) and broker_mid > 0):
+            if ref_broker:
+                return None, ("referans hesabın fiyatı alınamadı; fiyat farkı hesaplanamadığı için işlem güvenlik "
+                              "gereği açılmadı")
             return None, (f"referans fiyat ({esc(ref_id)}) alınamadı; fiyat farkı hesaplanamadığı için "
                           "işlem güvenlik gereği açılmadı")
         ref_mid = float(ref) * mult
         diff_pct = abs(broker_mid - ref_mid) / ref_mid * 100.0
         max_pct = float(getattr(cfg, "max_offset_pct", 1.0))
         if diff_pct > max_pct:
-            return None, (f"broker fiyatı ({fmt_price(broker_mid)}) ile {esc(ref_id)} fiyatı ({fmt_price(ref_mid)}) "
+            source = "referans hesabın fiyatı" if ref_broker else f"{esc(ref_id)} fiyatı"
+            return None, (f"broker fiyatı ({fmt_price(broker_mid)}) ile {source} ({fmt_price(ref_mid)}) "
                           f"arasındaki fark {fmt.fmt_pct(diff_pct)} (sınır {fmt.fmt_pct(max_pct)}); "
                           "yanlış sembol veya eski fiyat olabilir, işlem açılmadı")
         if getattr(cfg, "offset_mode", "additive") == "ratio":
             return {"mode": "ratio", "value": broker_mid / ref_mid}, None
         return {"mode": "additive", "value": broker_mid - ref_mid}, None
+
+    async def _reference_broker_quote(self, name: str, plan: TradePlan, raw_symbol: str | None) -> Quote | None:
+        """The live quote of the plan's instrument on the account ``name`` (a ``reference_broker``: the owner's own
+        account, read only - nothing is ever sent to it from here), in the signal's scale. None when the account is
+        not connected, does not list the instrument, gives no valid price or fails (the caller then fails closed /
+        waits). A MetaTrader adapter answers it from its own worker thread."""
+        ref = self._broker(name)
+        if ref is None:
+            return None
+        try:
+            sym = await ref.resolve_symbol(plan.base_asset, plan.quote_asset, plan.market_type, raw_symbol)
+            if sym is None:
+                return None
+            quote = await ref.get_quote(sym)
+        except asyncio.CancelledError:
+            if not stray_cancel():
+                raise
+            logger.error("%s: the reference price read was cancelled without a cancel request", name)
+            return None
+        except Exception:
+            logger.exception("%s: the reference price of %s could not be read", name, plan.base_asset)
+            return None
+        mid = (quote.bid + quote.ask) / 2.0
+        if not (quote.bid > 0 and quote.ask > 0 and math.isfinite(mid)):
+            return None
+        m = price_multiplier(sym.extra)
+        return Quote(bid=quote.bid / m, ask=quote.ask / m, last=mid / m)
+
+    async def _reference_broker_mid(self, name: str, plan: TradePlan, raw_symbol: str | None) -> float | None:
+        """Mid price of the plan's instrument on the account ``name`` (a ``reference_broker``), in the signal's scale
+        (see :meth:`_reference_broker_quote`)."""
+        quote = await self._reference_broker_quote(name, plan, raw_symbol)
+        return None if quote is None else (quote.bid + quote.ask) / 2.0
 
     async def _open_on_broker(
         self, broker: Broker, plan: TradePlan, trade: TradeRecord, raw_symbol: str | None,
@@ -4720,7 +4826,8 @@ class Engine:
         flow: _OpenFlow | None = None, mute_errors: bool = False, size_stop: float | None = None,
     ) -> BrokerOutcome:
         """``virtual``: the waiting virtual entry that just triggered (open it as a MARKET order with its stored
-        stop / take-profits, the offset measured now from ``ref_price``).
+        stop / take-profits, the offset measured now from ``ref_price``; for an entry that waits for a
+        ``reference_broker``, from that account's mid: ``ref_price`` when the caller just read it, else read here).
         ``size_stop``: another stop (signal scale) the size may be computed from: the farther of it and the plan's
         stop from the entry (a catch-up open with the trade's current stop after the trader moved it: never larger
         than the size of the signal's own stop). The order carries the plan's stop.
@@ -4746,8 +4853,13 @@ class Engine:
             conflict = await self._hedge_conflict(broker, plan, trade, sym.broker_symbol)
             if conflict:
                 return BrokerOutcome(name, "skipped", f"{esc(name)}: {conflict}", benign=True)
-            if virtual is None and virtual_entry_wanted(broker, plan, self._plan_kind(plan)):
+            kind = self._plan_kind(plan)
+            if virtual is None and virtual_entry_wanted(broker, plan, kind):
                 return await self._register_virtual(broker, plan, trade, sym, raw_symbol, flow)
+            if virtual is None and broker_virtual_wanted(broker, plan, kind):
+                # (never a broker limit on this account: it waits for the reference account's fill or price)
+                return await self._register_virtual(broker, plan, trade, sym, raw_symbol, flow,
+                                                    ref_broker=str(broker.config.reference_broker))
             entry_type = EntryType.MARKET if virtual is not None else plan.entry_type
             equity = await broker.get_equity()
             ccy = self._currency.get(name, "")
@@ -4797,7 +4909,10 @@ class Engine:
                 stop = virtual.stop_loss if virtual.stop_loss is not None else stop
                 tps = [TakeProfit(price=tp.price, close_fraction=tp.close_fraction) for tp in virtual.take_profits]
             signal_entry = plan.entry_price * mult if plan.entry_price else None
-            offset, offset_problem = await self._compute_price_offset(broker, plan, quote, mult, ref_price=ref_price)
+            ref_broker = (str((virtual.data or {}).get("reference_broker") or "") or None
+                          if virtual is not None else None)
+            offset, offset_problem = await self._compute_price_offset(
+                broker, plan, quote, mult, ref_price=ref_price, ref_broker=ref_broker, raw_symbol=raw_symbol)
             if offset_problem:
                 text = f"{esc(name)}: {offset_problem}"
                 return BrokerOutcome(name, "skipped", text)
@@ -4886,6 +5001,7 @@ class Engine:
                 pos.data["virtual_fired"] = {
                     "trigger_price": virtual.data.get("trigger_price"), "ref_price": ref_price,
                     "at": self._now().isoformat(),
+                    **({"reference_broker": ref_broker} if ref_broker else {}),
                 }
             await self._save_leg_position(trade.id, pos, flow)
             if pos.status is PositionStatus.FAILED:
@@ -4961,15 +5077,41 @@ class Engine:
     # ------------------------------------------------------------------ virtual (reference-touch) entries
     async def _register_virtual(
         self, broker: Broker, plan: TradePlan, trade: TradeRecord, sym: Any, raw_symbol: str | None,
-        flow: _OpenFlow | None = None,
+        flow: _OpenFlow | None = None, *, ref_broker: str | None = None,
     ) -> BrokerOutcome:
         """``entry_trigger: reference_touch``: no order on the broker. A PENDING position carrying
-        ``data["virtual_trigger"]`` is stored (it survives a restart); the monitor watches the reference price."""
+        ``data["virtual_trigger"]`` is stored (it survives a restart); the monitor watches the reference price.
+        ``ref_broker`` (``reference_broker``, a forex / CFD plan): the stored entry carries ``data["reference_broker"]``
+        instead and waits for that account's waiting entry of the trade to fill, or - while that account has none -
+        for that account's own price to reach the level (:meth:`_reference_broker_check`). Never a broker limit."""
         name = broker.name
-        ref_id = str(broker.config.reference_exchange)
         mult = price_multiplier(sym.extra)
         entry = float(plan.entry_price or 0.0) * mult
         hours = self._virtual_max_hours(float(getattr(broker.config, "virtual_trigger_max_hours", 48.0)))
+        if ref_broker:
+            pos = BrokerPosition(
+                broker=name, broker_symbol=sym.broker_symbol, side=plan.side, status=PositionStatus.PENDING,
+                quantity=0.0, remaining_quantity=0.0,
+                stop_loss=plan.stop_loss * mult, take_profits=scaled_take_profits(plan.take_profits, mult),
+                dry_run=self.config.dry_run,
+                data={
+                    "virtual_trigger": True, "virtual_state": "waiting", "trigger_price": entry,
+                    "reference_broker": ref_broker, "price_multiplier": mult, "raw_symbol": raw_symbol,
+                    "virtual_created_at": self._now().isoformat(), "virtual_max_hours": hours,
+                },
+            )
+            await self._save_leg_position(trade.id, pos, flow)
+            # (the owner's texts only: this outcome has a position, so it is never forwarded to the friend)
+            text = (f"{esc(name)}: sanal tetik kuruldu (limit emir konmadı): {esc(ref_broker)} hesabındaki giriş emri "
+                    f"dolunca, orada emir yoksa {esc(ref_broker)} fiyatı {fmt_price(plan.entry_price)} seviyesine "
+                    f"gelince {esc(name)}'da piyasa emriyle açılacak (en çok {fmt.fmt_number(hours)} saat beklenir)")
+            if not self.config.notifier.notify_on_execution:
+                await self._notify(f"🧭 #{trade.id} {esc(plan.base_asset)} {plan.side.value.upper()}: {text}",
+                                   Severity.INFO)
+            await self._log("virtual_registered", {"trade_id": trade.id, "broker": name, "trigger": entry,
+                                                    "reference_broker": ref_broker})
+            return BrokerOutcome(name, "ok", text, pos)
+        ref_id = str(broker.config.reference_exchange)
         # "The price ran to the first target without touching the entry" cancels a waiting entry. That rule
         # counts from the start when the market price is between the entry and the first target right now (as
         # it always did). A pullback limit starts with the price BEYOND its first target (the target lies
@@ -5145,8 +5287,13 @@ class Engine:
         # The trade is over on the other accounts: a filled position there has closed and none is left (the
         # trader's trade has been played out), or every entry there ended without a fill (expired, cancelled,
         # failed). This entry must not open the trade later on its account alone.
-        real = [p for p in await self.db.broker_positions(trade.id)
-                if p.broker != pos.broker and not is_virtual_pending(p)]
+        rows = await self.db.broker_positions(trade.id)
+        ref_name = str(d.get("reference_broker") or "")
+        if ref_name:
+            # (a leg of the reference account that never got onto that account - failed, nothing filled - is no leg:
+            # it does not end the trade; the entry then waits for that account's price, see _reference_broker_check)
+            rows = [p for p in rows if not reference_leg_never_placed(p, ref_name)]
+        real = [p for p in rows if p.broker != pos.broker and not is_virtual_pending(p)]
         if real and not any(p.status in ACTIVE_POSITION for p in real):
             if any(p.status is PositionStatus.CLOSED for p in real):
                 return await self._virtual_end(
@@ -5158,6 +5305,8 @@ class Engine:
                 "işlemin diğer hesaplardaki girişleri dolmadan sona erdi (süresi doldu, iptal edildi ya da "
                 "açılamadı); bekleyen sanal giriş de iptal edildi, bu hesapta işlem AÇILMADI.", Severity.INFO)
         broker = self._broker(pos.broker)       # None: not connected right now (the levels are still watched)
+        if d.get("reference_broker"):
+            return await self._reference_broker_check(trade, pos, broker, label, rows)
         ref_id = str(d.get("reference_exchange") or "")
         if not ref_id:
             return pos
@@ -5249,11 +5398,82 @@ class Engine:
                         "sanal giriş iptal edilir.", Severity.WARNING)
                     pos = noted
                 return await self._virtual_seen_now(trade, pos, now) if candles_read else pos
+        seen = (f"{esc(ref_label(ref_id))} fiyatı kısa süreliğine {fmt_price(worst / mult)} seviyesine geldi, şimdi "
+                f"{fmt_price(px / mult)}" if wicked else f"{esc(ref_label(ref_id))} fiyatı {fmt_price(px / mult)}")
+        at = f"{esc(ref_label(ref_id))} {fmt_price(px / mult)}"
+        return await self._virtual_fire(trade, pos, broker, label, _Fire(
+            mode="touch", what=f"tetik seviyesine gelindi ({at})", busy_what="tetik seviyesine gelindi",
+            busy_tail="Yanıt geldiğinde fiyat hâlâ seviyedeyse açılır.", done=f"tetiklendi ({at})",
+            seen=f"tetiklendi ({seen})", retry_tail="Fiyat seviyede kaldıkça sonraki kontrollerde en çok "
+            f"{VIRTUAL_RETRY_MAX} kez daha denenecek.",
+            head=f"sanal tetik tetiklendi ({seen}, seviye {fmt_price(trigger / mult)})",
+            ref_price=float(ref), log={"ref_price": ref}))
+
+    async def _reference_broker_check(
+        self, trade: TradeRecord, pos: BrokerPosition, broker: Broker | None, label: str, rows: list[BrokerPosition]
+    ) -> BrokerPosition:
+        """A waiting forex / CFD entry of a ``reference_broker`` account (the three rules every waiting entry has -
+        an interrupted fire, the expiry, the other accounts ended - have been applied, to ``rows``: the trade's
+        positions as this look read them; the same reading decides here, so that a reference leg that has closed
+        meanwhile is never taken for a fill the other rule did not see). Never a broker limit on this account:
+          * the reference account's leg of the trade has filled -> MARKET here, levels shifted by the offset read now;
+          * it has a waiting entry (its own limit order) -> this one waits for that order to fill;
+          * it has no waiting entry in the trade (its owner's answer is awaited, a rule skipped it, it was refused, it
+            ended unfilled while the trade goes on) -> the reference account's own live price (read only) decides:
+            long: ask <= the entry, short: bid >= the entry -> MARKET here; no price readable (not connected, no such
+            symbol there) -> it waits, the owner told (throttled); virtual_trigger_max_hours still ends it."""
+        d = pos.data
+        ref = str(d.get("reference_broker") or "")
+        legs = [p for p in rows if p.broker == ref]
+        filled = any(reference_leg_filled(p) for p in legs)
+        mult = price_multiplier(d)
+        level_px = float(d.get("trigger_price") or 0.0) / mult           # the signal's scale
+        level = fmt_price(level_px)
+        if filled:
+            if broker is None:
+                return pos          # not connected right now: decided again once it is back
+            what = f"{esc(ref)} hesabındaki giriş doldu"
+            return await self._virtual_fire(trade, pos, broker, label, _Fire(
+                mode="reference", what=what, busy_what=what, busy_tail="Yanıt geldiğinde açılır.", done=what,
+                seen=what, retry_tail=f"Sonraki kontrollerde en çok {VIRTUAL_RETRY_MAX} kez daha denenecek.",
+                head=f"{what} (seviye {level}), piyasa emriyle açıldı", log={"reference_broker": ref}))
+        if any(p.status in ACTIVE_POSITION for p in legs):
+            return pos              # its own order waits: its fill decides (never also the price: one trigger)
+        quote = await self._reference_broker_quote(ref, trade.plan, d.get("raw_symbol"))
+        if quote is None:
+            warn_key = (trade.id, f"{pos.broker}:refprice")
+            last = self._virtual_warned.get(warn_key)
+            if last is None or time.monotonic() - last >= VIRTUAL_NOTE_THROTTLE_SEC:
+                self._virtual_warned[warn_key] = time.monotonic()
+                await self._notify(
+                    f"⚠️ {label} {esc(pos.broker)}: {esc(ref)} fiyatı okunamıyor ({esc(ref)} bağlı değil ya da "
+                    f"sembolü yok); {esc(pos.broker)} girişi {level} seviyesi için beklemeye devam ediyor, limit "
+                    "emir KONMAZ.", Severity.WARNING)
+            return pos
+        long = pos.side is Side.LONG
+        touched = level_px > 0 and ((long and quote.ask <= level_px) or (not long and quote.bid >= level_px))
+        if not touched or broker is None:
+            return pos              # (touched while this account is not connected: decided again once it is back)
+        at = f"{esc(ref)} {fmt_price(quote.ask if long else quote.bid)}"
+        what = f"{esc(ref)} fiyatı giriş seviyesine geldi ({at})"
+        return await self._virtual_fire(trade, pos, broker, label, _Fire(
+            mode="price", what=what, busy_what=what, busy_tail="Yanıt geldiğinde fiyat hâlâ seviyedeyse açılır.",
+            done=what, seen=what,
+            retry_tail=f"Fiyat seviyede kaldıkça sonraki kontrollerde en çok {VIRTUAL_RETRY_MAX} kez daha denenecek.",
+            head=f"{what}, seviye {level}; piyasa emriyle açıldı",
+            ref_price=(quote.bid + quote.ask) / 2.0, log={"reference_broker": ref, "ref_price": quote.last}))
+
+    async def _virtual_fire(
+        self, trade: TradeRecord, pos: BrokerPosition, broker: Broker, label: str, fire: _Fire
+    ) -> BrokerPosition:
+        """Send the order of a waiting virtual entry - the one fire path of every kind of waiting entry. At most one
+        order is ever sent for it: its state "firing" is stored before the order goes out (a restart in between ends
+        it, never sends it again) and the account counts as busy for new signals until it is answered."""
+        d = pos.data
         if await self._is_paused():
             return await self._virtual_end(
                 trade, pos, PositionStatus.CANCELLED, "bot duraklatılmış",
-                f"tetik seviyesine gelindi ({esc(ref_label(ref_id))} {fmt_price(px / mult)}) ama yeni işlem açma "
-                "duraklatılmış (/durdur); sanal giriş iptal edildi, işlem AÇILMADI.")
+                f"{fire.what} ama yeni işlem açma duraklatılmış (/durdur); sanal giriş iptal edildi, işlem AÇILMADI.")
         running = self._leg_running.get(pos.broker)
         if running is not None and not running.done():
             # Another signal's open is in flight on this account: no second open at the same time (its hedge /
@@ -5266,9 +5486,9 @@ class Engine:
                     and (last is None or time.monotonic() - last >= VIRTUAL_NOTE_THROTTLE_SEC)):
                 self._virtual_warned[busy_key] = time.monotonic()
                 await self._notify(
-                    f"🧭 {label} {esc(pos.broker)}: tetik seviyesine gelindi ama {esc(pos.broker)} önceki bir emrine "
+                    f"🧭 {label} {esc(pos.broker)}: {fire.busy_what} ama {esc(pos.broker)} önceki bir emrine "
                     f"hâlâ yanıt vermedi; yanıt gelene kadar {esc(pos.broker)} hesabına yeni emir gönderilmiyor. "
-                    "Yanıt geldiğinde fiyat hâlâ seviyedeyse açılır.", Severity.WARNING)
+                    f"{fire.busy_tail}", Severity.WARNING)
             return pos
 
         # Touched: from here on at most one order may ever be sent (state saved BEFORE sending).
@@ -5280,13 +5500,12 @@ class Engine:
         self._leg_running[pos.broker] = marker
         try:
             outcome = await self._open_on_broker(
-                broker, trade.plan, trade, d.get("raw_symbol"), virtual=fired, ref_price=float(ref), mute_errors=True)
+                broker, trade.plan, trade, d.get("raw_symbol"), virtual=fired, ref_price=fire.ref_price,
+                mute_errors=True)
         finally:
             if self._leg_running.get(pos.broker) is marker:
                 del self._leg_running[pos.broker]
             marker.set_result(None)
-        seen = (f"{esc(ref_label(ref_id))} fiyatı kısa süreliğine {fmt_price(worst / mult)} seviyesine geldi, şimdi "
-                f"{fmt_price(px / mult)}" if wicked else f"{esc(ref_label(ref_id))} fiyatı {fmt_price(px / mult)}")
         if outcome.position is None:
             if outcome.kind == "error" and not outcome.sent:
                 # Nothing was sent to the broker (its symbol, balance or price could not be read): the entry is
@@ -5301,9 +5520,8 @@ class Engine:
                                                       "failures": failures, "text": outcome.text})
                     if failures == 1:
                         await self._notify(
-                            f"🧭 {label}: tetiklendi ({seen}) ama {esc(pos.broker)} hesabına ulaşılamadı, emir "
-                            f"gönderilmedi: {outcome.text}\nFiyat seviyede kaldıkça sonraki kontrollerde en çok "
-                            f"{VIRTUAL_RETRY_MAX} kez daha denenecek.", Severity.WARNING)
+                            f"🧭 {label}: {fire.seen} ama {esc(pos.broker)} hesabına ulaşılamadı, emir "
+                            f"gönderilmedi: {outcome.text}\n{fire.retry_tail}", Severity.WARNING)
                     return again        # the touch stays "unseen": the next pass looks at it again
             if outcome.kind == "error":
                 await self._notify(outcome.text, Severity.ERROR)     # (muted in _open_on_broker)
@@ -5313,13 +5531,11 @@ class Engine:
                 # sent again (the entry ends here).
                 return await self._virtual_end(
                     trade, pos, status, outcome.kind,
-                    f"tetiklendi ({esc(ref_label(ref_id))} {fmt_price(px / mult)}); "
-                    f"{_unknown_open_text([pos.broker])}. Emir tekrar gönderilmeyecek, sanal giriş sona erdi: "
-                    f"{outcome.text}", Severity.ERROR, unknown=True)
+                    f"{fire.done}; {_unknown_open_text([pos.broker])}. Emir tekrar gönderilmeyecek, sanal giriş sona "
+                    f"erdi: {outcome.text}", Severity.ERROR, unknown=True)
             return await self._virtual_end(
                 trade, pos, status, outcome.kind,
-                f"tetiklendi ({esc(ref_label(ref_id))} {fmt_price(px / mult)}) ama işlem açılmadı, sanal giriş "
-                f"iptal edildi: {outcome.text}")
+                f"{fire.done} ama işlem açılmadı, sanal giriş iptal edildi: {outcome.text}")
         new = outcome.position
         self._virtual_forget(trade.id, pos.broker)
         icon = "✅" if outcome.kind == "ok" else "⚠️"
@@ -5334,10 +5550,9 @@ class Engine:
                     + esc("; ".join(queued)) + "); sonucu ayrıca bildirilecek.")
         # The headline names the account: only this broker's entry was waiting (the others are not touched here).
         await self._notify(
-            f"{icon} <b>{label} {esc(pos.broker)} hesabında {word}</b> — sanal tetik tetiklendi ({seen}, seviye "
-            f"{fmt_price(trigger / mult)})\n• {outcome.text}{then}",
+            f"{icon} <b>{label} {esc(pos.broker)} hesabında {word}</b> — {fire.head}\n• {outcome.text}{then}",
             Severity.INFO if outcome.kind == "ok" else Severity.ERROR)
-        await self._log("virtual_fired", {"trade_id": trade.id, "broker": pos.broker, "ref_price": ref,
+        await self._log("virtual_fired", {"trade_id": trade.id, "broker": pos.broker, **fire.log,
                                           "status": new.status.value, "kind": outcome.kind})
         return new
 
@@ -7729,11 +7944,7 @@ class Engine:
                 if accounts is not None and p.broker not in accounts:
                     continue
                 if is_virtual_pending(p):
-                    ref_id = str(p.data.get("reference_exchange") or "")
-                    trig = p.data.get("trigger_price")
-                    mult = price_multiplier(p.data)
-                    bits = [f"• {esc(p.broker)}: {pos_status_text(p)}",
-                            f"{esc(ref_label(ref_id))} fiyatı {fmt_price(trig / mult if trig else None)} seviyesine değince"]
+                    bits = [f"• {esc(p.broker)}: {pos_status_text(p)}", waiting_entry_text(p, owner=accounts is None)]
                 else:
                     bits = [f"• {esc(p.broker)}: {_POS_STATUS_TR.get(p.status, p.status.value)}",
                             f"{_qty(p.remaining_quantity if p.status is PositionStatus.OPEN else p.quantity)}"]

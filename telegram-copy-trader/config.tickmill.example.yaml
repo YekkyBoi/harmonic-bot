@@ -33,6 +33,11 @@ brokers:
     # LIMIT girişte brokerda emir bekletme. Binance fiyatı seviyeye değince farkı o an ölç ve MARKET aç:
     entry_trigger: reference_touch
     virtual_trigger_max_hours: 48       # tetiklenmezse 48 saat sonra iptal
+    # FX konusundaki LIMIT girişlerde de brokerda emir bekletmemek için (isteğe bağlı): sizin MetaTrader hesabınızın
+    # (type mt5 / mt5_bridge) adını yazın. Tickmill'e limit emir HİÇ konmaz: o hesaptaki giriş emri dolunca, o
+    # hesapta emir yoksa (onay bekliyor, atlandı) o hesabın fiyatı giriş seviyesine gelince Tickmill'de MARKET açılır;
+    # stop / hedefler o anki fiyat farkıyla kaydırılır.
+    # reference_broker: fx
     # YER TUTUCU: arkadaşınızın MT5 "Market Watch" listesindeki TAM sembol adlarını yazın.
     # Tickmill'de kripto CFD adları ve sonekleri farklı olabilir (ör. BTCUSD, ETHUSD).
     symbol_map: {BTC: BTCUSD, ETH: ETHUSD}
