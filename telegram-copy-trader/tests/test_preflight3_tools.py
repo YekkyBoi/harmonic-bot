@@ -111,6 +111,16 @@ def b() -> Any:
     return load("bekci")
 
 
+@pytest.fixture(autouse=True)
+def _plenty_of_disk(monkeypatch: pytest.MonkeyPatch) -> None:
+    """The watchman also warns about low disk space: these tests must not depend on the free space of the machine
+    that runs them (tests/test_bekci_disk.py covers the warning with its own readings)."""
+    import shutil
+    from collections import namedtuple
+    usage = namedtuple("usage", "total used free")
+    monkeypatch.setattr(shutil, "disk_usage", lambda path: usage(10 ** 13, 0, 10 ** 13))
+
+
 @pytest.fixture(scope="module")
 def g() -> Any:
     module = load("guncelle")

@@ -8,6 +8,9 @@ so it also runs after a restart of the server before anyone logs on. Every run i
   "the bot is back" message);
 * nobody holds it (no file, or a file left behind by a closed window, a crash or a restart of the server):
   ONE message, then a reminder at most every 30 minutes while the bot stays down;
+* less than 5 GB free on the drive of the data folder (a full disk stops the bot from saving anything): ONE
+  message, then a reminder at most every 30 minutes while the space stays low (also during an update: an update
+  needs room most);
 * an update is running (``<data_dir>/guncelleme.lock`` younger than 30 minutes), the installed bot version does
   not write a lock file, or the answer cannot be told for certain: silence.
 
@@ -23,6 +26,8 @@ says nothing, so the same message can never repeat every five minutes.
 from __future__ import annotations
 
 import json
+import math
+import shutil
 import os
 import re
 import ssl
@@ -42,6 +47,8 @@ GUNCELLEME_KILIDI = "guncelleme.lock"     # written by guncelle.py while an upda
 DURUM_DOSYASI = "bekci.json"
 DENEME_ISTEGI = "bekci.dene"              # guncelle.py: "send one test message at your next pass"
 HATIRLATMA_ARASI = 30 * 60.0              # seconds between two reminders while the bot stays down
+DISK_ESIK = 5 * 1024 ** 3                 # bytes: less free space than this on the bot's data drive -> a warning
+DISK_HATIRLATMA_ARASI = 30 * 60.0         # seconds between two disk reminders while the space stays low
 GUNCELLEME_SURESI = 30 * 60.0             # an update lock younger than this means: an update is running
 ACILIS_PAYI = 300.0                       # seconds; see BOOT_SLACK_SEC in copytrader/__main__.py
 ZAMAN_ASIMI = 20.0                        # seconds for one Telegram request
@@ -55,6 +62,10 @@ HATIRLATMA = "⚠️ Bot hâlâ çalışmıyor (ilk uyarıdan bu yana {sure} ge�
 GERI_GELDI = "✅ Bot tekrar çalışıyor."
 DENEME_METNI = ("\U0001f6e1 Bekçi kuruldu ve çalışıyor: bot kapanırsa (sunucu yeniden başlarsa, pencere kapanırsa) "
                 "birkaç dakika içinde buradan haber verilir.")
+DISK_UYARI = ("⚠️ Sunucunun diskinde az yer kaldı: {bos} boş (sınır 5 GB). Disk dolarsa bot işlemleri "
+              "kaydedemez. Gereksiz dosyaları silip yer açın.")
+DISK_HATIRLATMA = ("⚠️ Sunucunun diskinde hâlâ az yer var: {bos} boş (ilk uyarıdan bu yana {sure} geçti). "
+                   "Gereksiz dosyaları silip yer açın.")
 AYAR_YOK = "bot_token ya da owner_user_id okunamadı (config.yaml / .env)"
 SUREC_OKUNAMIYOR = "bu sistemde çalışan programların durumu okunamıyor; botun çalışıp çalışmadığı anlaşılamaz"
 
@@ -333,6 +344,45 @@ def karar(durum: dict[str, Any], gorulen: str, an: float) -> tuple[str | None, d
     return None, yeni
 
 
+def gb_metni(bayt: float) -> str:
+    """'3,2 GB' (one decimal, Turkish comma)."""
+    return f"{math.floor(bayt / 1024 ** 3 * 10) / 10:.1f}".replace(".", ",") + " GB"   # (down: 4,97 -> 4,9)
+
+
+def bos_alan(yol: Path) -> float | None:
+    """Free bytes on the drive of ``yol``; None when it cannot be read."""
+    try:
+        return float(shutil.disk_usage(str(yol)).free)
+    except OSError:
+        return None
+
+
+def disk_karar(durum: dict[str, Any], bos: float | None, an: float) -> tuple[str | None, dict[str, Any]]:
+    """(message or None, the state to remember once it is sent) for the free space this pass read. Below
+    DISK_ESIK: a first warning, then a reminder at most every DISK_HATIRLATMA_ARASI while it stays low; back above
+    it: silence (the state is cleared). ``disk_son`` is kept after that, so space that drops again within the
+    reminder interval is not warned about twice in a row. Unreadable: nothing changes."""
+    yeni = dict(durum)
+    if bos is None:
+        return None, yeni
+    ilk, son = _sayi(durum.get("disk_ilk")), _sayi(durum.get("disk_son"))
+    if bos >= DISK_ESIK:
+        yeni["disk_ilk"] = None
+        return None, yeni
+    if son is not None and an < son:                       # the clock was set back: count from now
+        yeni["disk_son"] = an
+        return None, yeni
+    if ilk is None:
+        if son is not None and an - son < DISK_HATIRLATMA_ARASI:
+            return None, yeni                              # dropped again soon after a message: a new first one later
+        yeni.update(disk_ilk=an, disk_son=an)
+        return DISK_UYARI.format(bos=gb_metni(bos)), yeni
+    if son is None or an - son >= DISK_HATIRLATMA_ARASI:
+        yeni["disk_son"] = an
+        return DISK_HATIRLATMA.format(bos=gb_metni(bos), sure=sure_metni(max(0.0, an - ilk))), yeni
+    return None, yeni
+
+
 def durum_oku(veri: Path) -> dict[str, Any]:
     try:
         durum = json.loads((veri / DURUM_DOSYASI).read_text(encoding="utf-8"))
@@ -445,6 +495,7 @@ def bak(
     simdi: Callable[[], float] = time.time,
     gonder: Callable[[str, int, str], None] | None = None,
     durum_sor: Callable[[Path], str] = bot_durumu,
+    disk_sor: Callable[[Path], float | None] = bos_alan,
 ) -> str:
     """One pass over the bot folder ``bot``; returns what it saw / did (for the tests). The keyword arguments
     replace the clock, the Telegram request and the look at the lock file."""
@@ -455,6 +506,19 @@ def bak(
     if istek is not None:
         hata = deneme_yap(bot, gonder)
         kayit["deneme"] = {"istek": istek, "sonuc": hata or "tamam", "zaman": an}
+    # disk space first (its own state keys; the bot's message below is decided on what this leaves)
+    # (its own guard: whatever goes wrong here, the bot check below still runs)
+    try:
+        dmesaj, dyeni = disk_karar(kayit, disk_sor(veri), an)
+        if dmesaj is None:
+            kayit = dyeni
+        elif durum_yaz(veri, dyeni):                   # remembered: it may be said (never twice)
+            if mesaj_gonder(bot, dmesaj, gonder) is None:
+                kayit = dyeni
+            else:
+                durum_yaz(veri, kayit)                 # not sent: the next pass tries again
+    except Exception:          # noqa: BLE001 - the disk warning never stops the bot check
+        pass
     if guncelleme_suruyor(veri, an):
         gorulen = GUNCELLEME
     elif not kilit_yazan_surum(bot):
