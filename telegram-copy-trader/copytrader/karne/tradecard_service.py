@@ -22,11 +22,13 @@ the RESULT card once it is closed (see :mod:`.tradecard` for what the card says)
   file request (paused while the trading path is busy). The command answers at once; the card is made by a task of
   this service, one card at a time. Every failure is a short text for the owner; nothing raises into the bot.
   :meth:`stop` ends within STOP_WAIT_SEC.
-* **A ccxt position closed by hand on the exchange** (closed, no exit price of the bot's on record): its close is
-  read - read only, within FILLS_TIMEOUT_SEC - from the account's own fills of the symbol (the live adapter's
-  exchange, ``fetch_my_trades``; :func:`.tradecard.venue_close`), for the card only (the bot's own records, its
-  result, the report card and the closing notice stay as they are). Not found or not readable: the card is not made
-  (the owner reads why), never a guessed price.
+* **A ccxt position closed by hand on the exchange** (closed, no exit price of the bot's on record, or part of it
+  closed by the bot and the rest by hand: the bot's result not complete, :func:`.tradecard.venue_wanted`): its close
+  and the net money it made (fees in the account's quote currency included) are read - read only, within
+  FILLS_TIMEOUT_SEC - from the account's own fills of the symbol (the live adapter's exchange, ``fetch_my_trades``;
+  :func:`.tradecard.venue_close`), for the card only (the bot's own records, its result, the report card and the
+  closing notice stay as they are). Not found or not readable: the card is not made (the owner reads why), never a
+  guessed price; a position whose bot result is complete reads no fills.
 """
 
 from __future__ import annotations
@@ -37,6 +39,7 @@ import logging
 import re
 import time
 from collections.abc import Awaitable, Callable, Mapping, Sequence
+from dataclasses import replace
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any
@@ -303,7 +306,7 @@ class TradeCardService:
             bars, rec = await self._mt5_candles(account, trade, pos, closed_at, events, tf, now)
         elif source[0] == "ccxt" and source[1]:
             rec = tc.read_records(trade, pos, closed_at, events)
-            if not active and rec.exit_price is None:
+            if tc.venue_wanted(pos, rec):
                 rec = await self._closed_on_venue(account, pos, rec, now)
             bars = await self._ccxt_candles(str(source[1]), pos.broker_symbol, rec, pos, tf, now)
         else:
@@ -312,30 +315,35 @@ class TradeCardService:
         return data, tc.caption(trade, account, data["kind"])
 
     async def _closed_on_venue(self, account: str, pos: Any, rec: tc.Records, now: datetime) -> tc.Records:
-        """A closed position of a ccxt account with no exit price on record (closed by hand on the exchange): the
-        records with the close read from the account's own fills (tradecard.venue_close); ``rec`` as it is when the
-        account is not a live ccxt one, the position not real money, or the fills do not tell (the card then says the
-        close price is not on record). Read only, bounded; never raises (but CancelledError)."""
+        """A closed position of a ccxt account closed by hand on the exchange, in full or in part
+        (tradecard.venue_wanted): the records with the close and the net money read from the account's own fills
+        (tradecard.venue_close). The fills do not tell (the account is not a live ccxt one, the position not real
+        money: ``rec`` as it is; the read fails or the fills do not cover it: the same, but without the bot's own exit
+        price when part of the position was closed outside the bot's orders (that price is not the position's close: the
+        card then says the close price is not on record, never a part shown as the whole). Read only, bounded; never
+        raises (but CancelledError)."""
         broker = self._broker(account)
         if getattr(broker, "kind", None) != "ccxt" or pos.dry_run or (pos.data or {}).get("simulated"):
             return rec
+        unread = replace(rec, exit_price=None) if tc.venue_partial(pos) else rec
         fetch = getattr(getattr(broker, "exchange", None), "fetch_my_trades", None)
         opened = tc.venue_opened(pos, rec)
         if not callable(fetch) or opened is None:
-            return rec
+            return unread
+        quote = getattr(getattr(broker, "cfg", None), "quote_currency", None)
         try:
             since = int(as_utc(opened).timestamp() * 1000) - FILLS_SINCE_SLACK_MS
             trades = await asyncio.wait_for(fetch(pos.broker_symbol, since), FILLS_TIMEOUT_SEC)
-            found = tc.venue_close(pos, rec, list(trades or []), now)
+            found = tc.venue_close(pos, rec, list(trades or []), now, str(quote) if quote else None)
         except asyncio.CancelledError:
             raise
         except Exception as exc:      # noqa: BLE001 - the card is refused as before (no close price on record)
             logger.warning("Trade card: %s's fills of %s could not be read: %s", account, pos.broker_symbol,
                            str(exc) or type(exc).__name__)
-            return rec
+            return unread
         if found is None:
             logger.info("Trade card: %s's fills of %s do not cover the closed position", account, pos.broker_symbol)
-            return rec
+            return unread
         return found
 
     def _span(self, rec: tc.Records, pos: Any, tf: int, now: datetime, *, closed_market: bool

@@ -390,18 +390,20 @@ def binance_on(world: World) -> Any:
     return fake
 
 
-async def hand_closed_btc(world: World) -> dict[str, Any]:
+async def hand_closed_btc(world: World, realized: float | None = None, **data: Any) -> dict[str, Any]:
     """The BTC long (0.1 at 91,000) closed by hand on Binance: the adapter found it flat (no exit of its own, no
-    result) four minutes after the close; the only trade of binance this week."""
+    result) four minutes after the close; the only trade of binance this week. ``realized``: the bot's own result
+    (of a part it closed itself), ``data``: changes to its data."""
     t = world.long["trade"]
     start = datetime.fromtimestamp(world.long["bars"][0][0], tz=UTC)
     created = start + timedelta(minutes=15 * 58 + 3)
     fill = created + timedelta(seconds=20)
     seen_flat = start + timedelta(minutes=15 * 83 + 11)
-    pos = world.long["pos"].model_copy(deep=True, update={"realized_pnl": None})
+    pos = world.long["pos"].model_copy(deep=True, update={"realized_pnl": realized})
     pos.remaining_quantity = 0.0
     pos.data.update(opened_at=ms(fill), closed_at=ms(seen_flat), closed_reason="flat_on_exchange",
                     closed_outside=0.1, exits=[], entry_order_id="E1", sl_order_id="S1")
+    pos.data.update(data)
     tid = await add_trade(world.db, world.clock, t, pos, created=created, closed=seen_flat, status=TradeStatus.CLOSED)
     return {"id": tid, "start": start, "fill": fill, "seen_flat": seen_flat}
 
@@ -435,7 +437,7 @@ async def test_a_close_made_by_hand_on_binance_is_read_from_its_own_fills(world:
     assert data is not None, world.notes.lines
     vwap = (0.06 * 91950.0 + 0.04 * 92050.0) / 0.1                                         # 91,990
     assert data["kind"] == "result" and data["exit"] == pytest.approx(vwap)
-    # no money R (the result is not known): the price-based R, and the box drawn to that same close price
+    # the fills carry no fees and the initial risk is 0.1 x 600: the money's R (99 / 60) is the price move's here
     assert data["hero"] == tc.fmt_r((vwap - 91000.0) / 600.0) == "+1.65R"
     assert data["played_to"] == data["box_far"] == pytest.approx(vwap)
     assert data["timeline"][-1] == [f"{tc.to_uk(close2):%H:%M}", "Elle kapatıldı (borsada) · +1.65R"]
@@ -540,6 +542,176 @@ def test_the_close_from_the_fills_takes_only_this_positions_close() -> None:
     late = tc.venue_close(pos, tc.Records(filled=opened), [fill_of("sell", 0.1, 91000.0, NOW - timedelta(minutes=1))],
                           NOW)
     assert late is not None and late.closed == NOW - timedelta(minutes=1)
+
+
+def paid(fill: dict[str, Any], *fees: tuple[float, str]) -> dict[str, Any]:
+    """The fill with its fees (cost, currency), as ccxt lists them."""
+    fill["fees"] = [{"cost": cost, "currency": currency} for cost, currency in fees]
+    return fill
+
+
+async def test_a_close_made_by_hand_shows_the_net_money_in_r(world: World) -> None:
+    fake = binance_on(world)
+    # the initial risk the adapter stored: 66 (not 0.1 x 600: the lot's rounding, the fee estimate), so the money's
+    # R and the price's R differ
+    h = await hand_closed_btc(world, initial_risk={"loss": 66.0, "quantity": 0.1})
+    close1 = h["start"] + timedelta(minutes=15 * 83 + 2)
+    close2 = h["start"] + timedelta(minutes=15 * 83 + 7)
+    fake.trades = [
+        paid(fill_of("buy", 0.1, 91000.0, h["fill"], order="E1"), (4.55, "USDT")),            # the bot's entry
+        paid(fill_of("sell", 0.06, 91950.0, close1), (2.7585, "USDT")),
+        paid(fill_of("sell", 0.04, 92050.0, close2), (1.841, "USDT"), (0.01, "BNB")),       # (BNB: not counted)
+    ]
+    data = await card_of_first(world)
+    assert data is not None, world.notes.lines
+    money = 0.06 * 950.0 + 0.04 * 1050.0 - 4.55 - 2.7585 - 1.841                           # 89.8505
+    assert data["hero"] == tc.fmt_r(money / 66.0) == "+1.36R"                              # (the price: +1.65R)
+    assert data["played_to"] == data["box_far"] == pytest.approx(91000.0 + money / 66.0 * 600.0)
+    assert data["exit"] == pytest.approx(91990.0) and data["chips"][3][2] == "çıkış 91.990,0"
+    assert data["timeline"][-1] == [f"{tc.to_uk(close2):%H:%M}", "Elle kapatıldı (borsada) · +1.36R"]
+    rows = await world.db.account_trades("binance", NOW, trade_id=h["id"])
+    assert rows[0][1].realized_pnl is None and rows[0][1].data["exits"] == []              # the bot's record: as it was
+
+
+async def test_a_close_by_hand_without_the_initial_risk_is_the_price_move(world: World) -> None:
+    fake = binance_on(world)
+    h = await hand_closed_btc(world, initial_risk=None)
+    close = h["start"] + timedelta(minutes=15 * 83 + 2)
+    fake.trades = [paid(fill_of("buy", 0.1, 91000.0, h["fill"], order="E1"), (4.55, "USDT")),
+                   paid(fill_of("sell", 0.1, 91990.0, close), (4.6, "USDT"))]
+    data = await card_of_first(world)
+    assert data is not None, world.notes.lines
+    assert data["hero"] == "+1.65R" and data["played_to"] == data["box_far"] == data["exit"] == pytest.approx(91990.0)
+
+
+async def bot_tp1_then_hand(world: World) -> dict[str, Any]:
+    """The BTC long: half (0.05) closed by the bot's first target at 91,800, the rest closed by hand on Binance."""
+    start = datetime.fromtimestamp(world.long["bars"][0][0], tz=UTC)
+    tp1 = start + timedelta(minutes=15 * 75 + 1)
+    h = await hand_closed_btc(
+        world, realized=35.0, closed_outside=0.05, tp_order_ids=[{"id": "T1", "price": 91800.0, "qty": 0.05,
+                                                                  "status": "filled", "filled_qty": 0.05}],
+        exits=[{"order_id": "T1", "qty": 0.05, "price": 91800.0, "kind": "tp"}])   # (as the adapter books it: no time)
+    return dict(h, tp1=tp1, hand=start + timedelta(minutes=15 * 83 + 2))
+
+
+async def test_a_part_closed_by_the_bot_and_the_rest_by_hand_count_both(world: World) -> None:
+    fake = binance_on(world)
+    h = await bot_tp1_then_hand(world)
+    fake.trades = [
+        paid(fill_of("buy", 0.1, 91000.0, h["fill"], order="E1"), (4.55, "USDT")),
+        paid(fill_of("sell", 0.05, 91800.0, h["tp1"], order="T1"), (2.295, "USDT")),          # the bot's target
+        paid(fill_of("sell", 0.05, 92100.0, h["hand"]), (2.3025, "USDT")),                     # the owner's
+    ]
+    data = await card_of_first(world)
+    assert data is not None, world.notes.lines
+    money = 0.05 * 800.0 + 0.05 * 1100.0 - 4.55 - 2.295 - 2.3025                           # 85.8525
+    assert data["hero"] == tc.fmt_r(money / 60.0) == "+1.43R"                              # (the bot's part alone: no)
+    assert data["played_to"] == data["box_far"] == pytest.approx(91000.0 + money / 60.0 * 600.0)
+    assert data["exit"] == pytest.approx(91950.0) and data["chips"][3][1] == "Kapatıldı"
+    assert data["timeline"][-2:] == [[f"{tc.to_uk(h['tp1']):%H:%M}", "Hedef (kısmi)"],
+                                     [f"{tc.to_uk(h['hand']):%H:%M}", "Elle kapatıldı (borsada) · +1.43R"]]
+    assert fake.names() == ["fetch_my_trades"]
+    rows = await world.db.account_trades("binance", NOW, trade_id=h["id"])
+    assert rows[0][1].realized_pnl == 35.0 and len(rows[0][1].data["exits"]) == 1
+
+
+async def test_a_part_closed_by_hand_that_the_fills_do_not_show_makes_no_card(world: World) -> None:
+    fake = binance_on(world)
+    h = await bot_tp1_then_hand(world)
+    refusal = svc_mod.FAILED.format(why="kapanış fiyatı kayıtlarda yok")
+    # the bot's target only (half the size): its price is not the position's close
+    fake.trades = [paid(fill_of("sell", 0.05, 91800.0, h["tp1"], order="T1"), (2.295, "USDT"))]
+    assert await card_of_first(world) is None and world.notes.lines[-1] == refusal
+    fake.fail_when(lambda method, _args: method == "fetch_my_trades", cx.NetworkError("binance down"))
+    assert await card_of_first(world) is None and world.notes.lines[-1] == refusal
+    assert not world.notes.photos
+
+
+def test_the_moneys_r_of_a_close_by_hand_counts_the_fees() -> None:
+    # trade #12: BTC long at 64,695, stop 62,415.7, closed by hand on Binance at 65,014.3 (0.05 % a side)
+    sample = S.btc_long_result()
+    q, entry, stop, out_at = 0.026, 64695.0, 62415.7, 65014.3
+    opened = sample["rec"].filled
+    pos = sample["pos"].model_copy(deep=True, update={"avg_entry_price": entry, "quantity": q, "filled_quantity": q,
+                                                      "realized_pnl": None})
+    pos.data = {"initial_risk": {"loss": q * (entry - stop), "quantity": q}, "opened_at": ms(opened),
+                "entry_order_id": "E1", "closed_outside": q, "exits": []}
+    rec = tc.Records(filled=opened, closed=opened + timedelta(hours=3), reason="close")
+    at = opened + timedelta(hours=2)
+    fees = (entry * q * 0.0005, out_at * q * 0.0005)
+    trades = [paid(fill_of("buy", q, entry, opened, order="E1"), (fees[0], "USDT")),
+              paid(fill_of("sell", q, out_at, at), (fees[1], "USDT"))]
+    assert tc.venue_wanted(pos, rec)
+    found = tc.venue_close(pos, rec, trades, NOW, "USDT")
+    assert found is not None and found.exit_price == pytest.approx(out_at) and found.close_by == tc.CLOSED_ON_VENUE
+    money = (out_at - entry) * q - sum(fees)                                                 # 8.3018 - 1.6862
+    assert found.money == pytest.approx(money) and money == pytest.approx(6.61557, abs=1e-5)
+    r = tc.result_r(sample["trade"], pos, entry, stop, found.exit_price, found.money)
+    assert r == pytest.approx(money / (q * (entry - stop))) and tc.fmt_r(r) == "+0.11R"     # (the price: +0.14R)
+    assert tc.money_r(sample["trade"], pos, found.money) == pytest.approx(r)
+    assert tc.fmt_r(tc.result_r(sample["trade"], pos, entry, stop, found.exit_price)) == "+0.14R"
+    # a 0.5R signal: the hero in the plan's R, the box per position
+    half = sample["trade"].model_copy(deep=True)
+    half.plan.risk_r = 0.5
+    assert tc.result_r(half, pos, entry, stop, found.exit_price, found.money) == pytest.approx(r * 0.5)
+    assert tc.money_r(half, pos, found.money) == pytest.approx(r)
+    # the quote currency not known: no money (the price move)
+    assert tc.venue_close(pos, rec, trades, NOW).money is None
+    # a contract of 10: the move counts 10 times, the fees as they were paid
+    tens = pos.model_copy(deep=True)
+    tens.data["contract_size"] = 10
+    assert tc.venue_close(tens, rec, trades, NOW, "usdt").money == pytest.approx((out_at - entry) * q * 10 - sum(fees))
+    # one order closed it and opened a short: only the part used, and that part of its fee
+    flip = [trades[0], paid(fill_of("sell", 2 * q, out_at, at), (2 * fees[1], "USDT"))]
+    assert tc.venue_close(pos, rec, flip, NOW, "USDT").money == pytest.approx(money)
+    # 96 % covered: a close price, but no money (never a part shown as the whole)
+    some = [trades[0], paid(fill_of("sell", 0.96 * q, out_at, at), (fees[1], "USDT"))]
+    found_some = tc.venue_close(pos, rec, some, NOW, "USDT")
+    assert found_some is not None and found_some.exit_price == pytest.approx(out_at) and found_some.money is None
+    # the entry fills not found: the position's average entry, no entry fee
+    assert tc.venue_close(pos, rec, trades[1:], NOW, "USDT").money == pytest.approx((out_at - entry) * q - fees[1])
+
+
+def test_the_bots_own_close_under_an_order_it_did_not_keep_stays_its_own() -> None:
+    # the bot's stop closed the whole size (booked), but its trade list missed that order: the result is incomplete
+    sample = S.btc_long_result()
+    opened = sample["rec"].filled
+    pos = sample["pos"].model_copy(deep=True, update={"realized_pnl": -4.55})
+    pos.data.update(opened_at=ms(opened), entry_order_id="E1", pnl_incomplete=True,
+                    exits=[{"order_id": "S1", "qty": 0.1, "price": 90400.0, "kind": "sl"}])
+    rec = tc.Records(placed=sample["rec"].placed, filled=opened, closed=opened + timedelta(hours=1),
+                     exit_price=90400.0, reason="stop")
+    assert tc.venue_wanted(pos, rec) and not tc.venue_partial(pos)
+    at = opened + timedelta(minutes=50)
+    trades = [{**fill_of("buy", 0.1, 91000.0, opened, order="E1"), "fee": {"cost": 4.55, "currency": "USDT"}},
+              {**fill_of("sell", 0.1, 90400.0, at, order="S9"), "fee": {"cost": 4.52, "currency": "USDT"}}]
+    found = tc.venue_close(pos, rec, trades, NOW, "USDT")
+    assert found is not None and found.reason == "stop" and found.close_by is None and found.moves == []
+    money = -60.0 - 4.55 - 4.52                                     # (ccxt's single ``fee`` counts too)
+    assert found.money == pytest.approx(money)
+    data = S.data_of(dict(sample, pos=pos, rec=found))
+    assert data["hero"] == tc.fmt_r(money / 60.0) == "−1.15R" and data["timeline"][-1][1] == "Stop · −1.15R"
+    assert data["chips"][3][1] == "Stop"
+    # a short: the price falling is the profit
+    short = pos.model_copy(deep=True, update={"side": Side.SHORT})
+    flipped = [dict(trades[0], side="sell"), dict(trades[1], side="buy")]
+    assert tc.venue_close(short, rec, flipped, NOW, "USDT").money == pytest.approx(60.0 - 4.55 - 4.52)
+
+
+def test_a_complete_result_of_the_bots_is_not_read_from_the_fills() -> None:
+    sample = S.btc_long_money_r()
+    pos, rec = sample["pos"], sample["rec"]
+    assert not tc.venue_wanted(pos, rec)
+    # its own result stands even beside other money
+    assert tc.result_r(sample["trade"], pos, 91000.0, 90400.0, 92200.0, money=-50.0) == pytest.approx(1.97)
+    assert tc.money_r(sample["trade"], pos, -50.0) == pytest.approx(1.97)
+    data = S.data_of(dict(sample, rec=tc.Records(**{**rec.__dict__, "money": -50.0})))
+    assert data["hero"] == "+1.97R"
+    # part closed outside the bot / no exit price of its own / still open
+    assert tc.venue_wanted(pos.model_copy(deep=True, update={"data": {**pos.data, "closed_outside": 0.02}}), rec)
+    assert tc.venue_wanted(pos, tc.Records(closed=rec.closed))
+    assert not tc.venue_wanted(pos.model_copy(update={"status": PositionStatus.OPEN}), tc.Records())
 
 
 async def nas_on_fx2(world: World, *, fill_noted: bool = True) -> int:
