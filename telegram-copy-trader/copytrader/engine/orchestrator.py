@@ -4096,8 +4096,8 @@ class Engine:
             if into is not None:
                 # (looked at again under its lock: the trader may have closed it while the approval was checked)
                 fresh = await self.db.get_trade(into.id)
-                if fresh is None or fresh.status not in ACTIVE_TRADE:
-                    raise _IntoEnded(fresh)
+                if fresh is None or fresh.status not in ACTIVE_TRADE or await self._closing(fresh):
+                    raise _IntoEnded(fresh)     # (closed, or its close owed / on its way: over for the trader)
             await self._log("open_start", {"trade_id": trade.id, "plan": plan.model_dump(mode="json"),
                                            **({"only": sorted(only)} if only is not None else {}),
                                            **({"skip": sorted(skip)} if skip else {})})
@@ -5243,6 +5243,7 @@ class Engine:
         self._virtual_warned.pop((trade_id, broker), None)
         self._virtual_warned.pop((trade_id, f"{broker}:busy"), None)
         self._virtual_warned.pop((trade_id, f"{broker}:refprice"), None)
+        self._virtual_warned.pop((trade_id, f"{broker}:refdown"), None)
         self._ref_symbols.pop((trade_id, broker), None)
         self._ref_retry_at.pop((trade_id, broker), None)
         self._ref_seen.pop((trade_id, broker), None)
@@ -5570,6 +5571,18 @@ class Engine:
             # that moment (``ref_tp_msc``, that account's server clock, stored at once: a window read again - after
             # a busy look, a restart, the bar of the current minute - never counts what came before it).
             counted = [s for s in window if tp_from is None or (s[0] is not None and s[0] > tp_from)]
+            # Bars cannot be split: the bar of the minute the rule armed in also holds the prices before it. Like
+            # the crypto watch, that bar does not count - except a new extreme it made after the arming (beyond the
+            # one it had when the rule armed, ``ref_tp_bar``): that part came after it.
+            bar = d.get("ref_tp_bar")
+            if isinstance(bar, dict) and seen.get("source") == "bars":
+                for s in window:
+                    try:
+                        if s[0] == int(bar["msc"]) and ((long and s[2] > float(bar["hi"]))
+                                                         or (not long and s[3] < float(bar["lo"]))):
+                            counted.append(s)
+                    except (KeyError, TypeError, ValueError):
+                        break
             if not armed:
                 if any((long and s[1] < tp1) or (not long and s[4] > tp1) for s in counted):
                     armed = armed_now = True
@@ -5584,18 +5597,28 @@ class Engine:
             return await self._virtual_end(
                 trade, pos, PositionStatus.CANCELLED, "fiyat stop/hedefi geçti",
                 f"sanal tetik iptal edildi: {gap}; giriş tetiklenmeden fiyat uzaklaştı, işlem AÇILMADI.")
+        # A touch that could not be acted on at an earlier look (this account not connected / busy, its order not
+        # sent) is kept on the entry (``ref_touch``) until it is: decided again now, with the price now.
+        try:
+            kept = float(d["ref_touch"]) if d.get("ref_touch") is not None else None
+        except (TypeError, ValueError):
+            kept = None
+        if kept is not None:
+            entry_best = min(entry_best, kept) if long else max(entry_best, kept)
         touched = level_px > 0 and ((long and entry_best <= level_px) or (not long and entry_best >= level_px))
         now_px = now_ask if long else now_bid
         at_level = (long and now_px <= level_px) or (not long and now_px >= level_px)
         near = touched and (at_level or near_entry(now_px, level_px, stop, self._plan_risk(trade.plan)))
-        # The window counts as looked at, unless it holds a touch near the level: that one is acted on now, or - this
-        # account not connected, busy with another order, the order not sent - read again at the next look. (The
-        # first look has no history - only the price now, read again anyway: the watch always starts there.)
-        pos = await self._reference_seen(trade, pos, key,
-                                         None if near and since_msc is not None else seen.get("upto_msc"),
-                                         tp_armed_at=(now_msc, True) if armed_now else None)
+        # fx's worker thread was busy: its history since the previous look was not read. The price now may cancel
+        # (stop / first target passed), but it never opens: the window it skipped may hold a stop pass - decided at
+        # the next full read (``upto_msc`` stayed at the start).
+        history_pending = bool(seen.get("busy")) and since_msc is not None
+        pos = await self._reference_seen(trade, pos, key, seen.get("upto_msc"),
+                                         tp_armed_at=(now_msc, True, self._arming_bar(seen, now_msc, long))
+                                         if armed_now else None,
+                                         touch=(entry_best if near and not history_pending else None, near))
         d = pos.data
-        if not touched:
+        if not touched or history_pending:
             return pos
         if not near:
             # Only the history shows the touch; the price has turned back further than a market entry may be
@@ -5672,7 +5695,7 @@ class Engine:
             msc, bid, ask = data["now"]
             samples = [(s[0], s[1] / m, s[2] / m, s[3] / m, s[4] / m) for s in data.get("samples") or []]
             out = {"now": (msc, float(bid) / m, float(ask) / m), "samples": samples, "source": data.get("source"),
-                   "upto_msc": data.get("upto_msc")}
+                   "upto_msc": data.get("upto_msc"), "busy": bool(data.get("busy"))}
         except (KeyError, IndexError, TypeError, ValueError):
             logger.error("%s: unexpected price_since answer for %s", name, plan.base_asset)
             return None
@@ -5680,13 +5703,28 @@ class Engine:
             return None
         return out
 
+    @staticmethod
+    def _arming_bar(seen: dict[str, Any], now_msc: Any, long: bool) -> dict[str, Any] | None:
+        """The bar of the minute the first-target rule arms in (bars only), with the extreme it has at that moment
+        towards the target (a long: its bid high, a short: its ask low); see the bar rule in _reference_broker_check."""
+        if seen.get("source") != "bars" or now_msc is None:
+            return None
+        minute = int(now_msc) // _MINUTE_MS * _MINUTE_MS
+        for s in seen.get("samples") or []:
+            if s[0] == minute:
+                return {"msc": minute, "hi": s[2], "lo": s[3]}
+        return None
+
     async def _reference_seen(self, trade: TradeRecord, pos: BrokerPosition, key: tuple[int, str],
-                              upto_msc: Any, *, tp_armed_at: tuple[Any, bool] | None = None) -> BrokerPosition:
-        """The reference account's prices up to ``upto_msc`` (its server's clock; None: this window is not done with)
-        have been looked at: the next look starts there (kept in memory; stored at most once a minute, so that a
-        restart also looks at the time the bot was down). The first look's ``upto_msc`` is also when the watch
-        started (``ref_armed_msc``, stored at once: no bar of an earlier minute is read). ``tp_armed_at``: (server
-        ms, True) - the first-target rule counts from that moment on (``ref_tp_msc``, stored at once)."""
+                              upto_msc: Any, *, tp_armed_at: tuple[Any, bool, Any] | None = None,
+                              touch: tuple[float | None, bool] | None = None) -> BrokerPosition:
+        """The reference account's prices up to ``upto_msc`` (its server's clock) have been looked at: the next look
+        starts there (kept in memory; stored at most once a minute, so that a restart also looks at the time the bot
+        was down). The first look's ``upto_msc`` is also when the watch started (``ref_armed_msc``, stored at once:
+        no bar of an earlier minute is read). ``tp_armed_at``: (server ms, True, the bar of that minute or None) - the
+        first-target rule counts from that moment on (``ref_tp_msc`` / ``ref_tp_bar``, stored at once). ``touch``:
+        (price, True) a touch near the level to keep until it is acted on (``ref_touch``, stored at once);
+        (None, False) the price is far from the level now: a kept touch is dropped (never chased)."""
         try:
             upto = int(upto_msc) if upto_msc is not None else None
         except (TypeError, ValueError):
@@ -5699,7 +5737,10 @@ class Engine:
             stored = 0
         first = upto is not None and pos.data.get("ref_armed_msc") is None
         due = upto is not None and (first or stored == 0 or upto - stored >= _MINUTE_MS)
-        if not due and tp_armed_at is None:
+        keep, near = touch if touch is not None else (None, True)
+        touch_change = (keep is not None and pos.data.get("ref_touch") != keep) or (
+            not near and pos.data.get("ref_touch") is not None)
+        if not due and tp_armed_at is None and not touch_change:
             return pos
         new = pos.model_copy(deep=True)
         if first:
@@ -5707,12 +5748,20 @@ class Engine:
         if due:
             new.data["ref_seen_msc"] = upto
         if tp_armed_at is not None:
-            at, armed = tp_armed_at
+            at, armed, bar = tp_armed_at
             new.data["virtual_tp_armed"] = armed
             if at is not None:
                 new.data["ref_tp_msc"] = int(at)
             else:
                 new.data.pop("ref_tp_msc", None)
+            if bar is not None:
+                new.data["ref_tp_bar"] = bar
+            else:
+                new.data.pop("ref_tp_bar", None)
+        if keep is not None:
+            new.data["ref_touch"] = keep
+        elif not near:
+            new.data.pop("ref_touch", None)
         await self.db.save_broker_position(trade.id, new)
         return new
 
@@ -7193,6 +7242,7 @@ class Engine:
                         upto = self._ref_seen.get((trade.id, pos.broker)) or new.data.get("ref_seen_msc")
                         if upto is not None:
                             new.data["ref_tp_msc"] = int(upto)
+                        new.data.pop("ref_tp_bar", None)
                 text = f"{esc(name)}: TP " + " / ".join(fmt_price(tp.price) for tp in tps)
                 if len(levels) < len(plan.take_profits):
                     text += " (gerçekleşen hedef tekrar konmadı)"
@@ -7778,6 +7828,14 @@ class Engine:
                 await self._finish(conf, ConfirmationStatus.REJECTED, text,
                                    refused=f"#{early.id} işlemi onay beklerken {how}")
                 return text
+            if into is not None and await self._closing(into):
+                # The trader closed it and the bot's close of it is still owed / on its way: it is over.
+                text = (f"⛔ #{into.id} işlemi ({_names(skip or early_names)}) onay beklerken kapanıyor (trader "
+                        "kapattı, kapanışı sürüyor); diğer hesaplarda işlem açılmadı.")
+                await self._finish(conf, ConfirmationStatus.REJECTED, text,
+                                   refused=f"#{into.id} işlemi onay beklerken kapanıyordu")
+                return text
+            approved = plan             # (as the owner approved it: a re-ask shows this, never the trade's moves)
             size_stop: float | None = None
             if into is not None:
                 # The trader moved the trade's stop / targets while the question waited (applied to the early
@@ -7812,7 +7870,7 @@ class Engine:
                                                          exclude_trade=early.id if early is not None else None)
                      if (i.code, i.message_tr) not in known]
             if fresh:
-                return await self._reask_open(conf, plan, fresh)
+                return await self._reask_open(conf, approved, fresh)
             problem = await self._approval_price_problem(plan, conf.action.symbol)
             if problem:
                 text = f"⛔ {esc(problem)} — işlem açılmadı." + (f"\n{note}" if note else "")
@@ -7834,9 +7892,11 @@ class Engine:
                                              or await self._early_ended_alone(gone)):
                         # (never held by the early accounts, or only their own waiting-entry rules ended it: as at
                         # the top of this approval, the others open as a fresh trade)
-                        result = await self.execute_open(plan, raw_symbol=conf.action.symbol, skip=skip)
+                        result = await self.execute_open(plan, raw_symbol=conf.action.symbol, skip=skip,
+                                                         size_stop=size_stop)
                     else:
-                        how = ("kapandı" if gone is not None and gone.status is TradeStatus.CLOSED
+                        how = ("kapanıyor" if gone is not None and gone.status in ACTIVE_TRADE
+                               else "kapandı" if gone is not None and gone.status is TradeStatus.CLOSED
                                else "iptal edildi")
                         text = (f"⛔ #{into.id if into is not None else '?'} işlemi ({_names(skip or early_names)}) "
                                 f"onay beklerken {how}; diğer hesaplarda işlem açılmadı.")

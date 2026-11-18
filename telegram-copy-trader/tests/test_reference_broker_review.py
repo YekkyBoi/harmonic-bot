@@ -332,3 +332,114 @@ async def test_the_first_look_starts_the_watch_even_when_tickmill_cannot_act(uns
     await p.engine.monitor.run_virtual_once()
     (order,) = p.tickmill_orders()
     assert order[0] == "market_buy"
+
+
+# --------------------------------------------------------------------------- #
+# round 2
+# --------------------------------------------------------------------------- #
+def _fx_busy(p: Any) -> list[bool]:
+    """fx's worker thread has another call (an order, a sync) while the flag is set."""
+    fx = p.brokers["fx"]
+    flag = [True]
+    real = fx._oldest_call
+    other = SimpleNamespace(timed_out=False, running_for=lambda: 0.0, stuck_after=lambda: 1e9,
+                            relinking=lambda: False)
+    fx._oldest_call = lambda: other if flag[0] else real()                       # type: ignore[method-assign]
+    return flag
+
+
+async def test_a_busy_look_never_opens_its_skipped_history_decides_next(unsure) -> None:
+    p, _friend = unsure
+    _history(p, [(T0 + 0.3, 1.16090, 1.16098), (T0 + 0.5, 1.15880, 1.15890)])   # entry, then through the stop
+    await _armed_watch(p)
+    _tick(p, 1.15950, 1.15960, T0 + 1.5)                                          # between the stop and the entry
+    p.tickmill.set_price("EURUSD", 1.15960, 1.15970)
+    busy = _fx_busy(p)
+    await p.engine.monitor.run_virtual_once()
+    assert p.tickmill_orders() == [] and is_virtual_pending((await p.positions(1))["tickmill"])
+    busy[0] = False
+    await p.engine.monitor.run_virtual_once()                                     # the full read: the stop pass
+    assert (await p.positions(1))["tickmill"].status is PositionStatus.CANCELLED and p.tickmill_orders() == []
+
+
+async def test_a_busy_look_still_cancels_on_the_price_now(unsure) -> None:
+    p, _friend = unsure
+    await _armed_watch(p)
+    _tick(p, 1.15880, 1.15890, T0 + 1.5)                                          # through the stop right now
+    _fx_busy(p)
+    await p.engine.monitor.run_virtual_once()
+    assert (await p.positions(1))["tickmill"].status is PositionStatus.CANCELLED
+
+
+async def test_a_first_look_touch_while_tickmill_is_away_is_decided_when_it_is_back(unsure) -> None:
+    p, _friend = unsure
+    tick_b = next(b for b in p.engine.brokers if b.name == "tickmill")
+    _tick(p, 1.16195, 1.16205, T0)
+    action = fx_pair("EURUSD", Side.LONG, ENTRY, STOP, 1.1650, entry_type=EntryType.LIMIT).model_copy(
+        update={"confidence": 0.5})
+    await p.say(action, FX, "EUR LONG 1R Limit Emir")
+    p.engine.brokers = [b for b in p.engine.brokers if b.name != "tickmill"]
+    _tick(p, 1.16095, 1.16100, T0 + 1.0)                     # at the level on the first look, tickmill away
+    await p.engine.monitor.run_virtual_once()
+    assert (await p.positions(1))["tickmill"].data["ref_touch"] == pytest.approx(1.16100)
+    p.engine.brokers.append(tick_b)
+    p.tickmill.set_price("EURUSD", 1.16125, 1.16135)
+    _tick(p, 1.16110, 1.16120, T0 + 2.0)                     # 2 pips above: still near the level
+    await p.engine.monitor.run_virtual_once()
+    (order,) = p.tickmill_orders()
+    assert order[0] == "market_buy"
+
+
+async def test_a_kept_touch_is_dropped_once_the_price_is_far(unsure) -> None:
+    p, _friend = unsure
+    tick_b = next(b for b in p.engine.brokers if b.name == "tickmill")
+    await _armed_watch(p)
+    p.engine.brokers = [b for b in p.engine.brokers if b.name != "tickmill"]
+    _tick(p, 1.16095, 1.16100, T0 + 1.0)
+    await p.engine.monitor.run_virtual_once()
+    p.engine.brokers.append(tick_b)
+    _tick(p, 1.16245, 1.16255, T0 + 2.0)                     # ran away: never chased
+    await p.engine.monitor.run_virtual_once()
+    pos = (await p.positions(1))["tickmill"]
+    assert p.tickmill_orders() == [] and "ref_touch" not in pos.data and pos.data.get("virtual_missed")
+
+
+async def test_bars_a_new_high_after_the_arming_in_the_same_minute_reaches_the_target(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Bars cannot be split: the arming minute's bar counts only with an extreme beyond the one it had when the rule
+    armed (that part came after it). Its earlier high - from before the arming - never counts."""
+    p, _friend = await _make(tmp_path, monkeypatch, edit=_no_confirm)
+    try:
+        await _pullback(p)
+        minute = -(-T0 // 60) * 60
+        bar = {"time": minute, "open": 1.16160, "high": 1.16170, "low": 1.16100, "close": 1.16120, "spread": 10}
+
+        def copy_rates_range(symbol: str, timeframe: int, date_from: int, date_to: int) -> list[dict[str, Any]]:
+            return [dict(b) for b in [bar] if date_from <= b["time"] <= date_to]
+
+        p.terminal.copy_rates_range = copy_rates_range                           # type: ignore[method-assign]
+        _tick(p, 1.16120, 1.16130, minute + 10)                                  # arms (between)
+        await p.engine.monitor.run_virtual_once()
+        pos = (await p.positions(1))["tickmill"]
+        assert pos.data["virtual_tp_armed"] is True and pos.data["ref_tp_bar"]["hi"] == pytest.approx(1.16170)
+        bar["close"] = 1.16130                                                   # the bar goes on, same high
+        _tick(p, 1.16125, 1.16135, minute + 15)
+        await p.engine.monitor.run_virtual_once()
+        assert is_virtual_pending((await p.positions(1))["tickmill"])            # (its high is from before)
+        bar["high"] = 1.16180                                                    # a new high after the arming
+        _tick(p, 1.16120, 1.16130, minute + 20)
+        await p.engine.monitor.run_virtual_once()
+        assert (await p.positions(1))["tickmill"].status is PositionStatus.CANCELLED
+    finally:
+        await p.close()
+
+
+async def test_an_ended_entry_forgets_its_fx_down_warning(env) -> None:
+    p, _friend = env
+    await _eur_limit(p)
+    p.engine.brokers = [b for b in p.engine.brokers if b.name != "fx"]
+    await p.engine.monitor.run_virtual_once()
+    assert (1, "tickmill:refdown") in p.engine._virtual_warned
+    p.engine._virtual_forget(1, "tickmill")
+    assert (1, "tickmill:refdown") not in p.engine._virtual_warned

@@ -394,3 +394,130 @@ async def test_the_early_trade_failing_while_the_approval_is_checked_opens_the_o
         assert len(env.tm.opened) == 1                                  # (tickmill's order went out: not again)
     finally:
         await env.engine.stop()
+
+
+# --------------------------------------------------------------------------- #
+# round 2
+# --------------------------------------------------------------------------- #
+async def _move_stop(env: Any, price: float) -> None:
+    env.parser.push(result(ParsedAction(action=ActionType.MOVE_SL, new_stop_loss=price, refers_to_message_id=611,
+                                        used_message_ids=[612], confidence=0.95, summary_tr=f"stop {price}")))
+    await env.msg(612, f"stop {price}", topic=CRYPTO, reply_to=611)
+    await env.engine.on_messages_ready(CHAT, KADIR, CRYPTO)
+
+
+def _quote(env: Any, bid: float) -> None:
+    for b in (env.binance, env.tm):
+        b.quote = Quote(bid=bid, ask=bid + 0.2, last=bid + 0.1)
+    env.engine.prices.prices["ETH"] = bid + 0.1
+
+
+async def _plain_quantity() -> float:
+    """binance's size for the same signal and price without any early account or stop move (the reference)."""
+    database = Database(":memory:")
+    await database.open()
+    env = await make_env(database, flag=False)
+    try:
+        await env.crypto_signal()
+        (conf,) = env.notifier.confirmations
+        _quote(env, 2238.0)
+        await env.engine.handle_confirmation(conf.id, True)
+        (req,) = env.binance.opened
+        return req.quantity
+    finally:
+        await env.engine.stop()
+        await database.close()
+
+
+async def test_the_fallback_fresh_trade_is_sized_from_the_signals_stop_too(db: Database) -> None:
+    env = await make_env(db)
+    try:
+        await env.crypto_signal()
+        (conf,) = env.notifier.confirmations
+        _quote(env, 2236.0)
+        await _move_stop(env, 2239.5)
+        _quote(env, 2238.0)
+        real = env.engine._approval_price_problem
+
+        async def failed_meanwhile(plan: Any, raw: Any) -> Any:
+            await db.update_trade(1, status=TradeStatus.FAILED)
+            return await real(plan, raw)
+
+        env.engine._approval_price_problem = failed_meanwhile           # type: ignore[method-assign]
+        await env.engine.handle_confirmation(conf.id, True)
+        (req,) = env.binance.opened
+        assert req.stop_loss == 2239.5 and req.quantity == await _plain_quantity()
+    finally:
+        await env.engine.stop()
+
+
+async def test_a_re_ask_keeps_the_owners_plan_the_moved_stop_never_becomes_a_correction(db: Database) -> None:
+    from copytrader.engine.orchestrator import _issue
+
+    env = await make_env(db)
+    try:
+        await env.crypto_signal()
+        (conf,) = env.notifier.confirmations
+        _quote(env, 2236.0)
+        await _move_stop(env, 2239.5)
+        _quote(env, 2238.0)
+        real = env.engine._trade_issues
+        calls = {"n": 0}
+
+        async def once(plan: Any, chat_id: int, **kw: Any) -> Any:
+            out = await real(plan, chat_id, **kw)
+            calls["n"] += 1
+            return out + [_issue("duplicate_signal", "Benzer bir işlem zaten var (#9).")] if calls["n"] == 1 else out
+
+        env.engine._trade_issues = once                                 # type: ignore[method-assign]
+        await env.engine.handle_confirmation(conf.id, True)             # something new: asked again
+        new = env.notifier.confirmations[-1]
+        assert new.id != conf.id and new.plan.stop_loss == 2250.6       # type: ignore[union-attr]
+        await env.engine.handle_confirmation(new.id, True)
+        (req,) = env.binance.opened
+        assert req.stop_loss == 2239.5 and req.quantity == await _plain_quantity()
+        assert len(await _trades(db)) == 1 and len(env.tm.opened) == 1
+    finally:
+        await env.engine.stop()
+
+
+async def test_yes_while_the_traders_close_of_the_early_trade_is_still_owed_opens_nothing(db: Database) -> None:
+    env = await make_env(db)
+    try:
+        await env.crypto_signal()
+        (conf,) = env.notifier.confirmations
+        env.tm.fail["close_position"] = BrokerError("market closed / link down")
+        env.parser.push(result(ParsedAction(action=ActionType.CLOSE, close_fraction=1.0, refers_to_message_id=611,
+                                            base_asset="ETH", side=Side.SHORT, used_message_ids=[613],
+                                            confidence=0.95, summary_tr="kapat")))
+        await env.msg(613, "kapattık", topic=CRYPTO, reply_to=611)
+        await env.engine.on_messages_ready(CHAT, KADIR, CRYPTO)
+        trade = await db.get_trade(1)
+        assert trade is not None and await env.engine._closing(trade)
+        out = await env.engine.handle_confirmation(conf.id, True)
+        assert "onay beklerken kapanıyor" in out and env.binance.opened == []
+    finally:
+        await env.engine.stop()
+
+
+async def test_a_close_owed_meanwhile_is_found_under_the_lock_too(db: Database) -> None:
+    env = await make_env(db)
+    try:
+        await env.crypto_signal()
+        (conf,) = env.notifier.confirmations
+        env.tm.fail["close_position"] = BrokerError("link down")
+        real = env.engine._approval_price_problem
+
+        async def closing_meanwhile(plan: Any, raw: Any) -> Any:
+            env.parser.push(result(ParsedAction(action=ActionType.CLOSE, close_fraction=1.0, refers_to_message_id=611,
+                                                base_asset="ETH", side=Side.SHORT, used_message_ids=[613],
+                                                confidence=0.95, summary_tr="kapat")))
+            await env.msg(613, "kapattık", topic=CRYPTO, reply_to=611)
+            await env.engine.on_messages_ready(CHAT, KADIR, CRYPTO)
+            return await real(plan, raw)
+
+        env.engine._approval_price_problem = closing_meanwhile          # type: ignore[method-assign]
+        out = await env.engine.handle_confirmation(conf.id, True)
+        assert "onay beklerken kapanıyor" in out and env.binance.opened == []
+    finally:
+        await env.engine.stop()
