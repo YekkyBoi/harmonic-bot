@@ -889,5 +889,10 @@ class Mt5BridgeBroker(Broker):
         return await self._rpc("trade_chart", broker_symbol, int(timeframe_min), float(start), float(end),  # type: ignore[no-any-return]
                                list(tickets), anchor_utc)
 
+    async def price_since(self, broker_symbol: str, since_msc: int | None,
+                          since_utc: float | None = None) -> dict[str, Any]:
+        """The helper's ``Mt5Broker.price_since`` (the latest tick and the prices since a time, read only)."""
+        return await self._rpc("price_since", broker_symbol, since_msc, since_utc)  # type: ignore[no-any-return]
+
 
 __all__ = ["Mt5BridgeBroker", "error_from_wire", "helper_command"]

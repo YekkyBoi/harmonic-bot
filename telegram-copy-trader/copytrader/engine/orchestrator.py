@@ -1233,6 +1233,7 @@ class Engine:
         # (resolved once, not on every look) / monotonic time before which a failed read is not tried again
         self._ref_symbols: dict[tuple[int, str], Any] = {}
         self._ref_retry_at: dict[tuple[int, str], float] = {}
+        self._ref_seen: dict[tuple[int, str], int] = {}       # ... -> the server ms its prices were looked at up to
         self._monitor_task: asyncio.Task[None] | None = None
         self._accepting = True                     # False once shutdown began: no new work is started
         self._brokers_closed = False
@@ -5108,6 +5109,21 @@ class Engine:
         mult = price_multiplier(sym.extra)
         entry = float(plan.entry_price or 0.0) * mult
         hours = self._virtual_max_hours(float(getattr(broker.config, "virtual_trigger_max_hours", 48.0)))
+        # "The price ran to the first target without touching the entry" cancels a waiting entry. That rule
+        # counts from the start when the market price is between the entry and the first target right now (as
+        # it always did). A pullback limit starts with the price BEYOND its first target (the target lies
+        # between the entry and today's price): there, and when the price is not known now, the rule starts
+        # to count once the reference price has been seen between the two (see _virtual_check). The price is
+        # the one the signal was just judged with (no reference reading: the offset is measured at the touch).
+        # (A ``reference_broker`` entry: the same rule on that account's price, see _reference_broker_check.)
+        tp_armed = True
+        if plan.take_profits:
+            tp1 = plan.take_profits[0].price
+            price = await self._plan_price_within(plan, raw_symbol, VIRTUAL_REGISTER_PRICE_TIMEOUT_SEC)
+            if price is None or not (math.isfinite(price) and price > 0):
+                tp_armed = False
+            else:
+                tp_armed = not (price >= tp1 if plan.side is Side.LONG else price <= tp1)
         if ref_broker:
             pos = BrokerPosition(
                 broker=name, broker_symbol=sym.broker_symbol, side=plan.side, status=PositionStatus.PENDING,
@@ -5118,6 +5134,7 @@ class Engine:
                     "virtual_trigger": True, "virtual_state": "waiting", "trigger_price": entry,
                     "reference_broker": ref_broker, "price_multiplier": mult, "raw_symbol": raw_symbol,
                     "virtual_created_at": self._now().isoformat(), "virtual_max_hours": hours,
+                    "virtual_tp_armed": tp_armed,
                 },
             )
             await self._save_leg_position(trade.id, pos, flow)
@@ -5132,20 +5149,6 @@ class Engine:
                                                     "reference_broker": ref_broker})
             return BrokerOutcome(name, "ok", text, pos)
         ref_id = str(broker.config.reference_exchange)
-        # "The price ran to the first target without touching the entry" cancels a waiting entry. That rule
-        # counts from the start when the market price is between the entry and the first target right now (as
-        # it always did). A pullback limit starts with the price BEYOND its first target (the target lies
-        # between the entry and today's price): there, and when the price is not known now, the rule starts
-        # to count once the reference price has been seen between the two (see _virtual_check). The price is
-        # the one the signal was just judged with (no reference reading: the offset is measured at the touch).
-        tp_armed = True
-        if plan.take_profits:
-            tp1 = plan.take_profits[0].price
-            price = await self._plan_price_within(plan, raw_symbol, VIRTUAL_REGISTER_PRICE_TIMEOUT_SEC)
-            if price is None or not (math.isfinite(price) and price > 0):
-                tp_armed = False
-            else:
-                tp_armed = not (price >= tp1 if plan.side is Side.LONG else price <= tp1)
         pos = BrokerPosition(
             broker=name, broker_symbol=sym.broker_symbol, side=plan.side, status=PositionStatus.PENDING,
             quantity=0.0, remaining_quantity=0.0,
@@ -5204,6 +5207,7 @@ class Engine:
         self._virtual_warned.pop((trade_id, f"{broker}:refprice"), None)
         self._ref_symbols.pop((trade_id, broker), None)
         self._ref_retry_at.pop((trade_id, broker), None)
+        self._ref_seen.pop((trade_id, broker), None)
 
     async def _virtual_tick(self, trade: TradeRecord, pos: BrokerPosition, now: datetime) -> BrokerPosition:
         """One look at a waiting virtual entry (monitor hook, trade lock held): expire / gap-cancel / trigger.
@@ -5465,8 +5469,18 @@ class Engine:
         key = (trade.id, pos.broker)
         if time.monotonic() < self._ref_retry_at.get(key, 0.0):
             return pos              # (its last read failed: not tried again on every look)
-        quote = await self._reference_broker_quote(ref, trade.plan, d.get("raw_symbol"), cache=key)
-        if quote is None:
+        since = self._ref_seen.get(key) or d.get("ref_seen_msc")
+        try:
+            since_msc = int(since) if since is not None else None
+        except (TypeError, ValueError):
+            since_msc = None
+        try:
+            created = utc(datetime.fromisoformat(str(d.get("virtual_created_at"))))
+        except (TypeError, ValueError):
+            created = utc(trade.created_at)
+        seen = await self._reference_prices(ref, trade.plan, d.get("raw_symbol"), key, since_msc,
+                                            created.timestamp())
+        if seen is None:
             self._ref_retry_at[key] = time.monotonic() + REFERENCE_PRICE_RETRY_SEC
             warn_key = (trade.id, f"{pos.broker}:refprice")
             last = self._virtual_warned.get(warn_key)
@@ -5479,17 +5493,150 @@ class Engine:
             return pos
         self._ref_retry_at.pop(key, None)
         long = pos.side is Side.LONG
-        touched = level_px > 0 and ((long and quote.ask <= level_px) or (not long and quote.bid >= level_px))
-        if not touched or broker is None:
+        _t, now_bid, now_ask = seen["now"]
+        stop = pos.stop_loss / mult if pos.stop_loss is not None else None
+        tp1 = pos.take_profits[0].price / mult if pos.take_profits else None
+        armed = d.get("virtual_tp_armed", True) is not False
+        was_armed = armed
+        gap: str | None = None
+        touched_at: float | None = None
+        # In time order, the prices since the previous look and the latest one. A long enters on the ask and leaves
+        # on the bid (its stop and targets), a short the other way round - as that account's own orders would.
+        for _msc, bid_lo, bid_hi, ask_lo, ask_hi in [*seen["samples"], (None, now_bid, now_bid, now_ask, now_ask)]:
+            exit_worst, exit_best = (bid_lo, bid_hi) if long else (ask_hi, ask_lo)
+            if stop is not None and ((long and exit_worst <= stop) or (not long and exit_worst >= stop)):
+                gap = (f"{esc(ref)} fiyatı ({fmt_price(exit_worst)}) stop seviyesini ({fmt_price(stop)}) geçti")
+                break
+            if tp1 is not None:
+                # "The price ran to the first target without touching the entry: the trade idea is played out" -
+                # the crypto rule: it counts once the price has been BETWEEN the entry and that target (a pullback
+                # limit starts beyond its first target and has to come back through it first).
+                if not armed:
+                    if (long and exit_worst < tp1) or (not long and exit_worst > tp1):
+                        armed = True
+                elif (long and exit_best >= tp1) or (not long and exit_best <= tp1):
+                    gap = (f"{esc(ref)} fiyatı ({fmt_price(exit_best)}) ilk hedefi ({fmt_price(tp1)}) geçti")
+                    break
+            entry_best = ask_lo if long else bid_hi
+            if level_px > 0 and ((long and entry_best <= level_px) or (not long and entry_best >= level_px)):
+                touched_at = entry_best
+                break
+        if gap:
+            return await self._virtual_end(
+                trade, pos, PositionStatus.CANCELLED, "fiyat stop/hedefi geçti",
+                f"sanal tetik iptal edildi: {gap}; giriş tetiklenmeden fiyat uzaklaştı, işlem AÇILMADI.")
+        pos = await self._reference_seen(trade, pos, key, seen.get("upto_msc"),
+                                         armed if armed != was_armed else None)
+        d = pos.data
+        if touched_at is None or broker is None:
             return pos              # (touched while this account is not connected: decided again once it is back)
-        at = f"{esc(ref)} {fmt_price(quote.ask if long else quote.bid)}"
+        now_px = now_ask if long else now_bid
+        at_level = (long and now_px <= level_px) or (not long and now_px >= level_px)
+        if not at_level and not near_entry(now_px, level_px, stop, self._plan_risk(trade.plan)):
+            # Only the history shows the touch; the price has turned back further than a market entry may be
+            # from the level (the validator's tolerance): never chase it, as the crypto watch does.
+            if not d.get("virtual_missed"):
+                noted = pos.model_copy(deep=True)
+                noted.data["virtual_missed"] = {"at": self._now().isoformat(), "extreme": touched_at, "price": now_px}
+                await self.db.save_broker_position(trade.id, noted)
+                await self._log("virtual_missed", {"trade_id": trade.id, "broker": pos.broker,
+                                                   "extreme": touched_at, "price": now_px, "reference_broker": ref})
+                await self._notify(
+                    f"🧭 {label} {esc(pos.broker)}: tetik seviyesi görüldü ama fiyat uzaklaştı; "
+                    f"{esc(pos.broker)}'da açılmadı. {esc(ref)} fiyatı kısa süreliğine {fmt_price(touched_at)} "
+                    f"seviyesine geldi (tetik {level}), şimdi {fmt_price(now_px)}. Fiyat seviyeye dönerse açılır; "
+                    "stop veya ilk hedef geçilirse sanal giriş iptal edilir.", Severity.WARNING)
+                pos = noted
+            return pos
+        at = (f"{esc(ref)} {fmt_price(now_px)}" if at_level
+              else f"{esc(ref)} kısa süreliğine {fmt_price(touched_at)}, şimdi {fmt_price(now_px)}")
         what = f"{esc(ref)} fiyatı giriş seviyesine geldi ({at})"
         return await self._virtual_fire(trade, pos, broker, label, _Fire(
             mode="price", what=what, busy_what=what, busy_tail="Yanıt geldiğinde fiyat hâlâ seviyedeyse açılır.",
             done=what, seen=what,
             retry_tail=f"Fiyat seviyede kaldıkça sonraki kontrollerde en çok {VIRTUAL_RETRY_MAX} kez daha denenecek.",
             head=f"{what}, seviye {level}; piyasa emriyle açıldı",
-            ref_price=(quote.bid + quote.ask) / 2.0, log={"reference_broker": ref, "ref_price": quote.last}))
+            ref_price=(now_bid + now_ask) / 2.0,
+            log={"reference_broker": ref, "ref_bid": now_bid, "ref_ask": now_ask, "source": seen.get("source")}))
+
+    async def _reference_prices(
+        self, name: str, plan: TradePlan, raw_symbol: str | None, key: tuple[int, str], since_msc: int | None,
+        since_utc: float,
+    ) -> dict[str, Any] | None:
+        """What a waiting entry that watches the account ``name``'s price needs from it, read only, in the signal's
+        scale: its adapter's ``price_since`` (MetaTrader: the latest tick and every price since the previous look,
+        see Mt5Broker.price_since) - or, for an adapter without it, the latest quote alone. None when nothing can be
+        read (not connected, no such symbol, no price now)."""
+        ref = self._broker(name)
+        if ref is None:
+            return None
+        reader = getattr(ref, "price_since", None)
+        if reader is None:
+            reader = getattr(getattr(ref, "inner", None), "price_since", None)     # (a dry-run wrapper)
+        if reader is None:
+            quote = await self._reference_broker_quote(name, plan, raw_symbol, cache=key)
+            if quote is None:
+                return None
+            return {"now": (None, quote.bid, quote.ask), "samples": [], "source": None, "upto_msc": None}
+        try:
+            sym = self._ref_symbols.get(key)
+            if sym is None:
+                sym = await ref.resolve_symbol(plan.base_asset, plan.quote_asset, plan.market_type, raw_symbol)
+                if sym is None:
+                    return None
+                self._ref_symbols[key] = sym
+            data = await reader(sym.broker_symbol, since_msc, since_utc)
+        except asyncio.CancelledError:
+            if not stray_cancel():
+                raise
+            logger.error("%s: the reference price read was cancelled without a cancel request", name)
+            return None
+        except BrokerError as exc:      # (expected now and then - not connected, market closed: no traceback)
+            self._ref_symbols.pop(key, None)
+            logger.warning("%s: the reference prices of %s could not be read: %s", name, plan.base_asset, exc)
+            return None
+        except Exception:
+            self._ref_symbols.pop(key, None)
+            logger.exception("%s: the reference prices of %s could not be read", name, plan.base_asset)
+            return None
+        m = price_multiplier(sym.extra)
+        try:
+            msc, bid, ask = data["now"]
+            samples = [(s[0], s[1] / m, s[2] / m, s[3] / m, s[4] / m) for s in data.get("samples") or []]
+            out = {"now": (msc, float(bid) / m, float(ask) / m), "samples": samples, "source": data.get("source"),
+                   "upto_msc": data.get("upto_msc")}
+        except (KeyError, IndexError, TypeError, ValueError):
+            logger.error("%s: unexpected price_since answer for %s", name, plan.base_asset)
+            return None
+        if not (out["now"][1] > 0 and out["now"][2] > 0):
+            return None
+        return out
+
+    async def _reference_seen(self, trade: TradeRecord, pos: BrokerPosition, key: tuple[int, str],
+                              upto_msc: Any, armed: bool | None) -> BrokerPosition:
+        """The reference account's prices up to ``upto_msc`` (its server's clock) have been looked at: the next look
+        starts there (kept in memory; stored at most once a minute, so that a restart also looks at the time the bot
+        was down). ``armed``: the first-target rule now counts (stored at once)."""
+        try:
+            upto = int(upto_msc) if upto_msc is not None else None
+        except (TypeError, ValueError):
+            upto = None
+        if upto is not None:
+            self._ref_seen[key] = upto
+        try:
+            stored = int(pos.data.get("ref_seen_msc") or 0)
+        except (TypeError, ValueError):
+            stored = 0
+        due = upto is not None and (stored == 0 or upto - stored >= _MINUTE_MS)
+        if not due and armed is None:
+            return pos
+        new = pos.model_copy(deep=True)
+        if due:
+            new.data["ref_seen_msc"] = upto
+        if armed is not None:
+            new.data["virtual_tp_armed"] = armed
+        await self.db.save_broker_position(trade.id, new)
+        return new
 
     async def _virtual_fire(
         self, trade: TradeRecord, pos: BrokerPosition, broker: Broker, label: str, fire: _Fire

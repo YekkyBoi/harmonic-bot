@@ -201,8 +201,11 @@ risk:
 #                    fiyatlardan biri okunamazsa ya da fark max_offset_pct'yi aşarsa açılmaz. Teknik sınırlar kalır
 #                    (stop ya da ilk hedef geçilmişse, fiyat girişten max_entry_distance_pct'den uzaksa açılmaz).
 #                    Referans hesabın fiyatı okunamazsa bekler (uyarı gelir; virtual_trigger_max_hours sonra iptal),
-#                    limit emre dönmez. O hesabın girişi dolmadan biterse (süresi doldu, iptal) bekleyen giriş de
-#                    iptal edilir. Piyasa emirli sinyaller ve kripto (reference_exchange / entry_trigger) aynen
+#                    limit emre dönmez. İki kontrol arasındaki kısa dokunuş o hesabın tik geçmişinden (yoksa
+#                    1 dakikalık mumlarından) görülür; fiyat o arada çok uzaklaştıysa kovalanmaz, seviyeye dönerse
+#                    açılır. Fiyat girişe değmeden stopu ya da ilk hedefi geçerse bekleyen giriş iptal edilir
+#                    (kripto sanal tetikteki kural). O hesabın girişi dolmadan biterse (süresi doldu, iptal) bekleyen
+#                    giriş de iptal edilir. Piyasa emirli sinyaller ve kripto (reference_exchange / entry_trigger) aynen
 #                    kalır. Boş = kapalı (varsayılan). Örnek:  reference_broker: fx
 #
 # Bir brokerı açtıktan sonra MUTLAKA 'python -m copytrader check' çalıştırın:

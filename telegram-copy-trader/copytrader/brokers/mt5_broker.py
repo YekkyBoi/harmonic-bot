@@ -153,6 +153,7 @@ class MT5:
 
 
 _STALE_TICK_SEC = 600           # a tick older than this = market closed (no expiration is set)
+PRICE_SINCE_MAX_TICKS = 5000    # price_since: at most this many ticks per look (more: the 1-minute bars instead)
 _EMPTY_TICK_WAITS = 10          # waits (of tick_wait_sec, 0.3 s) for a tick with a bid and an ask: about 3 s
 _NEW_POSITION_POLLS = 10        # look-ups (one per tick_wait_sec) for the position of an accepted market order: ~3 s
 _METAL_BASES = frozenset({"XAU", "XAG", "XPT", "XPD"})
@@ -3529,6 +3530,86 @@ class Mt5Broker(MetaTraderLegBroker):
             except (KeyError, IndexError, TypeError, ValueError):
                 continue
         return {"offset": offset, "bars": bars, "deals": deals}
+
+    async def price_since(self, broker_symbol: str, since_msc: int | None, since_utc: float | None = None,
+                          max_ticks: int = PRICE_SINCE_MAX_TICKS) -> dict[str, Any]:
+        """READ ONLY, for a waiting entry of another account that watches this account's price (the engine's
+        ``reference_broker``): the latest tick of ``broker_symbol`` and every price it had since ``since_msc`` (the
+        ``upto_msc`` an earlier answer gave: the trade server's own millisecond clock, as MetaTrader keeps tick
+        times, so no clock conversion is involved), so that a touch between two looks is not missed.
+
+        ``since_msc`` None (the first look): from ``since_utc`` (UTC epoch seconds, when the entry was set),
+        turned into the server's clock by the whole-hour offset of a fresh tick (:meth:`_tick_is_stale`); without a
+        fresh tick, from the latest tick on.
+
+        {"now": (time_msc, bid, ask), "samples": [(time_msc, bid_low, bid_high, ask_low, ask_high)] in time order,
+        after the start and up to the latest tick, "source": "ticks" | "bars" | None, "upto_msc": what has been
+        looked at (the next look starts there), "busy": True when another call came to this terminal meanwhile:
+        the history is not read now (``upto_msc`` stays the start, the next look reads it)}.
+
+        The history: the ticks (copy_ticks_from, at most ``max_ticks``); more than that, or no ticks, the 1-minute
+        bars instead (copy_rates_range; the bars are bid prices, the ask is the bid plus the bar's spread; only the
+        minutes that began after the start count, the minute it began in also holds earlier prices). Like
+        :meth:`trade_chart` it stays out of an order's way: every call goes through the worker thread with its time
+        limit, and before each history call it looks whether that thread has anything else to do. Raises
+        BrokerError when there is no price now."""
+        self._require()
+        tick, err = await self._call("symbol_info_tick", broker_symbol)
+        bid, ask = (_f(getattr(tick, "bid", 0.0)), _f(getattr(tick, "ask", 0.0))) if tick is not None else (0.0, 0.0)
+        if tick is None or bid <= 0 or ask <= 0:
+            raise BrokerError(f"MT5 {broker_symbol} fiyatı alınamadı: {_err_text(err) if tick is None else 'fiyat yok'}")
+        t_sec = int(_f(getattr(tick, "time", 0)))
+        t_msc = int(_f(getattr(tick, "time_msc", 0))) or t_sec * 1000
+        out: dict[str, Any] = {"now": (t_msc, bid, ask), "samples": [], "source": None, "upto_msc": t_msc,
+                               "busy": False}
+        start = since_msc
+        if start is None and since_utc is not None and t_sec > 0 and not self._tick_is_stale(t_sec):
+            offset = int(round((t_sec - self._now_epoch()) / 3600.0)) * 3600
+            start = int((float(since_utc) + offset) * 1000)
+        if start is None or start >= t_msc:
+            return out
+        busy = {**out, "busy": True, "upto_msc": start}
+        if self._oldest_call() is not None:
+            return busy
+        samples: list[tuple[int, float, float, float, float]] = []
+        rows: Any = None
+        if hasattr(self._mt5, "copy_ticks_from"):
+            flags = getattr(self._mt5, "COPY_TICKS_INFO", 1)
+            rows, _err = await self._call("copy_ticks_from", broker_symbol, int(start // 1000), int(max_ticks) + 1,
+                                          flags)
+        if rows is not None and len(rows) <= max_ticks:
+            for r in rows:
+                try:
+                    msc = int(r["time_msc"]) or int(r["time"]) * 1000
+                    b, a = float(r["bid"]), float(r["ask"])
+                except (KeyError, IndexError, TypeError, ValueError):
+                    continue
+                if start < msc <= t_msc and b > 0 and a > 0:
+                    samples.append((msc, b, b, a, a))
+            out["source"] = "ticks"
+        else:
+            if self._oldest_call() is not None:
+                return busy
+            info, _err = await self._call("symbol_info", broker_symbol)
+            point = _f(getattr(info, "point", 0.0)) if info is not None else 0.0
+            first = -(-int(start // 1000) // 60) * 60                  # the first minute that began after the start
+            if first <= t_sec:
+                if self._oldest_call() is not None:
+                    return busy
+                frame = getattr(self._mt5, "TIMEFRAME_M1", TIMEFRAME_VALUES["M1"])
+                bars, _err = await self._call("copy_rates_range", broker_symbol, frame, first, t_sec)
+                for r in bars if bars is not None else ():
+                    try:
+                        open_sec, low, high = int(r["time"]), float(r["low"]), float(r["high"])
+                        spread = float(r["spread"]) * point
+                    except (KeyError, IndexError, TypeError, ValueError):
+                        continue
+                    if open_sec >= first and low > 0 and high > 0:
+                        samples.append((open_sec * 1000, low, high, low + spread, high + spread))
+                out["source"] = "bars" if bars is not None else None
+        samples.sort(key=lambda s: s[0])
+        out["samples"] = samples
+        return out
 
 
 # The trade card's server clock from the first opening deal against the bot's own UTC record of that fill: trusted

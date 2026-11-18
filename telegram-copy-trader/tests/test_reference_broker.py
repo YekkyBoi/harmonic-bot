@@ -16,6 +16,7 @@ from __future__ import annotations
 
 import re
 from pathlib import Path
+from types import SimpleNamespace
 from typing import Any
 
 import pytest
@@ -384,7 +385,7 @@ async def test_fx_price_watch_reads_lightly_and_backs_off_after_a_failed_read(un
     await _unsure_eur_limit(p)
     fx = p.brokers["fx"]
     calls = {"resolve": 0, "quote": 0}
-    real_resolve, real_quote = fx.resolve_symbol, fx.get_quote
+    real_resolve, real_quote = fx.resolve_symbol, fx.price_since
 
     async def resolve(*a: Any, **k: Any) -> Any:
         calls["resolve"] += 1
@@ -394,7 +395,7 @@ async def test_fx_price_watch_reads_lightly_and_backs_off_after_a_failed_read(un
         calls["quote"] += 1
         return await real_quote(*a, **k)
 
-    fx.resolve_symbol, fx.get_quote = resolve, quote                    # type: ignore[method-assign]
+    fx.resolve_symbol, fx.price_since = resolve, quote                  # type: ignore[method-assign]
     for _ in range(3):
         await p.engine.monitor.run_virtual_once()
     assert calls == {"resolve": 1, "quote": 3} and p.tickmill_orders() == []
@@ -410,6 +411,166 @@ async def test_fx_price_watch_reads_lightly_and_backs_off_after_a_failed_read(un
     await p.engine.monitor.run_virtual_once()
     (order,) = p.tickmill_orders()
     assert order[0] == "market_buy"
+
+
+# --------------------------------------------------------------------------- #
+# what happened between two looks: fx's tick history (or its 1-minute bars)
+# --------------------------------------------------------------------------- #
+T0 = tps.SERVER_TIME                                                     # fx's server clock (UTC+2 in the fake)
+
+
+def _tick(p: Prod, bid: float, ask: float, at: float) -> None:
+    """fx's latest tick at server time ``at`` (seconds)."""
+    p.terminal.ticks["EURUSD"] = SimpleNamespace(bid=bid, ask=ask, last=0.0, time=int(at), time_msc=int(at * 1000))
+
+
+def _history(p: Prod, ticks: list[tuple[float, float, float]]) -> list[tuple[Any, ...]]:
+    """fx's tick history (server time, bid, ask), read with copy_ticks_from; returns the calls made to it."""
+    calls: list[tuple[Any, ...]] = []
+    rows = [{"time": int(t), "time_msc": int(t * 1000), "bid": b, "ask": a} for t, b, a in ticks]
+
+    def copy_ticks_from(symbol: str, date_from: int, count: int, flags: int) -> list[dict[str, Any]]:
+        calls.append((symbol, date_from, count, flags))
+        return [r for r in rows if r["time"] >= date_from][:count]
+
+    p.terminal.copy_ticks_from = copy_ticks_from                         # type: ignore[attr-defined]
+    return calls
+
+
+async def _armed_watch(p: Prod) -> None:
+    """A low-confidence EUR long limit (fx asked, tickmill watching fx's price) and its first look at T0."""
+    _tick(p, 1.16195, 1.16205, T0)
+    await _unsure_eur_limit(p)
+    await p.engine.monitor.run_virtual_once()
+    assert p.tickmill_orders() == []
+
+
+async def test_a_brief_touch_between_two_looks_is_seen_in_fx_ticks(unsure) -> None:
+    p, _friend = unsure
+    calls = _history(p, [(T0 + 0.5, 1.16090, 1.16098), (T0 + 1.0, 1.16110, 1.16120)])
+    await _armed_watch(p)
+    _tick(p, 1.16110, 1.16120, T0 + 1.5)                     # back above the entry, but within ~3 pips of it
+    p.tickmill.set_price("EURUSD", 1.16125, 1.16135)
+    await p.engine.monitor.run_virtual_once()
+    (order,) = p.tickmill_orders()
+    assert order[0] == "market_buy"
+    assert calls and calls[-1][1] == T0                       # read from where the previous look ended
+    (note,) = [t for t in p.texts() if "#1 EUR LONG tickmill hesabında açıldı" in t]
+    assert "kısa süreliğine 1.16098" in note
+
+
+async def test_a_brief_touch_far_behind_is_not_chased(unsure) -> None:
+    p, _friend = unsure
+    _history(p, [(T0 + 0.5, 1.16090, 1.16098)])
+    await _armed_watch(p)
+    _tick(p, 1.16245, 1.16255, T0 + 1.5)                     # the price ran away (15 pips): no chase
+    await p.engine.monitor.run_virtual_once()
+    assert p.tickmill_orders() == []
+    assert any("tetik seviyesi görüldü ama fiyat uzaklaştı" in t for t in p.texts())
+    pos = (await p.positions(1))["tickmill"]
+    assert is_virtual_pending(pos) and pos.data["virtual_missed"]
+    _tick(p, 1.16090, 1.16100, T0 + 3.0)                     # back at the level: opens
+    p.tickmill.set_price("EURUSD", 1.16105, 1.16115)
+    await p.engine.monitor.run_virtual_once()
+    (order,) = p.tickmill_orders()
+    assert order[0] == "market_buy"
+
+
+async def test_without_tick_history_the_one_minute_bars_show_the_touch(unsure) -> None:
+    p, _friend = unsure
+    await _armed_watch(p)                                     # (the fake terminal has no copy_ticks_from)
+    first = -(-T0 // 60) * 60                                 # the first minute that began after the first look
+    asked: list[tuple[Any, ...]] = []
+
+    def copy_rates_range(symbol: str, timeframe: int, date_from: int, date_to: int) -> list[dict[str, Any]]:
+        asked.append((symbol, timeframe, date_from, date_to))
+        return [{"time": first - 60, "open": 1.1619, "high": 1.1620, "low": 1.1600, "close": 1.1619, "spread": 10},
+                {"time": first, "open": 1.1619, "high": 1.1620, "low": 1.16085, "close": 1.1612, "spread": 10}]
+
+    p.terminal.copy_rates_range = copy_rates_range            # type: ignore[method-assign]
+    _tick(p, 1.16110, 1.16120, first + 30)
+    p.tickmill.set_price("EURUSD", 1.16125, 1.16135)
+    await p.engine.monitor.run_virtual_once()
+    (order,) = p.tickmill_orders()                            # low 1.16085 + spread 0.00010 -> ask 1.16095 <= 1.1610
+    assert order[0] == "market_buy"
+    assert asked == [("EURUSD", 1, first, first + 30)]        # M1, from the first whole minute after the look
+
+
+async def test_fx_reaching_the_first_target_before_the_entry_cancels_the_waiting_entry(unsure) -> None:
+    p, _friend = unsure
+    _history(p, [(T0 + 0.5, 1.16505, 1.16515)])               # bid 1.16505 >= TP 1.1650, the entry never touched
+    await _armed_watch(p)
+    _tick(p, 1.16400, 1.16410, T0 + 1.5)
+    await p.engine.monitor.run_virtual_once()
+    pos = (await p.positions(1))["tickmill"]
+    assert pos.status is PositionStatus.CANCELLED and p.tickmill_orders() == []
+    (note,) = [t for t in p.texts() if "sanal tetik iptal edildi" in t]
+    assert "fx fiyatı (1.16505) ilk hedefi (1.165) geçti" in note
+    assert "giriş tetiklenmeden fiyat uzaklaştı, işlem AÇILMADI" in note
+
+
+async def test_a_pullback_limit_counts_the_target_only_after_fx_has_been_between(tmp_path: Path,
+                                                                               monkeypatch: pytest.MonkeyPatch) -> None:
+    """A long limit whose first target is BELOW today's price (a pullback): fx above the target at the signal does
+    not cancel it; once fx has been between the entry and the target, reaching the target again does."""
+    p, _friend = await _make(tmp_path, monkeypatch, edit=_no_confirm)
+    try:
+        tps.set_eurusd(p, 1.16195, 1.16205)
+        action = fx_pair("EURUSD", Side.LONG, 1.1600, 1.1580, 1.1615, entry_type=EntryType.LIMIT).model_copy(
+            update={"confidence": 0.5})
+        _tick(p, 1.16195, 1.16205, T0)
+        await p.say(action, FX, "EUR LONG 1R Limit Emir")
+        pos = (await p.positions(1))["tickmill"]
+        assert pos.data["virtual_tp_armed"] is False
+        await p.engine.monitor.run_virtual_once()
+        assert is_virtual_pending((await p.positions(1))["tickmill"])            # above the target: still waiting
+        _history(p, [(T0 + 0.5, 1.16100, 1.16110)])                               # between the entry and the target
+        _tick(p, 1.16120, 1.16130, T0 + 1.0)
+        await p.engine.monitor.run_virtual_once()
+        pos = (await p.positions(1))["tickmill"]
+        assert is_virtual_pending(pos) and pos.data["virtual_tp_armed"] is True
+        _history(p, [(T0 + 1.5, 1.16155, 1.16165)])                               # now at the target
+        _tick(p, 1.16140, 1.16150, T0 + 2.0)
+        await p.engine.monitor.run_virtual_once()
+        assert (await p.positions(1))["tickmill"].status is PositionStatus.CANCELLED
+        assert p.tickmill_orders() == []
+    finally:
+        await p.close()
+
+
+async def test_fx_passing_the_stop_before_the_look_cancels_never_opens(unsure) -> None:
+    p, _friend = unsure
+    _history(p, [(T0 + 0.5, 1.15880, 1.15890)])               # straight through the entry and the stop 1.1590
+    await _armed_watch(p)
+    _tick(p, 1.15950, 1.15960, T0 + 1.5)
+    await p.engine.monitor.run_virtual_once()
+    assert (await p.positions(1))["tickmill"].status is PositionStatus.CANCELLED and p.tickmill_orders() == []
+    assert any("stop seviyesini (1.159) geçti" in t for t in p.texts())
+
+
+async def test_fx_busy_with_another_call_skips_the_history_and_reads_it_next_time(unsure) -> None:
+    p, _friend = unsure
+    calls = _history(p, [(T0 + 0.5, 1.16090, 1.16098)])
+    await _armed_watch(p)
+    _tick(p, 1.16110, 1.16120, T0 + 1.5)
+    fx = p.brokers["fx"]
+    busy = [True]
+    real = fx._oldest_call
+    other = SimpleNamespace(timed_out=False, running_for=lambda: 0.0, stuck_after=lambda: 1e9,
+                            relinking=lambda: False)                  # another call running on fx's worker thread
+    fx._oldest_call = lambda: other if busy[0] else real()       # type: ignore[method-assign]
+    await p.engine.monitor.run_virtual_once()
+    assert p.tickmill_orders() == [] and calls == []          # an order may be on its way: not in its way
+    busy[0] = False
+    p.tickmill.set_price("EURUSD", 1.16125, 1.16135)
+    await p.engine.monitor.run_virtual_once()
+    (order,) = p.tickmill_orders()                            # the touch at T0 + 0.5 is still found
+    assert order[0] == "market_buy" and calls[-1][1] == T0
+
+
+def test_the_tickmill_bridge_can_serve_price_since_too() -> None:
+    from copytrader.brokers import mt5_bridge, mt5_helper
+    assert "price_since" in mt5_helper.METHODS and callable(getattr(mt5_bridge.Mt5BridgeBroker, "price_since"))
 
 
 async def test_a_short_fires_on_fx_bid_at_or_above_the_entry(unsure) -> None:
