@@ -388,6 +388,15 @@ def plan_changes(raw: dict[str, Any], config: AppConfig, *,
                 notes.append(f"{TICKMILL_BROKER}: '{FX_BROKER}' adlı etkin bir MetaTrader hesabı (type mt5 / "
                              "mt5_bridge) yok; reference_broker yazılmadı (FX limit girişlerinde tickmill her "
                              "zamanki limit emri kullanır)")
+        # 10. The owner's decision: tickmill's lot from the signal's own entry price, like the trader's (0.94 per 100
+        #     USD -> 0.47 per 50), never below 1R and at most lot_rounding_max_over above it at the real entry. Only
+        #     when the key is not there yet (a value written by hand stays).
+        setting(("brokers", i), block, model, "size_from_signal_entry", True,
+                f"{TICKMILL_BROKER}: piyasa emrinde lot sinyaldeki giriş fiyatına göre hesaplanacak (trader'ın "
+                "lotu gibi); stopta kayıp 1R'nin altına düşmez, gerçek girişten en çok lot_rounding_max_over "
+                "(varsayılan 10) üstüne çıkar (size_from_signal_entry: true)",
+                lambda c: getattr(_broker(c, TICKMILL_BROKER), "size_from_signal_entry", None) is True,
+                TICKMILL_BROKER, wanted=lambda v: True)
     return changes, notes
 
 

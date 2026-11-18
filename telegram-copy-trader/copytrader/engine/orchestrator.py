@@ -703,7 +703,9 @@ def rounding_headroom(broker: Broker) -> float:
 def max_rounded_risk(broker: Broker, amount: float) -> float:
     """The most a size of ``broker`` sized for ``amount`` may lose at the stop through its lot rounding: ``amount``
     for "down", x LOT_ROUNDING_MAX_OVERSHOOT for "nearest", + lot_rounding_max_over for "up"."""
-    if str(getattr(broker.config, "lot_rounding", "down") or "down") == "up":
+    if (str(getattr(broker.config, "lot_rounding", "down") or "down") == "up"
+            or getattr(broker.config, "size_from_signal_entry", False) is True):
+        # ("up", and a size from the signal's own entry: at most lot_rounding_max_over above, see _signal_entry_size)
         over = getattr(broker.config, "lot_rounding_max_over", None)
         over = float(over) if isinstance(over, (int, float)) and math.isfinite(over) and over >= 0 \
             else sizing.DEFAULT_LOT_ROUNDING_MAX_OVER
@@ -5019,6 +5021,11 @@ class Engine:
                     plan.side, entry, sizing_stop, signal_entry,
                     getattr(risk, "max_size_multiple", DEFAULT_MAX_SIZE_MULTIPLE))
             size = await broker.size_position(sym, plan.side, sizing_entry, sizing_stop, amount)
+            signal_sized: str | None = None
+            if (entry_type is EntryType.MARKET and not size_capped and signal_entry
+                    and getattr(broker.config, "size_from_signal_entry", False)):
+                size, signal_sized = await self._signal_entry_size(
+                    broker, sym, plan.side, size, signal_entry, sizing_entry, sizing_stop, amount)
             req = OpenRequest(
                 plan=plan,
                 symbol=sym,
@@ -5074,6 +5081,8 @@ class Engine:
                     f"{fill}")
             if offset:
                 text += f" ({offset_text(offset)})"
+            if signal_sized:
+                text += f"; {esc(signal_sized)}"
             warnings = [*size.warnings, *(str(w) for w in pos.data.get("warnings") or [])]
             if size_capped:
                 # (what the quantity really sent loses - rounded to the broker's step, its fees counted as the sizing
@@ -5122,6 +5131,51 @@ class Engine:
             if not mute_errors:
                 await self._notify(text, Severity.ERROR)
             return BrokerOutcome(name, "error", text, sent=sent, unknown=sent)    # (after the order: it may exist)
+
+    async def _signal_entry_size(
+        self, broker: Broker, sym: Any, side: Side, live: SizingResult, signal_entry: float, live_entry: float,
+        stop: float, amount: float,
+    ) -> tuple[SizingResult, str | None]:
+        """``size_from_signal_entry`` (the friend's tickmill): a market order is sized like the trader sizes it - on
+        the signal's own entry-to-stop distance (``signal_entry``, in this broker's scale and offset), rounded down
+        like his lot - but never below ``live`` (today's size from the live entry: never under 1R at the stop), and
+        never losing more at the stop, from the live entry the order really gets, than 1R + lot_rounding_max_over:
+        beyond that the largest lot step within it (still never below ``live``). Returns (the size, the short Turkish
+        note for the open line) - (``live``, None) when the signal's distance gives no more."""
+        name = broker.name
+        q_live = live.quantity
+        step = float(getattr(sym, "qty_step", 0) or 0)
+        if not (q_live > 0 and step > 0 and math.isfinite(live.est_loss_at_sl) and live.est_loss_at_sl > 0):
+            return live, None
+        per_unit_live = live.est_loss_at_sl / q_live          # (the money lost per unit from the live entry)
+        try:
+            at_signal = await broker.size_position(sym, side, signal_entry, stop, amount)
+        except Exception as exc:                              # (a sizing refusal of the signal's distance: today's)
+            logger.info("%s: no size from the signal's entry (%s); the live entry's stands", name, exc)
+            return live, None
+        if not (at_signal.quantity > 0 and math.isfinite(at_signal.est_loss_at_sl) and at_signal.est_loss_at_sl > 0):
+            return live, None
+        per_unit_signal = at_signal.est_loss_at_sl / at_signal.quantity
+        wanted = sizing.floor_to_step(amount / per_unit_signal, step)          # the trader's own lot for 1R
+        over = getattr(broker.config, "lot_rounding_max_over", None)
+        over = float(over) if isinstance(over, (int, float)) and math.isfinite(over) and over >= 0 \
+            else sizing.DEFAULT_LOT_ROUNDING_MAX_OVER
+        cap = amount + over
+        if wanted * per_unit_live > cap * (1 + 1e-9):
+            wanted = sizing.floor_to_step(cap / per_unit_live, step)            # the largest step within 1R + over
+        if wanted <= q_live * (1 + 1e-9):
+            return live, None
+        try:
+            # (sized again by the adapter for exactly that quantity: its own margin and limit checks apply to it)
+            sized = await broker.size_position(sym, side, live_entry, stop, wanted * per_unit_live)
+        except Exception as exc:
+            logger.info("%s: the signal-entry size %s was refused (%s); the live entry's stands", name, wanted, exc)
+            return live, None
+        if abs(sized.quantity - wanted) > step * 1e-6:
+            return live, None
+        loss = sized.est_loss_at_sl
+        result = sized.model_copy(update={"risk_amount": amount, "warnings": list(live.warnings)})
+        return result, f"lot sinyal girişine göre ({_qty(wanted)}); stopta kayıp ~{_money(loss)}"
 
     async def _save_leg_position(self, trade_id: int, pos: BrokerPosition, flow: _OpenFlow | None) -> None:
         """Store the position a leg just got from its broker (at once: a crash must never lose it). Every

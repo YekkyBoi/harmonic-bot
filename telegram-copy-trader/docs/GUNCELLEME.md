@@ -65,6 +65,7 @@ yazar.
 | `tickmill` > `lot_rounding` | `up` | Lot yukarı yuvarlanır: stopta kayıp 1R'nin altına düşmez, 1R'yi en çok `lot_rounding_max_over` (varsayılan 10) kadar aşar; daha fazla aşacaksa aşağı yuvarlanır ve bildirilir. Yoksa yazılır, eski güncellemenin yazdığı `nearest` da `up` olur; elle yazdığınız başka bir değer kalır. Sizin hesaplarınız aşağı yuvarlamada kalır |
 | `tickmill` > `confirm_open` | `false` | Bot emin olamayıp "açayım mı?" diye sorduğunda tickmill'de işlem beklemeden, okunduğu gibi açılır; soru sizin hesaplarınız için aynen gelir (yalnızca bu satır yoksa yazılır) |
 | `tickmill` > `fees_in_risk` | `false` | Tickmill'de lot yalnızca stoptaki fiyat kaybına göre hesaplanır, komisyon 1R'nin üstüne ödenir (yalnızca bu satır yoksa yazılır) |
+| `tickmill` > `size_from_signal_entry` | `true` | Piyasa emrinde tickmill'in lotu sinyaldeki giriş fiyatına göre hesaplanır (trader'ın lotu gibi: 100 USD'ye 0.94 lot ise 50 USD'ye 0.47); stopta kayıp 1R'nin altına düşmez, gerçek giriş fiyatından en çok `lot_rounding_max_over` (varsayılan 10) üstüne çıkar. Girişi yazılmamış sinyaller her zamanki gibi (yalnızca bu satır yoksa yazılır) |
 | `tickmill` > `reference_broker` | `fx` | FX konusundaki limit girişlerde tickmill'e limit emir konmaz: fx hesabınızdaki giriş emri dolunca, fx'te emir yoksa fx fiyatı seviyeye gelince tickmill'de piyasa emriyle açılır (yalnızca bu satır yoksa ve `fx` etkin bir MetaTrader hesabıysa yazılır) |
 | `tickmill` > `type` | `mt5_bridge` | Bilgisayarda Tickmill MT5 terminali bulunursa MetaApi yerine o terminal kullanılır (bir kez; bulunamazsa MetaApi'de kalır ve bunu bir satırla yazar) |
 | `tickmill` > `terminal_path` | bulunan `terminal64.exe` yolu | Program Files içinde adında "Tickmill" geçen klasördeki terminal |
@@ -83,11 +84,11 @@ BU sürümde MetaApi'ye geri dönmek için bloktaki `type: mt5_bridge` satırın
 Eski bir sürüme dönmek için yalnızca `.\venv\Scripts\python.exe guncelle.py --geri-al` kullanın: kodla birlikte
 o zamanki `config.yaml` dosyasını da yedekten geri koyar. Eski kodu elle (yalnızca kod dosyalarını) geri koymayın:
 eski sürümler bu güncellemenin eklediği `lot_rounding`, `confirm_open`, `fees_in_risk`, `reference_broker`,
-`terminal_path` ve `broker_company` ayarlarını tanımaz ve
-bot hiç açılmaz (sizin hesaplarınız dahil). `type: metaapi` yazmak bunu çözmez; elle dönülecekse `config.yaml` da
+`size_from_signal_entry`, `terminal_path` ve `broker_company` ayarlarını tanımaz ve bot hiç açılmaz (sizin
+hesaplarınız dahil). `type: metaapi` yazmak bunu çözmez; elle dönülecekse `config.yaml` da
 güncellemeden önceki yedeğiyle (`config.yaml.yedek-...` ya da `yedek\<tarih>\config.yaml`) değiştirilmelidir.
 Bu ayarlar Tickmill terminali bulunamasa da eklenir (`risk_usd`, `lot_rounding`, `confirm_open`, `fees_in_risk`,
-`reference_broker`).
+`reference_broker`, `size_from_signal_entry`).
 
 Önerilen sıra (sizin fx hesabınız için en güvenlisi): önce Tickmill terminalini KURMADAN bu sürüme güncelleyin ve
 botun fx hesabına bağlandığını görün (bot o anda FundingPips terminalini `data\mt5_terminal_fx.json` dosyasına

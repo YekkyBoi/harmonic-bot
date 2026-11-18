@@ -130,10 +130,12 @@ KNOWS_OPEN_RISK = "daily_loss_include_open_risk" in _BrokerBase.model_fields
 KNOWS_LOT_ROUNDING = "lot_rounding" in _BrokerBase.model_fields
 # The friend's second round (step 9): confirm_open / fees_in_risk / lot_rounding "up" / reference_broker.
 KNOWS_STEP9 = all(k in _BrokerBase.model_fields for k in ("confirm_open", "fees_in_risk", "reference_broker"))
+KNOWS_STEP10 = "size_from_signal_entry" in _BrokerBase.model_fields
 LOT_ROUNDING = "up" if KNOWS_STEP9 else "nearest"
 # The lines the update adds to the tickmill block of the production replica (risk_usd 45 -> 50 is replaced in place).
 TICKMILL_ADDED = (["confirm_open: false", "fees_in_risk: false", "lot_rounding: up", "reference_broker: fx"]
-                  if KNOWS_STEP9 else ["lot_rounding: nearest"] if KNOWS_LOT_ROUNDING else [])
+                  if KNOWS_STEP9 else ["lot_rounding: nearest"] if KNOWS_LOT_ROUNDING else []) + (
+    ["size_from_signal_entry: true"] if KNOWS_STEP10 else [])
 N_TICKMILL = (1 if KNOWS_LOT_ROUNDING else 0) + len(TICKMILL_ADDED)
 # Settings the production replica needs: binance x2, notifier x2, risk x2, the kripto topic (+ fx open risk)
 # (+ tickmill: risk_usd 45 -> 50 and the TICKMILL_ADDED lines; no Tickmill terminal on the test machine: it stays on
@@ -2532,7 +2534,7 @@ def test_migrate_step_9_after_an_earlier_update_turns_nearest_into_up_and_adds_t
     path = prod_file(tmp_path, text)
     lines = m.migrate_config(path, terminal=none)
     tick = [line for line in lines if line.startswith("tickmill:")]
-    assert len(tick) == 4 and not any("risk_usd" in line for line in tick)
+    assert len(tick) == 4 + (1 if KNOWS_STEP10 else 0) and not any("risk_usd" in line for line in tick)
     assert any(line.endswith("(lot_rounding: up) — önceki ayar: nearest") for line in tick)
     new = path.read_text(encoding="utf-8")
     assert "    lot_rounding: up\n" in new and "lot_rounding: nearest" not in new          # replaced in place
@@ -2546,12 +2548,28 @@ def test_migrate_step_9_after_an_earlier_update_turns_nearest_into_up_and_adds_t
     assert m.migrate_config(path, terminal=none) == []                                 # idempotent
 
 
+@pytest.mark.skipif(not KNOWS_STEP10, reason="this version has no size_from_signal_entry")
+def test_migrate_step_10_after_the_previous_update_adds_only_size_from_signal_entry(tmp_path: Path) -> None:
+    m = migrate_mod()
+    none = (None, None)
+    text = PROD_YAML.replace("    risk_usd: 45\n", "    risk_usd: 50\n    lot_rounding: up\n    confirm_open: false\n"
+                             "    fees_in_risk: false\n    reference_broker: fx\n")
+    path = prod_file(tmp_path, text)
+    lines = m.migrate_config(path, terminal=none)
+    tick = [line for line in lines if line.startswith("tickmill:")]
+    assert len(tick) == 1 and tick[0].endswith("(size_from_signal_entry: true)")
+    assert tickmill_block(load_config(path)).size_from_signal_entry is True
+    assert broker_of(load_config(path), "fx").size_from_signal_entry is False      # only tickmill
+    assert m.migrate_config(path, terminal=none) == []                             # idempotent
+
+
 @pytest.mark.skipif(not KNOWS_STEP9, reason="this version has no confirm_open / fees_in_risk / reference_broker")
 def test_migrate_step_9_leaves_every_value_written_by_hand(tmp_path: Path) -> None:
     m = migrate_mod()
     none = (None, None)
     text = PROD_YAML.replace("    risk_usd: 45\n", "    risk_usd: 45\n    lot_rounding: down\n    confirm_open: true\n"
-                             "    fees_in_risk: true\n    reference_broker: fx\n")
+                             "    fees_in_risk: true\n    reference_broker: fx\n"
+                             + ("    size_from_signal_entry: false\n" if KNOWS_STEP10 else ""))
     path = prod_file(tmp_path, text)
     lines = m.migrate_config(path, terminal=none)
     assert not any(line.startswith("tickmill:") for line in lines)

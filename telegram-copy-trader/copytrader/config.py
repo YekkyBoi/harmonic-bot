@@ -313,6 +313,11 @@ class _BrokerBase(_Base):
     # loss at the stop. None (default): risk.include_fees_in_risk decides, as for every account. False: sized on the
     # price loss at the stop only (the commission is paid on top). True: always counted.
     fees_in_risk: bool | None = None
+    # true: a MARKET order whose signal names an entry price is sized like the trader sizes it - on the signal's own
+    # entry-to-stop distance (rounded down like his lot) - never below the size from the live entry (never under 1R
+    # at the stop), and never losing more than 1R + lot_rounding_max_over at the stop from the live entry the order
+    # gets (beyond it the largest lot step within it). Signals without an entry price and resting limits: as before.
+    size_from_signal_entry: bool = False
 
     @field_validator("reference_broker")
     @classmethod

@@ -204,6 +204,8 @@ def _risk_text(config: AppConfig) -> str:
         if getattr(b, "lot_rounding", "down") == "up":
             notes.append(f"lot yukarı yuvarlanır, stopta hedefin en çok {getattr(b, 'lot_rounding_max_over', 10.0):g} "
                          "üstü")
+        if getattr(b, "size_from_signal_entry", False) is True:
+            notes.append("lot sinyalin giriş fiyatına göre")
         if getattr(b, "fees_in_risk", None) is False:
             notes.append("komisyon riske katılmaz")
         elif getattr(b, "fees_in_risk", None) is True and not config.risk.include_fees_in_risk:

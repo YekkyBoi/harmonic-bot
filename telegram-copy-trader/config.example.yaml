@@ -191,6 +191,10 @@ risk:
 #   fees_in_risk     bu hesapta komisyon 1R'nin içine sayılsın mı: boş = risk.include_fees_in_risk ne diyorsa;
 #                    false = lot yalnızca stoptaki fiyat kaybına göre hesaplanır (commission_per_lot / komisyon
 #                    1R'nin üstüne ödenir); true = her zaman sayılır
+#   size_from_signal_entry  true = giriş fiyatı yazılı piyasa emirli sinyalde lot, trader'ın yaptığı gibi
+#                    sinyaldeki giriş ile stop arasındaki mesafeye göre hesaplanır (aşağı yuvarlanır); canlı
+#                    girişe göre hesaplanan lottan küçük olmaz (stopta kayıp 1R'nin altına düşmez) ve gerçek
+#                    girişten stopta kayıp en çok 1R + lot_rounding_max_over olur. Varsayılan false
 #   reference_broker (isteğe bağlı) LIMIT girişli FOREX/CFD sinyallerinde (kripto olmayan; konunun türüne
 #                    göre, yukarıdaki kural) bu hesapta limit emir HİÇ KONMAZ: burada adı yazılan BAŞKA bir
 #                    MetaTrader hesabı (type mt5 / mt5_bridge, etkin) referans olur. O hesabın bu işlemde bekleyen

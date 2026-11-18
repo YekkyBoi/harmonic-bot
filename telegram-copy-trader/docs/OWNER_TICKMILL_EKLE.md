@@ -124,7 +124,8 @@ Notlar:
 - `optional: true` satırı **çok önemli**. Silme.
 - `risk_usd: 5` arkadaşın için 1R'de en fazla 5 dolar demektir. Küçük başla.
 - `symbol_map` ve `allowed_assets` örnektir. Arkadaşından gelen sembol adlarına göre düzelt.
-- `confirm_open: false`, `fees_in_risk: false`, `lot_rounding: up` ve `reference_broker: fx` satırlarını
+- `confirm_open: false`, `fees_in_risk: false`, `lot_rounding: up`, `reference_broker: fx` ve
+  `size_from_signal_entry: true` satırlarını
   güncelleme (`guncelle.py`, 6. adım) `tickmill` bloğuna kendisi ekler; elle yazmanız gerekmez. Yalnızca blokta
   henüz yoksa yazılır (`lot_rounding: nearest` ise `up` olur); elle yazdığınız başka bir değer kalır.
   - `confirm_open: false`: bot bir sinyalden emin olamayıp "AÇAYIM MI?" diye sorduğunda Tickmill'de işlem
@@ -138,6 +139,9 @@ Notlar:
     `fx` etkin bir MetaTrader hesabıysa (type mt5 / mt5_bridge) yazılır.
   - `fees_in_risk: false` ve `lot_rounding: up`: lot stoptaki fiyat kaybına göre hesaplanır (komisyon 1R'nin
     üstüne ödenir) ve yukarı yuvarlanır; stopta kayıp 1R'nin altına düşmez, en çok 10 üstüne çıkar.
+  - `size_from_signal_entry: true`: piyasa emrinde lot sinyaldeki giriş fiyatına göre hesaplanır (trader'ın lotu
+    gibi: 100 USD'ye 0.94 lot ise 50 USD'ye 0.47). Fiyat girişten kötü dolarsa da lot bunun altına inmez; stopta
+    kayıp gerçek girişten en çok 1R + 10 olur (fazlası olacaksa o sınıra kadar küçültülür).
 
 ### 3b. Konu yollarına `tickmill` ekle
 
