@@ -14,6 +14,7 @@ from __future__ import annotations
 import asyncio
 import importlib.util
 import json
+import math
 import os
 import shutil
 import sys
@@ -628,15 +629,21 @@ async def test_a_part_closed_by_hand_that_the_fills_do_not_show_makes_no_card(wo
     assert not world.notes.photos
 
 
-async def other_btc_long(world: World, created: datetime, closed: datetime) -> None:
-    """Another BTC long of the bot's on binance (0.1 from 90,000, its target filled at 91,500)."""
+async def other_btc_long(world: World, created: datetime, closed: datetime | None) -> None:
+    """Another BTC long of the bot's on binance (0.1 from 90,000, its target filled at 91,500; ``closed`` None:
+    still open)."""
     pos = world.long["pos"].model_copy(deep=True, update={"realized_pnl": 150.0})
     pos.remaining_quantity = 0.0
-    pos.data.update(opened_at=ms(created + timedelta(seconds=20)), closed_at=ms(closed), entry_order_id="E_B",
+    pos.data.update(opened_at=ms(created + timedelta(seconds=20)), entry_order_id="E_B",
                     tp_order_ids=[{"id": "T_B"}], exits=[{"order_id": "T_B", "qty": 0.1, "price": 91500.0,
                                                           "kind": "tp"}])
+    if closed is None:
+        pos = pos.model_copy(update={"status": PositionStatus.OPEN, "realized_pnl": None, "remaining_quantity": 0.1})
+        pos.data["exits"] = []
+    else:
+        pos.data["closed_at"] = ms(closed)
     await add_trade(world.db, world.clock, world.long["trade"], pos, created=created, closed=closed,
-                    status=TradeStatus.CLOSED)
+                    status=TradeStatus.CLOSED if closed is not None else TradeStatus.OPEN)
 
 
 def fills_of_a_and_b(h: dict[str, Any], b_at: datetime) -> list[dict[str, Any]]:
@@ -647,13 +654,31 @@ def fills_of_a_and_b(h: dict[str, Any], b_at: datetime) -> list[dict[str, Any]]:
             paid(fill_of("sell", 0.05, 92100.0, h["hand"]), (2.3025, "USDT"))]
 
 
-async def test_another_bot_trade_on_the_symbol_meanwhile_makes_no_card(world: World) -> None:
+async def test_a_close_by_hand_while_another_bot_trade_held_the_symbol_makes_no_card(world: World) -> None:
     fake = binance_on(world)
     h = await bot_tp1_then_hand(world)
-    await other_btc_long(world, h["fill"] + timedelta(minutes=10), h["fill"] + timedelta(minutes=40))
-    fake.trades = fills_of_a_and_b(h, h["fill"] + timedelta(minutes=30))
+    # B: a BTC long of the bot's from 10 minutes after A's fill until after A's close by hand
+    await other_btc_long(world, h["fill"] + timedelta(minutes=10), h["hand"] + timedelta(minutes=1))
+    fake.trades = fills_of_a_and_b(h, h["hand"] + timedelta(seconds=30))
     assert await card_of_first(world) is None                                  # (A is the first of the list)
     assert world.notes.lines[-1] == svc_mod.FAILED.format(why=tc.VENUE_SHARED) and not world.notes.photos
+
+
+async def test_another_bot_trade_opened_after_the_close_by_hand_is_no_doubt(world: World) -> None:
+    fake = binance_on(world)
+    h = await bot_tp1_then_hand(world)
+    # A's rest closed by hand, the bot saw it flat 9 minutes later, a new BTC long B opened 6 minutes after that
+    # (within the fills' margin after A's end) and is still open
+    b_open = h["seen_flat"] + timedelta(minutes=6)
+    await other_btc_long(world, b_open, None)
+    fake.trades = [paid(fill_of("buy", 0.1, 91000.0, h["fill"], order="E1"), (4.55, "USDT")),
+                   paid(fill_of("sell", 0.05, 91800.0, h["tp1"], order="T1"), (2.295, "USDT")),
+                   paid(fill_of("sell", 0.05, 92100.0, h["hand"]), (2.3025, "USDT")),
+                   paid(fill_of("buy", 0.1, 92000.0, b_open + timedelta(seconds=20), order="E_B"), (4.6, "USDT"))]
+    data = await card_of_first(world)
+    assert data is not None, world.notes.lines
+    money = 0.05 * 800.0 + 0.05 * 1100.0 - 4.55 - 2.295 - 2.3025
+    assert data["hero"] == tc.fmt_r(money / 60.0) == "+1.43R" and data["exit"] == pytest.approx(91950.0)
 
 
 async def test_another_bot_trade_on_the_symbol_before_it_is_no_doubt(world: World) -> None:
@@ -773,28 +798,36 @@ def test_another_trade_of_the_bots_fills_are_never_this_ones_close() -> None:
     b_pos.data = {"opened_at": ms(opened + timedelta(minutes=5)), "entry_order_id": "E_B",
                   "tp_order_ids": [{"id": "T_B"}], "exits": [{"order_id": "T_B", "qty": 0.1, "price": 91500.0}]}
     rows = [(sample["trade"], pos, rec.closed), (b_trade, b_pos, opened + timedelta(minutes=31))]
-    foreign, shared = tc.venue_neighbours(pos, rec, sample["trade"].id, rows, NOW)
-    assert {"E_B", "T_B"} <= foreign and "T_A" not in foreign and shared
-    # B held BTC long meanwhile: the fill by hand cannot be told to be A's - no card, never a guessed number
-    with pytest.raises(tc.CardProblem, match="ayırt edilemiyor"):
-        tc.venue_close(pos, rec, trades, NOW, "USDT", foreign=foreign, shared=shared)
-    # without that overlap: B's fills are left out, A's own target first, then the hand close
-    found = tc.venue_close(pos, rec, trades, NOW, "USDT", foreign=foreign)
+    foreign, busy = tc.venue_neighbours(pos, rec, sample["trade"].id, rows, NOW)
+    assert {"E_B", "T_B"} <= foreign and "T_A" not in foreign
+    assert busy == [(ms(opened + timedelta(minutes=5)), ms(opened + timedelta(minutes=31)))]
+    # B's fills are left out; the close by hand (+2h) came after B's time: A's own target, then the hand close
+    found = tc.venue_close(pos, rec, trades, NOW, "USDT", foreign=foreign, busy=busy)
     money = 0.05 * 800.0 + 0.05 * 1100.0 - 4.55 - 2.29 - 2.30
     assert found is not None and found.exit_price == pytest.approx(91950.0) and found.money == pytest.approx(money)
     r = tc.result_r(sample["trade"], pos, 91000.0, 90400.0, found.exit_price, found.money)
     assert tc.fmt_r(r) == "+1.43R" and found.close_by == tc.CLOSED_ON_VENUE
-    # B on the other side, on another symbol, or over before A opened: no overlap
+    # a close by hand inside B's time (+20 min) cannot be told to be A's: no card, never a guessed number
+    inside = [*trades[:4], paid(fill_of("sell", 0.05, 92100.0, opened + timedelta(minutes=20), order="H"),
+                                (2.30, "USDT"))]
+    with pytest.raises(tc.CardProblem, match="ayırt edilemiyor"):
+        tc.venue_close(pos, rec, inside, NOW, "USDT", foreign=foreign, busy=busy)
+    # ... but A's own fills inside it are A's
+    own = pos.model_copy(deep=True)
+    own.data["sl_order_id"] = "S_A"
+    inside[-1]["order"] = "S_A"
+    assert tc.venue_close(own, rec, inside, NOW, "USDT", foreign=foreign, busy=busy) is not None
+    # B on the other side or on another symbol: no span; B still open or its end not known: open-ended; its open
+    # time not known: from its trade's start
     for change in ({"side": Side.SHORT}, {"broker_symbol": "ETH/USDT:USDT"}):
-        assert not tc.venue_neighbours(pos, rec, 12, [(b_trade, b_pos.model_copy(update=change), None)], NOW)[1]
-    early = b_trade.model_copy(update={"created_at": opened - timedelta(hours=3)})
-    gone = b_pos.model_copy(deep=True)
-    gone.data["opened_at"] = ms(opened - timedelta(hours=3))
-    assert not tc.venue_neighbours(pos, rec, 12, [(early, gone, opened - timedelta(hours=1))], NOW)[1]
-    # B still open, or its end not known: overlapping
-    assert tc.venue_neighbours(pos, rec, 12, [(early, gone.model_copy(update={"status": PositionStatus.OPEN}),
-                                                None)], NOW)[1]
-    assert tc.venue_neighbours(pos, rec, 12, [(early, gone, None)], NOW)[1]
+        assert tc.venue_neighbours(pos, rec, 12, [(b_trade, b_pos.model_copy(update=change), None)], NOW)[1] == []
+    b_start = ms(opened + timedelta(minutes=5))
+    assert tc.venue_neighbours(pos, rec, 12, [(b_trade, b_pos.model_copy(update={"status": PositionStatus.OPEN}),
+                                               None)], NOW)[1] == [(b_start, math.inf)]
+    assert tc.venue_neighbours(pos, rec, 12, [(b_trade, b_pos, None)], NOW)[1] == [(b_start, math.inf)]
+    bare = b_pos.model_copy(deep=True)
+    bare.data.pop("opened_at")
+    assert tc.venue_neighbours(pos, rec, 12, [(b_trade, bare, None)], NOW)[1] == [(ms(b_trade.created_at), math.inf)]
 
 
 def test_a_complete_result_of_the_bots_is_not_read_from_the_fills() -> None:

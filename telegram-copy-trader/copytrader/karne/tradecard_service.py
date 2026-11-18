@@ -337,10 +337,10 @@ class TradeCardService:
         try:
             since = int(as_utc(opened).timestamp() * 1000) - FILLS_SINCE_SLACK_MS
             rows = await self._db.account_trades(account, as_utc(opened) - timedelta(milliseconds=FILLS_SINCE_SLACK_MS))
-            foreign, shared = tc.venue_neighbours(pos, rec, trade_id, rows, now)
+            foreign, busy = tc.venue_neighbours(pos, rec, trade_id, rows, now)
             trades = await asyncio.wait_for(fetch(pos.broker_symbol, since), FILLS_TIMEOUT_SEC)
             found = tc.venue_close(pos, rec, list(trades or []), now, str(quote) if quote else None,
-                                   foreign=foreign, shared=shared)
+                                   foreign=foreign, busy=busy)
         except (asyncio.CancelledError, tc.CardProblem):
             raise
         except Exception as exc:      # noqa: BLE001 - the card is refused as before (no close price on record)
