@@ -51,6 +51,7 @@ METHODS = frozenset({
     "connect", "close", "get_equity", "get_free_margin", "account_currency", "resolve_symbol", "get_quote",
     "size_position", "open_position", "update_stop_loss", "update_take_profits", "close_position", "cancel_entry",
     "cancel_entry_remainder", "sync_position", "health_problem", "adopt_tagged", "startup_warnings",
+    "trade_chart",          # read only: bars + deals for the owner's trade card
 })
 
 logger = logging.getLogger("copytrader.mt5_helper")

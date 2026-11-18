@@ -142,6 +142,7 @@ class ParsedAction(BaseModel):
     ambiguities: list[str] = Field(default_factory=list)  # Turkish, one short sentence each
     summary_tr: str = ""                  # one-line Turkish summary of what was understood
     reasoning_brief: str = ""             # where each number came from (image label / text)
+    chart_timeframe_min: int | None = None  # bar size (minutes) of the signal's chart picture; None = not shown
 
 
 class ParseResult(BaseModel):
@@ -191,6 +192,9 @@ class TradePlan(BaseModel):
     created_at: datetime
     route: str | None = None              # TopicRoute.name the signal came from (e.g. "kripto")
     broker_names: list[str] = Field(default_factory=list)  # brokers to trade on; empty = every enabled broker
+    # Bar size (minutes) of the signal's chart picture, as the parser read it (None: not shown, or a plan of an
+    # older version). Only the owner's trade card (copytrader.karne.tradecard) uses it: nothing that trades does.
+    chart_timeframe_min: int | None = None
 
 
 _PAIR_METALS = frozenset({"XAU", "XAG", "XPT", "XPD"})

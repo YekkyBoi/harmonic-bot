@@ -882,5 +882,12 @@ class Mt5BridgeBroker(Broker):
     async def sync_position(self, pos: BrokerPosition) -> BrokerPosition:
         return await self._rpc("sync_position", pos, timeout=SYNC_TIMEOUT_SEC)  # type: ignore[no-any-return]
 
+    # ---- the owner's trade card (read only) -------------------------------------------------------------
+    async def trade_chart(self, broker_symbol: str, timeframe_min: int, start: float, end: float,
+                          tickets: Any = (), anchor_utc: float | None = None) -> dict[str, Any]:
+        """The helper's ``Mt5Broker.trade_chart`` (bars and deals, read only; a read's time limit)."""
+        return await self._rpc("trade_chart", broker_symbol, int(timeframe_min), float(start), float(end),  # type: ignore[no-any-return]
+                               list(tickets), anchor_utc)
+
 
 __all__ = ["Mt5BridgeBroker", "error_from_wire", "helper_command"]

@@ -251,6 +251,26 @@ class FakeMT5:
         return tuple(d for d in self.deals
                      if (ticket is None or d.order == ticket) and (position is None or d.position_id == position))
 
+    RATE_STEPS = {1: 60, 5: 300, 15: 900, 30: 1800, 16385: 3600, 16388: 14400, 16408: 86400}
+
+    def copy_rates_range(self, symbol: str, timeframe: int, date_from: Any, date_to: Any) -> Any:
+        """Bars of ``symbol`` (server-time epochs, like the package's numpy rows: indexable by field name) from
+        ``date_from`` to ``date_to`` (epoch seconds of the server's clock): a gentle saw-tooth around the bid."""
+        if self._log("copy_rates_range", symbol, timeframe, date_from, date_to):
+            return None
+        if symbol not in self.symbols or timeframe not in self.RATE_STEPS:
+            return None
+        step = self.RATE_STEPS[timeframe]
+        first = -(-int(date_from) // step) * step
+        base = self.ticks.get(symbol, SimpleNamespace(bid=100.0)).bid or 100.0
+        rows = []
+        for k, t in enumerate(range(first, int(date_to) + 1, step)):
+            o = base * (1 + 0.001 * ((k % 7) - 3))
+            c = base * (1 + 0.001 * (((k + 1) % 7) - 3))
+            rows.append({"time": t, "open": o, "high": max(o, c) * 1.0005, "low": min(o, c) * 0.9995, "close": c,
+                         "tick_volume": 10, "spread": 1, "real_volume": 0})
+        return rows
+
     def request_problem(self, request: Any) -> str | None:
         """The package's own argument check: the message it puts into last_error, or None when acceptable."""
         if not isinstance(request, dict):

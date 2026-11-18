@@ -864,6 +864,54 @@ class Database:
             )
         return [(int(r["trade_id"]), _load_position(r["position_json"])) for r in rows]
 
+    async def account_trades(
+        self, broker: str, since: datetime, trade_id: int | None = None
+    ) -> list[tuple[TradeRecord, BrokerPosition, datetime | None]]:
+        """(trade, ``broker``'s position in it, the time that position reached its final status or None) for every
+        position of ``broker`` that is PENDING / OPEN now, ended at or after ``since``, or whose trade was created at
+        or after ``since``; oldest trade first. ``trade_id``: that one trade only (whatever the times). Read only
+        (the owner's trade card, copytrader.karne.tradecard)."""
+        marks = ", ".join("?" for _ in _ACTIVE_POSITION)
+        params: list[Any] = [broker]
+        if trade_id is not None:
+            where = "bp.trade_id = ?"
+            params.append(int(trade_id))
+        else:
+            where = f"(bp.status IN ({marks}) OR bp.closed_at >= ? OR t.created_at >= ?)"
+            params += [*(s.value for s in _ACTIVE_POSITION), _dt_to_db(since), _dt_to_db(since)]
+        sql = (
+            "SELECT t.*, bp.position_json AS bp_position_json, bp.closed_at AS bp_closed_at "
+            "FROM broker_positions bp JOIN trades t ON t.id = bp.trade_id "
+            f"WHERE bp.broker = ? AND {where} ORDER BY t.created_at, t.id"
+        )
+        async with self._read() as conn:
+            rows = await self._fetchall(conn, sql, params)
+        return [(_row_to_trade(r), _load_position(r["bp_position_json"]), _dt_from_db(r["bp_closed_at"]))
+                for r in rows]
+
+    async def events_between(self, kinds: Iterable[str], start: datetime, end: datetime,
+                             limit: int = 5000) -> list[dict[str, Any]]:
+        """Audit events of the given kinds with ``start <= ts <= end``, OLDEST first (at most ``limit``):
+        ``{"id", "ts", "kind", "payload"}``. Read only (the owner's trade card: what happened to one trade)."""
+        names = sorted(set(kinds))
+        if not names:
+            return []
+        marks = ", ".join("?" for _ in names)
+        async with self._read() as conn:
+            rows = await self._fetchall(
+                conn,
+                f"SELECT * FROM events WHERE ts >= ? AND ts <= ? AND kind IN ({marks}) ORDER BY id LIMIT ?",
+                [_dt_to_db(start), _dt_to_db(end), *names, int(limit)],
+            )
+        out: list[dict[str, Any]] = []
+        for r in rows:
+            try:
+                payload = json.loads(r["payload_json"])
+            except ValueError:
+                continue
+            out.append({"id": int(r["id"]), "ts": _dt_from_db(r["ts"]), "kind": r["kind"], "payload": payload})
+        return out
+
     async def realized_pnl_since(self, broker: str, since: datetime) -> float:
         """Sum of realized_pnl of ``broker``'s positions with ``closed_at >= since``."""
         async with self._read() as conn:

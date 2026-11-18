@@ -108,6 +108,9 @@ _ACTION_SCHEMA: dict[str, Any] = {
         ),
         "confidence": _described({"type": "number"}, "0..1"),
         "summary_tr": _described({"type": "string"}, "One Turkish line for the owner"),
+        "chart_timeframe_min": _nullable(
+            {"type": "integer"}, "open / incomplete: bar size in minutes shown in the chart screenshot's header; "
+            "null when not visible. Picture only: never a reason for an ambiguity or a lower confidence"),
     },
     "additionalProperties": False,
 }
@@ -154,6 +157,7 @@ class _WireAction(BaseModel):
     ambiguities: list[str]
     confidence: float
     summary_tr: str
+    chart_timeframe_min: float | None = None   # (default + lenient type: never a reason to refuse a response)
 
 
 class _WireResult(BaseModel):
@@ -743,6 +747,7 @@ def _to_action(w: _WireAction, messages: list[StoredMessage], context: ParseCont
         ambiguities=ambiguities,
         summary_tr=w.summary_tr.strip(),
         reasoning_brief=w.evidence.strip(),
+        chart_timeframe_min=chart_timeframe(w.chart_timeframe_min),
     )
     if not parsed.summary_tr:
         parsed.summary_tr = _fallback_summary(parsed)
@@ -877,6 +882,19 @@ def _flag_bare_status(a: ParsedAction, messages: list[StoredMessage]) -> ParsedA
     text = " / ".join(" ".join(m.text.split()) for m in used)
     text = text if len(text) <= 40 else text[:39] + "…"
     return a.model_copy(update={"ambiguities": [_AMB_BARE_STATUS.format(text=text)]})
+
+
+CHART_TIMEFRAME_MAX_MIN = 10080       # a week: a larger "bar size" is not one
+
+
+def chart_timeframe(value: object) -> int | None:
+    """The chart's bar size in minutes as the model read it from the screenshot's header, or None (not given, or
+    not a believable bar size). Inert: only the owner's trade card uses it; it never raises an issue."""
+    if isinstance(value, bool) or not isinstance(value, (int, float)):
+        return None
+    if not math.isfinite(value) or value != int(value) or not 1 <= int(value) <= CHART_TIMEFRAME_MAX_MIN:
+        return None
+    return int(value)
 
 
 def _fill_missing_ids(actions: list[ParsedAction], provided: list[int]) -> list[ParsedAction]:

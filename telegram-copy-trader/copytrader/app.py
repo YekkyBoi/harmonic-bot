@@ -289,6 +289,7 @@ class App:
     broker_errors: list[str] = field(default_factory=list)
     mirror: Any = None               # the copy of the source group for the owner's friend (/grup), or None
     karne: Any = None                # the owner's weekly report card (/karne), or None
+    tradecard: Any = None            # the owner's trade card (/<account>kart), or None
 
 
 def build_app(
@@ -370,7 +371,55 @@ def build_app(
         except Exception:      # noqa: BLE001 - a report card is never a reason not to trade
             logger.exception("Report card (karne) could not be set up; the bot runs without it")
             karne = None
-    return App(config, db, parser, brokers, notifier, engine, listener, errors, mirror, karne)
+    tradecard = None
+    if callable(getattr(notifier, "set_tradecard", None)):
+        try:
+            tradecard = build_tradecard(config, db, notifier, engine, listener, data_dir)
+            notifier.set_tradecard(tradecard)
+        except Exception:      # noqa: BLE001 - a picture is never a reason not to trade
+            logger.exception("Trade card (/<hesap>kart) could not be set up; the bot runs without it")
+            tradecard = None
+    return App(config, db, parser, brokers, notifier, engine, listener, errors, mirror, karne, tradecard)
+
+
+def card_account_names(config: AppConfig) -> list[str]:
+    """The accounts the owner's trade card is made for (/<account>kart), in the config's order: his accounts that
+    trade real money (:func:`real_account_names`, never the friend's) and his hand-traded (manual) ones; none in
+    dry-run."""
+    if config.dry_run:
+        return []
+    real = set(real_account_names(config, friend=False))
+    return [b.name for b in config.enabled_brokers
+            if b.name in real or (getattr(b, "type", None) == "manual" and not is_friend_account(b))]
+
+
+def build_tradecard(config: AppConfig, db: Any, notifier: Any, engine: Any, listener: Any,
+                    data_dir: str | os.PathLike[str]) -> Any:
+    """The owner's trade card service (copytrader.karne.tradecard_service): reads the database, the candles of the
+    public exchange or - read only - of the account's own MetaTrader terminal, draws in another process."""
+    from .karne.tradecard_service import TradeCardService
+    from .telegram.group_mirror import trading_path_busy
+
+    names = card_account_names(config)
+    configs = {b.name: b for b in config.enabled_brokers if b.name in names}
+    sources: dict[str, tuple[str, str | None]] = {}
+    for name, cfg in configs.items():
+        kind = getattr(cfg, "type", None)
+        if kind == "ccxt":
+            sources[name] = ("ccxt", cfg.exchange)
+        elif kind in ("paper", "manual"):
+            sources[name] = ("ccxt", cfg.price_source_exchange)
+        elif kind in ("mt5", "mt5_bridge"):
+            sources[name] = ("mt5", None)
+
+    def broker_of(name: str) -> Any:
+        return next((b for b in list(getattr(engine, "brokers", None) or []) if b.name == name), None)
+
+    return TradeCardService(
+        db, notifier, data_dir, accounts=names, aliases={n: list(c.aliases) for n, c in configs.items()},
+        sources=sources, broker=broker_of, oracle=getattr(engine, "reference_prices", None),
+        manual=[n for n, c in configs.items() if getattr(c, "type", None) == "manual"],
+        busy=lambda: trading_path_busy(listener, notifier, engine))
 
 
 def real_account_names(config: AppConfig, *, friend: bool | None = None) -> list[str]:
@@ -679,6 +728,8 @@ async def serve(app: App, stop: asyncio.Event | None = None, *, stop_file: Path 
             #    running handlers).
             if app.karne is not None:
                 await _safe(app.karne.stop())
+            if app.tradecard is not None:
+                await _safe(app.tradecard.stop())
             if app.mirror is not None:
                 await _safe(app.mirror.stop())
             await _safe(app.listener.stop())
@@ -767,6 +818,6 @@ async def run(config_path: str | os.PathLike[str] = "config.yaml") -> bool:
 
 
 __all__ = ["App", "STOP_REQUEST_FILE", "build_app", "clear_stop_request", "config_secrets", "make_parser",
-           "mask_secrets", "parser_deadline_sec", "read_stop_request", "real_account_names", "run", "serve",
+           "mask_secrets", "parser_deadline_sec", "card_account_names", "build_tradecard", "read_stop_request", "real_account_names", "run", "serve",
            "setup_logging",
            "stop_request_path", "watch_event_loop", "watch_stop_request", "write_stop_request"]

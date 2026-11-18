@@ -1,6 +1,7 @@
 """The drawing process: ``python -m copytrader.karne <data.json> <card.png> [--scale N] [--limit SECONDS]``.
 
-Started by the bot (:mod:`copytrader.karne.render`) for ONE card and nothing else: it reads the JSON the bot wrote,
+Started by the bot (:mod:`copytrader.karne.render`) for ONE card and nothing else (the weekly report card, or the
+owner's trade card when the data says ``"card": "trade"``: :mod:`.tradecard_design`): it reads the JSON the bot wrote,
 draws the card with Pillow and writes the PNG (to a temporary name first, renamed when it is whole: a process that is
 killed never leaves half a picture under the final name). It talks to nothing: no network, no database, no Telegram.
 
@@ -52,14 +53,21 @@ def main(argv: list[str] | None = None) -> int:
     except Exception as exc:      # noqa: BLE001
         print(f"karne: cannot read the card data: {type(exc).__name__}: {exc}", file=sys.stderr)
         return EXIT_INPUT
+    trade_card = data.get("card") == "trade"        # the owner's trade card (tradecard_design), else the weekly one
     try:
-        from . import design
+        if trade_card:
+            from . import tradecard_design as design
+        else:
+            from . import design  # type: ignore[no-redef]
     except ImportError as exc:
         print(f"karne: Pillow is not installed ({exc})", file=sys.stderr)
         return EXIT_NO_PILLOW
     part = f"{args.out}.part.png"
     try:
-        design.render(data, PRESET, part, out_scale=args.scale)
+        if trade_card:
+            design.render(data, part)
+        else:
+            design.render(data, PRESET, part, out_scale=args.scale)
         os.replace(part, args.out)
     except Exception:             # noqa: BLE001
         traceback.print_exc()

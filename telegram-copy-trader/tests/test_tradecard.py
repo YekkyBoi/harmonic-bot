@@ -1,0 +1,897 @@
+"""The owner's trade card (/<hesap>kart): one picture of one of his trades on one account.
+
+Part 1 (no Pillow): the command, owner only (never the friend, never the friend's account), the week's numbered list
+and its pick (TTL, one use, never confused with /pozkapat's list or an awaited correction), the entry / result card
+choice, the card's figures (the ORIGINAL stop, the close price, R, the candles after the close), the chart's bar size
+(the parser's new field, 15 by default), the MetaTrader candles (fake terminal, also through the bridge's helper
+process), the public candles, the subprocess renderer being used.
+Part 2 (Pillow): real pictures (2560 x 1600) through the real drawing process, and the asset name's lining figures
+with and without raqm. ``TRADECARD_OUT=<folder>`` keeps the pictures of the real-render test there.
+"""
+
+from __future__ import annotations
+
+import asyncio
+import importlib.util
+import json
+import os
+import shutil
+import sys
+import time
+from datetime import UTC, datetime, timedelta
+from pathlib import Path
+from types import SimpleNamespace
+from typing import Any
+
+import pytest
+import tradecard_samples as S
+from test_mt5_broker import SERVER_TIME, FakeMT5, connected
+from test_notifier import FakeBotClient, FakeEngine, MsgEvent
+
+from copytrader import app as app_mod
+from copytrader.brokers import mt5_broker, mt5_helper
+from copytrader.brokers.mt5_bridge import Mt5BridgeBroker
+from copytrader.brokers.mt5_broker import MT5, Mt5Broker
+from copytrader.config import AppConfig, NotifierConfig, TelegramConfig
+from copytrader.engine.prices import ReferencePriceOracle
+from copytrader.karne import render as render_mod
+from copytrader.karne import tradecard as tc
+from copytrader.karne import tradecard_service as svc_mod
+from copytrader.karne.render import OK, RenderResult, render_card
+from copytrader.karne.tradecard_service import TradeCardService
+from copytrader.models import (
+    ActionType,
+    BrokerPosition,
+    EntryType,
+    ParsedAction,
+    PositionStatus,
+    Side,
+    TakeProfit,
+    TradeStatus,
+)
+from copytrader.parsing import llm_parser, prompts
+from copytrader.storage.db import Database
+from copytrader.telegram import notifier as notifier_mod
+from copytrader.telegram.notifier import BotNotifier
+
+OWNER, FRIEND = 777, 555
+NOW = datetime(2026, 11, 18, 12, 0, tzinfo=UTC)               # a Wednesday; the week began Sun 15.11 22:00 UK
+HAS_PILLOW = importlib.util.find_spec("PIL") is not None
+needs_pillow = pytest.mark.skipif(not HAS_PILLOW, reason="Pillow is not installed (optional: the card's picture)")
+
+
+# =========================================================================== #
+# A database with one week of one account's trades
+# =========================================================================== #
+class Clock:
+    def __init__(self, now: datetime) -> None:
+        self.now = now
+
+    def __call__(self) -> datetime:
+        return self.now
+
+
+def ms(moment: datetime) -> int:
+    return int(moment.timestamp() * 1000)
+
+
+async def add_trade(db: Database, clock: Clock, sample_trade: Any, pos: BrokerPosition, *, created: datetime,
+                    closed: datetime | None = None, status: TradeStatus = TradeStatus.OPEN,
+                    others: tuple[BrokerPosition, ...] = ()) -> int:
+    clock.now = created
+    rec = await db.create_trade(sample_trade.plan, TradeStatus.OPENING)
+    await db.update_trade(rec.id, status=TradeStatus.OPEN)
+    for other in others:
+        await db.save_broker_position(rec.id, other)
+    if closed is not None:
+        clock.now = closed
+    await db.save_broker_position(rec.id, pos)
+    if status is not TradeStatus.OPEN:
+        await db.update_trade(rec.id, status=status)
+    clock.now = NOW
+    return rec.id
+
+
+class Notes:
+    """The notifier as the service sees it: the owner's lines and photos."""
+
+    def __init__(self) -> None:
+        self.lines: list[str] = []
+        self.photos: list[tuple[str, str]] = []
+        self.refuse: str | None = None
+
+    async def tell_owner(self, text: str) -> None:
+        self.lines.append(text)
+
+    async def send_owner_photo(self, path: str, *, caption: str = "", busy: Any = None) -> str | None:
+        self.photos.append((path, caption))
+        return self.refuse
+
+
+class Oracle:
+    def __init__(self, bars: list[tuple[float, ...]]) -> None:
+        self.bars = bars
+        self.calls: list[tuple[Any, ...]] = []
+
+    async def ohlcv(self, exchange: str, symbol: str, timeframe: str, since_ms: int, until_ms: int) -> Any:
+        self.calls.append((exchange, symbol, timeframe, since_ms, until_ms))
+        return [(int(b[0] * 1000), *b[1:5]) for b in self.bars if since_ms <= b[0] * 1000 <= until_ms]
+
+
+class Renderer:
+    def __init__(self, folder: Path) -> None:
+        self.folder = folder
+        self.data: list[dict[str, Any]] = []
+
+    async def __call__(self, data: dict[str, Any], folder: Any, **_kw: Any) -> RenderResult:
+        json.dumps(data, allow_nan=False)                       # (it goes to the drawing process as JSON)
+        self.data.append(data)
+        path = self.folder / f"card{len(self.data)}.png"
+        path.write_bytes(b"png")
+        return RenderResult(OK, path=path)
+
+
+class World:
+    """binance (ccxt) and fx2 (MetaTrader) cards on a real database; the outside world faked."""
+
+    async def up(self, tmp_path: Path) -> World:
+        self.clock = Clock(NOW)
+        self.db = Database(str(tmp_path / "bot.db"), clock=self.clock)
+        await self.db.open()
+        self.notes = Notes()
+        self.long = S.btc_long_result()
+        self.oracle = Oracle(self.long["bars"])
+        self.renderer = Renderer(tmp_path)
+        self.mono = [1000.0]
+        self.fx2 = SimpleNamespace(calls=[], answer=None)
+
+        async def trade_chart(*args: Any) -> Any:
+            self.fx2.calls.append(args)
+            return self.fx2.answer
+
+        self.fx2.trade_chart = trade_chart
+        self.svc = TradeCardService(
+            self.db, self.notes, tmp_path, accounts=["binance", "fx", "fx2", "breakout"],
+            aliases={"fx": ["fx1", "FundingPips"]},
+            sources={"binance": ("ccxt", "binanceusdm"), "fx": ("mt5", None), "fx2": ("mt5", None),
+                     "breakout": ("ccxt", "binanceusdm")},
+            broker=lambda name: self.fx2 if name == "fx2" else None, oracle=self.oracle, manual=["breakout"],
+            clock=self.clock, renderer=self.renderer, pillow=lambda: True, monotonic=lambda: self.mono[0])
+        return self
+
+    async def week(self) -> dict[str, int]:
+        """binance this week: #a closed on Monday (the BTC sample), #b opened last week and still open, #c a limit
+        waiting since Tuesday; not listed: #d ended last week, #e an entry that expired unfilled, and tickmill's."""
+        t = self.long["trade"]
+        start = datetime.fromtimestamp(self.long["bars"][0][0], tz=UTC)
+        created = start + timedelta(minutes=15 * 58 + 3)
+        fill = created + timedelta(seconds=20)
+        close = start + timedelta(minutes=15 * 83 + 7)
+        closed_pos = self.long["pos"].model_copy(deep=True)
+        closed_pos.data.update(opened_at=ms(fill), closed_at=ms(close), closed_reason="take_profit",
+                               exits=[{"price": 91800.0, "qty": 0.05, "kind": "tp"},
+                                      {"price": 92200.0, "qty": 0.05, "kind": "tp"}])
+        tick = BrokerPosition(broker="tickmill", broker_symbol="BTCUSD", side=Side.LONG, status=PositionStatus.CLOSED,
+                              quantity=1, filled_quantity=1, avg_entry_price=91000.0, realized_pnl=1.0)
+        ids = {"a": await add_trade(self.db, self.clock, t, closed_pos, created=created, closed=close,
+                                    status=TradeStatus.CLOSED, others=(tick,))}
+        self.clock.now = start + timedelta(minutes=15 * 70 + 2)
+        await self.db.log_event("manage_done", {"trade_id": ids["a"], "action": "move_sl",
+                                                "plan": {"move_sl_to_entry": True},
+                                                "outcomes": [{"broker": "binance", "kind": "ok", "text": ""}]})
+        self.clock.now = NOW
+        open_pos = BrokerPosition(broker="binance", broker_symbol="ETH/USDT:USDT", side=Side.LONG,
+                                  status=PositionStatus.OPEN, quantity=1, filled_quantity=1, avg_entry_price=3100.0,
+                                  stop_loss=3050.0,
+                                  data={"opened_at": ms(datetime(2026, 11, 12, 9, 0, 30, tzinfo=UTC))})
+        ids["b"] = await add_trade(self.db, self.clock, S.trade(0, S.plan("ETH", Side.LONG, 3100, 3050, [3200]),
+                                                                 TradeStatus.OPEN, NOW), open_pos,
+                                   created=datetime(2026, 11, 12, 9, 0, tzinfo=UTC))
+        pending = BrokerPosition(broker="binance", broker_symbol="SOL/USDT:USDT", side=Side.SHORT,
+                                 status=PositionStatus.PENDING, quantity=1)
+        ids["c"] = await add_trade(self.db, self.clock, S.trade(0, S.plan("SOL", Side.SHORT, 150, 155, [140],
+                                                                           entry_type=EntryType.LIMIT),
+                                                                 TradeStatus.PENDING, NOW), pending,
+                                   created=datetime(2026, 11, 17, 8, 0, tzinfo=UTC))
+        self.clock.now = datetime(2026, 11, 17, 8, 0, 2, tzinfo=UTC)
+        await self.db.log_event("order_send", {"trade_id": ids["c"], "broker": "binance"})
+        self.clock.now = NOW
+        old = open_pos.model_copy(update={"status": PositionStatus.CLOSED, "realized_pnl": 5.0})
+        ids["d"] = await add_trade(self.db, self.clock, S.trade(0, S.plan("XRP", Side.LONG, 2.0, 1.9, [2.2]),
+                                                                 TradeStatus.CLOSED, NOW), old,
+                                   created=datetime(2026, 11, 10, 9, 0, tzinfo=UTC),
+                                   closed=datetime(2026, 11, 13, 9, 0, tzinfo=UTC), status=TradeStatus.CLOSED)
+        expired = pending.model_copy(update={"status": PositionStatus.CANCELLED})
+        ids["e"] = await add_trade(self.db, self.clock, S.trade(0, S.plan("ADA", Side.LONG, 1.0, 0.9, [1.2]),
+                                                                 TradeStatus.CANCELLED, NOW), expired,
+                                   created=datetime(2026, 11, 16, 9, 0, tzinfo=UTC),
+                                   closed=datetime(2026, 11, 16, 21, 0, tzinfo=UTC), status=TradeStatus.CANCELLED)
+        return ids
+
+    async def settle(self) -> None:
+        job = self.svc._job
+        if job is not None:
+            await asyncio.wait_for(asyncio.gather(job, return_exceptions=True), 10)
+
+    async def down(self) -> None:
+        await self.svc.stop()
+        await self.db.close()
+
+
+@pytest.fixture
+async def world(tmp_path: Path):
+    w = await World().up(tmp_path)
+    yield w
+    await w.down()
+
+
+# =========================================================================== #
+# The week and the list
+# =========================================================================== #
+def test_the_week_is_the_weekly_report_cards_week() -> None:
+    assert tc.week_start(NOW) == datetime(2026, 11, 15, 22, 0, tzinfo=UTC)
+    assert tc.week_start(datetime(2026, 11, 15, 21, 59, tzinfo=UTC)) == datetime(2026, 11, 8, 22, 0, tzinfo=UTC)
+    summer = datetime(2026, 7, 15, 12, 0, tzinfo=UTC)          # British Summer Time: Sunday 22:00 UK = 21:00 UTC
+    assert tc.week_start(summer) == datetime(2026, 7, 12, 21, 0, tzinfo=UTC)
+
+
+async def test_the_list_holds_this_weeks_trades_of_that_account_only(world: World) -> None:
+    ids = await world.week()
+    reply = await world.svc.command("binance")
+    lines = [line for line in reply.splitlines() if line[:2] in ("1-", "2-", "3-", "4-")]
+    assert len(lines) == 3, reply
+    assert lines[0].startswith("1- ETH LONG") and f"#{ids['b']}" in lines[0] and "açık" in lines[0]
+    assert lines[1].startswith("2- BTC LONG") and f"#{ids['a']}" in lines[1] and "kapandı" in lines[1]
+    assert lines[2].startswith("3- SOL SHORT") and f"#{ids['c']}" in lines[2] and "bekliyor" in lines[2]
+    assert f"#{ids['d']}" not in reply and f"#{ids['e']}" not in reply
+    assert world.svc.list_live()
+    assert "tickmill" not in reply
+
+
+async def test_no_trades_this_week_says_so(world: World) -> None:
+    reply = await world.svc.command("fx")
+    assert "bu hafta" in reply and "işlem yok" in reply
+    assert not world.svc.list_live()
+
+
+async def test_a_number_picks_once_and_the_list_expires(world: World) -> None:
+    await world.week()
+    await world.svc.command("binance")
+    assert "listede yok" in await world.svc.pick("9")
+    assert world.svc.list_live()                                       # a wrong number leaves the list
+    assert "tek bir numara" in await world.svc.pick("1-3")
+    assert await world.svc.pick("2") == svc_mod.STARTED
+    await world.settle()
+    assert not world.svc.list_live()                                   # one use
+    assert "liste" in (await world.svc.pick("2")).lower()
+    await world.svc.command("binance")
+    world.mono[0] += svc_mod.CARD_LIST_TTL_SEC + 1
+    assert not world.svc.list_live()
+    assert "süresi doldu" in await world.svc.pick("1")
+    assert svc_mod.CARD_LIST_TTL_SEC == notifier_mod.POZKAPAT_TTL_SEC
+
+
+async def test_an_explicit_number_of_that_accounts_list(world: World) -> None:
+    await world.week()
+    assert "önce" in await world.svc.command("binance", "2")
+    await world.svc.command("binance")
+    assert "önce" in await world.svc.command("fx2", "2")               # the list is binance's
+    assert await world.svc.command("binance", "2") == svc_mod.STARTED
+    await world.settle()
+    assert world.renderer.data and world.renderer.data[0]["kind"] == "result"
+
+
+async def test_a_closed_position_gets_the_result_card(world: World) -> None:
+    ids = await world.week()
+    await world.svc.command("binance")
+    await world.svc.pick("2")
+    await world.settle()
+    data = world.renderer.data[-1]
+    assert data["card"] == "trade" and data["kind"] == "result" and data["no"] == ids["a"]
+    assert data["stop"] == 90400.0 and data["target"] == 92200.0      # the ORIGINAL stop, the LAST target
+    assert data["exit"] == pytest.approx(92000.0) and data["box_far"] == pytest.approx(92000.0)
+    assert data["box_end"] == data["k_exit"]
+    assert data["hero"] == "+1.97R"                                    # position_result_r: 118 / 60
+    assert [s[1] for s in data["timeline"]] == ["Giriş · piyasa emri", "Stop girişe çekildi", "Hedef · +1.97R"]
+    assert data["chips"][3][1] == "Hedef ✓"
+    assert world.notes.photos and "BTC LONG" in world.notes.photos[0][1] and "Sonuç kartı" in world.notes.photos[0][1]
+    exchange, symbol, timeframe, since, until = world.oracle.calls[-1]
+    assert (exchange, symbol, timeframe) == ("binanceusdm", "BTC/USDT:USDT", "15m")   # no picture size read: 15
+
+
+async def test_an_open_position_gets_the_entry_card_and_a_pending_one_too(world: World) -> None:
+    world.oracle.bars = S.walk(datetime(2026, 11, 11, 18, 0, tzinfo=UTC), 640, 3090.0, seed=5)
+    await world.week()
+    await world.svc.command("binance")
+    await world.svc.pick("1")
+    await world.settle()
+    data = world.renderer.data[-1]
+    assert data["kind"] == "entry" and data["hero"] is None and data["k_exit"] is None
+    assert data["box_end"] == data["k_entry"] + tc.ENTRY_BOX_BARS
+    assert data["chips"][3][1] == "Açık" and data["last_price"] == data["bars"][-1][4]
+    world.oracle.bars = S.walk(datetime(2026, 11, 16, 12, 0, tzinfo=UTC), 180, 151.0, seed=6)
+    await world.svc.command("binance")
+    await world.svc.pick("3")
+    await world.settle()
+    data = world.renderer.data[-1]
+    assert data["kind"] == "entry" and data["pending"] and not data["arrow_entry"]
+    assert data["chips"][3][1] == "Bekliyor" and data["fill"] == 150.0
+
+
+async def test_the_card_is_chosen_at_the_pick_from_a_fresh_read(world: World) -> None:
+    world.oracle.bars = S.walk(datetime(2026, 11, 11, 18, 0, tzinfo=UTC), 640, 3090.0, seed=5)
+    ids = await world.week()
+    await world.svc.command("binance")                                  # #b is open in the list ...
+    rows = await world.db.account_trades("binance", NOW, trade_id=ids["b"])
+    closed = rows[0][1].model_copy(deep=True, update={"status": PositionStatus.CLOSED, "realized_pnl": 50.0})
+    closed.data.update(closed_at=ms(NOW - timedelta(hours=1)), exits=[{"price": 3150.0, "qty": 1.0, "kind": "close"}])
+    await world.db.save_broker_position(ids["b"], closed)               # ... and closes before the number
+    await world.svc.pick("1")
+    await world.settle()
+    data = world.renderer.data[-1]
+    assert data["kind"] == "result" and data["exit"] == 3150.0 and data["hero"] == "+1.00R"
+    with pytest.raises(tc.CardProblem, match="kapanış fiyatı"):          # no close price on record: no made-up card
+        tc.card_data(rows[0][0], closed.model_copy(update={"data": {}, "realized_pnl": None}), "binance",
+                     tc.Records(filled=NOW - timedelta(hours=3), closed=NOW), world.oracle.bars, 15)
+
+
+async def test_failures_are_a_short_line_never_an_exception(world: World) -> None:
+    await world.week()
+    world.oracle.bars = []
+    await world.svc.command("binance")
+    await world.svc.pick("2")
+    await world.settle()
+    assert world.notes.lines and "mumlar okunamadı" in world.notes.lines[-1] and not world.notes.photos
+    world.oracle.bars = world.long["bars"]
+    world.notes.refuse = "Telegram yok"
+    await world.svc.command("binance")
+    await world.svc.pick("2")
+    await world.settle()
+    assert "gönderilemedi" in world.notes.lines[-1]
+
+
+async def test_without_pillow_no_process_is_started(world: World) -> None:
+    await world.week()
+    world.svc._pillow = lambda: False
+    await world.svc.command("binance")
+    await world.svc.pick("2")
+    await world.settle()
+    assert not world.renderer.data and "Pillow" in world.notes.lines[-1]
+
+
+async def test_the_card_goes_to_the_subprocess_renderer(world: World, monkeypatch: pytest.MonkeyPatch) -> None:
+    """The service draws through karne.render.render_card (another process, its time limit) by default."""
+    assert TradeCardService.__init__.__kwdefaults__["renderer"] is render_card
+    seen: list[Any] = []
+
+    async def fake_render(data: dict[str, Any], folder: Any, **kw: Any) -> RenderResult:
+        seen.append((data["card"], Path(folder).name, kw))
+        return RenderResult("failed", detail="x")
+
+    await world.week()
+    world.svc._renderer = fake_render
+    await world.svc.command("binance")
+    await world.svc.pick("2")
+    await world.settle()
+    assert seen == [("trade", svc_mod.TEMP_DIR, {})] and "çizim hatası" in world.notes.lines[-1]
+
+
+async def test_a_metatrader_account_reads_its_own_terminal_and_server_time_becomes_uk_time(world: World) -> None:
+    sample = S.nas_short_result()
+    offset = 7200
+    t = sample["trade"]
+    pos = sample["pos"].model_copy(deep=True)
+    tid = await add_trade(world.db, world.clock, t, pos, created=datetime(2026, 11, 17, 5, 51, tzinfo=UTC),
+                          closed=datetime(2026, 11, 17, 9, 24, tzinfo=UTC), status=TradeStatus.CLOSED)
+    world.clock.now = datetime(2026, 11, 17, 5, 51, 30, tzinfo=UTC)
+    await world.db.log_event("order_send", {"trade_id": tid, "broker": "fx2"})
+    world.clock.now = datetime(2026, 11, 17, 7, 56, tzinfo=UTC)
+    await world.db.log_event("entry_filled", {"trade_id": tid, "broker": "fx2"})
+    world.clock.now = datetime(2026, 11, 17, 9, 4, tzinfo=UTC)
+    await world.db.log_event("manage_done", {"trade_id": tid, "action": "move_sl", "plan": {"move_sl_to_entry": True},
+                                             "outcomes": [{"broker": "fx2", "kind": "ok"}]})
+    world.clock.now = datetime(2026, 11, 17, 9, 23, tzinfo=UTC)
+    await world.db.log_event("manage_done", {"trade_id": tid, "action": "close",
+                                             "outcomes": [{"broker": "fx2", "kind": "ok"}]})
+    world.clock.now = NOW
+    fill_srv = int(datetime(2026, 11, 17, 7, 55, tzinfo=UTC).timestamp()) + offset
+    out_srv = int(datetime(2026, 11, 17, 9, 23, tzinfo=UTC).timestamp()) + offset
+    world.fx2.answer = {"offset": offset, "bars": [(b[0] + offset, *b[1:]) for b in sample["bars"]],
+                        "deals": [{"time": fill_srv, "price": 27300.0, "volume": 1.0, "entry": "in",
+                                   "reason": "manual"},
+                                  {"time": out_srv, "price": 27055.1, "volume": 1.0, "entry": "out",
+                                   "reason": "manual"}]}
+    await world.svc.command("fx2")
+    await world.svc.pick("1")
+    await world.settle()
+    assert not world.notes.lines, world.notes.lines
+    data = world.renderer.data[-1]
+    symbol, tf, start, end, tickets, anchor = world.fx2.calls[-1]
+    assert (symbol, tf, tickets) == ("US100.cash", 15, [501])
+    assert anchor == datetime(2026, 11, 17, 7, 56, tzinfo=UTC).timestamp()     # the bot's own record of the fill
+    assert [s[0] for s in data["timeline"]] == ["05:51", "07:55", "09:04", "09:23"]
+    assert data["timeline"][-1][1] == "Grup kapattı · +1.70R" and data["hero"] == "+1.70R"
+    assert data["stop"] == 27444.06 and data["exit"] == pytest.approx(27055.1)
+    assert data["chips"][3][1:3] == ["Kapatıldı", "çıkış 27.055,10"]
+    assert data["subtitle"].startswith("US100.cash  ·  15 dakika  ·  17.11.2026")
+    world.fx2.answer = {"offset": None, "bars": [], "deals": []}
+    await world.svc.command("fx2")
+    await world.svc.pick("1")
+    await world.settle()
+    assert "saati belirlenemedi" in world.notes.lines[-1]
+
+
+# =========================================================================== #
+# The card's figures (pure)
+# =========================================================================== #
+def test_the_original_stop_stays_when_the_stop_was_moved() -> None:
+    sample = S.nas_short_result()
+    assert sample["pos"].stop_loss == 27300.0 and sample["trade"].current_stop_loss == 27300.0   # moved to entry
+    data = S.data_of(sample)
+    assert data["stop"] == 27444.06 and data["chips"][1][:3] == ["STOP", "27.444,06", "−1R"]
+    assert data["chips"][2][:3] == ["HEDEF", "27.010,25", "+2.01R"]
+    assert data["timeline"][2] == ["09:04", "Stop girişe çekildi"]
+
+
+def test_the_result_box_ends_at_the_close_and_reaches_the_close_price() -> None:
+    data = S.data_of(S.nas_short_result())
+    assert data["kind"] == "result" and data["box_end"] == data["k_exit"]
+    assert data["box_far"] == data["exit"] == 27055.10 and data["target"] == 27010.25
+    assert data["hero"] == "+1.70R"
+    k_fill = data["k_entry"]
+    bar = data["bars"][k_fill]
+    assert bar[0] <= datetime(2026, 11, 17, 7, 55, tzinfo=UTC).timestamp() < bar[0] + 900
+    assert data["bars"][data["k_exit"]][0] == datetime(2026, 11, 17, 9, 15, tzinfo=UTC).timestamp()
+
+
+def test_after_an_early_close_the_candles_run_on_until_a_level_is_touched() -> None:
+    sample = S.nas_short_result()
+    bars = sample["bars"]
+    data = S.data_of(sample)
+    k_exit = data["k_exit"]
+    first = round((data["bars"][0][0] - bars[0][0]) / 900)
+    ix = first + k_exit
+    touch = next(j for j in range(ix + 1, len(bars)) if bars[j][3] <= 27010.25 or bars[j][2] >= 27444.06)
+    assert len(data["bars"]) == min(len(bars), max(ix + tc.RESULT_AFTER_BARS, touch + tc.AFTER_TOUCH_BARS) + 1) - first
+    assert k_exit - data["k_entry"] >= 4
+    assert data["k_entry"] == tc.BARS_BEFORE                            # 58 candles before the entry
+
+
+def test_a_take_profit_close_stops_the_candles_24_after_it() -> None:
+    data = S.data_of(S.btc_long_result())
+    assert data["chips"][3][1] == "Hedef ✓"
+    assert len(data["bars"]) == data["k_exit"] + tc.RESULT_AFTER_BARS + 1
+
+
+def test_a_long_trade_shortens_what_is_shown_before_it() -> None:
+    sample = S.eth_long_entry()
+    sample["bars"] = S.walk(datetime.fromtimestamp(sample["bars"][0][0], tz=UTC), 400, 3080.0, seed=2)
+    data = S.data_of(sample)
+    assert data["k_entry"] == tc.MIN_BARS_BEFORE                      # 20 before the entry, then up to now
+    assert len(data["bars"]) == 400 - (tc.BARS_BEFORE - tc.MIN_BARS_BEFORE) and data["slots"] == len(data["bars"]) + 8
+
+
+def test_the_entry_card() -> None:
+    data = S.data_of(S.eth_long_entry())
+    assert data["kind"] == "entry" and data["hero"] is None
+    assert data["box_end"] == data["k_entry"] + tc.ENTRY_BOX_BARS and data["box_far"] == data["target"] == 3186.0
+    assert data["slots"] >= data["k_entry"] + 1 + tc.ENTRY_ROOM_BARS
+    assert data["chips"][3][:3] == ["DURUM", "Açık", "pozisyon açıldı"]
+    assert data["chips"][4][0] == "ZAMAN"
+    assert data["timeline"] == [["17:31", "Giriş · piyasa emri"]]          # hand-traded: no "brokerda" step
+    assert data["footer"] == "İngiltere saati" and "ÖRNEK" not in json.dumps(data, ensure_ascii=False)
+
+
+def test_levels_in_the_accounts_own_scale_and_the_last_target() -> None:
+    sample = S.btc_long_result()
+    pos = sample["pos"].model_copy(deep=True)
+    pos.data.update(price_multiplier=1000.0, price_offset={"mode": "additive", "value": 5.0})
+    assert tc.original_stop(sample["trade"], pos) == 90400.0 * 1000 + 5.0
+    assert tc.card_target(sample["trade"], pos) == 92200.0 * 1000 + 5.0    # the LAST of two take profits
+    no_tp = sample["trade"].model_copy(deep=True)
+    no_tp.plan.take_profits = []
+    assert tc.card_target(no_tp, pos) is None
+
+
+def test_a_hand_traded_account_gets_the_r_of_the_price_move() -> None:
+    sample = S.btc_long_result()
+    pos = sample["pos"].model_copy(deep=True)
+    pos.data["simulated"] = True
+    assert tc.result_r(sample["trade"], pos, 91000.0, 90400.0, 92200.0) == pytest.approx(2.0)
+    half = sample["trade"].model_copy(deep=True)
+    half.plan.risk_r = 0.5
+    assert tc.result_r(half, pos, 91000.0, 90400.0, 90400.0) == pytest.approx(-0.5)
+
+
+def test_the_records_of_an_exchange_position() -> None:
+    sample = S.btc_long_result()
+    t, pos = sample["trade"], sample["pos"].model_copy(deep=True)
+    fill, close = datetime(2026, 11, 16, 15, 33, tzinfo=UTC), datetime(2026, 11, 16, 21, 52, tzinfo=UTC)
+    pos.data.update(opened_at=ms(fill), closed_at=ms(close), closed_reason="manual_close",
+                    exits=[{"price": 91500.0, "qty": 0.1, "kind": "close"}])
+    events = [{"ts": fill - timedelta(seconds=2), "kind": "order_send", "payload": {"trade_id": 12, "broker": "binance"}},
+              {"ts": close, "kind": "pozkapat", "payload": {"closes": [["binance", 12]]}},
+              {"ts": close, "kind": "manage_done", "payload": {"trade_id": 12, "action": "move_sl", "plan": {},
+                                                               "outcomes": [{"broker": "fx", "kind": "ok"}]}}]
+    rec = tc.read_records(t, pos, None, events)
+    assert (rec.filled, rec.closed, rec.exit_price, rec.reason, rec.close_by) == (fill, close, 91500.0, "close", "owner")
+    assert rec.moves == []                                             # another account's stop move
+
+
+def test_the_chart_bar_size_from_the_signal_picture_else_15() -> None:
+    t = S.btc_long_result()["trade"]
+    assert tc.timeframe_of(t, svc_mod.CCXT_TIMEFRAMES) == 15
+    t.plan.chart_timeframe_min = 60
+    assert tc.timeframe_of(t, svc_mod.CCXT_TIMEFRAMES) == 60
+    t.plan.chart_timeframe_min = 45                                    # no such bar size on the venue: 15
+    assert tc.timeframe_of(t, svc_mod.CCXT_TIMEFRAMES) == 15
+    data = S.data_of(S.nas_short_result())
+    assert "15 dakika" in data["subtitle"] and data["bar_sec"] == 900
+    assert tuple(mt5_broker.TIMEFRAMES) == svc_mod.MT5_TIMEFRAMES
+
+
+def test_time_labels_are_uk_time() -> None:
+    summer = datetime(2026, 7, 15, 9, 0, tzinfo=UTC)
+    times = [(summer + timedelta(minutes=15 * k)).timestamp() for k in range(40)]
+    labels = dict(tc._time_labels(times, 15))
+    assert all(text.endswith(":00") for text in labels.values())
+    assert labels[4] == "11:00"                                        # 10:00 UTC in British Summer Time
+
+
+# =========================================================================== #
+# The parser's new field (inert, backward compatible)
+# =========================================================================== #
+def test_the_parser_reads_the_charts_bar_size_only_when_it_is_a_bar_size() -> None:
+    schema = llm_parser.WIRE_SCHEMA["properties"]["actions"]["items"]
+    assert "chart_timeframe_min" in schema["properties"] and "chart_timeframe_min" in schema["required"]
+    assert prompts.WORKED_EXAMPLE_OUTPUT["actions"][0]["chart_timeframe_min"] is None
+    assert "chart_timeframe_min" in prompts.SYSTEM_PROMPT
+    action = dict(prompts.WORKED_EXAMPLE_OUTPUT["actions"][0])
+    action.pop("chart_timeframe_min")
+    assert llm_parser._WireAction.model_validate(action).chart_timeframe_min is None   # an older response
+    assert llm_parser._WireAction.model_validate({**action, "chart_timeframe_min": 15}).chart_timeframe_min == 15
+    for raw, read in ((15, 15), (60.0, 60), (0, None), (-5, None), (7.5, None), (99999, None), (True, None),
+                      (None, None)):
+        assert llm_parser.chart_timeframe(raw) == read, raw
+
+
+def test_the_bar_size_goes_onto_the_plan_and_an_old_plan_reads_15() -> None:
+    from copytrader.config import LLMConfig, RiskConfig
+    from copytrader.parsing import validator
+
+    action = ParsedAction(action=ActionType.OPEN, base_asset="BTC", side=Side.LONG, entry_type=EntryType.MARKET,
+                          entry_price=91000.0, stop_loss=90400.0, take_profits=[TakeProfit(price=92200.0)],
+                          risk_r=1.0, confidence=0.97, used_message_ids=[1], chart_timeframe_min=5)
+    plan, _issues = validator.build_open_plan(action, risk=RiskConfig(), llm=LLMConfig(), market_price=91000.0,
+                                              source_chat_id=-1, now=NOW)
+    assert plan is not None and plan.chart_timeframe_min == 5
+    old = json.loads(plan.model_dump_json())
+    old.pop("chart_timeframe_min")
+    assert type(plan).model_validate(old).chart_timeframe_min is None
+
+
+# =========================================================================== #
+# MetaTrader: the terminal's own candles, read only
+# =========================================================================== #
+@pytest.fixture
+def mt5_clock(monkeypatch: pytest.MonkeyPatch) -> None:
+    """The fake ticks carry SERVER_TIME (server = UTC+2): the broker's "now" to match (as test_mt5_broker)."""
+    monkeypatch.setattr(Mt5Broker, "_now_epoch", staticmethod(lambda: SERVER_TIME - 7200.0))
+    monkeypatch.setattr(Mt5Broker, "tick_wait_sec", 0.0)
+
+
+async def test_mt5_trade_chart_reads_bars_and_deals_in_server_time(mt5_clock: None) -> None:
+    fake = FakeMT5()
+    b = await connected(fake)
+    try:
+        fake.deals.append(SimpleNamespace(ticket=1, order=9, time=SERVER_TIME - 3600, time_msc=0, type=1,
+                                          entry=MT5.DEAL_ENTRY_IN, position_id=77, reason=3, volume=1.0,
+                                          price=2230.0))
+        fake.deals.append(SimpleNamespace(ticket=2, order=10, time=SERVER_TIME - 600, time_msc=0, type=0,
+                                          entry=MT5.DEAL_ENTRY_OUT, position_id=77, reason=MT5.DEAL_REASON_TP,
+                                          volume=1.0, price=2200.0))
+        utc_now = SERVER_TIME - 7200
+        answer = await b.trade_chart("ETHUSD", 15, utc_now - 3600 * 5, utc_now, [77])
+        assert answer["offset"] == 7200
+        assert 19 <= len(answer["bars"]) <= 21 and answer["bars"][0][0] % 900 == 0
+        assert answer["bars"][0][0] >= utc_now - 3600 * 5 + 7200                  # asked in the server's clock
+        assert [(d["entry"], d["reason"], d["price"]) for d in answer["deals"]] == [("in", "manual", 2230.0),
+                                                                                    ("out", "tp", 2200.0)]
+        assert not [c for c in fake.calls if c[0] in ("order_send", "order_check")]      # read only
+        sent = [c for c in fake.calls if c[0] == "copy_rates_range"][-1]
+        assert sent[1][1] == 15                                                   # TIMEFRAME_M15
+        json.dumps(answer)                                                        # plain data (the bridge pickles it)
+    finally:
+        await b.close()
+
+
+async def test_mt5_trade_chart_with_a_closed_market(mt5_clock: None, monkeypatch: pytest.MonkeyPatch) -> None:
+    fake = FakeMT5()
+    b = await connected(fake)
+    try:
+        monkeypatch.setattr(Mt5Broker, "_now_epoch", staticmethod(lambda: SERVER_TIME - 7200 + 3 * 86400))
+        fake.deals.append(SimpleNamespace(ticket=1, order=9, time=SERVER_TIME - 3600, time_msc=0, type=1,
+                                          entry=MT5.DEAL_ENTRY_IN, position_id=77, reason=3, volume=1.0,
+                                          price=2230.0))
+        blind = await b.trade_chart("ETHUSD", 15, SERVER_TIME - 90000, SERVER_TIME, [77])
+        assert blind["offset"] is None and blind["bars"] == []                     # nothing guessed
+        assert not [c for c in fake.calls if c[0] == "copy_rates_range"]
+        anchored = await b.trade_chart("ETHUSD", 15, SERVER_TIME - 90000, SERVER_TIME, [77],
+                                       anchor_utc=SERVER_TIME - 3600 - 7200 + 40)
+        assert anchored["offset"] == 7200 and anchored["bars"]
+        with pytest.raises(Exception, match="7 dakikalık"):
+            await b.trade_chart("ETHUSD", 7, 0, 1)
+    finally:
+        await b.close()
+
+
+def test_the_helper_lets_the_bot_call_only_the_read(monkeypatch: pytest.MonkeyPatch) -> None:
+    assert "trade_chart" in mt5_helper.METHODS
+    assert "trade_chart" not in {"open_position", "close_position"}           # (a read: READ_TIMEOUT_SEC)
+
+
+async def test_the_bridge_forwards_the_read_with_a_reads_limit(monkeypatch: pytest.MonkeyPatch) -> None:
+    seen: list[Any] = []
+
+    async def rpc(self: Any, method: str, *args: Any, timeout: float | None = None, **kw: Any) -> Any:
+        seen.append((method, args, timeout))
+        return {"offset": 0, "bars": [], "deals": []}
+
+    monkeypatch.setattr(Mt5BridgeBroker, "_rpc", rpc)
+    bridge = Mt5BridgeBroker.__new__(Mt5BridgeBroker)
+    assert (await bridge.trade_chart("EURUSD", 15, 1.0, 2.0, (5,), 3.0))["offset"] == 0
+    assert seen == [("trade_chart", ("EURUSD", 15, 1.0, 2.0, [5], 3.0), None)]
+
+
+@pytest.mark.skipif(sys.platform == "win32", reason="the fake terminal's helper tests are POSIX")
+async def test_the_bridge_reads_candles_through_the_real_helper_process(tmp_path: Path,
+                                                                        monkeypatch: pytest.MonkeyPatch) -> None:
+    from test_mt5_bridge import Terminal, bridge
+
+    from mt5_fake_terminal import TERMINAL_COMPANY_ENV, TERMINAL_CONTROL_ENV, TERMINAL_FOLDER_ENV, TERMINAL_STATE_ENV
+
+    t = Terminal(tmp_path)
+    monkeypatch.setenv(mt5_helper.FAKE_ENV, "mt5_fake_terminal:make")
+    monkeypatch.setenv(mt5_helper.FAKE_PATH_ENV, str(Path(__file__).resolve().parent))
+    monkeypatch.setenv(TERMINAL_STATE_ENV, str(t.state))
+    monkeypatch.setenv(TERMINAL_CONTROL_ENV, str(t.control))
+    monkeypatch.setenv(TERMINAL_FOLDER_ENV, r"C:\Program Files\Tickmill MT5 Terminal")
+    monkeypatch.setenv(TERMINAL_COMPANY_ENV, "Tickmill Ltd")
+    b = await bridge(t)
+    try:
+        now = time.time()
+        answer = await asyncio.wait_for(b.trade_chart("EURUSD", 15, now - 7200, now), 25)
+        assert answer["offset"] == 7200 and len(answer["bars"]) >= 8
+    finally:
+        await asyncio.wait_for(b.close(), 25)
+
+
+# =========================================================================== #
+# The public candles
+# =========================================================================== #
+async def test_the_public_candles_of_the_venues_own_symbol() -> None:
+    class Ex:
+        def __init__(self) -> None:
+            self.calls: list[Any] = []
+
+        async def fetch_ohlcv(self, symbol: str, timeframe: str, since: int, limit: int) -> list[list[float]]:
+            self.calls.append((symbol, timeframe, since, limit))
+            return [[since + k * 900_000, 1.0, 2.0, 0.5, 1.5, 9.0] for k in range(3)]
+
+        async def close(self) -> None:
+            pass
+
+    ex = Ex()
+    oracle = ReferencePriceOracle(exchanges={"binanceusdm": ex})
+    rows = await oracle.ohlcv("binanceusdm", "1000PEPE/USDT:USDT", "15m", 0, 2 * 900_000)
+    assert rows == [(0, 1.0, 2.0, 0.5, 1.5), (900_000, 1.0, 2.0, 0.5, 1.5), (1_800_000, 1.0, 2.0, 0.5, 1.5)]
+    assert ex.calls[0][:2] == ("1000PEPE/USDT:USDT", "15m")
+    assert await oracle.ohlcv("nosuchexchange", "X", "15m", 0, 1) is None
+
+
+# =========================================================================== #
+# On Telegram: owner only, never the friend, never confused with /pozkapat
+# =========================================================================== #
+@pytest.fixture
+async def chat(world: World, tmp_path: Path):
+    n = BotNotifier(NotifierConfig(bot_token="123:abc", owner_user_id=OWNER),
+                    TelegramConfig(api_id=1, api_hash="x", source_chats=[-100]), str(tmp_path))
+    client, engine = FakeBotClient(), FakeEngine()
+    engine.notifier = n
+    engine.closed = []
+
+    async def close_on_accounts(pairs: Any, *, hide_others: bool = False) -> str:
+        engine.closed.append(list(pairs))
+        return "kapatıldı"
+
+    engine.close_on_accounts = close_on_accounts
+    engine.friend_account_names = lambda: ["tickmill"]
+    n._client = client
+    n._engine = engine
+    n.set_tradecard(world.svc)
+    n.set_friend(FRIEND)
+    friend: list[str] = []
+    n._friend_put = lambda message: friend.append(message.text)        # type: ignore[method-assign]
+    await world.week()
+    return SimpleNamespace(n=n, client=client, engine=engine, friend=friend, world=world)
+
+
+def owner_texts(client: FakeBotClient) -> list[str]:
+    return [m.text for m in client.sent if m.entity == OWNER]
+
+
+async def test_the_owners_command_and_pick_never_reach_the_friend(chat: Any) -> None:
+    await chat.n.handle_message(MsgEvent("/binancekart", sender_id=OWNER))
+    assert "1- ETH LONG" in owner_texts(chat.client)[-1]
+    await chat.n.handle_message(MsgEvent("2", sender_id=OWNER))
+    assert owner_texts(chat.client)[-1] == svc_mod.STARTED
+    await chat.world.settle()
+    assert chat.world.renderer.data[-1]["kind"] == "result"
+    assert chat.friend == [] and chat.engine.closed == []
+
+
+async def test_aliases_and_unknown_or_friend_accounts(chat: Any) -> None:
+    await chat.n.handle_message(MsgEvent("/fx1kart", sender_id=OWNER))
+    assert "fx" in owner_texts(chat.client)[-1] and "işlem yok" in owner_texts(chat.client)[-1]
+    await chat.n.handle_message(MsgEvent("/tickmillkart", sender_id=OWNER))
+    last = owner_texts(chat.client)[-1]
+    assert "yalnızca sizin hesaplarınız" in last and "/tickmillkart" not in last.split(":", 1)[1]
+    assert "/binancekart" in last and "/breakoutkart" in last
+    assert chat.friend == []
+
+
+async def test_the_friend_cannot_use_it(chat: Any) -> None:
+    assert "kart" not in " ".join(notifier_mod.FRIEND_COMMANDS) and "kart" not in notifier_mod.FRIEND_HELP
+    await chat.n.handle_message(MsgEvent("/tickmillkart", sender_id=FRIEND))
+    await chat.n.handle_message(MsgEvent("/binancekart", sender_id=FRIEND))
+    assert chat.friend == [notifier_mod.FRIEND_REFUSED]                  # (one refusal line now and then)
+    await chat.n.handle_message(MsgEvent("/binancekart", sender_id=OWNER))
+    await chat.n.handle_message(MsgEvent("1", sender_id=FRIEND))        # the owner's card list is not his
+    assert chat.world.svc.list_live() and not chat.world.renderer.data
+
+
+async def test_the_help_text_names_the_card_commands() -> None:
+    assert "/binancekart" in notifier_mod.HELP_TEXT and "/fx2kart" in notifier_mod.HELP_TEXT
+    assert "/breakoutkart" in notifier_mod.HELP_TEXT
+
+
+@pytest.mark.parametrize("card_first", [True, False])
+async def test_a_number_with_both_lists_waiting_chooses_neither(chat: Any, card_first: bool) -> None:
+    async def pozkapat_list() -> None:
+        chat.n._pk_lists[OWNER] = (time.monotonic(), [("binance", 1, "#1 ETH LONG (açık)")])
+
+    if card_first:
+        await chat.n.handle_message(MsgEvent("/binancekart", sender_id=OWNER))
+        await pozkapat_list()
+    else:
+        await pozkapat_list()
+        await chat.n.handle_message(MsgEvent("/binancekart", sender_id=OWNER))
+    await chat.n.handle_message(MsgEvent("1", sender_id=OWNER))
+    last = owner_texts(chat.client)[-1]
+    assert "/pozkapat 1" in last and "/binancekart 1" in last and "Hiçbir pozisyon kapatılmadı" in last
+    assert chat.engine.closed == [] and not chat.world.renderer.data
+    assert OWNER in chat.n._pk_lists and chat.world.svc.list_live()   # both still wait
+    await chat.n.handle_message(MsgEvent("/binancekart 2", sender_id=OWNER))
+    await chat.world.settle()
+    assert chat.world.renderer.data and chat.engine.closed == []
+    assert chat.friend == []
+
+
+async def test_a_number_while_a_correction_is_awaited_is_the_correction(chat: Any) -> None:
+    await chat.n.handle_message(MsgEvent("/binancekart", sender_id=OWNER))
+    chat.engine.awaiting = "c1"
+    await chat.n.handle_message(MsgEvent("2", sender_id=OWNER))
+    assert ("correction", "c1", "2") in chat.engine.calls
+    assert chat.world.svc.list_live() and not chat.world.renderer.data
+
+
+async def test_without_a_card_list_a_number_goes_to_pozkapat_as_before(chat: Any) -> None:
+    chat.n._pk_lists[OWNER] = (time.monotonic(), [("binance", 1, "#1 ETH LONG (açık)")])
+    await chat.n.handle_message(MsgEvent("1", sender_id=OWNER))
+    assert chat.engine.closed == [[("binance", 1)]]
+
+
+def test_the_card_accounts_are_the_owners_real_and_hand_traded_ones() -> None:
+    def config(dry: bool = False) -> AppConfig:
+        return AppConfig(
+            telegram=TelegramConfig(api_id=1, api_hash="h", source_chats=[-1]),
+            notifier=NotifierConfig(bot_token="1:a", owner_user_id=OWNER), dry_run=dry,
+            brokers=[dict(type="ccxt", name="binance", exchange="binanceusdm"),
+                     dict(type="mt5", name="fx", login=1, password="x", server="s", aliases=["fx1"]),
+                     dict(type="mt5_bridge", name="fx2", terminal_path="C:/a/terminal64.exe", friend_account=False,
+                          broker_company="BEM"),
+                     dict(type="mt5_bridge", name="tickmill", optional=True, terminal_path="C:/b/terminal64.exe",
+                          broker_company="Tickmill"),
+                     dict(type="manual", name="breakout"), dict(type="paper", name="paper")])
+
+    assert app_mod.card_account_names(config()) == ["binance", "fx", "fx2", "breakout"]
+    assert app_mod.card_account_names(config(dry=True)) == []
+    service = app_mod.build_tradecard(config(), None, SimpleNamespace(), SimpleNamespace(brokers=[]), None, "/tmp")
+    assert service.accounts == ["binance", "fx", "fx2", "breakout"]
+    assert service.command_account("fx1kart") == "fx" and service.command_account("FX2KART") == "fx2"
+    assert service.command_account("tickmillkart") is None and service.command_account("paperkart") is None
+    assert service._sources == {"binance": ("ccxt", "binanceusdm"), "fx": ("mt5", None), "fx2": ("mt5", None),
+                                "breakout": ("ccxt", "binanceusdm")}
+
+
+def test_the_bot_never_imports_the_drawing_module() -> None:
+    import subprocess
+
+    argv, env, cwd = render_mod.render_command()
+    code = ("import sys\nimport copytrader.app, copytrader.karne.tradecard_service, copytrader.karne.tradecard\n"
+            "assert 'copytrader.karne.tradecard_design' not in sys.modules\nprint('ok')\n")
+    result = subprocess.run([argv[0], "-B", "-c", code], cwd=cwd, env=env, capture_output=True, text=True,
+                            timeout=120)
+    assert result.returncode == 0 and result.stdout.strip() == "ok", result.stderr
+
+
+# =========================================================================== #
+# Part 2: real pictures (Pillow)
+# =========================================================================== #
+@needs_pillow
+async def test_real_cards_through_the_drawing_process(tmp_path: Path) -> None:
+    from PIL import Image
+
+    keep = os.environ.get("TRADECARD_OUT")
+    for name, sample in (("short_result", S.nas_short_result()), ("long_result", S.btc_long_result()),
+                         ("entry", S.eth_long_entry())):
+        started = time.monotonic()
+        result = await render_card(S.data_of(sample), tmp_path / "kart")
+        took = time.monotonic() - started
+        assert result.ok and result.path is not None, result
+        with Image.open(result.path) as image:
+            assert image.size == (2560, 1600) and image.format == "PNG"
+        size = result.path.stat().st_size
+        print(f"\ntrade card {name}: {took:.1f} s in the drawing process, {size / 1024:.0f} kB")
+        if keep:
+            Path(keep).mkdir(parents=True, exist_ok=True)
+            shutil.copy(result.path, Path(keep) / f"{name}.png")
+        render_mod.remove_picture(result.path)
+
+
+@needs_pillow
+@pytest.mark.parametrize("lnum", [True, False])
+def test_the_asset_name_with_and_without_raqm(tmp_path: Path, monkeypatch: pytest.MonkeyPatch, lnum: bool) -> None:
+    from PIL import Image, features
+
+    from copytrader.karne import tradecard_design as design
+
+    if lnum and not features.check("raqm"):
+        pytest.skip("this Pillow has no raqm")
+    monkeypatch.setattr(design, "LNUM", lnum)
+    if not lnum:
+        # a Pillow without raqm refuses OpenType features: make sure none is asked for
+        real_text = design.ImageDraw.ImageDraw.text
+
+        def no_features(self: Any, *args: Any, **kw: Any) -> Any:
+            assert "features" not in kw, kw
+            return real_text(self, *args, **kw)
+
+        monkeypatch.setattr(design.ImageDraw.ImageDraw, "text", no_features)
+    cv = design.Canvas()
+    width = design.asset_name(cv, (56, 130), "NAS100", 80, design.INK)
+    plain = design.Canvas()
+    letters = design.asset_name(plain, (56, 130), "NAS", 80, design.INK)
+    assert width > letters * 1.6
+    out = tmp_path / "card.png"
+    design.render(S.data_of(S.nas_short_result()), str(out))
+    with Image.open(out) as image:
+        assert image.size == design.SIZE == (2560, 1600)
+
+
+@needs_pillow
+def test_the_card_uses_only_the_shipped_fonts(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    from copytrader.karne import tradecard_design as design
+
+    used: set[str] = set()
+    plain = design._font.__wrapped__
+
+    def spy(name: str, px: int) -> Any:
+        used.add(name)
+        return plain(name, px)
+
+    monkeypatch.setattr(design, "_font", spy)
+    for sample in (S.nas_short_result(), S.btc_long_result(), S.eth_long_entry()):
+        design.render(S.data_of(sample), str(tmp_path / "x.png"))
+    shipped = {p.stem for p in (Path(design.FONTS_DIR)).glob("*.ttf")}
+    assert used <= shipped and "CormorantGaramond_600SemiBold" in used

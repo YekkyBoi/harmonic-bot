@@ -681,6 +681,7 @@ def build_open_plan(
         created_at=now,
         route=route,
         broker_names=list(broker_names or []),
+        chart_timeframe_min=action.chart_timeframe_min,
     )
     plan.summary_tr = _open_summary(plan, entry_is_market_price=entry is None, show_risk_pct=risk_pct_applies)
     return plan, issues.items

@@ -246,6 +246,43 @@ class ReferencePriceOracle:
             raise error
         return None
 
+    async def ohlcv(
+        self, exchange_id: str, symbol: str, timeframe: str, since_ms: int, until_ms: int
+    ) -> list[tuple[int, float, float, float, float]] | None:
+        """Candles of ``symbol`` (the venue's own unified ccxt symbol, e.g. "BTC/USDT:USDT", so the prices are in
+        that venue's scale) on the public ``exchange_id`` client, ``timeframe`` in ccxt's notation ("15m", "1h"),
+        from the one that opens at or after ``since_ms`` up to ``until_ms``: (open time ms, open, high, low, close),
+        oldest first. None: they cannot be read (unknown exchange or symbol, network error...). Never raises.
+        Read only (the owner's trade card)."""
+        if not exchange_id or not symbol or not timeframe:
+            return None
+        try:
+            ex = self._client(exchange_id)
+            if ex is None or not hasattr(ex, "fetch_ohlcv"):
+                return None
+            out: dict[int, tuple[int, float, float, float, float]] = {}
+            since = int(since_ms)
+            for _page in range(CANDLE_MAX_PAGES):
+                rows = await asyncio.wait_for(ex.fetch_ohlcv(symbol, timeframe, since, CANDLE_PAGE),
+                                              self._timeout + 5)
+                rows = [r for r in rows or [] if len(r) >= 5 and r[0] is not None and r[0] >= since]
+                for ts, o, h, low, c, *_rest in rows:
+                    if all(_valid(v) for v in (o, h, low, c)) and int(ts) <= until_ms:
+                        out[int(ts)] = (int(ts), float(o), float(h), float(low), float(c))
+                if not rows or len(rows) < CANDLE_PAGE or int(rows[-1][0]) >= until_ms:
+                    break
+                since = int(rows[-1][0]) + 1
+            return [out[k] for k in sorted(out)]
+        except asyncio.CancelledError:
+            if not stray_cancel():
+                raise
+            logger.warning("Candles of %s on %s: the request was cancelled without a cancel request",
+                           symbol, exchange_id)
+            return None
+        except Exception as exc:  # never raise
+            logger.warning("Candles of %s on %s unavailable: %s", symbol, exchange_id, exc)
+            return None
+
     async def close(self) -> None:
         clients, self._clients = self._clients, {}
         for ex in clients.values():

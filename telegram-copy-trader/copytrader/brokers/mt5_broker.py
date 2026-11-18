@@ -3419,3 +3419,86 @@ class Mt5Broker(MetaTraderLegBroker):
             "entry": (sum(_f(d.price) * _f(d.volume) for d in ins) / in_vol) if in_vol else None,
             "reason": reason,
         }
+
+    # ---- the owner's trade card (read only) ------------------------------------------------------------
+    async def trade_chart(
+        self, broker_symbol: str, timeframe_min: int, start: float, end: float,
+        tickets: Sequence[Any] = (), anchor_utc: float | None = None,
+    ) -> dict[str, Any]:
+        """What the owner's trade card (copytrader.karne.tradecard) needs from this terminal, READ ONLY: the
+        terminal's bars of ``broker_symbol`` (``timeframe_min``, one of TIMEFRAMES) from ``start`` to ``end`` (UTC
+        epoch seconds), and the deals of the positions ``tickets``. Plain data only (it crosses the mt5_bridge pipe):
+
+        {"offset": the trade server's clock minus UTC in seconds (a whole number of hours) or None when it cannot be
+        told, "bars": [(open time, open, high, low, close)], "deals": [{"time", "time_msc", "price", "volume",
+        "entry": "in" | "out", "reason": "sl" | "tp" | "stop_out" | "manual", "position"}]} - the times in the TRADE
+        SERVER's clock as MetaTrader keeps them (the card turns them into UTC with ``offset``).
+
+        The offset: from a fresh tick (its time is server time, see :meth:`_tick_is_stale`); with a closed market
+        (no fresh tick), from the first opening deal of ``tickets`` against ``anchor_utc`` (the bot's own UTC record
+        of that fill), rounded to whole hours. Neither: offset None and no bars (nothing is guessed). Every call goes
+        through the adapter's own worker thread with its time limit (:meth:`_call`): the event loop never waits for
+        the terminal. Raises BrokerError when the terminal does not answer."""
+        self._require()
+        name = TIMEFRAMES.get(int(timeframe_min))
+        if name is None:
+            raise BrokerError(f"MT5 {timeframe_min} dakikalık mum desteklemiyor")
+        offset: int | None = None
+        res, _err = await self._call("symbol_info_tick", broker_symbol)
+        tick_time = int(_f(getattr(res, "time", 0))) if res is not None else 0
+        if tick_time > 0 and not self._tick_is_stale(tick_time):
+            offset = int(round((tick_time - self._now_epoch()) / 3600.0)) * 3600
+        deals: list[dict[str, Any]] = []
+        for ticket in dict.fromkeys(t for t in tickets if t is not None):
+            try:
+                position = int(ticket)
+            except (TypeError, ValueError):
+                continue
+            for d in await self._get_list("history_deals_get", position=position, what="işlem geçmişi"):
+                if int(getattr(d, "type", -1)) not in (MT5.DEAL_TYPE_BUY, MT5.DEAL_TYPE_SELL):
+                    continue
+                entry = int(getattr(d, "entry", -1))
+                msc = int(_f(getattr(d, "time_msc", 0)))
+                deals.append({
+                    "time": int(_f(getattr(d, "time", 0))) or msc // 1000,
+                    "time_msc": msc,
+                    "price": _f(getattr(d, "price", 0.0)),
+                    "volume": _f(getattr(d, "volume", 0.0)),
+                    "entry": "in" if entry == MT5.DEAL_ENTRY_IN else "out",
+                    "reason": {MT5.DEAL_REASON_SL: "sl", MT5.DEAL_REASON_TP: "tp", MT5.DEAL_REASON_SO: "stop_out"}.get(
+                        int(getattr(d, "reason", -1)), "manual"),
+                    "position": position,
+                })
+        deals.sort(key=lambda d: (d["time_msc"] or d["time"] * 1000, d["entry"] != "in"))
+        if offset is None and anchor_utc is not None:
+            ins = [d["time"] for d in deals if d["entry"] == "in" and d["time"] > 0]
+            if ins:
+                guess = round((min(ins) - float(anchor_utc)) / 3600.0)
+                if -14 <= guess <= 14:
+                    offset = int(guess) * 3600
+        if offset is None:
+            return {"offset": None, "bars": [], "deals": deals}
+        frame = getattr(self._mt5, f"TIMEFRAME_{name}", None)
+        if not isinstance(frame, int):
+            frame = TIMEFRAME_VALUES[name]
+        rates, err = await self._call("copy_rates_range", broker_symbol, frame, int(start) + offset,
+                                      int(end) + offset)
+        if rates is None:
+            raise BrokerError(f"MT5 {broker_symbol} mumları alınamadı: {_err_text(err)}")
+        bars: list[tuple[int, float, float, float, float]] = []
+        for r in rates:
+            try:
+                bars.append((int(r["time"]), float(r["open"]), float(r["high"]), float(r["low"]), float(r["close"])))
+            except (KeyError, IndexError, TypeError, ValueError):
+                continue
+        return {"offset": offset, "bars": bars, "deals": deals}
+
+
+# MetaTrader's bar sizes the trade card may ask for (minutes -> the package's TIMEFRAME_<name>), with the package's
+# own values for a module that lacks the name (the real package has them all).
+TIMEFRAMES: dict[int, str] = {1: "M1", 2: "M2", 3: "M3", 4: "M4", 5: "M5", 6: "M6", 10: "M10", 12: "M12", 15: "M15",
+                              20: "M20", 30: "M30", 60: "H1", 120: "H2", 180: "H3", 240: "H4", 360: "H6", 480: "H8",
+                              720: "H12", 1440: "D1"}
+TIMEFRAME_VALUES: dict[str, int] = {"M1": 1, "M2": 2, "M3": 3, "M4": 4, "M5": 5, "M6": 6, "M10": 10, "M12": 12,
+                                    "M15": 15, "M20": 20, "M30": 30, "H1": 16385, "H2": 16386, "H3": 16387,
+                                    "H4": 16388, "H6": 16390, "H8": 16392, "H12": 16396, "D1": 16408}

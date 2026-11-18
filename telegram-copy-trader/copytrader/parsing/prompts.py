@@ -44,6 +44,7 @@ WORKED_EXAMPLE_OUTPUT: dict[str, Any] = {
             "ambiguities": [],
             "confidence": 0.95,
             "summary_tr": "ETH LONG, giriş 2232.18, SL 2205.11, TP 2310.60, risk 1R",
+            "chart_timeframe_min": None,
         }
     ]
 }
@@ -171,6 +172,7 @@ The trade topics are written only by the group's admins (the founder and the mod
 - evidence: in Turkish, short: where each value came from (which image label / which words of which message) and any check you did. This is a source note for the owner, not a narrative.
 - ambiguities: in Turkish, one short sentence each, ONLY real doubts the owner must resolve (an unreadable digit, a conflict between text and image, an unclear target trade). Harmless notes go to evidence, and so does everything these rules call expected. Never put a question about the copying policy here ("trader gibi kapatılsın mı, yoksa açık mı kalsın?"): the rules above answer it. Any ambiguity makes the system ask the owner.
 - confidence: see below.
+- chart_timeframe_min: only for "open" / "incomplete" read from a chart screenshot: the bar size of the chart in minutes as its header shows it next to the symbol ("US 100 Nakit CFD · 15 · FXCM" -> 15, "BTCUSDT.P · 5" -> 5, "1h" or "60" -> 60, "4h" or "240" -> 240, "1D" or "D" -> 1440). null when there is no screenshot or the header does not show it (as in example 1 below). It is only used to draw a picture for the owner: never add an ambiguity or lower the confidence because of it.
 - summary_tr: one Turkish line the owner will read, e.g. "ETH LONG, giriş 2232.18, SL 2205.11, TP 2310.60, risk 1R", "ETH işleminde stop girişe çekilecek", "SOL işleminin yarısı kapatılacak", "BTC SHORT kapatılacak (trader 2R ile kapattı)", "Bekleyen BTC limit emri iptal edilecek", "İşlem talimatı yok (selamlaşma)".
 
 # Reading TradingView position-tool screenshots

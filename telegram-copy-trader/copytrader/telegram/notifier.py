@@ -172,6 +172,8 @@ HELP_TEXT = (
     "(/grup: durum; grupları arkadaşınız o gruplarda /bagla ile bağlar)\n"
     "/karne — bu haftanın karnesi, şu ana kadar (haftalık karne her pazar 22:00'de, İngiltere saatiyle, kendiliğinden "
     "gelir); /karne hepsi — bugüne kadarki tüm işlemler\n"
+    "/binancekart · /fxkart · /fx2kart · /breakoutkart (hesap adı + kart) — o hesabın bu haftaki işlemlerinin "
+    "numaralı listesi; numara yazınca işlemin kartı (resim) gelir: açık işlemde giriş kartı, kapanmışta sonuç kartı\n"
     "/yardim — bu mesaj\n\n"
     "Onay mesajlarında: ✅ Onayla · ✏️ Düzelt (doğrusunu yazarsınız) · ❌ İptal\n"
     "Bir onay mesajını yanıtlayarak da düzeltme yazabilirsiniz."
@@ -246,6 +248,11 @@ OWNER_FILE_POLL_SEC = 0.2
 OWNER_FILE_NO_AES = ("Telegram'a dosya göndermek için hızlı şifreleme paketi (cryptg) kurulu değil; kurmak için botun "
                      "klasöründe: python -m pip install cryptg")
 KARNE_OFF_TEXT = "ℹ️ Karne bu kurulumda kullanılamıyor."
+# A plain number while BOTH a /pozkapat list and a trade card list wait: neither is chosen (a number meant for a card
+# must never close a position, nor the other way round).
+CARD_OR_CLOSE_TEXT = ("❓ Hem /pozkapat listesi hem işlem kartı listesi açık; numarayı hangisi için yazdığınızı "
+                      "belirtin: <code>/pozkapat {n}</code> ya da <code>/{card} {n}</code>. Hiçbir pozisyon "
+                      "kapatılmadı.")
 ROLE_TR = {"ana": "ana grup", "sohbet": "sohbet grubu"}
 ROLE_ACC = {"ana": "ana grubu", "sohbet": "sohbet grubu"}
 ROLE_DATIVE = {"ana": "ana grubuna", "sohbet": "sohbet grubuna"}
@@ -484,6 +491,8 @@ class BotNotifier:
         self._group_alert_at: float | None = None              # monotonic: the owner was told about a failed copy then
         self._group_peers: dict[int, Any] = {}                 # a supergroup a group was upgraded to -> its input peer
         self._karne: Any = None                                # karne.service.KarneService (set by the app): /karne
+        # karne.tradecard_service.TradeCardService (set by the app): the owner's /<account>kart and its numbered list
+        self._tradecard: Any = None
         self._username: str | None = None                      # the bot's own username (for /bagla@...)
         self._me_id: int | None = None                         # the bot's own user id (its posts are never copied)
 
@@ -808,6 +817,18 @@ class BotNotifier:
         if entry is not None and time.monotonic() - entry[0] > POZKAPAT_TTL_SEC:
             self._pk_lists.pop(self._owner, None)       # (an expired list never takes a number any more)
             entry = None
+        card = self._tradecard
+        if (reply_to is None and card is not None and _PK_PICK_RE.match(text) and card.list_live()
+                and await engine.awaiting_correction_id() is None):
+            # A number for the trade card list. Never while a correction is awaited (the number is the correction
+            # then), and never while a /pozkapat list waits too: the owner says which one (nothing is closed).
+            if entry is not None:
+                numbers = re.findall(r"\d+", text)
+                await self._send(CARD_OR_CLOSE_TEXT.format(
+                    n=esc(numbers[0] if numbers else "1"), card=esc(card.list_command())), mirror=False)
+                return
+            await self._send(await card.pick(text), mirror=False)
+            return
         if (reply_to is None and entry is not None and _PK_PICK_RE.match(text)
                 and await engine.awaiting_correction_id() is None):
             # A choice from /pozkapat - never while a correction is awaited: the number is the correction then
@@ -838,6 +859,10 @@ class BotNotifier:
     async def _run_command(self, name: str, args: str) -> None:
         command = _COMMANDS.get(name)
         engine = self._engine
+        card = self._tradecard
+        if command is None and card is not None and card.is_card_command(name):
+            await self._card_command(card, name, args)
+            return
         if command is None:
             await self._send(f"❓ Bilinmeyen komut: /{esc(name)}\nKomutlar için /yardim yazın.")
             return
@@ -1542,6 +1567,31 @@ class BotNotifier:
             log.exception("Group copy: could not drop the earlier friend's bindings")
             return False
 
+    # ---- the owner's trade card (/<account>kart; copytrader.karne.tradecard_service) ----------------------
+    def set_tradecard(self, service: Any) -> None:
+        """The app's TradeCardService: ``/<account>kart`` asks it for the numbered list, a number picks; it sends the
+        picture through :meth:`send_owner_photo` and its lines through :meth:`tell_owner` (the owner's alone)."""
+        self._tradecard = service
+
+    async def _card_command(self, card: Any, name: str, args: str) -> None:
+        """``/<account>kart [N]`` of the owner (only the owner gets here). Its answers are never copied to the
+        friend."""
+        if self._engine is None:
+            await self._send("⏳ Sistem henüz hazır değil, biraz sonra tekrar deneyin.", mirror=False)
+            return
+        account = card.command_account(name)
+        if account is None:
+            await self._send(card.not_an_account(name), mirror=False)
+            return
+        await self._send(await card.command(account, args), mirror=False)
+
+    async def send_owner_photo(self, path: str, *, caption: str = "",
+                               busy: Callable[[], bool] | None = None) -> str | None:
+        """One picture for the OWNER as a PHOTO (the trade card), with ``caption`` (HTML): :meth:`send_owner_document`
+        in every rule (one bounded request, paused while the trading path is busy, never sent twice, never to the
+        friend), only not as a file. Returns None when Telegram confirmed it, else the reason in Turkish."""
+        return await self._send_document(self._owner, path, caption=caption, busy=busy, photo=True)
+
     # ---- the owner's report card (/karne; copytrader.karne) ------------------------------------------------
     def set_karne(self, karne: Any) -> None:
         """The app's KarneService: ``/karne`` asks it for a card; it sends through :meth:`send_owner_document` and
@@ -1588,8 +1638,9 @@ class BotNotifier:
         return await self._send_document(self._owner, path, caption=caption, name=name, busy=busy)
 
     async def _send_document(self, chat: int, path: str, *, caption: str = "", name: str | None = None,
-                             busy: Callable[[], bool] | None = None) -> str | None:
-        """One file to ``chat`` (the owner's or the friend's), as :meth:`send_owner_document` describes."""
+                             busy: Callable[[], bool] | None = None, photo: bool = False) -> str | None:
+        """One file to ``chat`` (the owner's or the friend's), as :meth:`send_owner_document` describes (``photo``:
+        as a photo, not a file)."""
         client = self._client
         if client is None or self._shut:
             return "bildirim botu çalışmıyor"
@@ -1618,9 +1669,9 @@ class BotNotifier:
                     await asyncio.sleep(OWNER_FILE_POLL_SEC)
 
             await pause()
-            attributes = [types.DocumentAttributeFilename(name)] if name else None
+            attributes = [types.DocumentAttributeFilename(name)] if name and not photo else None
             task = self._track(asyncio.ensure_future(client.send_file(
-                chat, path, caption=caption, parse_mode="html", force_document=True, attributes=attributes,
+                chat, path, caption=caption, parse_mode="html", force_document=not photo, attributes=attributes,
                 progress_callback=pause)))
             done, _ = await asyncio.wait({task}, timeout=OWNER_FILE_TIMEOUT_SEC)
             if not done:
