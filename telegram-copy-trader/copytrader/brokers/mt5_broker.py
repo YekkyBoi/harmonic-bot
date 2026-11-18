@@ -3592,6 +3592,12 @@ class Mt5Broker(MetaTraderLegBroker):
             first = int(start // 1000) // 60 * 60                         # the minute the previous look was in
             if armed_msc is not None:
                 first = max(first, -(-int(armed_msc // 1000) // 60) * 60)  # never before the watch started
+            if first > t_sec:
+                # The ticks could not be read and no bar may be read yet (still the minute the watch started in,
+                # whose bar also holds earlier prices): that time stays unread, like a busy terminal.
+                logger.warning("%s: the ticks of %s since %s could not be read and no whole minute has passed since "
+                               "the watch started; read again at the next look", self.name, broker_symbol, start)
+                return {**out, "upto_msc": start, "unread": True}
             if first <= t_sec:
                 if self._oldest_call() is not None:
                     return busy

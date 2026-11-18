@@ -5580,7 +5580,7 @@ class Engine:
                 for s in window:
                     try:
                         if s[0] == int(bar["msc"]) and ((long and s[2] > float(bar["hi"]))
-                                                         or (not long and s[3] < float(bar["lo"]))):
+                                                         or (not long and s[1] < float(bar["lo"]))):
                             counted.append(s)
                     except (KeyError, TypeError, ValueError):
                         break
@@ -5717,13 +5717,14 @@ class Engine:
     @staticmethod
     def _arming_bar(seen: dict[str, Any], now_msc: Any, long: bool) -> dict[str, Any] | None:
         """The bar of the minute the first-target rule arms in (bars only), with the extreme it has at that moment
-        towards the target (a long: its bid high, a short: its ask low); see the bar rule in _reference_broker_check."""
+        towards the target, on the bid side as bars are kept (a long: its high, a short: its low - the ask moves with
+        the bar's spread); see the bar rule in _reference_broker_check."""
         if seen.get("source") != "bars" or now_msc is None:
             return None
         minute = int(now_msc) // _MINUTE_MS * _MINUTE_MS
         for s in seen.get("samples") or []:
             if s[0] == minute:
-                return {"msc": minute, "hi": s[2], "lo": s[3]}
+                return {"msc": minute, "hi": s[2], "lo": s[1]}
         return None
 
     async def _reference_seen(self, trade: TradeRecord, pos: BrokerPosition, key: tuple[int, str],

@@ -312,6 +312,7 @@ async def test_a_target_move_never_counts_the_prices_before_it(unsure) -> None:
 
 async def test_the_first_look_starts_the_watch_even_when_tickmill_cannot_act(unsure) -> None:
     p, _friend = unsure
+    _history(p, [])                                                # (fx's tick history: readable, no ticks)
     tick_b = next(b for b in p.engine.brokers if b.name == "tickmill")
     p.engine.brokers = [b for b in p.engine.brokers if b.name != "tickmill"]
     pos = (await p.positions(1))["tickmill"] if await p.trades() else None
@@ -373,6 +374,7 @@ async def test_a_busy_look_still_cancels_on_the_price_now(unsure) -> None:
 
 async def test_a_first_look_touch_while_tickmill_is_away_is_decided_when_it_is_back(unsure) -> None:
     p, _friend = unsure
+    _history(p, [])                                                # (fx's tick history: readable, no ticks)
     tick_b = next(b for b in p.engine.brokers if b.name == "tickmill")
     _tick(p, 1.16195, 1.16205, T0)
     action = fx_pair("EURUSD", Side.LONG, ENTRY, STOP, 1.1650, entry_type=EntryType.LIMIT).model_copy(
@@ -392,6 +394,7 @@ async def test_a_first_look_touch_while_tickmill_is_away_is_decided_when_it_is_b
 
 async def test_a_kept_touch_is_dropped_once_the_price_is_far(unsure) -> None:
     p, _friend = unsure
+    _history(p, [])                                                # (fx's tick history: readable, no ticks)
     tick_b = next(b for b in p.engine.brokers if b.name == "tickmill")
     await _armed_watch(p)
     p.engine.brokers = [b for b in p.engine.brokers if b.name != "tickmill"]
@@ -458,6 +461,66 @@ async def test_unreadable_history_never_opens_and_is_read_again(unsure) -> None:
     readable[0] = True
     await p.engine.monitor.run_virtual_once()                       # the minute's bar went through the stop 1.1590
     assert (await p.positions(1))["tickmill"].status is PositionStatus.CANCELLED and p.tickmill_orders() == []
+
+
+async def test_ticks_unreadable_in_the_watchs_first_minute_never_open(unsure) -> None:
+    """The ticks cannot be read and no bar may be read yet (the minute the watch started in): that time stays unread -
+    the price now never opens; the next readable look sees the stop pass in it."""
+    p, _friend = unsure
+    await _armed_watch(p)                                          # watch starts at T0 (20 s into a minute)
+    rows = [{"time": int(T0 + 0.5), "time_msc": int((T0 + 0.5) * 1000), "bid": 1.15880, "ask": 1.15890}]
+    readable = [False]
+
+    def copy_ticks_from(symbol: str, date_from: int, count: int, flags: int) -> Any:
+        return [r for r in rows if r["time"] >= date_from][:count] if readable[0] else None
+
+    p.terminal.copy_ticks_from = copy_ticks_from                    # type: ignore[attr-defined]
+    _tick(p, 1.16090, 1.16100, T0 + 1.5)                            # at the level now (history unknown)
+    p.tickmill.set_price("EURUSD", 1.16105, 1.16115)
+    await p.engine.monitor.run_virtual_once()
+    assert p.tickmill_orders() == [] and is_virtual_pending((await p.positions(1))["tickmill"])
+    assert p.engine._ref_seen[(1, "tickmill")] == T0 * 1000        # (the time since T0 stays unread)
+    readable[0] = True
+    await p.engine.monitor.run_virtual_once()                       # the stop pass at T0 + 0.5
+    assert (await p.positions(1))["tickmill"].status is PositionStatus.CANCELLED and p.tickmill_orders() == []
+
+
+async def test_bars_a_short_arming_bar_is_judged_by_its_bid_low_not_its_moving_spread(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A short pullback (first target above today's price): the arming minute's bar counts only with a bid low below
+    the one it had when the rule armed - a wider spread later in the bar (its ask low unchanged or lower) is no new
+    price."""
+    p, _friend = await _make(tmp_path, monkeypatch, edit=_no_confirm)
+    try:
+        tps.set_eurusd(p, 1.16195, 1.16205)
+        action = fx_pair("EURUSD", Side.SHORT, 1.1640, 1.1660, 1.1625, entry_type=EntryType.LIMIT).model_copy(
+            update={"confidence": 0.5})
+        _tick(p, 1.16195, 1.16205, T0)
+        await p.say(action, FX, "EUR SHORT 1R Limit Emir")
+        assert (await p.positions(1))["tickmill"].data["virtual_tp_armed"] is False
+        await p.engine.monitor.run_virtual_once()
+        minute = -(-T0 // 60) * 60
+        bar = {"time": minute, "open": 1.16250, "high": 1.16300, "low": 1.16240, "close": 1.16280, "spread": 10}
+
+        def copy_rates_range(symbol: str, timeframe: int, date_from: int, date_to: int) -> list[dict[str, Any]]:
+            return [dict(b) for b in [bar] if date_from <= b["time"] <= date_to]
+
+        p.terminal.copy_rates_range = copy_rates_range                           # type: ignore[method-assign]
+        _tick(p, 1.16280, 1.16290, minute + 10)                                  # between: arms
+        await p.engine.monitor.run_virtual_once()
+        pos = (await p.positions(1))["tickmill"]
+        assert pos.data["virtual_tp_armed"] is True and pos.data["ref_tp_bar"]["lo"] == pytest.approx(1.16240)
+        bar["spread"] = 2                                          # the spread narrows: the ask low falls, no new bid
+        _tick(p, 1.16280, 1.16290, minute + 15)
+        await p.engine.monitor.run_virtual_once()
+        assert is_virtual_pending((await p.positions(1))["tickmill"])
+        bar["low"] = 1.16230                                       # a new low after the arming: ask <= 1.1625
+        _tick(p, 1.16270, 1.16280, minute + 20)
+        await p.engine.monitor.run_virtual_once()
+        assert (await p.positions(1))["tickmill"].status is PositionStatus.CANCELLED
+    finally:
+        await p.close()
 
 
 async def test_an_ended_entry_forgets_its_fx_down_warning(env) -> None:
