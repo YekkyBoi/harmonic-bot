@@ -18,18 +18,23 @@ Rules (the owner's, one place):
   plan's ``stop_loss``, which a stop move never changes: moves appear only in the timeline); the target = the LAST of
   the plan's take profits (none: no target zone).
 * **Result**: the close price = the volume-weighted price of the position's exits (MetaTrader: its closing deals);
-  a ccxt position closed by hand on the exchange (no exit of the bot's on record): the volume-weighted price of the
-  account's own close-side fills on the exchange (:func:`venue_close`: in the position's time, oldest first, until
-  they cover its filled quantity; less than VENUE_COVER of it: no card); none known: no card;
+  a ccxt position closed by hand on the exchange, in full (no exit of the bot's on record) or in part (some of it
+  closed outside the bot's orders, :func:`venue_wanted`): the volume-weighted price of the account's own fills on
+  the exchange - the bot's own exits of it first, then close-side fills by hand, never one of another position of
+  the bot's (:func:`venue_close`: in the position's time, oldest first, until they cover its filled quantity; less
+  than VENUE_COVER of it: no card; a fill by hand made while another position of the bot's held the same symbol
+  in the same direction: no card, VENUE_SHARED); none known: no card;
   the result in R = :func:`copytrader.engine.monitor.position_result_r` (the closing notice's own figure); without it
-  (a simulated / hand-traded account, an older position) the price move, ``side x (close - entry) / (entry - stop)``,
-  times the plan's size in R.
+  (closed by hand on the exchange) the net money those fills made (fees in the quote currency included,
+  ``Records.money``) / the position's real initial risk, times the plan's size in R (the owner's: "the profit that
+  went into the pocket, in R"); without either (a simulated / hand-traded account, an older position) the price
+  move, ``side x (close - entry) / (entry - stop)``, times the plan's size in R.
 * **The result box** is drawn to the R the money made (the owner's: "the R is what money actually went into the
   account, and the chart is drawn to match it"): its profit (or loss) edge, the dashed entry -> exit line and the
   darker played-out part end at ``fill + side x R x |fill - original stop|``, R = the money's R of the position
-  (:func:`money_r`, the closing notice's figure before the plan's size in R); the exit arrow stays on the close
-  candle and the DURUM chip shows the recorded close price. Without a money R (a hand-traded / simulated account,
-  an older position): the close price, as the price-based R.
+  (:func:`money_r`, the closing notice's figure - or the fills' money - before the plan's size in R); the exit arrow
+  stays on the close candle and the DURUM chip shows the recorded close price. Without a money R (a hand-traded /
+  simulated account, an older position): the close price, as the price-based R.
 * **Candles**: the chart's bar size from the signal's picture (``plan.chart_timeframe_min``), 15 minutes when it was
   not read or the venue has no such bar size; BARS_BEFORE bars before the entry; the entry card runs on to the latest
   bar (the dotted line is the price now), the result card until the price touches the target or the stop after the
@@ -45,7 +50,7 @@ from dataclasses import dataclass, field
 from datetime import datetime, timedelta
 from typing import Any
 
-from ..engine.monitor import _simulated, position_result_r
+from ..engine.monitor import _simulated, position_initial_risk, position_result_r
 from ..models import BrokerPosition, EntryType, PositionStatus, Side, TradeRecord, instrument_label
 from .uktime import UTC, as_utc, last_slot, stamp_tr, to_uk
 
@@ -65,6 +70,8 @@ MINUS = "−"
 VENUE_COVER = 0.95                # a close read from the exchange's fills must cover this much of the filled quantity
 VENUE_CLOSE_MARGIN = timedelta(minutes=10)    # ... fills up to this long after the bot saw the position end
 CLOSED_ON_VENUE = "venue"         # Records.close_by: closed on the exchange, outside the bot (by hand)
+VENUE_SHARED = ("bu sırada aynı hesapta aynı yönde aynı sembolde botun başka bir işlemi de açıktı; borsada elle "
+                "yapılan kapanışın hangi işleme ait olduğu ayırt edilemiyor")
 EVENT_KINDS = ("order_send", "entry_filled", "manage_done", "manage_late_done", "pozkapat", "close_all")
 _TP_WORDS = frozenset({"tp", "take_profit"})
 _STOP_WORDS = frozenset({"sl", "stop", "stop_out", "stop_replaced"})
@@ -234,8 +241,11 @@ class Records:
     closed: datetime | None = None    # the (last) exit
     exit_price: float | None = None   # volume-weighted price of the exits
     reason: str | None = None         # "tp" | "stop" | "close": how the position ended (its LAST exit)
-    moves: list[tuple[datetime, str]] = field(default_factory=list)      # stop moves (timeline)
+    moves: list[tuple[datetime, str]] = field(default_factory=list)      # stop moves (timeline; before a close by
+    #                                   hand on the exchange also the parts the bot closed before it: venue_close)
     close_by: str | None = None       # who closed it: "group" | "owner" | "all" | CLOSED_ON_VENUE | None
+    money: float | None = None        # the net money the position made, read from the account's own fills
+    #                                   (venue_close; the card only: the bot's realized_pnl is not changed)
 
 
 def _reason_word(raw: object) -> str:
@@ -352,15 +362,106 @@ def venue_opened(pos: BrokerPosition, rec: Records) -> datetime | None:
     return _ms_time((pos.data or {}).get("opened_at")) or rec.filled
 
 
-def venue_close(pos: BrokerPosition, rec: Records, trades: Sequence[Mapping[str, Any]], now: datetime
-                ) -> Records | None:
-    """The close of a ccxt position the bot booked no exit price for (closed by hand on the exchange), from the
-    account's own fills of its symbol (ccxt ``fetch_my_trades``): the close-side fills from the position's open time
-    up to the time the bot saw it end + VENUE_CLOSE_MARGIN (no such time: now), oldest first, until they cover its
-    filled quantity (the last one only for the part needed: one order may close it and open the other side); a
-    hedge-mode fill of the other side's position is not one of them. The close price is their volume-weighted price,
-    the close time the last one used. None: no open time, nothing filled, or the fills cover less than VENUE_COVER of
-    the quantity. ``rec`` is not changed (a copy is returned)."""
+def venue_wanted(pos: BrokerPosition, rec: Records) -> bool:
+    """A closed position whose card reads its close from the account's own fills (ccxt): no exit price of the bot's
+    on record (closed by hand on the exchange), or part of it closed outside the bot's orders (:func:`venue_partial`:
+    the bot's exit price is only its own part's). The bot's own exits covering the size - its result complete, or
+    only its trade list short of them (``pnl_incomplete``) - no: the card as the bot's records tell it."""
+    return pos.status not in _ACTIVE and (rec.exit_price is None or venue_partial(pos))
+
+
+def venue_partial(pos: BrokerPosition) -> bool:
+    """Part of the position (or all of it) was closed outside the bot's orders (the adapter's ``closed_outside``):
+    the bot's own exit price is not the position's close."""
+    try:
+        return float((pos.data or {}).get("closed_outside") or 0.0) > 0
+    except (TypeError, ValueError):
+        return True
+
+
+def _fee_in(t: Mapping[str, Any], quote: str) -> float:
+    """A fill's fees in the quote currency (the ccxt adapter's rule in ``_realized_pnl``: ``fees``, else ``fee``;
+    a fee in another currency is not counted)."""
+    total = 0.0
+    for fee in (t.get("fees") or ([t["fee"]] if t.get("fee") else [])):
+        if isinstance(fee, Mapping) and str(fee.get("currency", "")).upper() == quote:
+            try:
+                cost = float(fee.get("cost") or 0.0)
+            except (TypeError, ValueError):
+                continue
+            total += cost if math.isfinite(cost) else 0.0
+    return total
+
+
+def _bot_steps(data: Mapping[str, Any], filled_at: Mapping[str, float], before: datetime
+               ) -> list[tuple[datetime, str]]:
+    """The parts the bot itself closed before a close by hand: its booked exits, one step per order (timeline, no
+    R), at the time its fills used show (``filled_at``: order -> the last one's time, ms), else the time the exit
+    carries; neither known: no step."""
+    steps: list[tuple[datetime, str]] = []
+    seen: set[str] = set()
+    for x in data.get("exits") or []:
+        if not isinstance(x, Mapping):
+            continue
+        order = str(x.get("order_id") or "")
+        if order and order in seen:
+            continue
+        seen.add(order)
+        at = _ms_time(filled_at.get(order)) if order in filled_at else _ms_time(x.get("at"))
+        if at is not None and at <= before:
+            word = {"tp": "Hedef", "stop": "Stop"}.get(_reason_word(x.get("kind")), "Kapatıldı")
+            steps.append((at, f"{word} (kısmi)"))
+    return steps
+
+
+def venue_neighbours(pos: BrokerPosition, rec: Records, trade_id: int,
+                     rows: Iterable[tuple[TradeRecord, BrokerPosition, datetime | None]], now: datetime
+                     ) -> tuple[set[str], list[tuple[float, float]]]:
+    """The account's other positions of the bot's (``rows``: the database's, e.g. ``account_trades``): the order ids
+    of all of them (their fills are never this position's close), and the time spans (epoch ms, both ends included)
+    in which one of them held the same symbol in the same direction: from its open time (the adapter's
+    ``opened_at``, else its trade's start; neither: from the start of time) to its end (the time the bot saw it end;
+    still open or not known: open-ended). A fill by hand inside such a span cannot be told to be this position's
+    (:func:`venue_close`)."""
+    foreign: set[str] = set()
+    spans: list[tuple[float, float]] = []
+    symbol = (pos.broker_symbol or "").strip().upper()
+    for trade, other, closed_at in rows:
+        if trade.id == trade_id:
+            continue
+        foreign |= _own_order_ids(other.data or {})
+        if (other.side is not pos.side or (other.broker_symbol or "").strip().upper() != symbol
+                or not traded(other)):
+            continue
+        data = other.data or {}
+        o_start = _ms_time(data.get("opened_at")) or (as_utc(trade.created_at) if trade.created_at else None)
+        o_end = None if other.status in _ACTIVE else (
+            as_utc(closed_at) if closed_at is not None else _ms_time(data.get("closed_at")))
+        spans.append((o_start.timestamp() * 1000.0 if o_start is not None else -math.inf,
+                      o_end.timestamp() * 1000.0 if o_end is not None else math.inf))
+    return foreign, spans
+
+
+def venue_close(pos: BrokerPosition, rec: Records, trades: Sequence[Mapping[str, Any]], now: datetime,
+                quote: str | None = None, *, foreign: Iterable[str] = (),
+                busy: Sequence[tuple[float, float]] = ()) -> Records | None:
+    """The close of a ccxt position from the account's own fills of its symbol (ccxt ``fetch_my_trades``), for a
+    position closed by hand on the exchange, in full or in part (:func:`venue_wanted`): first the fills of the bot's
+    own orders of it (a part it closed itself), then the close-side fills by hand - of no order of any other position
+    of the bot's (``foreign``: their order ids, :func:`venue_neighbours`) - from the position's open time up to the
+    time the bot saw it end + VENUE_CLOSE_MARGIN (no such time: now), oldest first, until they cover its filled
+    quantity (the last one only for the part needed: one order may close it and open the other side); a hedge-mode
+    fill of the other side's position is not one of them. The close price is their volume-weighted price, the close
+    time the last one used. None: no open time, nothing filled, or the fills cover less than VENUE_COVER of the
+    quantity. CardProblem (VENUE_SHARED): a fill by hand used falls in a span in which another position of the
+    bot's held the symbol in the same direction (``busy``: epoch ms spans, :func:`venue_neighbours`): it cannot be
+    told whose it was. ``rec`` is not changed (a copy is returned).
+
+    The money (``Records.money``): ``sum (exit_i - entry) x amount_i x contract size x side`` - the fees, in the
+    quote currency ``quote``, of the fills used (a fill used in part: that part of its fee) and of the position's
+    own entry fills (the open-side fills of the bot's orders of it, as the adapter's ``_realized_pnl``; the entry is
+    their volume-weighted price, none found: the position's average entry). Only when the fills cover the whole
+    quantity and the quote currency is known; else None (the card's R is then the price move)."""
     opened = venue_opened(pos, rec)
     try:
         need = float(pos.filled_quantity or 0.0)
@@ -372,9 +473,14 @@ def venue_close(pos: BrokerPosition, rec: Records, trades: Sequence[Mapping[str,
     end = (as_utc(rec.closed) + VENUE_CLOSE_MARGIN if rec.closed is not None else as_utc(now)).timestamp() * 1000.0
     close_side = "sell" if pos.side is Side.LONG else "buy"
     own_side = "LONG" if pos.side is Side.LONG else "SHORT"
-    fills: list[tuple[float, float, float, str]] = []
+    data = pos.data or {}
+    own = _own_order_ids(data)
+    foreign = set(foreign) - own
+    fills: list[tuple[float, float, float, str, Mapping[str, Any]]] = []
+    mine: list[tuple[float, float, float, str, Mapping[str, Any]]] = []
+    entries: list[tuple[float, float, Mapping[str, Any]]] = []
     for t in trades:
-        if not isinstance(t, Mapping) or t.get("side") != close_side:
+        if not isinstance(t, Mapping) or t.get("side") not in ("buy", "sell"):
             continue
         info = t.get("info") if isinstance(t.get("info"), Mapping) else {}
         side_of_position = str(info.get("positionSide") or "").upper()
@@ -386,19 +492,33 @@ def venue_close(pos: BrokerPosition, rec: Records, trades: Sequence[Mapping[str,
             continue
         if not all(math.isfinite(v) for v in (at, price, amount)) or price <= 0 or amount <= 0:
             continue
-        if start <= at <= end:
-            fills.append((at, price, amount, str(t.get("order") or "")))
+        order = str(t.get("order") or "")
+        if t.get("side") != close_side:
+            if order in own:
+                entries.append((price, amount, t))          # (the bot's entry order(s) of this position)
+        elif order in own:
+            mine.append((at, price, amount, order, t))      # (the bot's own exit of this position: any time)
+        elif order not in foreign and start <= at <= end:
+            fills.append((at, price, amount, order, t))     # (by hand: no order of any position of the bot's)
+    mine.sort(key=lambda f: f[0])
     fills.sort(key=lambda f: f[0])
     used: list[tuple[float, float]] = []
-    left, last_at, orders = need, None, set()
-    for at, price, amount, order in fills:
+    left, last_at, last_order, fees = need, None, "", 0.0
+    filled_at: dict[str, float] = {}
+    for at, price, amount, order, t in mine + fills:
         if left <= need * 1e-9:
             break
+        if order not in own and any(lo <= at <= hi for lo, hi in busy):
+            # another position of the bot's held this symbol in this direction at that time: a fill by hand cannot
+            # be told to be this position's (never a guessed close)
+            raise CardProblem(VENUE_SHARED)
         take = min(amount, left)
         used.append((price, take))
+        fees += _fee_in(t, quote.upper()) * take / amount if quote else 0.0
         left -= take
-        last_at = at
-        orders.add(order)
+        if last_at is None or at >= last_at:
+            last_at, last_order = at, order
+        filled_at[order] = max(at, filled_at.get(order, at))
     covered = need - left
     price = _weighted(used)
     if price is None or last_at is None or covered < need * VENUE_COVER:
@@ -408,30 +528,74 @@ def venue_close(pos: BrokerPosition, rec: Records, trades: Sequence[Mapping[str,
         return None
     out = Records(placed=rec.placed, filled=rec.filled, closed=closed, exit_price=price, reason=rec.reason or "close",
                   moves=[m for m in rec.moves if m[0] <= closed], close_by=rec.close_by)
-    data = pos.data or {}
-    if out.close_by is None and not data.get("exits") and not (orders & _own_order_ids(data)):
-        out.close_by = CLOSED_ON_VENUE
+    if out.close_by is None and last_order not in own and (not data.get("exits") or venue_partial(pos)):
+        # the last part was closed by hand on the exchange (the parts the bot closed before it stay in the timeline);
+        # not when the bot's own exits cover the size (an exit of its whose order it did not keep: its own close)
+        out.close_by, out.reason = CLOSED_ON_VENUE, "close"
+        out.moves = sorted(out.moves + _bot_steps(data, filled_at, closed), key=lambda m: m[0])
+    entry = _weighted([(p, q) for p, q, _t in entries]) if entries else None
+    if entry is None:
+        try:
+            entry = float(pos.avg_entry_price) if pos.avg_entry_price is not None else None
+        except (TypeError, ValueError):
+            entry = None
+    try:
+        size = float(data.get("contract_size", 1.0) or 1.0)
+    except (TypeError, ValueError):
+        size = math.nan
+    if quote and entry is not None and math.isfinite(entry) and entry > 0 and math.isfinite(size) and size > 0 \
+            and left <= need * 1e-9:
+        direction = 1.0 if pos.side is Side.LONG else -1.0
+        fees += sum(_fee_in(t, quote.upper()) for _p, _q, t in entries)
+        money = sum((p - entry) * q * size * direction for p, q in used) - fees
+        out.money = money if math.isfinite(money) else None
     return out
 
 
-def money_r(trade: TradeRecord, pos: BrokerPosition) -> float | None:
-    """The R the money made on this position, per position: ``realized_pnl`` / its real initial risk
-    (:func:`position_result_r` with size 1, i.e. BEFORE the plan's size in R). Only when the card's hero is that money
-    figure too (:func:`result_r` takes the closing notice's own R): a hand-traded / simulated account, a position
-    without its stored initial risk or one the plan's size in R does not fit: None (the price-based box)."""
-    if _simulated(pos) or position_result_r(pos, trade.plan.risk_r) is None:
+def _fills_r(trade: TradeRecord, pos: BrokerPosition, money: float | None) -> float | None:
+    """The money read from the account's fills (``Records.money``) / the position's real initial risk
+    (:func:`position_initial_risk`), per position (before the plan's size in R). None: no such money, a simulated
+    account, no stored initial risk, or a plan's size in R that is not a positive number."""
+    if money is None or _simulated(pos):
         return None
-    return position_result_r(pos, 1.0)
+    risk = position_initial_risk(pos)
+    if risk is None:
+        return None
+    try:
+        value, size = float(money) / risk, float(trade.plan.risk_r)
+    except (TypeError, ValueError):
+        return None
+    return value if math.isfinite(value) and math.isfinite(size) and size > 0 else None
 
 
-def result_r(trade: TradeRecord, pos: BrokerPosition, fill: float, stop: float, exit_price: float | None
-             ) -> float | None:
-    """The result in R: the closing notice's own figure (:func:`position_result_r`); a simulated (hand-traded)
-    account or one without it: the price move in units of the original stop distance, times the plan's size in R."""
+def money_r(trade: TradeRecord, pos: BrokerPosition, money: float | None = None) -> float | None:
+    """The R the money made on this position, per position: ``realized_pnl`` / its real initial risk
+    (:func:`position_result_r` with size 1, i.e. BEFORE the plan's size in R); the bot's result not complete (or
+    none): the money read from the account's own fills (``money``, :func:`venue_close`) / that risk. Only when the
+    card's hero is that money figure too (:func:`result_r` takes the same): a hand-traded / simulated account, a
+    position without its stored initial risk or one the plan's size in R does not fit: None (the price-based box)."""
+    if _simulated(pos):
+        return None
+    if position_result_r(pos, trade.plan.risk_r) is not None:
+        return position_result_r(pos, 1.0)
+    return _fills_r(trade, pos, money)
+
+
+def result_r(trade: TradeRecord, pos: BrokerPosition, fill: float, stop: float, exit_price: float | None,
+             money: float | None = None) -> float | None:
+    """The result in R: the closing notice's own figure (:func:`position_result_r`); without it, the money read from
+    the account's own fills (``money``: a close made by hand on the exchange) / the real initial risk, times the
+    plan's size in R; a simulated (hand-traded) account or one without either: the price move in units of the
+    original stop distance, times the plan's size in R."""
     if not _simulated(pos):
         value = position_result_r(pos, trade.plan.risk_r)
         if value is not None:
             return value
+        per_position = _fills_r(trade, pos, money)
+        if per_position is not None:
+            value = per_position * float(trade.plan.risk_r)
+            if math.isfinite(value):
+                return value
     risk = abs(fill - stop)
     if exit_price is None or not risk > 0:
         return None
@@ -541,7 +705,7 @@ def card_data(
     played_to: float | None = None
     if kind == "result":
         exit_price = rec.exit_price         # (only a recorded one: never worked back from the result)
-        r_out = result_r(trade, pos, fill, stop, exit_price)
+        r_out = result_r(trade, pos, fill, stop, exit_price, rec.money)
         if exit_price is None or r_out is None:
             raise CardProblem("kapanış fiyatı kayıtlarda yok")
         if rec.closed is None:
@@ -553,7 +717,7 @@ def card_data(
         # text). With the plan's size in R != 1 the hero is this R times that size (a 0.5R signal that made its 2R
         # target: the box reaches the target, the hero reads +1.00R): the box shows the price move the money made,
         # the hero the result counted in the plan's R. No money R: the recorded close price (price-based).
-        per_position = money_r(trade, pos)
+        per_position = money_r(trade, pos, rec.money)
         played_to = exit_price
         if per_position is not None:
             edge = fill + sign * per_position * risk
@@ -718,8 +882,9 @@ def search_end(closed: datetime, tf_min: int, now: datetime) -> datetime:
     return min(as_utc(now), as_utc(closed) + timedelta(minutes=tf_min * (TOUCH_SEARCH_BARS + 1)))
 
 
-__all__ = ["BARS_BEFORE", "CLOSED_ON_VENUE", "DEFAULT_TIMEFRAME_MIN", "EVENT_KINDS", "VENUE_COVER", "CardProblem",
+__all__ = ["BARS_BEFORE", "CLOSED_ON_VENUE", "DEFAULT_TIMEFRAME_MIN", "EVENT_KINDS", "VENUE_COVER", "VENUE_SHARED",
+           "CardProblem",
            "Deal", "Records", "caption",
            "card_data", "card_target", "entry_price", "fmt_num", "fmt_r", "list_label", "listed", "money_r",
            "original_stop", "price_digits", "read_records", "result_r", "search_end", "shown_symbol", "timeframe_of",
-           "venue_close", "venue_opened", "venue_price", "week_start", "window"]
+           "venue_close", "venue_neighbours", "venue_opened", "venue_partial", "venue_price", "venue_wanted", "week_start", "window"]
