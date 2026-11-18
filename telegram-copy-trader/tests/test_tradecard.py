@@ -530,9 +530,8 @@ async def test_the_owners_own_number_does_not_refuse_his_card(chat: Any, monkeyp
     await chat.n._on_message_event(MsgEvent("/fx2kart", sender_id=OWNER))
     await chat.n.drain(5)
     await chat.n._on_message_event(MsgEvent("1", sender_id=OWNER))       # handled in a task of the notifier
-    await asyncio.sleep(0.05)
+    await chat.n.drain(5)                   # (the card's job exists once the number has been answered)
     await world.settle()
-    await chat.n.drain(5)
     assert True in looks                    # the owner's own handler was still running when the card began
     assert looked_while_reading == [False] and world.renderer.data and svc_mod.BUSY_TRADING not in world.notes.lines
 
@@ -1112,6 +1111,28 @@ def test_the_card_accounts_are_the_owners_real_and_hand_traded_ones() -> None:
                                 "breakout": ("ccxt", "binanceusdm")}
 
 
+async def test_the_apps_card_service_refuses_the_read_while_an_order_flow_runs(tmp_path: Path) -> None:
+    """The production wiring: build_tradecard's ``busy`` is trading_path_busy over the engine's running order flows
+    (its ``_critical`` tasks) and monitor syncs."""
+    config = AppConfig(telegram=TelegramConfig(api_id=1, api_hash="h", source_chats=[-1]),
+                       notifier=NotifierConfig(bot_token="1:a", owner_user_id=OWNER),
+                       brokers=[dict(type="mt5", name="fx", login=1, password="x", server="s")])
+    flow: asyncio.Future[None] = asyncio.get_running_loop().create_future()
+    engine = SimpleNamespace(brokers=[], _critical={flow}, monitor=SimpleNamespace(_running={}))
+    service = app_mod.build_tradecard(config, None, SimpleNamespace(), engine, SimpleNamespace(), str(tmp_path))
+    service._idle_wait = 0.0
+    assert service._path_busy()
+    with pytest.raises(svc_mod._TradingBusy):
+        await service._wait_idle()
+    flow.set_result(None)
+    sync: asyncio.Future[None] = asyncio.get_running_loop().create_future()
+    engine.monitor._running[1] = sync                                        # a monitor sync (virtual fires too)
+    assert service._path_busy()
+    sync.set_result(None)
+    assert not service._path_busy()
+    await service._wait_idle()                                               # idle: at once
+
+
 def test_the_bot_never_imports_the_drawing_module() -> None:
     import subprocess
 
@@ -1147,6 +1168,25 @@ async def test_real_cards_through_the_drawing_process(tmp_path: Path) -> None:
             Path(keep).mkdir(parents=True, exist_ok=True)
             shutil.copy(result.path, Path(keep) / f"{name}.png")
         render_mod.remove_picture(result.path)
+
+
+@needs_pillow
+def test_the_drawing_ends_the_played_out_part_at_the_moneys_r(tmp_path: Path) -> None:
+    from PIL import Image, ImageChops
+
+    from copytrader.karne import tradecard_design as design
+
+    data = S.data_of(S.btc_long_money_r())
+
+    def pixels(card: dict[str, Any], name: str) -> Image.Image:
+        design.render(card, str(tmp_path / name))
+        return Image.open(tmp_path / name).convert("RGB")
+
+    base = pixels(data, "a.png")
+    other_exit = pixels({**data, "exit": 91500.0}, "b.png")                 # the recorded close is only the chip's
+    assert ImageChops.difference(base, other_exit).getbbox() is None
+    other_edge = pixels({**data, "played_to": 92000.0}, "c.png")         # the dashed line and the played-out part
+    assert ImageChops.difference(base, other_edge).getbbox() is not None
 
 
 @needs_pillow

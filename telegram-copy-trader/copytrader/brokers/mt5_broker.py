@@ -3442,10 +3442,12 @@ class Mt5Broker(MetaTraderLegBroker):
         and would be an hour off, which is why the deals come first); else from the deal, rounded to whole hours.
         None of them: offset None and no bars (nothing is guessed).
 
-        Never in the way of an order: every call goes through the adapter's own worker thread with its time limit
-        (:meth:`_call`) - the one order_send uses - and before each of its calls this read looks whether the worker
-        thread has anything else to do (a sync, an order): if so it stops there and answers "busy" (no further call
-        of it is queued in front of trading). Raises BrokerError when the terminal does not answer."""
+        Kept out of an order's way as far as it can be: every call goes through the adapter's own worker thread with
+        its time limit (:meth:`_call`) - the one order_send uses - and before each of its calls this read looks
+        whether the worker thread has anything else to do (a sync, an order; through mt5_bridge the helper serves
+        each request in a task of its own, so they are seen here too): if so it stops there and answers "busy" (no
+        further call of it is queued in front of trading). A call it has started cannot be cut short: an order that
+        comes meanwhile waits for that one call. Raises BrokerError when the terminal does not answer."""
         self._require()
         name = TIMEFRAMES.get(int(timeframe_min))
         if name is None:
