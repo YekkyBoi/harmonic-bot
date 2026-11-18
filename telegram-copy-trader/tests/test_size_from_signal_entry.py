@@ -77,7 +77,8 @@ async def test_a_fill_far_worse_is_capped_at_1r_plus_the_overshoot(tmp_path: Pat
         await _market_long(p, ask=1.09728)                                 # 12.8 pips: 0.47 would lose 60.16
         lots = _tickmill_lots(p)
         assert lots == 0.46 and lots * 128.0 <= 60.0                       # the largest step within 50 + 10
-        assert any("lot sinyal girişine göre (0.46); stopta kayıp ~58.88" in t for t in p.texts())
+        assert any("lot sinyal girişine göre 0.47 olurdu, 1R + 10 sınırıyla 0.46; stopta kayıp ~58.88" in t
+                   for t in p.texts())
     finally:
         await p.close()
 
@@ -154,10 +155,47 @@ async def test_a_refused_signal_entry_size_keeps_the_live_one() -> None:
     live = SizingResult(quantity=0.45, risk_amount=50.0, est_loss_at_sl=0.45 * 113, est_fees_at_sl=0.0,
                         notional=0.0, leverage=None, margin_required=None, warnings=[])
     sym = SimpleNamespace(qty_step=0.01)
-    engine = Engine.__new__(Engine)
-    size, note = await Engine._signal_entry_size(engine, Broker(), sym, Side.LONG, live, ENTRY, 1.09713, STOP,
-                                                 50.0)  # type: ignore[arg-type]
+    logged: list[tuple[str, dict[str, Any]]] = []
+
+    async def log(kind: str, payload: dict[str, Any]) -> None:
+        logged.append((kind, payload))
+
+    size, note = await Engine._signal_entry_size(SimpleNamespace(_log=log), Broker(), sym, Side.LONG, live, ENTRY,
+                                                 1.09713, STOP, 50.0)  # type: ignore[arg-type]
     assert size is live and note is None
+    assert logged and logged[-1][0] == "signal_entry_size" and logged[-1][1]["used"] is False
+
+
+@pytest.mark.parametrize("rounding", ["up", "down", "nearest"])
+async def test_a_per_lot_loss_that_moves_a_little_between_calls_still_gives_the_signal_lot(rounding: str) -> None:
+    """The adapter reads its conversion rate again on every call: a per-lot loss a little different on the last call
+    must still land on the signal's lot, whatever the broker's own rounding."""
+    from types import SimpleNamespace
+
+    from copytrader.engine.orchestrator import Engine
+    from copytrader.risk.sizing import compute_lot_size
+
+    drift = [1.0, 1.0, 1.003]                       # (live, signal, the last call: +0.3 %)
+
+    class Broker:
+        name = "tickmill"
+        config = SimpleNamespace(lot_rounding=rounding, lot_rounding_max_over=10.0)
+
+        async def size_position(self, sym: Any, side: Any, entry: float, stop: float, amount: float) -> SizingResult:
+            per_lot = abs(entry - stop) * 100000 * drift.pop(0)
+            q = compute_lot_size(risk_amount=amount, loss_per_lot=per_lot, lot_step=0.01, min_lot=0.01,
+                                 rounding=rounding, max_over=10.0)
+            return SizingResult(quantity=q, risk_amount=amount, est_loss_at_sl=q * per_lot, est_fees_at_sl=0.0,
+                                notional=0.0, leverage=None, margin_required=None, warnings=[])
+
+    async def log(kind: str, payload: dict[str, Any]) -> None:
+        return None
+
+    broker = Broker()
+    live = await broker.size_position(None, Side.LONG, 1.09713, STOP, 50.0)
+    size, note = await Engine._signal_entry_size(SimpleNamespace(_log=log), broker, SimpleNamespace(qty_step=0.01),
+                                                 Side.LONG, live, ENTRY, 1.09713, STOP, 50.0)  # type: ignore[arg-type]
+    assert size.quantity == 0.47 and note is not None and "(0.47)" in note
 
 
 async def test_a_waiting_entry_fired_by_fxs_fill_is_sized_from_the_signal_entry(tmp_path: Path,

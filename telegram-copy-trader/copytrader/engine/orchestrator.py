@@ -5025,7 +5025,7 @@ class Engine:
             if (entry_type is EntryType.MARKET and not size_capped and signal_entry
                     and getattr(broker.config, "size_from_signal_entry", False)):
                 size, signal_sized = await self._signal_entry_size(
-                    broker, sym, plan.side, size, signal_entry, sizing_entry, sizing_stop, amount)
+                    broker, sym, plan.side, size, signal_entry, sizing_entry, sizing_stop, amount, trade_id=trade.id)
             req = OpenRequest(
                 plan=plan,
                 symbol=sym,
@@ -5134,47 +5134,67 @@ class Engine:
 
     async def _signal_entry_size(
         self, broker: Broker, sym: Any, side: Side, live: SizingResult, signal_entry: float, live_entry: float,
-        stop: float, amount: float,
+        stop: float, amount: float, *, trade_id: int | None = None,
     ) -> tuple[SizingResult, str | None]:
         """``size_from_signal_entry`` (the friend's tickmill): a market order is sized like the trader sizes it - on
         the signal's own entry-to-stop distance (``signal_entry``, in this broker's scale and offset), rounded down
         like his lot - but never below ``live`` (today's size from the live entry: never under 1R at the stop), and
         never losing more at the stop, from the live entry the order really gets, than 1R + lot_rounding_max_over:
         beyond that the largest lot step within it (still never below ``live``). Returns (the size, the short Turkish
-        note for the open line) - (``live``, None) when the signal's distance gives no more."""
+        note for the open line) - (``live``, None) when the signal's distance gives no more. Every decision is logged
+        ("signal_entry_size")."""
         name = broker.name
         q_live = live.quantity
         step = float(getattr(sym, "qty_step", 0) or 0)
-        if not (q_live > 0 and step > 0 and math.isfinite(live.est_loss_at_sl) and live.est_loss_at_sl > 0):
+        record: dict[str, Any] = {"trade_id": trade_id, "broker": name, "signal_entry": signal_entry,
+                                  "live_entry": live_entry, "stop": stop, "live_quantity": q_live}
+
+        async def keep(why: str) -> tuple[SizingResult, str | None]:
+            await self._log("signal_entry_size", {**record, "used": False, "why": why})
             return live, None
+
+        if not (q_live > 0 and step > 0 and math.isfinite(live.est_loss_at_sl) and live.est_loss_at_sl > 0):
+            return await keep("no live size")
         per_unit_live = live.est_loss_at_sl / q_live          # (the money lost per unit from the live entry)
         try:
             at_signal = await broker.size_position(sym, side, signal_entry, stop, amount)
         except Exception as exc:                              # (a sizing refusal of the signal's distance: today's)
             logger.info("%s: no size from the signal's entry (%s); the live entry's stands", name, exc)
-            return live, None
+            return await keep(f"signal sizing refused: {exc}")
         if not (at_signal.quantity > 0 and math.isfinite(at_signal.est_loss_at_sl) and at_signal.est_loss_at_sl > 0):
-            return live, None
+            return await keep("no signal size")
         per_unit_signal = at_signal.est_loss_at_sl / at_signal.quantity
-        wanted = sizing.floor_to_step(amount / per_unit_signal, step)          # the trader's own lot for 1R
+        signal_lot = sizing.floor_to_step(amount / per_unit_signal, step)      # the trader's own lot for 1R
         over = getattr(broker.config, "lot_rounding_max_over", None)
         over = float(over) if isinstance(over, (int, float)) and math.isfinite(over) and over >= 0 \
             else sizing.DEFAULT_LOT_ROUNDING_MAX_OVER
         cap = amount + over
+        wanted, capped = signal_lot, False
         if wanted * per_unit_live > cap * (1 + 1e-9):
-            wanted = sizing.floor_to_step(cap / per_unit_live, step)            # the largest step within 1R + over
+            wanted, capped = sizing.floor_to_step(cap / per_unit_live, step), True   # the largest step within it
+        record.update(signal_quantity=signal_lot, wanted=wanted, capped=capped)
         if wanted <= q_live * (1 + 1e-9):
-            return live, None
+            return await keep("not more than the live size")
+        # Sized again by the adapter for that quantity (its own margin and limit checks apply to it). The target is
+        # set half a step inside the broker's own rounding, so that a per-lot loss that moved a little since the
+        # first call (a conversion rate read again) still lands on ``wanted``.
+        rounding = str(getattr(broker.config, "lot_rounding", "down") or "down")
+        raw = wanted - step / 2 if rounding == "up" else wanted if rounding == "nearest" else wanted + step / 2
         try:
-            # (sized again by the adapter for exactly that quantity: its own margin and limit checks apply to it)
-            sized = await broker.size_position(sym, side, live_entry, stop, wanted * per_unit_live)
+            sized = await broker.size_position(sym, side, live_entry, stop, raw * per_unit_live)
         except Exception as exc:
-            logger.info("%s: the signal-entry size %s was refused (%s); the live entry's stands", name, wanted, exc)
-            return live, None
+            logger.warning("%s: the signal-entry size %s was refused (%s); the live entry's stands", name, wanted, exc)
+            return await keep(f"refused: {exc}")
         if abs(sized.quantity - wanted) > step * 1e-6:
-            return live, None
+            logger.warning("%s: the signal-entry size came back as %s instead of %s; the live entry's stands", name,
+                           sized.quantity, wanted)
+            return await keep(f"came back as {sized.quantity}")
         loss = sized.est_loss_at_sl
+        await self._log("signal_entry_size", {**record, "used": True, "quantity": wanted, "loss_at_stop": loss})
         result = sized.model_copy(update={"risk_amount": amount, "warnings": list(live.warnings)})
+        if capped:
+            return result, (f"lot sinyal girişine göre {_qty(signal_lot)} olurdu, 1R + {fmt.fmt_number(over)} "
+                            f"sınırıyla {_qty(wanted)}; stopta kayıp ~{_money(loss)}")
         return result, f"lot sinyal girişine göre ({_qty(wanted)}); stopta kayıp ~{_money(loss)}"
 
     async def _save_leg_position(self, trade_id: int, pos: BrokerPosition, flow: _OpenFlow | None) -> None:
