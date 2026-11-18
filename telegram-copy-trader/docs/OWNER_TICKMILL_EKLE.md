@@ -124,16 +124,20 @@ Notlar:
 - `optional: true` satırı **çok önemli**. Silme.
 - `risk_usd: 5` arkadaşın için 1R'de en fazla 5 dolar demektir. Küçük başla.
 - `symbol_map` ve `allowed_assets` örnektir. Arkadaşından gelen sembol adlarına göre düzelt.
-- İsteğe bağlı: `confirm_open: false` satırı eklenirse, bot bir sinyalden emin olamayıp "AÇAYIM MI?" diye
-  sorduğunda Tickmill'de işlem beklemeden, okunduğu gibi açılır (LIMIT girişte sanal tetik / bekleyen emir
-  her zamanki gibi). Soru sizin hesaplarınız için aynen gelir; Evet derseniz onlar aynı işleme eklenir,
-  Tickmill ikinci kez açılmaz. Hayır derseniz Tickmill'deki işlem açık kalır ve normal yönetilir.
-  Bu satırı ancak bu özelliği içeren sürüme güncelledikten SONRA ekleyin (eski sürüm bilinmeyen ayarı reddeder).
-- İsteğe bağlı: `reference_broker: fx` satırı eklenirse FX konusundaki LIMIT sinyallerde Tickmill'e limit emir
-  hiç konmaz. Sizin fx hesabınızdaki giriş emri dolunca Tickmill'de piyasa emriyle açılır; fx'te emir yoksa
-  (onayınızı bekliyor, atlandı, reddedildi) fx hesabının kendi fiyatı giriş seviyesine gelince açılır. fx'in
-  fiyatı okunamazsa (bağlı değil) bekler ve size uyarı gelir; limit emre dönmez. Kripto ve piyasa emirli
-  sinyaller aynen kalır. Bu satır da güncellemeden SONRA eklenir.
+- `confirm_open: false`, `fees_in_risk: false`, `lot_rounding: up` ve `reference_broker: fx` satırlarını
+  güncelleme (`guncelle.py`, 6. adım) `tickmill` bloğuna kendisi ekler; elle yazmanız gerekmez. Yalnızca blokta
+  henüz yoksa yazılır (`lot_rounding: nearest` ise `up` olur); elle yazdığınız başka bir değer kalır.
+  - `confirm_open: false`: bot bir sinyalden emin olamayıp "AÇAYIM MI?" diye sorduğunda Tickmill'de işlem
+    beklemeden, okunduğu gibi açılır (LIMIT girişte sanal tetik her zamanki gibi). Soru sizin hesaplarınız için
+    aynen gelir; Evet derseniz onlar aynı işleme eklenir, Tickmill ikinci kez açılmaz. Hayır derseniz Tickmill'deki
+    işlem açık kalır ve normal yönetilir.
+  - `reference_broker: fx`: FX konusundaki LIMIT sinyallerde Tickmill'e limit emir hiç konmaz. Sizin fx
+    hesabınızdaki giriş emri dolunca Tickmill'de piyasa emriyle açılır; fx'te emir yoksa (onayınızı bekliyor,
+    atlandı, reddedildi) fx hesabının kendi fiyatı giriş seviyesine gelince açılır. fx'in fiyatı okunamazsa (bağlı
+    değil) bekler ve size uyarı gelir; limit emre dönmez. Kripto ve piyasa emirli sinyaller aynen kalır. Yalnızca
+    `fx` etkin bir MetaTrader hesabıysa (type mt5 / mt5_bridge) yazılır.
+  - `fees_in_risk: false` ve `lot_rounding: up`: lot stoptaki fiyat kaybına göre hesaplanır (komisyon 1R'nin
+    üstüne ödenir) ve yukarı yuvarlanır; stopta kayıp 1R'nin altına düşmez, en çok 10 üstüne çıkar.
 
 ### 3b. Konu yollarına `tickmill` ekle
 

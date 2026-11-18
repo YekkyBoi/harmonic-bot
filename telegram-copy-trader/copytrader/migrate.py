@@ -42,7 +42,8 @@ FX_BROKER = "fx"
 TICKMILL_BROKER = "tickmill"      # the friend's account
 TICKMILL_COMPANY = "Tickmill"
 # The friend's two requests the owner approved: 1R 45 -> 50 USD (only from exactly 45, and only together with the
-# first lot_rounding of the block: a later manual 45 stays), and sizes rounded to the NEAREST lot step.
+# first lot_rounding of the block: a later manual 45 stays), and sizes rounded to the NEAREST lot step - rounded UP
+# since the second round of requests (step 9 of plan_changes).
 TICKMILL_OLD_RISK_USD, TICKMILL_NEW_RISK_USD = 45, 50
 # Manual override of the Tickmill terminal search (also set by ``guncelle.py --tickmill-terminal``): the path of its
 # terminal64.exe (or of its folder), or one of TERMINAL_OFF to stay on MetaApi.
@@ -82,6 +83,15 @@ def _is_placeholder(value: Any) -> bool:
 
 def _knows(model: Any, key: str) -> bool:
     return key in (getattr(model, "model_fields", None) or {})
+
+
+def _knows_value(model: Any, key: str, value: Any) -> bool:
+    """Does the installed config model take ``value`` for ``key`` (a Literal field: one of its values)?"""
+    field = (getattr(model, "model_fields", None) or {}).get(key)
+    if field is None:
+        return False
+    args = getattr(field.annotation, "__args__", None)
+    return value in args if args else True
 
 
 def _broker(config: AppConfig, name: str) -> Any:
@@ -322,7 +332,9 @@ def plan_changes(raw: dict[str, Any], config: AppConfig, *,
             else:
                 notes.append(f"bu sürüm mt5_bridge ayarlarını tanımıyor; {TICKMILL_BROKER} MetaApi'de bırakıldı")
         # 8. The friend's requests: 1R 45 -> 50 USD and lots rounded to the nearest step. Both only together with the
-        #    block's first lot_rounding: once it is there, whatever the owner writes later stays.
+        #    block's first lot_rounding: once it is there, whatever the owner writes later stays. (A version that
+        #    knows lot_rounding "up" writes that instead, step 9: the lot_rounding of a block that has none is
+        #    written once, by step 9.)
         if "lot_rounding" not in block:
             risk_now = block.get("risk_usd", _MISSING)
             if _same_number(risk_now, TICKMILL_OLD_RISK_USD) and _knows(model, "risk_usd"):
@@ -331,11 +343,51 @@ def plan_changes(raw: dict[str, Any], config: AppConfig, *,
                     f"{TICKMILL_BROKER}: 1R riski {TICKMILL_OLD_RISK_USD} → {TICKMILL_NEW_RISK_USD} USD "
                     f"(risk_usd: {TICKMILL_NEW_RISK_USD})",
                     lambda c: getattr(_broker(c, TICKMILL_BROKER), "risk_usd", None) == TICKMILL_NEW_RISK_USD))
-            setting(("brokers", i), block, model, "lot_rounding", "nearest",
-                    f"{TICKMILL_BROKER}: lot en yakın adıma yuvarlanacak (0.125 → 0.13; stopta kayıp hedefi %15'ten "
-                    "fazla aşacaksa aşağı yuvarlanır) (lot_rounding: nearest)",
-                    lambda c: getattr(_broker(c, TICKMILL_BROKER), "lot_rounding", None) == "nearest",
-                    TICKMILL_BROKER, wanted=lambda v: True)
+            if not _knows_value(model, "lot_rounding", "up"):
+                setting(("brokers", i), block, model, "lot_rounding", "nearest",
+                        f"{TICKMILL_BROKER}: lot en yakın adıma yuvarlanacak (0.125 → 0.13; stopta kayıp hedefi "
+                        "%15'ten fazla aşacaksa aşağı yuvarlanır) (lot_rounding: nearest)",
+                        lambda c: getattr(_broker(c, TICKMILL_BROKER), "lot_rounding", None) == "nearest",
+                        TICKMILL_BROKER, wanted=lambda v: True)
+        # 9. The friend's second round of requests (the owner approved them):
+        #    - confirm_open: false - a signal the bot would ask about is opened on tickmill at once, as read;
+        #    - fees_in_risk: false - 1R is the price loss at the stop, the commission is paid on top;
+        #    - lot_rounding: up - never below 1R at the stop (at most lot_rounding_max_over, default 10, above);
+        #      written where there is none, and over step 8's "nearest" (any other value is the owner's: it stays);
+        #    - reference_broker: fx - FX limit entries wait for the fx account's fill / price, never a tickmill limit
+        #      (only when the fx account is a MetaTrader account that is enabled).
+        #    Each only when the key is not there yet (any value written by hand stays).
+        setting(("brokers", i), block, model, "confirm_open", False,
+                f"{TICKMILL_BROKER}: bot emin olamayıp 'açayım mı?' diye sorduğunda tickmill'de işlem beklemeden, "
+                "okunduğu gibi açılacak; soru diğer hesaplar için aynen gelir (confirm_open: false)",
+                lambda c: getattr(_broker(c, TICKMILL_BROKER), "confirm_open", None) is False,
+                TICKMILL_BROKER, wanted=lambda v: True)
+        setting(("brokers", i), block, model, "fees_in_risk", False,
+                f"{TICKMILL_BROKER}: lot yalnızca stoptaki fiyat kaybına göre hesaplanacak, komisyon 1R'nin üstüne "
+                "ödenir (fees_in_risk: false)",
+                lambda c: getattr(_broker(c, TICKMILL_BROKER), "fees_in_risk", None) is False,
+                TICKMILL_BROKER, wanted=lambda v: True)
+        if _knows_value(model, "lot_rounding", "up"):
+            setting(("brokers", i), block, model, "lot_rounding", "up",
+                    f"{TICKMILL_BROKER}: lot yukarı yuvarlanacak, stopta kayıp 1R'nin altına düşmez (1R'yi en çok "
+                    "lot_rounding_max_over kadar, varsayılan 10, aşar; daha fazla aşacaksa aşağı yuvarlanır ve "
+                    "bildirilir) (lot_rounding: up)"
+                    + (" — önceki ayar: nearest" if block.get("lot_rounding") == "nearest" else ""),
+                    lambda c: getattr(_broker(c, TICKMILL_BROKER), "lot_rounding", None) == "up",
+                    TICKMILL_BROKER, wanted=lambda v: v != "nearest")
+        if "reference_broker" not in block:
+            fx = _broker(config, FX_BROKER)
+            if fx is not None and fx.enabled and getattr(fx, "type", None) in ("mt5", "mt5_bridge"):
+                setting(("brokers", i), block, model, "reference_broker", FX_BROKER,
+                        f"{TICKMILL_BROKER}: FX konusundaki limit girişlerde tickmill'e limit emir konmayacak; "
+                        f"{FX_BROKER} hesabındaki giriş dolunca, orada emir yoksa {FX_BROKER} fiyatı seviyeye gelince "
+                        f"piyasa emriyle açılacak (reference_broker: {FX_BROKER})",
+                        lambda c: getattr(_broker(c, TICKMILL_BROKER), "reference_broker", None) == FX_BROKER,
+                        TICKMILL_BROKER, wanted=lambda v: True)
+            else:
+                notes.append(f"{TICKMILL_BROKER}: '{FX_BROKER}' adlı etkin bir MetaTrader hesabı (type mt5 / "
+                             "mt5_bridge) yok; reference_broker yazılmadı (FX limit girişlerinde tickmill her "
+                             "zamanki limit emri kullanır)")
     return changes, notes
 
 
