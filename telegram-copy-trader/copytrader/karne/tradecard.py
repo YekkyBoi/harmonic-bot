@@ -17,7 +17,8 @@ Rules (the owner's, one place):
   the entry = the position's fill price (pending: its limit price); the stop = the signal's ORIGINAL stop (the
   plan's ``stop_loss``, which a stop move never changes: moves appear only in the timeline); the target = the LAST of
   the plan's take profits (none: no target zone).
-* **Result**: the close price = the volume-weighted price of the position's exits (MetaTrader: its closing deals);
+* **Result**: the close price = the volume-weighted price of the position's exits (MetaTrader: its closing deals;
+  none on record: no card);
   the result in R = :func:`copytrader.engine.monitor.position_result_r` (the closing notice's own figure); without it
   (a simulated / hand-traded account, an older position) the price move, ``side x (close - entry) / (entry - stop)``,
   times the plan's size in R.
@@ -439,10 +440,8 @@ def card_data(
     ix: int | None = None
     exit_price: float | None = None
     if kind == "result":
-        exit_price = rec.exit_price
+        exit_price = rec.exit_price         # (only a recorded one: never worked back from the result)
         r_out = result_r(trade, pos, fill, stop, exit_price)
-        if exit_price is None and r_out is not None:
-            exit_price = fill + sign * (r_out / float(trade.plan.risk_r or 1.0)) * risk
         if exit_price is None or r_out is None:
             raise CardProblem("kapanış fiyatı kayıtlarda yok")
         if rec.closed is None:
@@ -554,7 +553,10 @@ def card_data(
         "stop": stop,
         "target": target,
         "exit": exit_price,
-        "box_far": exit_price if kind == "result" else target,
+        # the box's profit side: the result card's reaches the close price - when the close made a profit; a loss
+        # (or break-even) has no profit side, only the stop zone and the darker played-out part entry -> close
+        "box_far": (exit_price if exit_price is not None and sign * (exit_price - fill) > 0 else None)
+        if kind == "result" else target,
         "last_price": drawn[-1][4],
         "digits": digits,
         "time_labels": [[k, text] for k, text in _time_labels(times, tf_min)],

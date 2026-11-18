@@ -303,7 +303,7 @@ def render(T: dict[str, Any], out: str) -> None:
     px0, py0, px1, py1 = L, 310, R, 886
     cv.glass((px0, py0, px1, py1), radius=28, a=0.045)
     gx0, gx1, gy0, gy1 = px0 + 26, px1 - 122, py0 + 34, py1 - 54
-    levels = [fill, stop, *(v for v in (target, box_far) if v is not None)]
+    levels = [fill, stop, *(float(v) for v in (target, box_far, T.get("exit")) if v is not None)]
     lo_raw = min(min(b[3] for b in bars), *levels)
     hi_raw = max(max(b[2] for b in bars), *levels)
     span = max(hi_raw - lo_raw, abs(hi_raw) * 1e-6, 1e-12)

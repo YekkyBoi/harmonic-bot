@@ -444,6 +444,31 @@ def test_the_result_box_ends_at_the_close_and_reaches_the_close_price() -> None:
     assert data["bars"][data["k_exit"]][0] == datetime(2026, 11, 17, 9, 15, tzinfo=UTC).timestamp()
 
 
+def test_a_losing_result_has_no_profit_side_and_keeps_the_original_stop_line() -> None:
+    data = S.data_of(S.nas_short_stopped())
+    assert data["hero"] == "−1.02R" and data["chips"][3][1] == "Stop"
+    assert data["box_far"] is None and data["exit"] == 27446.0 and data["stop"] == 27444.06
+    assert data["timeline"][-1][1] == "Stop · −1.02R"
+    loss = S.data_of(S.btc_long_closed_at_a_loss())
+    assert loss["hero"] == "−0.50R" and loss["box_far"] is None and loss["box_end"] == loss["k_exit"]
+    assert loss["timeline"][-1][1] == "Elle kapatıldı · −0.50R" and loss["chips"][3][2] == "çıkış 90.700,0"
+
+
+def test_no_recorded_close_price_is_no_card() -> None:
+    sample = S.btc_long_result()
+    sample["rec"].exit_price = None
+    with pytest.raises(tc.CardProblem, match="kapanış fiyatı"):
+        S.data_of(sample)
+
+
+def test_a_pending_entry_card() -> None:
+    data = S.data_of(S.sol_short_pending())
+    assert data["kind"] == "entry" and data["pending"] and not data["arrow_entry"]
+    assert data["fill"] == 150.0 and data["box_far"] == 140.0 and data["k_entry"] == tc.BARS_BEFORE
+    assert data["chips"][3][1] == "Bekliyor"
+    assert [s[1] for s in data["timeline"]] == ["Limit emir kondu", "Giriş bekleniyor"]
+
+
 def test_after_an_early_close_the_candles_run_on_until_a_level_is_touched() -> None:
     sample = S.nas_short_result()
     bars = sample["bars"]
@@ -836,7 +861,8 @@ async def test_real_cards_through_the_drawing_process(tmp_path: Path) -> None:
 
     keep = os.environ.get("TRADECARD_OUT")
     for name, sample in (("short_result", S.nas_short_result()), ("long_result", S.btc_long_result()),
-                         ("entry", S.eth_long_entry())):
+                         ("entry", S.eth_long_entry()), ("short_stopped", S.nas_short_stopped()),
+                         ("long_loss_close", S.btc_long_closed_at_a_loss()), ("pending_entry", S.sol_short_pending())):
         started = time.monotonic()
         result = await render_card(S.data_of(sample), tmp_path / "kart")
         took = time.monotonic() - started

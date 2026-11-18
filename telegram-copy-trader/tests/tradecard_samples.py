@@ -122,3 +122,50 @@ def data_of(sample: dict[str, Any], tf: int = 15) -> dict[str, Any]:
 
 def finite(value: float) -> bool:
     return isinstance(value, float) and math.isfinite(value)
+
+
+def nas_short_stopped() -> dict[str, Any]:
+    """The NAS100 short of the sample, stopped out instead: the price rises to the original stop (27,444.06) and the
+    stop fills at 27,446.00 (-1.02R)."""
+    sample = nas_short_result()
+    start = datetime.fromtimestamp(sample["bars"][0][0], tz=UTC)
+    sample["bars"] = walk(start, 140, 27420.0, seed=7, path={40: 27350.0, 59: 27300.0, 62: 27360.0, 66: 27470.0,
+                                                             72: 27380.0, 90: 27250.0, 110: 27150.0}, vol=0.0009)
+    pos = sample["pos"].model_copy(deep=True)
+    pos.realized_pnl, pos.stop_loss = -102.0, 27444.06
+    pos.data["legs"][0]["reason"] = "sl"
+    sample["pos"] = pos
+    sample["trade"] = sample["trade"].model_copy(update={"current_stop_loss": 27444.06})
+    sample["rec"] = tc.Records(placed=sample["rec"].placed, filled=sample["rec"].filled,
+                               closed=datetime(2026, 11, 17, 9, 2, tzinfo=UTC), exit_price=27446.0, reason="stop")
+    return sample
+
+
+def btc_long_closed_at_a_loss() -> dict[str, Any]:
+    """The BTC long of the sample, closed early by the owner (/pozkapat) at 90,700 (-0.5R)."""
+    sample = btc_long_result()
+    start = datetime.fromtimestamp(sample["bars"][0][0], tz=UTC)
+    sample["bars"] = walk(start, 130, 90600.0, seed=3, path={58: 91000.0, 64: 90820.0, 68: 90700.0, 80: 90500.0,
+                                                              95: 91400.0, 110: 92300.0}, vol=0.0011)
+    pos = sample["pos"].model_copy(deep=True)
+    pos.realized_pnl = -30.0
+    sample["pos"] = pos
+    sample["rec"] = tc.Records(placed=sample["rec"].placed, filled=sample["rec"].filled,
+                               closed=start + timedelta(minutes=15 * 68 + 4), exit_price=90700.0, reason="close",
+                               close_by="owner")
+    return sample
+
+
+def sol_short_pending() -> dict[str, Any]:
+    """A SOL short limit at 150 on binance, waiting for the price (placed 8 candles ago)."""
+    start = MON + timedelta(hours=5)
+    bars = walk(start, 66, 146.0, seed=13, path={58: 147.2, 65: 148.4}, vol=0.002)
+    p = plan("SOL", Side.SHORT, 150.0, 155.0, [140.0], entry_type=EntryType.LIMIT, tf=15)
+    created = start + timedelta(minutes=15 * 58 + 2)
+    t = trade(15, p, TradeStatus.PENDING, created)
+    pos = BrokerPosition(broker="binance", broker_symbol="SOL/USDT:USDT", side=Side.SHORT,
+                         status=PositionStatus.PENDING, quantity=10.0, stop_loss=155.0,
+                         take_profits=[TakeProfit(price=140.0)],
+                         data={"entry_created_ms": int(created.timestamp() * 1000)})
+    rec = tc.Records(placed=created + timedelta(seconds=2))
+    return {"trade": t, "pos": pos, "rec": rec, "bars": bars, "account": "binance"}
