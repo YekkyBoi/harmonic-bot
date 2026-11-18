@@ -534,6 +534,49 @@ async def test_ticks_unreadable_past_the_first_minute_its_bar_never_opens_by_its
     assert p.tickmill_orders() == [] and is_virtual_pending((await p.positions(1))["tickmill"])
 
 
+async def test_a_touch_on_a_look_that_may_not_open_is_kept_and_decided_at_the_next_full_read(unsure) -> None:
+    """Ticks unreadable in the watch's first minute: the look at the level may not open (its history is unread) but
+    keeps the touch; the next full read (the first minute's bar for the stop, no pass) opens it - 2 pips above."""
+    p, _friend = unsure
+    await _armed_watch(p)                                          # watch starts at T0 (20 s into minute ma)
+    ma = T0 // 60 * 60
+
+    def copy_ticks_from(symbol: str, date_from: int, count: int, flags: int) -> Any:
+        return None
+
+    def copy_rates_range(symbol: str, timeframe: int, date_from: int, date_to: int) -> list[dict[str, Any]]:
+        bars = [{"time": ma, "open": 1.16195, "high": 1.16200, "low": 1.16088, "close": 1.16110, "spread": 10},
+                {"time": ma + 60, "open": 1.16110, "high": 1.16125, "low": 1.16105, "close": 1.16110, "spread": 10}]
+        return [b for b in bars if date_from <= b["time"] <= date_to]
+
+    p.terminal.copy_ticks_from = copy_ticks_from                    # type: ignore[attr-defined]
+    p.terminal.copy_rates_range = copy_rates_range                  # type: ignore[method-assign]
+    p.tickmill.set_price("EURUSD", 1.16105, 1.16115)
+    _tick(p, 1.16088, 1.16098, T0 + 5)                              # at the level now, history unread
+    await p.engine.monitor.run_virtual_once()
+    pos = (await p.positions(1))["tickmill"]
+    assert p.tickmill_orders() == [] and pos.data["ref_touch"] == pytest.approx(1.16098)
+    _tick(p, 1.16110, 1.16120, ma + 61)                             # the next minute: 2 pips above (near)
+    p.tickmill.set_price("EURUSD", 1.16125, 1.16135)
+    await p.engine.monitor.run_virtual_once()
+    (order,) = p.tickmill_orders()
+    assert order[0] == "market_buy"
+
+
+async def test_a_kept_touch_from_a_busy_look_still_yields_to_a_stop_pass_in_the_skipped_history(unsure) -> None:
+    p, _friend = unsure
+    _history(p, [(T0 + 0.5, 1.15880, 1.15890)])                     # through the stop since the last look
+    await _armed_watch(p)
+    _tick(p, 1.16090, 1.16100, T0 + 1.5)                            # at the level now
+    p.tickmill.set_price("EURUSD", 1.16105, 1.16115)
+    busy = _fx_busy(p)
+    await p.engine.monitor.run_virtual_once()
+    assert p.tickmill_orders() == [] and (await p.positions(1))["tickmill"].data.get("ref_touch") is not None
+    busy[0] = False
+    await p.engine.monitor.run_virtual_once()                       # the full read: the stop pass wins
+    assert (await p.positions(1))["tickmill"].status is PositionStatus.CANCELLED and p.tickmill_orders() == []
+
+
 async def test_bars_a_short_arming_bar_is_judged_by_its_bid_low_not_its_moving_spread(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:

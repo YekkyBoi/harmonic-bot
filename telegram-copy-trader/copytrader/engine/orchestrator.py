@@ -5629,7 +5629,9 @@ class Engine:
         pos = await self._reference_seen(trade, pos, key, seen.get("upto_msc"),
                                          tp_armed_at=(now_msc, True, self._arming_bar(seen, now_msc, long))
                                          if armed_now else None,
-                                         touch=(entry_best if near and not history_pending else None, near))
+                                         # (a touch near the level is kept also on a look that may not open: the
+                                         # next full read decides it, after its stop / first-target checks)
+                                         touch=(entry_best if near else None, near))
         d = pos.data
         if not touched or history_pending:
             return pos
