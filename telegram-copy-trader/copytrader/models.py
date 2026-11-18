@@ -254,6 +254,10 @@ class PendingConfirmation(BaseModel):
     awaiting_correction: bool = False     # owner pressed "Düzelt" and we wait for their text
     # kind "catch_up": {"trade_id": int, "broker": str, "text": the question (HTML), ...} (Engine._ask_catch_up)
     catch_up: dict[str, Any] | None = None
+    # kind "open": the accounts set to ``confirm_open: false`` already took this signal without waiting (the question
+    # is for the route's other accounts only): {"trade_id": int, "brokers": [names], "done": [names never sent
+    # again on approval], "line": HTML line shown with the question} (Engine._open_early)
+    early: dict[str, Any] | None = None
 
 
 # --------------------------------------------------------------------------- #

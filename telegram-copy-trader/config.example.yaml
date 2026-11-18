@@ -148,6 +148,13 @@ risk:
 #                    bir yeniden bağlanmayı dener; bağlanınca haber verir. Çalışırken çıkan hatalar da diğer
 #                    hesapların kopyalarını engellemez. Varsayılan false: bağlanamayan broker bugünkü gibi
 #                    ERROR ile bildirilir. Örnek: config.tickmill.example.yaml
+#   confirm_open     false = bot bir sinyalden emin olamayıp "... AÇAYIM MI?" diye sorduğunda (düşük güven,
+#                    hedef yok, okuma şüphesi) bu hesapta işlem BEKLEMEDEN, okunduğu gibi açılır; soru konunun
+#                    diğer hesapları için aynen sorulur. Evet: diğerleri aynı işleme eklenir (bu hesap ikinci kez
+#                    açılmaz). Hayır / süre dolması: diğerleri açılmaz, bu hesaptaki işlem açık kalır ve normal
+#                    yönetilir. Stopsuz / işlem yapılamaz sinyal, mevcut işlemle ilgili şüphe (tekrar paylaşım, aynı
+#                    mesaj) ve hesabın kendi kuralları (günlük zarar, no_hedge, allowed_assets) yine geçerlidir.
+#                    LIMIT girişte hesabın giriş ayarı (entry_trigger) aynen uygulanır. Varsayılan true (önce sorulur).
 #   symbol_map       sembol eşleme, ör: {ETH: ETHUSD, XAU: GOLD}. Döviz paritesini parite adıyla yazın,
 #                    ör: {EURJPY: EURJPY.x} (EUR diye yazmayın: bütün EUR paritelerini değiştirir)
 #   allowed_assets   boş = tüm varlıklar; ör: [BTC, ETH] = sadece bunlar (PEPE yazmak 1000PEPE'yi de kapsar)

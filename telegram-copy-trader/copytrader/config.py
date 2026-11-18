@@ -253,6 +253,12 @@ class _BrokerBase(_Base):
     # whether a signal this account missed is opened there later. False: the owner's own (the owner answers it). Not
     # written: an optional account is the friend's, every other one the owner's (as before this setting existed).
     friend_account: bool | None = None
+    # confirm_open: false = a new signal the bot is unsure about (the "... AÇAYIM MI?" question: low confidence, no
+    # target, a reading doubt) is opened on this account at once, as read, without waiting for the owner; the
+    # question is still asked for the route's other accounts. Only such doubts are skipped: a signal that cannot be
+    # traded (no stop...), a doubt about existing trades (a repost, the same message) and this account's own rules
+    # (daily loss, no_hedge, allowed_assets) stop it here as everywhere. Default true: the owner is asked first.
+    confirm_open: bool = True
     # Other names the owner may use for this account in commands (/pozkapat fx1): never a name of another account.
     aliases: list[str] = Field(default_factory=list)
     symbol_map: dict[str, str] = Field(default_factory=dict)   # "ETH" -> "ETHUSD" (base asset or raw symbol -> broker symbol)

@@ -403,6 +403,9 @@ def format_confirmation(conf: PendingConfirmation, *, with_expiry: bool = True, 
         if with_expiry and conf.plan is not None:
             parts.append(BUTTON_HINT_OPEN if isinstance(conf.plan, TradePlan) else BUTTON_HINT_MANAGE)
         parts.append("")
+    if conf.kind != "manage" and conf.early and conf.early.get("line"):
+        # (accounts set to confirm_open: false took the signal already; the engine wrote this line, HTML)
+        parts += [str(conf.early["line"]), ""]
     parts += [HEADER_INCOMPLETE if conf.kind == "incomplete" else HEADER_UNSURE, ""]
     if isinstance(conf.plan, TradePlan):
         parts.append(format_plan(conf.plan))
@@ -431,7 +434,8 @@ def format_confirmation(conf: PendingConfirmation, *, with_expiry: bool = True, 
     if with_expiry:
         if conf.plan is None:
             parts.append("✏️ Onaylamak için önce <b>Düzelt</b> ile eksik bilgiyi yazın.")
-        outcome = "bu değişiklik uygulanmaz" if conf.kind == "manage" else "işlem açılmaz"
+        outcome = ("bu değişiklik uygulanmaz" if conf.kind == "manage"
+                   else "diğer hesaplarda işlem açılmaz" if conf.early else "işlem açılmaz")
         parts.append(f"⏳ {expiry_minutes(conf)} dk içinde yanıt gelmezse {outcome}.")
     return "\n".join(parts)
 

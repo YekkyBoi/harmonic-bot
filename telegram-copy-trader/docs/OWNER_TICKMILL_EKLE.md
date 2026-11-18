@@ -124,6 +124,11 @@ Notlar:
 - `optional: true` satırı **çok önemli**. Silme.
 - `risk_usd: 5` arkadaşın için 1R'de en fazla 5 dolar demektir. Küçük başla.
 - `symbol_map` ve `allowed_assets` örnektir. Arkadaşından gelen sembol adlarına göre düzelt.
+- İsteğe bağlı: `confirm_open: false` satırı eklenirse, bot bir sinyalden emin olamayıp "AÇAYIM MI?" diye
+  sorduğunda Tickmill'de işlem beklemeden, okunduğu gibi açılır (LIMIT girişte sanal tetik / bekleyen emir
+  her zamanki gibi). Soru sizin hesaplarınız için aynen gelir; Evet derseniz onlar aynı işleme eklenir,
+  Tickmill ikinci kez açılmaz. Hayır derseniz Tickmill'deki işlem açık kalır ve normal yönetilir.
+  Bu satırı ancak bu özelliği içeren sürüme güncelledikten SONRA ekleyin (eski sürüm bilinmeyen ayarı reddeder).
 
 ### 3b. Konu yollarına `tickmill` ekle
 
