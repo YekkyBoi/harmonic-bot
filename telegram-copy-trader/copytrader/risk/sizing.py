@@ -197,6 +197,15 @@ def compute_linear_size(
                                  loss_per_unit, max_over)
     if refused:
         warnings.append(refused)
+    raw = risk_amount / loss_per_unit
+    if (rounding == "up" and quantity > 0 and quantity >= min_qty
+            and floor_to_step(raw, qty_step) < max(min_qty, qty_step) * (1 - 1e-9)):
+        # (lot_rounding "up" lifted a size below the smallest order to it - within lot_rounding_max_over: told, as the
+        # MetaTrader adapter and the round-up to the minimum below tell it)
+        warnings.append(
+            f"Miktar minimum emir büyüklüğüne yükseltildi ({_fmt(round(raw, 10))} → {_fmt(quantity)}); "
+            f"stopta kayıp ~{quantity * loss_per_unit:.2f} (hedef {risk_amount:.2f})."
+        )
     if max_qty is not None and quantity > max_qty:
         capped = floor_to_step(max_qty, qty_step)
         warnings.append(

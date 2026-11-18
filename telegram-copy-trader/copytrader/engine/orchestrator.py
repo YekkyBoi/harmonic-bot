@@ -371,6 +371,15 @@ class _OpenFlow:
     blocked: set[str] = field(default_factory=set)
 
 
+class _IntoEnded(Exception):
+    """An approval was to add the other accounts to the early accounts' trade (confirm_open: false), and that trade has
+    ended meanwhile (found under its lock, right before the orders): nothing was sent."""
+
+    def __init__(self, trade: TradeRecord | None) -> None:
+        super().__init__(f"trade {trade.id if trade is not None else '?'} ended")
+        self.trade = trade
+
+
 @dataclass
 class _Fire:
     """Why a waiting virtual entry is sent now (:meth:`Engine._virtual_fire`), and its texts for the owner (HTML).
@@ -3954,8 +3963,10 @@ class Engine:
         """Open lock held. ``ev`` would be asked about; the ``early`` accounts (confirm_open: false) take it now, as
         read (their own rules - daily loss, no_hedge, duplicates of their own positions - apply as for any open),
         and the owner is asked as before for the route's other accounts. The question carries the trade: its "Evet"
-        adds the other accounts to that trade (an early account is never sent the signal twice), its "Hayır" or
-        expiry leaves the early accounts' positions as they are, managed like any trade's."""
+        adds the other accounts to that trade while it is the same trade idea (see :meth:`_approve_open`; an early
+        account whose order went out is never sent the signal twice, one that a rule of its own refused is tried
+        again - the question says which), its "Hayır" or expiry leaves the early accounts' positions as they are,
+        managed like any trade's."""
         plan = ev.plan
         assert isinstance(plan, TradePlan)
         names = [b.name for b in early]
@@ -3968,14 +3979,18 @@ class Engine:
                 self._execute_open(plan, ev.action.symbol, only=frozenset(names), early_tag=tag),
                 f"open-{plan.plan_id}")
         except Exception as exc:
-            # (its order may have gone out: the early accounts are never sent this signal again on approval)
+            # (its order may have gone out: the early accounts are never sent this signal again on approval; the
+            # trade it may have created is found again by its message, so that an approval adds to it - never a
+            # second trade of the same message)
             logger.exception("The early open of %s failed", plan.plan_id)
             await self._notify(f"🚨 {_names(names)}: onay beklenmeden açılış hata verdi (<code>{esc(exc)}</code>); "
                                "hesapta elle kontrol edin.", Severity.ERROR)
+            made = await self._trade_of_plan(plan)
             await self._ask_eval(ev, chat_id, conf_id=conf_id, early={
-                "trade_id": None, "brokers": names, "done": names,
-                "line": f"⚠️ {_names(names)}: onay beklenmeden açılış hata verdi; onaylarsanız bu hesaba tekrar "
-                        "gönderilmez (elle kontrol edin)."})
+                "trade_id": made.id if made is not None else None, "brokers": names, "done": names,
+                "line": f"⚠️ {_names(names)}: onay beklenmeden açılış hata verdi"
+                        + (f" (#{made.id})" if made is not None else "")
+                        + "; onaylarsanız bu hesaba tekrar gönderilmez (elle kontrol edin)."})
             return
         if trade is None:       # (the early accounts went away meanwhile: nothing was sent, asked as before)
             await self._ask_eval(ev, chat_id, conf_id=conf_id)
@@ -3985,14 +4000,28 @@ class Engine:
         if not asked:
             return
         states = "; ".join(f"{esc(o.broker)}: {self._early_state(o)}" for o in outcomes) or "—"
+        # never sent again on approval: whatever went out (or may have), or is still on its way
+        done = [o.broker for o in outcomes if o.position is not None or o.sent or o.kind == "late"]
+        again = [n for n in names if n not in done]       # (a rule of its own refused it: nothing was sent)
         info = {
-            "trade_id": trade.id, "brokers": names,
-            # never sent again on approval: whatever went out (or may have), or is still on its way
-            "done": [o.broker for o in outcomes if o.position is not None or o.sent or o.kind == "late"],
-            "line": f"⚡ <b>#{trade.id}</b> onay beklenmeden açılışa gönderildi — {states}. Bu soru yalnızca "
-                    f"{_names(asked)} için.",
+            "trade_id": trade.id, "brokers": names, "done": done,
+            "line": f"⚡ <b>#{trade.id}</b> onay beklenmeden açılışa gönderildi — {states}. Bu soru "
+                    + (f"{_names(asked)} için; onaylarsanız {_names(again)} hesabı da yeniden denenir (ilk denemede emir "
+                       "gönderilmedi)." if again else f"yalnızca {_names(asked)} için."),
         }
         await self._ask_eval(ev, chat_id, conf_id=conf_id, early=info)
+
+    async def _trade_of_plan(self, plan: TradePlan) -> TradeRecord | None:
+        """The trade created for ``plan`` (found by its source messages and plan id), if any."""
+        for mid in plan.source_message_ids:
+            try:
+                found = await self.db.find_trade_by_message(plan.source_chat_id, mid)
+            except Exception:
+                logger.exception("Could not look up the trade of message %s", mid)
+                return None
+            if found is not None and found.plan.plan_id == plan.plan_id:
+                return found
+        return None
 
     @staticmethod
     def _limit_filled_by(active: list[TradeRecord]) -> str:
@@ -4007,7 +4036,8 @@ class Engine:
                 "iptal edin (bekleyen girişler de sayılır); sınır config.yaml'daki risk.max_open_trades değeridir.")
 
     async def execute_open(self, plan: TradePlan, *, raw_symbol: str | None = None,
-                           skip: Collection[str] = (), into: TradeRecord | None = None) -> str:
+                           skip: Collection[str] = (), into: TradeRecord | None = None,
+                           size_stop: float | None = None) -> str:
         """Open ``plan`` on every broker that can trade it (only ``plan.broker_names`` when it names any:
         a forum topic's brokers). Returns an HTML result text.
         Runs as a critical section: never interrupted half-way by a cancelled caller or shutdown.
@@ -4017,12 +4047,14 @@ class Engine:
         :meth:`_open_early`): never sent it again, never told "skipped" or remembered as missed. ``into``: their
         trade, still active: the other brokers' positions are added to it (no second trade)."""
         text, _trade, _outcomes = await self._critical_section(
-            self._execute_open(plan, raw_symbol, skip=frozenset(skip), into=into), f"open-{plan.plan_id}")
+            self._execute_open(plan, raw_symbol, skip=frozenset(skip), into=into, size_stop=size_stop),
+            f"open-{plan.plan_id}")
         return text
 
     async def _execute_open(
         self, plan: TradePlan, raw_symbol: str | None, *, only: frozenset[str] | None = None,
         skip: frozenset[str] = frozenset(), into: TradeRecord | None = None, early_tag: str | None = None,
+        size_stop: float | None = None,
     ) -> tuple[str, TradeRecord | None, list[BrokerOutcome]]:
         """(report, trade, outcomes). ``only``: the confirm_open: false accounts that take the signal before the
         owner's answer (:meth:`_open_early`; ``early_tag``: a line its report carries): the others are neither
@@ -4061,6 +4093,11 @@ class Engine:
         label = f"#{trade.id} {esc(plan.base_asset)} {plan.side.value.upper()}"
         late: list[_LateLeg] = []
         async with self.trade_lock(trade.id):
+            if into is not None:
+                # (looked at again under its lock: the trader may have closed it while the approval was checked)
+                fresh = await self.db.get_trade(into.id)
+                if fresh is None or fresh.status not in ACTIVE_TRADE:
+                    raise _IntoEnded(fresh)
             await self._log("open_start", {"trade_id": trade.id, "plan": plan.model_dump(mode="json"),
                                            **({"only": sorted(only)} if only is not None else {}),
                                            **({"skip": sorted(skip)} if skip else {})})
@@ -4072,7 +4109,7 @@ class Engine:
             try:
                 # (an early flow waits only an optional account's short grace: the owner's question comes after it)
                 answered, waiting = await self._run_open_legs(brokers, plan, trade, raw_symbol, flow,
-                                                              short=only is not None)
+                                                              short=only is not None, size_stop=size_stop)
             finally:
                 protected = await self.monitor.unlend(trade.id, timeout=LEG_DEADLINE_SEC)
             # In route order. A broker of the route whose allowed_assets does not list the asset is named too.
@@ -4219,7 +4256,7 @@ class Engine:
     # ------------------------------------------------------------------ broker legs of an open flow
     async def _run_open_legs(
         self, brokers: list[Broker], plan: TradePlan, trade: TradeRecord, raw_symbol: str | None, flow: _OpenFlow,
-        *, short: bool = False,
+        *, short: bool = False, size_stop: float | None = None,
     ) -> tuple[dict[str, BrokerOutcome], dict[str, asyncio.Task[BrokerOutcome]]]:
         """Send ``plan`` to every broker at once, each in its own task, and wait until all have answered, but
         never longer than LEG_DEADLINE_SEC; an optional broker only OPTIONAL_LEG_GRACE_SEC (see
@@ -4234,7 +4271,8 @@ class Engine:
         started = asyncio.get_running_loop().time()
         tasks: dict[str, asyncio.Task[BrokerOutcome]] = {}
         for b in brokers:
-            task = asyncio.ensure_future(self._open_leg(b, plan, trade, raw_symbol, flow))
+            extra = {"size_stop": size_stop} if size_stop is not None else {}
+            task = asyncio.ensure_future(self._open_leg(b, plan, trade, raw_symbol, flow, **extra))
             task.set_name(f"open-{plan.plan_id}-{b.name}")
             tasks[b.name] = task
         optional = {b.name for b in brokers if self._is_optional(b)}
@@ -7608,6 +7646,8 @@ class Engine:
                 return f"Bu onay artık geçerli değil ({_CONF_STATUS_TR.get(conf.status, conf.status.value)})."
             if utc(conf.expires_at) <= self._now():
                 text = "⌛ Bu onayın süresi dolmuş; işlem yapılmadı."
+                note = await self._early_kept_note(conf) if conf.kind != "manage" else ""
+                text += f" {note}" if note else ""
                 await self._finish(conf, ConfirmationStatus.EXPIRED, text)
                 return text
             if conf.kind == "catch_up":
@@ -7658,21 +7698,31 @@ class Engine:
         """Did the early accounts' trade end only because their own waiting entries ended by their own rules (expiry,
         the price passed the stop or reached the first target before the entry, a refusal at the touch) - never
         filled, and not by the trader (a cancel, "stop girişe")? Then nothing of the trade was played out by the
-        trader: an approval opens the other accounts as a fresh trade, with its own price check."""
+        trader: an approval opens the other accounts as a fresh trade, with its own price check - what an "Evet" did
+        before confirm_open existed (on every route, with or without reference_broker)."""
         rows = await self.db.broker_positions(trade.id)
         return bool(rows) and all(
             p.status in (PositionStatus.CANCELLED, PositionStatus.FAILED) and not reference_leg_filled(p)
             and (p.data or {}).get("virtual_end") not in (None, "stop girişe çekildi")
             for p in rows)
 
+    @staticmethod
+    def _same_signal(a: TradePlan, b: TradePlan) -> bool:
+        """The same trade idea: asset / pair, side and route (a correction or an edit may have changed one)."""
+        return same_pair(a, b) and a.side is b.side and (a.route or None) == (b.route or None)
+
     async def _early_kept_note(self, conf: PendingConfirmation) -> str:
-        """HTML sentence: the early accounts' trade stays (empty when there is none, or it has ended)."""
+        """HTML sentence: the early accounts' trade stays (empty when there is none, or it has ended); while their
+        order is still unanswered (the trade is being sent), it says so instead of calling it open."""
         if not conf.early:
             return ""
         names = [str(n) for n in (conf.early.get("brokers") or [])]
         trade = await self._early_trade(conf)
         if trade is None or trade.status not in ACTIVE_TRADE:
             return ""
+        if trade.status is TradeStatus.OPENING:
+            return (f"{_names(names)} hesabına onay beklenmeden gönderilen emrin yanıtı bekleniyor; açılırsa #{trade.id} "
+                    "işlemi normal yönetilir.")
         return (f"{_names(names)} hesabındaki #{trade.id} işlemi açık kalır (onay beklenmeden açılmıştı) ve normal "
                 "yönetilir.")
 
@@ -7682,10 +7732,15 @@ class Engine:
         return "diğer hesaplarda işlem açılmadı." + (f" {note}" if note else "")
 
     async def _approve_open(self, conf: PendingConfirmation, plan: TradePlan) -> str:
-        """``conf.early``: accounts set to confirm_open: false took the signal before this answer (:meth:`_open_early`):
-        they are never sent it again; the other accounts are added to their trade while it is active (a fresh trade
-        without them when it never got a position there); a trade that has meanwhile closed or been cancelled (the
-        trader closed it, its stop or target was hit, its waiting entry ended) is not opened on the others."""
+        """``conf.early``: accounts set to confirm_open: false took the signal before this answer (:meth:`_open_early`).
+        Those of them whose early attempt sent an order (or may have: ``done``) are never sent it again; one whose
+        early attempt sent nothing (a rule of its own refused it) is tried again with the others, as the question
+        said. The other accounts are added to the early trade while it is active and is the same trade idea (asset,
+        side, route); the levels the owner did not correct take the trade's current ones (the trader may have moved
+        them meanwhile), sized from the signal's own stop. A correction / edit that changed the idea opens the others
+        as a trade of their own, the early accounts left out. A same-idea early trade that the trader closed or
+        cancelled meanwhile is not opened on the others; one that only its own waiting-entry rules ended is no
+        decision of the trader's: the others open as a fresh trade, as an "Evet" always did."""
         if await self._is_paused():
             text = "⏸ Sistem duraklatılmış; işlem açılmadı. (/devam yazıp sinyali tekrar değerlendirin.)"
             note = await self._early_kept_note(conf)
@@ -7696,24 +7751,43 @@ class Engine:
             if not self._accepting:
                 return SHUTDOWN_TEXT
             early = await self._early_trade(conf) if conf.early else None
+            early_names = [str(n) for n in ((conf.early or {}).get("brokers") or [])]
             skip = self._early_done(conf) if conf.early else []
-            into = early if early is not None and early.status in ACTIVE_TRADE else None
-            if (early is not None and early.status in (TradeStatus.CLOSED, TradeStatus.CANCELLED)
+            same = early is not None and self._same_signal(plan, early.plan)
+            apart = ""
+            if early is not None and not same:
+                # The owner's correction (or the trader's edit) made it another trade idea: the early accounts hold
+                # the first reading; never sent this one too.
+                skip = sorted(set(skip) | set(early_names))
+                apart = (f"• {_names(early_names)}: onay beklenmeden açılan #{early.id} işlemi ilk okumayla "
+                         f"({esc(early.plan.base_asset)} {early.plan.side.value.upper()}) açılmıştı; bu onay ayrı bir "
+                         f"işlem olarak açıldı, {_names(early_names)} hesabına gönderilmedi.")
+            into = early if same and early is not None and early.status in ACTIVE_TRADE else None
+            if (same and early is not None and early.status in (TradeStatus.CLOSED, TradeStatus.CANCELLED)
                     and not await self._early_ended_alone(early)):
                 how = "kapandı" if early.status is TradeStatus.CLOSED else "iptal edildi"
-                names = skip or [str(n) for n in ((conf.early or {}).get("brokers") or [])]
-                text = (f"⛔ #{early.id} işlemi ({_names(names)}) onay beklerken {how}; diğer hesaplarda işlem "
-                        "açılmadı.")
+                text = (f"⛔ #{early.id} işlemi ({_names(skip or early_names)}) onay beklerken {how}; diğer hesaplarda "
+                        "işlem açılmadı.")
                 await self._finish(conf, ConfirmationStatus.REJECTED, text,
                                    refused=f"#{early.id} işlemi onay beklerken {how}")
                 return text
-            if into is not None and (not _same_price(into.current_stop_loss, into.plan.stop_loss)
-                                     or [tp.price for tp in into.current_take_profits]
-                                     != [tp.price for tp in into.plan.take_profits]):
+            size_stop: float | None = None
+            if into is not None:
                 # The trader moved the trade's stop / targets while the question waited (applied to the early
-                # accounts): the others open with the trade's levels as they are now, like a catch-up open.
-                plan = plan.model_copy(update={"stop_loss": into.current_stop_loss,
-                                               "take_profits": list(into.current_take_profits)})
+                # accounts): the others open with the trade's levels as they are now, like a catch-up open - except
+                # what the owner corrected himself (his value differs from the first reading): that stands. A moved
+                # stop never sizes the position (the signal's own stop does, see _open_on_broker size_stop).
+                first = into.plan
+                update: dict[str, Any] = {}
+                if (_same_price(plan.stop_loss, first.stop_loss)
+                        and not _same_price(into.current_stop_loss, first.stop_loss)):
+                    update["stop_loss"] = into.current_stop_loss
+                    size_stop = plan.stop_loss
+                if ([tp.price for tp in plan.take_profits] == [tp.price for tp in first.take_profits]
+                        and [tp.price for tp in into.current_take_profits] != [tp.price for tp in first.take_profits]):
+                    update["take_profits"] = list(into.current_take_profits)
+                if update:
+                    plan = plan.model_copy(update=update)
             note = await self._early_kept_note(conf)
             limit = self.config.risk.max_open_trades
             # (the early accounts' trade is this signal itself: it never counts against its own approval)
@@ -7743,10 +7817,26 @@ class Engine:
             await self.db.save_confirmation(conf)
             self._disarm_expiry(conf.id)
             try:
-                result = await self.execute_open(plan, raw_symbol=conf.action.symbol, skip=skip, into=into)
+                try:
+                    result = await self.execute_open(plan, raw_symbol=conf.action.symbol, skip=skip, into=into,
+                                                     size_stop=size_stop)
+                except _IntoEnded as ended:
+                    # The trader closed / cancelled it while this approval was being checked (found under its lock).
+                    gone = ended.trade
+                    if gone is not None and await self._early_ended_alone(gone):
+                        result = await self.execute_open(plan, raw_symbol=conf.action.symbol, skip=skip)
+                    else:
+                        how = ("kapandı" if gone is not None and gone.status is TradeStatus.CLOSED
+                               else "iptal edildi")
+                        text = (f"⛔ #{into.id if into is not None else '?'} işlemi ({_names(skip or early_names)}) "
+                                f"onay beklerken {how}; diğer hesaplarda işlem açılmadı.")
+                        await self._finish(conf, ConfirmationStatus.REJECTED, text, refused=f"işlem onay beklerken {how}")
+                        return text
             except Exception as exc:
                 logger.exception("execute_open failed for confirmation %s", conf.id)
                 result = f"🚨 İşlem açılırken hata: <code>{esc(exc)}</code>"
+            if apart:
+                result += f"\n{apart}"
         await self._finish(conf, ConfirmationStatus.APPROVED, result)
         return result
 
@@ -7866,6 +7956,8 @@ class Engine:
             actions = [a for a in result.actions if a.action is not ActionType.NONE]
             if not actions:
                 out = "❌ Düzeltmeye göre işlem talimatı yok; işlem yapılmadı."
+                note = await self._early_kept_note(conf) if conf.kind != "manage" else ""
+                out += f" {note}" if note else ""
                 await self._finish(conf, ConfirmationStatus.REJECTED, out)
                 return out
             action = actions[0]
@@ -8106,8 +8198,10 @@ class Engine:
                 return
             actions = [a for a in result.actions if a.action is not ActionType.NONE]
             if not actions:
+                note = await self._early_kept_note(conf) if conf.kind != "manage" else ""
                 await self._finish(conf, ConfirmationStatus.SUPERSEDED,
-                                   "♻️ Mesaj düzenlendi; artık işlem talimatı görünmüyor — işlem yapılmadı.")
+                                   "♻️ Mesaj düzenlendi; artık işlem talimatı görünmüyor — işlem yapılmadı."
+                                   + (f" {note}" if note else ""))
                 return
             action = actions[0]
             if not action.used_message_ids:
