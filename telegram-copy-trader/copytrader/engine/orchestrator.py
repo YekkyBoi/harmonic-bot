@@ -5499,7 +5499,7 @@ class Engine:
                 # That account's position of the trade has already ended (stopped out / closed) before this entry
                 # was sent: the trade has played out there - never opened here afterwards on its own.
                 return await self._virtual_end(
-                    trade, pos, PositionStatus.CANCELLED, f"{ref} pozisyonu kapandı",
+                    trade, pos, PositionStatus.CANCELLED, "referans hesaptaki pozisyon kapandı",
                     f"{esc(ref)} hesabındaki giriş dolmuş ama pozisyon bu arada kapanmış (stop / kapanış); bekleyen "
                     "sanal giriş iptal edildi, bu hesapta işlem AÇILMADI.", Severity.INFO)
             if broker is None:
@@ -5589,8 +5589,10 @@ class Engine:
         at_level = (long and now_px <= level_px) or (not long and now_px >= level_px)
         near = touched and (at_level or near_entry(now_px, level_px, stop, self._plan_risk(trade.plan)))
         # The window counts as looked at, unless it holds a touch near the level: that one is acted on now, or - this
-        # account not connected, busy with another order, the order not sent - read again at the next look.
-        pos = await self._reference_seen(trade, pos, key, None if near else seen.get("upto_msc"),
+        # account not connected, busy with another order, the order not sent - read again at the next look. (The
+        # first look has no history - only the price now, read again anyway: the watch always starts there.)
+        pos = await self._reference_seen(trade, pos, key,
+                                         None if near and since_msc is not None else seen.get("upto_msc"),
                                          tp_armed_at=(now_msc, True) if armed_now else None)
         d = pos.data
         if not touched:
@@ -7756,12 +7758,17 @@ class Engine:
             same = early is not None and self._same_signal(plan, early.plan)
             apart = ""
             if early is not None and not same:
-                # The owner's correction (or the trader's edit) made it another trade idea: the early accounts hold
-                # the first reading; never sent this one too.
-                skip = sorted(set(skip) | set(early_names))
-                apart = (f"• {_names(early_names)}: onay beklenmeden açılan #{early.id} işlemi ilk okumayla "
-                         f"({esc(early.plan.base_asset)} {early.plan.side.value.upper()}) açılmıştı; bu onay ayrı bir "
-                         f"işlem olarak açıldı, {_names(early_names)} hesabına gönderilmedi.")
+                # The owner's correction (or the trader's edit) made it another trade idea: the early accounts that
+                # took (or may have taken) the first reading are never sent this one too; one whose early attempt
+                # sent nothing takes this one like any account. The first reading's trade stays apart: the trader's
+                # later replies to the signal reach the newest trade of the message (this one), so it is named.
+                held = [n for n in early_names if n in skip]
+                if held:
+                    apart = (f"• {_names(held)}: onay beklenmeden açılan #{early.id} işlemi ilk okumayla "
+                             f"({esc(early.plan.base_asset)} {early.plan.side.value.upper()}) açılmıştı; bu onay ayrı "
+                             f"bir işlem olarak açıldı, {_names(held)} hesabına gönderilmedi. #{early.id} ayrı kalır: "
+                             "sinyale gelen sonraki talimatlar yeni işleme uygulanır, gerekirse #"
+                             f"{early.id} işlemini elle yönetin (/pozkapat).")
             into = early if same and early is not None and early.status in ACTIVE_TRADE else None
             if (same and early is not None and early.status in (TradeStatus.CLOSED, TradeStatus.CANCELLED)
                     and not await self._early_ended_alone(early)):
@@ -7823,7 +7830,10 @@ class Engine:
                 except _IntoEnded as ended:
                     # The trader closed / cancelled it while this approval was being checked (found under its lock).
                     gone = ended.trade
-                    if gone is not None and await self._early_ended_alone(gone):
+                    if gone is not None and (gone.status is TradeStatus.FAILED
+                                             or await self._early_ended_alone(gone)):
+                        # (never held by the early accounts, or only their own waiting-entry rules ended it: as at
+                        # the top of this approval, the others open as a fresh trade)
                         result = await self.execute_open(plan, raw_symbol=conf.action.symbol, skip=skip)
                     else:
                         how = ("kapandı" if gone is not None and gone.status is TradeStatus.CLOSED

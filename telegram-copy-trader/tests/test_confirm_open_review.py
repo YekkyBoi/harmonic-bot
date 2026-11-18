@@ -322,3 +322,75 @@ def test_up_rounding_to_the_smallest_order_is_told_on_the_exchange_path() -> Non
     plain = compute_linear_size(risk_amount=41.0, entry=100.0, stop=99.0, qty_step=0.1, min_qty=0.1,
                                 contract_size=100.0, rounding="up", include_fees=False)
     assert plain.quantity == 0.5 and plain.warnings == []
+
+
+# --------------------------------------------------------------------------- #
+# follow-ups of the review round
+# --------------------------------------------------------------------------- #
+async def test_a_corrected_idea_takes_an_early_account_whose_first_attempt_sent_nothing(db: Database) -> None:
+    env = await make_env(db)
+    env.tm.config.daily_loss_limit_pct = 3.0
+    real = db.realized_pnl_since
+
+    async def lost_today(name: str, start: Any) -> float:
+        return -100000.0 if name == "tickmill" else await real(name, start)
+
+    db.realized_pnl_since = lost_today                                  # type: ignore[method-assign]
+    try:
+        await env.crypto_signal()                                       # tickmill refused by its daily loss rule
+        (conf,) = env.notifier.confirmations
+        assert conf.early is not None and conf.early["done"] == []
+        db.realized_pnl_since = real                                    # type: ignore[method-assign]
+        await env.engine.request_correction(conf.id)
+        env.parser.push(result(eth_short(side=Side.LONG, stop_loss=2228.0, take_profits=[], summary_tr="ETH LONG",
+                                         confidence=0.95)))
+        await env.engine.handle_correction(conf.id, "LONG")
+        out = await env.engine.handle_confirmation(env.notifier.confirmations[-1].id, True)
+        assert [r.plan.side for r in env.tm.opened] == [Side.LONG]       # (it holds nothing of the first reading)
+        assert [r.plan.side for r in env.binance.opened] == [Side.LONG]
+        assert "ilk okumayla" not in out
+    finally:
+        await env.engine.stop()
+
+
+async def test_after_a_corrected_idea_the_traders_replies_reach_the_new_trade_and_the_line_says_so(
+    db: Database
+) -> None:
+    env = await make_env(db)
+    try:
+        await env.crypto_signal()
+        (conf,) = env.notifier.confirmations
+        await env.engine.request_correction(conf.id)
+        env.parser.push(result(eth_short(side=Side.LONG, stop_loss=2228.0, take_profits=[], summary_tr="ETH LONG",
+                                         confidence=0.95)))
+        await env.engine.handle_correction(conf.id, "LONG")
+        out = await env.engine.handle_confirmation(env.notifier.confirmations[-1].id, True)
+        assert "#1 ayrı kalır" in out and "elle yönetin" in out
+        env.parser.push(result(ParsedAction(action=ActionType.CLOSE, close_fraction=1.0, refers_to_message_id=611,
+                                            base_asset="ETH", side=Side.LONG, used_message_ids=[613],
+                                            confidence=0.95, summary_tr="kapat")))
+        await env.msg(613, "kapattık", topic=CRYPTO, reply_to=611)
+        await env.engine.on_messages_ready(CHAT, KADIR, CRYPTO)
+        assert env.binance.calls_of("close_position") and env.tm.calls_of("close_position") == []
+        assert (await db.get_trade(1)).status is TradeStatus.OPEN        # type: ignore[union-attr]
+    finally:
+        await env.engine.stop()
+
+
+async def test_the_early_trade_failing_while_the_approval_is_checked_opens_the_others_fresh(db: Database) -> None:
+    env = await make_env(db)
+    try:
+        await env.crypto_signal()
+        (conf,) = env.notifier.confirmations
+        real = env.engine._approval_price_problem
+
+        async def failed_meanwhile(plan: Any, raw: Any) -> Any:
+            await db.update_trade(1, status=TradeStatus.FAILED)         # (e.g. its late order answered with a refusal)
+            return await real(plan, raw)
+
+        env.engine._approval_price_problem = failed_meanwhile           # type: ignore[method-assign]
+        out = await env.engine.handle_confirmation(conf.id, True)
+        assert "onay beklerken" not in out and len(env.binance.opened) == 1
+        assert len(env.tm.opened) == 1                                  # (tickmill's order went out: not again)
+    finally:
+        await env.engine.stop()

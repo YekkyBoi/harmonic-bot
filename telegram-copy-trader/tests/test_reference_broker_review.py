@@ -22,12 +22,13 @@ import pytest
 import test_preflight_scenarios as tps
 from copytrader.engine.monitor import is_virtual_pending
 from copytrader.engine.orchestrator import Engine
-from copytrader.models import BrokerPosition, EntryType, PositionStatus, Side
+from copytrader.models import ActionType, BrokerPosition, EntryType, ParsedAction, PositionStatus, Side, TakeProfit
 from fakes import FakeNotifier
 from test_mt5_bridge import bridge, eth, term  # noqa: F401  (term: fixture)
 from test_preflight_scenarios import FX, KRIPTO, _isolate, btc, fx_pair  # noqa: F401  (_isolate: autouse)
 from test_reference_broker import (  # noqa: F401  (env, unsure: fixtures)
-    ENTRY, STOP, T0, _armed_watch, _eur_limit, _fx_ticket, _history, _make, _no_confirm, _tick, env, unsure,
+    ENTRY, STOP, T0, _armed_watch, _eur_limit, _friend_clean, _fx_ticket, _history, _make, _no_confirm, _settle,
+    _tick, env, unsure,
 )
 
 
@@ -196,6 +197,8 @@ async def test_fx_leg_filled_and_closed_before_the_look_cancels_even_with_anothe
     assert p.tickmill_orders() == []
     assert (await p.positions(1))["tickmill"].status is PositionStatus.CANCELLED
     assert any("pozisyon bu arada kapanmış" in t for t in p.texts())
+    await _settle(p)
+    _friend_clean(_friend.texts)                                   # (the friend's feed never names fx)
 
 
 async def test_a_touch_seen_while_tickmill_is_away_is_decided_once_it_is_back(unsure) -> None:
@@ -263,3 +266,69 @@ async def test_price_since_round_trip_through_the_bridge(term) -> None:  # noqa:
         assert again["now"][1] > 0
     finally:
         await b.close()
+
+
+# --------------------------------------------------------------------------- #
+# follow-ups of the review round
+# --------------------------------------------------------------------------- #
+async def _watch_with_mid(p: Any) -> int:
+    _tick(p, 1.16195, 1.16205, T0)
+    action = fx_pair("EURUSD", Side.LONG, ENTRY, STOP, 1.1650, entry_type=EntryType.LIMIT).model_copy(
+        update={"confidence": 0.5})
+    mid = await p.say(action, FX, "EUR LONG 1R Limit Emir")
+    await p.engine.monitor.run_virtual_once()
+    return mid
+
+
+async def test_a_target_move_never_counts_the_prices_before_it(unsure) -> None:
+    """The trader moves the first target of the waiting entry: prices read again from before the move (here: the
+    in-memory look position lost, as after a restart) neither arm the rule for the new target nor reach it."""
+    p, _friend = unsure
+    mid = await _watch_with_mid(p)
+    _history(p, [(T0 + 0.5, 1.16410, 1.16420)])                    # (below the first target 1.1650: nothing)
+    _tick(p, 1.16195, 1.16205, T0 + 1.5)
+    await p.engine.monitor.run_virtual_once()
+    move = ParsedAction(action=ActionType.MOVE_TP, take_profits=[TakeProfit(price=1.1640)], refers_to_message_id=mid,
+                        confidence=0.95, summary_tr="TP 1.1640")
+    await p.say(move, FX, "TP 1.1640", reply_to=mid)
+    for conf in p.notifier.confirmations:                          # (asked when the move is doubtful: approved)
+        if conf.kind == "manage":
+            await p.engine.handle_confirmation(conf.id, True)
+    pos = (await p.positions(1))["tickmill"]
+    assert [tp.price for tp in pos.take_profits] == [1.1640] and pos.data["virtual_tp_armed"] is False
+    assert pos.data["ref_tp_msc"] == int((T0 + 1.5) * 1000)
+    p.engine._ref_seen.clear()                                     # (the window is read again from T0)
+    _history(p, [(T0 + 0.5, 1.16410, 1.16420), (T0 + 2.0, 1.16190, 1.16200)])
+    _tick(p, 1.16195, 1.16205, T0 + 2.5)
+    await p.engine.monitor.run_virtual_once()
+    pos = (await p.positions(1))["tickmill"]
+    assert is_virtual_pending(pos)                                 # 1.1641 at T0 + 0.5 came before the move
+    assert pos.data["virtual_tp_armed"] is True                    # between the entry and 1.1640 after it
+    _history(p, [(T0 + 3.0, 1.16405, 1.16415)])                    # the new target reached after the move
+    _tick(p, 1.16300, 1.16310, T0 + 3.5)
+    await p.engine.monitor.run_virtual_once()
+    assert (await p.positions(1))["tickmill"].status is PositionStatus.CANCELLED
+
+
+async def test_the_first_look_starts_the_watch_even_when_tickmill_cannot_act(unsure) -> None:
+    p, _friend = unsure
+    tick_b = next(b for b in p.engine.brokers if b.name == "tickmill")
+    p.engine.brokers = [b for b in p.engine.brokers if b.name != "tickmill"]
+    pos = (await p.positions(1))["tickmill"] if await p.trades() else None
+    assert pos is None
+    p.engine.brokers.append(tick_b)
+    _tick(p, 1.16195, 1.16205, T0)
+    action = fx_pair("EURUSD", Side.LONG, ENTRY, STOP, 1.1650, entry_type=EntryType.LIMIT).model_copy(
+        update={"confidence": 0.5})
+    await p.say(action, FX, "EUR LONG 1R Limit Emir")              # (tickmill connected for the signal)
+    p.engine.brokers = [b for b in p.engine.brokers if b.name != "tickmill"]
+    _tick(p, 1.16095, 1.16100, T0 + 1.0)                           # at the level on the first look, tickmill away
+    await p.engine.monitor.run_virtual_once()
+    pos = (await p.positions(1))["tickmill"]
+    assert is_virtual_pending(pos) and pos.data.get("ref_armed_msc") == int((T0 + 1.0) * 1000)
+    p.engine.brokers.append(tick_b)
+    p.tickmill.set_price("EURUSD", 1.16105, 1.16115)
+    _tick(p, 1.16095, 1.16100, T0 + 2.0)
+    await p.engine.monitor.run_virtual_once()
+    (order,) = p.tickmill_orders()
+    assert order[0] == "market_buy"
