@@ -23,7 +23,7 @@ the RESULT card once it is closed (see :mod:`.tradecard` for what the card says)
   this service, one card at a time. Every failure is a short text for the owner; nothing raises into the bot.
   :meth:`stop` ends within STOP_WAIT_SEC.
 * **A ccxt position closed by hand on the exchange** (closed, no exit price of the bot's on record, or part of it
-  closed by the bot and the rest by hand: the bot's result not complete, :func:`.tradecard.venue_wanted`): its close
+  closed by the bot and the rest by hand: :func:`.tradecard.venue_wanted`): its close
   and the net money it made (fees in the account's quote currency included) are read - read only, within
   FILLS_TIMEOUT_SEC - from the account's own fills of the symbol (the live adapter's exchange, ``fetch_my_trades``;
   :func:`.tradecard.venue_close`), for the card only (the bot's own records, its result, the report card and the
@@ -307,25 +307,28 @@ class TradeCardService:
         elif source[0] == "ccxt" and source[1]:
             rec = tc.read_records(trade, pos, closed_at, events)
             if tc.venue_wanted(pos, rec):
-                rec = await self._closed_on_venue(account, pos, rec, now)
+                rec = await self._closed_on_venue(account, trade.id, pos, rec, now)
             bars = await self._ccxt_candles(str(source[1]), pos.broker_symbol, rec, pos, tf, now)
         else:
             raise tc.CardProblem("bu hesabın mumları okunamıyor")
         data = tc.card_data(trade, pos, account, rec, bars, tf, manual=account in self._manual, now=now)
         return data, tc.caption(trade, account, data["kind"])
 
-    async def _closed_on_venue(self, account: str, pos: Any, rec: tc.Records, now: datetime) -> tc.Records:
+    async def _closed_on_venue(self, account: str, trade_id: int, pos: Any, rec: tc.Records, now: datetime
+                               ) -> tc.Records:
         """A closed position of a ccxt account closed by hand on the exchange, in full or in part
         (tradecard.venue_wanted): the records with the close and the net money read from the account's own fills
-        (tradecard.venue_close). The fills do not tell (the account is not a live ccxt one, the position not real
-        money: ``rec`` as it is; the read fails or the fills do not cover it: the same, but without the bot's own exit
-        price when part of the position was closed outside the bot's orders (that price is not the position's close: the
-        card then says the close price is not on record, never a part shown as the whole). Read only, bounded; never
-        raises (but CancelledError)."""
+        (tradecard.venue_close; the fills of the account's other positions of the bot's are never this one's:
+        tradecard.venue_neighbours, from the database). The fills do not tell (the account is not a live ccxt one,
+        the position not real money, the read fails or the fills do not cover it): ``rec`` as it is, but without
+        the bot's own exit price when part of the position was closed outside the bot's orders (that price is not
+        the position's close: the card then says the close price is not on record, never a part shown as the
+        whole). Read only, bounded; raises only CardProblem (tradecard.VENUE_SHARED: a close by hand that cannot be
+        told to be this position's) and CancelledError."""
+        unread = replace(rec, exit_price=None) if tc.venue_partial(pos) else rec
         broker = self._broker(account)
         if getattr(broker, "kind", None) != "ccxt" or pos.dry_run or (pos.data or {}).get("simulated"):
-            return rec
-        unread = replace(rec, exit_price=None) if tc.venue_partial(pos) else rec
+            return unread
         fetch = getattr(getattr(broker, "exchange", None), "fetch_my_trades", None)
         opened = tc.venue_opened(pos, rec)
         if not callable(fetch) or opened is None:
@@ -333,9 +336,12 @@ class TradeCardService:
         quote = getattr(getattr(broker, "cfg", None), "quote_currency", None)
         try:
             since = int(as_utc(opened).timestamp() * 1000) - FILLS_SINCE_SLACK_MS
+            rows = await self._db.account_trades(account, as_utc(opened) - timedelta(milliseconds=FILLS_SINCE_SLACK_MS))
+            foreign, shared = tc.venue_neighbours(pos, rec, trade_id, rows, now)
             trades = await asyncio.wait_for(fetch(pos.broker_symbol, since), FILLS_TIMEOUT_SEC)
-            found = tc.venue_close(pos, rec, list(trades or []), now, str(quote) if quote else None)
-        except asyncio.CancelledError:
+            found = tc.venue_close(pos, rec, list(trades or []), now, str(quote) if quote else None,
+                                   foreign=foreign, shared=shared)
+        except (asyncio.CancelledError, tc.CardProblem):
             raise
         except Exception as exc:      # noqa: BLE001 - the card is refused as before (no close price on record)
             logger.warning("Trade card: %s's fills of %s could not be read: %s", account, pos.broker_symbol,

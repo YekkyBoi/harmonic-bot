@@ -628,6 +628,58 @@ async def test_a_part_closed_by_hand_that_the_fills_do_not_show_makes_no_card(wo
     assert not world.notes.photos
 
 
+async def other_btc_long(world: World, created: datetime, closed: datetime) -> None:
+    """Another BTC long of the bot's on binance (0.1 from 90,000, its target filled at 91,500)."""
+    pos = world.long["pos"].model_copy(deep=True, update={"realized_pnl": 150.0})
+    pos.remaining_quantity = 0.0
+    pos.data.update(opened_at=ms(created + timedelta(seconds=20)), closed_at=ms(closed), entry_order_id="E_B",
+                    tp_order_ids=[{"id": "T_B"}], exits=[{"order_id": "T_B", "qty": 0.1, "price": 91500.0,
+                                                          "kind": "tp"}])
+    await add_trade(world.db, world.clock, world.long["trade"], pos, created=created, closed=closed,
+                    status=TradeStatus.CLOSED)
+
+
+def fills_of_a_and_b(h: dict[str, Any], b_at: datetime) -> list[dict[str, Any]]:
+    return [paid(fill_of("buy", 0.1, 91000.0, h["fill"], order="E1"), (4.55, "USDT")),
+            paid(fill_of("buy", 0.1, 90000.0, b_at - timedelta(minutes=20), order="E_B"), (4.5, "USDT")),
+            paid(fill_of("sell", 0.1, 91500.0, b_at, order="T_B"), (4.575, "USDT")),             # B's target
+            paid(fill_of("sell", 0.05, 91800.0, h["tp1"], order="T1"), (2.295, "USDT")),
+            paid(fill_of("sell", 0.05, 92100.0, h["hand"]), (2.3025, "USDT"))]
+
+
+async def test_another_bot_trade_on_the_symbol_meanwhile_makes_no_card(world: World) -> None:
+    fake = binance_on(world)
+    h = await bot_tp1_then_hand(world)
+    await other_btc_long(world, h["fill"] + timedelta(minutes=10), h["fill"] + timedelta(minutes=40))
+    fake.trades = fills_of_a_and_b(h, h["fill"] + timedelta(minutes=30))
+    assert await card_of_first(world) is None                                  # (A is the first of the list)
+    assert world.notes.lines[-1] == svc_mod.FAILED.format(why=tc.VENUE_SHARED) and not world.notes.photos
+
+
+async def test_another_bot_trade_on_the_symbol_before_it_is_no_doubt(world: World) -> None:
+    fake = binance_on(world)
+    h = await bot_tp1_then_hand(world)
+    await other_btc_long(world, h["fill"] - timedelta(hours=3), h["fill"] - timedelta(hours=1))
+    fake.trades = fills_of_a_and_b(h, h["fill"] - timedelta(hours=1, minutes=1))
+    n = len(world.renderer.data)
+    await world.svc.command("binance")
+    assert await world.svc.pick("2") == svc_mod.STARTED                        # (B is the first of the list now)
+    await world.settle()
+    assert len(world.renderer.data) > n, world.notes.lines
+    data = world.renderer.data[-1]
+    money = 0.05 * 800.0 + 0.05 * 1100.0 - 4.55 - 2.295 - 2.3025
+    assert data["hero"] == tc.fmt_r(money / 60.0) == "+1.43R" and data["exit"] == pytest.approx(91950.0)
+
+
+async def test_a_part_closed_by_hand_on_an_account_without_its_adapter_makes_no_card(world: World) -> None:
+    binance_on(world)
+    h = await bot_tp1_then_hand(world)
+    world.svc._broker = lambda name: None                                      # (the adapter is not there)
+    assert await card_of_first(world) is None
+    assert world.notes.lines[-1] == svc_mod.FAILED.format(why="kapanış fiyatı kayıtlarda yok")
+    assert h["id"] and not world.notes.photos
+
+
 def test_the_moneys_r_of_a_close_by_hand_counts_the_fees() -> None:
     # trade #12: BTC long at 64,695, stop 62,415.7, closed by hand on Binance at 65,014.3 (0.05 % a side)
     sample = S.btc_long_result()
@@ -673,8 +725,10 @@ def test_the_moneys_r_of_a_close_by_hand_counts_the_fees() -> None:
     assert tc.venue_close(pos, rec, trades[1:], NOW, "USDT").money == pytest.approx((out_at - entry) * q - fees[1])
 
 
-def test_the_bots_own_close_under_an_order_it_did_not_keep_stays_its_own() -> None:
-    # the bot's stop closed the whole size (booked), but its trade list missed that order: the result is incomplete
+def test_the_bots_own_close_with_its_trade_list_short_is_not_read_from_the_fills() -> None:
+    # the bot's stop closed the whole size (booked at 90,400), but its trade list missed that order (pnl_incomplete,
+    # nothing closed outside it): the card as the bot's records tell it, no fills read - another trade's target
+    # (0.1 at 93,000) in the same time would otherwise be taken for this one's close
     sample = S.btc_long_result()
     opened = sample["rec"].filled
     pos = sample["pos"].model_copy(deep=True, update={"realized_pnl": -4.55})
@@ -682,21 +736,65 @@ def test_the_bots_own_close_under_an_order_it_did_not_keep_stays_its_own() -> No
                     exits=[{"order_id": "S1", "qty": 0.1, "price": 90400.0, "kind": "sl"}])
     rec = tc.Records(placed=sample["rec"].placed, filled=opened, closed=opened + timedelta(hours=1),
                      exit_price=90400.0, reason="stop")
-    assert tc.venue_wanted(pos, rec) and not tc.venue_partial(pos)
+    assert not tc.venue_wanted(pos, rec) and not tc.venue_partial(pos)
+    data = S.data_of(dict(sample, pos=pos, rec=rec))
+    assert data["hero"] == "−1.00R" and data["timeline"][-1][1] == "Stop · −1.00R" and data["chips"][3][1] == "Stop"
+    # (venue_close itself: the bot's own exit first, ccxt's single ``fee`` counts, a short's sign)
     at = opened + timedelta(minutes=50)
     trades = [{**fill_of("buy", 0.1, 91000.0, opened, order="E1"), "fee": {"cost": 4.55, "currency": "USDT"}},
-              {**fill_of("sell", 0.1, 90400.0, at, order="S9"), "fee": {"cost": 4.52, "currency": "USDT"}}]
+              {**fill_of("sell", 0.1, 93000.0, at - timedelta(minutes=20), order="T_B"),
+               "fee": {"cost": 4.65, "currency": "USDT"}},
+              {**fill_of("sell", 0.1, 90400.0, at, order="S1"), "fee": {"cost": 4.52, "currency": "USDT"}}]
     found = tc.venue_close(pos, rec, trades, NOW, "USDT")
-    assert found is not None and found.reason == "stop" and found.close_by is None and found.moves == []
-    money = -60.0 - 4.55 - 4.52                                     # (ccxt's single ``fee`` counts too)
-    assert found.money == pytest.approx(money)
-    data = S.data_of(dict(sample, pos=pos, rec=found))
-    assert data["hero"] == tc.fmt_r(money / 60.0) == "−1.15R" and data["timeline"][-1][1] == "Stop · −1.15R"
-    assert data["chips"][3][1] == "Stop"
-    # a short: the price falling is the profit
+    assert found is not None and found.exit_price == pytest.approx(90400.0) and found.reason == "stop"
+    assert found.close_by is None and found.money == pytest.approx(-60.0 - 4.55 - 4.52)
     short = pos.model_copy(deep=True, update={"side": Side.SHORT})
-    flipped = [dict(trades[0], side="sell"), dict(trades[1], side="buy")]
+    flipped = [dict(trades[0], side="sell"), dict(trades[2], side="buy")]
     assert tc.venue_close(short, rec, flipped, NOW, "USDT").money == pytest.approx(60.0 - 4.55 - 4.52)
+
+
+def test_another_trade_of_the_bots_fills_are_never_this_ones_close() -> None:
+    # A: long 0.1 at 91,000 (risk 60), half closed by its own target at 91,800 (+1h), the rest by hand at 92,100
+    # (+2h); B: another long of the bot's on BTC, its target 0.1 at 91,500 (+30 min)
+    sample = S.btc_long_result()
+    opened = sample["rec"].filled
+    pos = sample["pos"].model_copy(deep=True, update={"realized_pnl": 35.0, "remaining_quantity": 0.0})
+    pos.data = {"initial_risk": {"loss": 60.0, "quantity": 0.1}, "opened_at": ms(opened), "entry_order_id": "E_A",
+                "closed_outside": 0.05, "exits": [{"order_id": "T_A", "qty": 0.05, "price": 91800.0, "kind": "tp"}],
+                "tp_order_ids": [{"id": "T_A"}]}
+    rec = tc.Records(filled=opened, closed=opened + timedelta(hours=3), reason="tp", exit_price=91800.0)
+    trades = [paid(fill_of("buy", 0.1, 91000.0, opened, order="E_A"), (4.55, "USDT")),
+              paid(fill_of("buy", 0.1, 90000.0, opened + timedelta(minutes=5), order="E_B"), (4.5, "USDT")),
+              paid(fill_of("sell", 0.1, 91500.0, opened + timedelta(minutes=30), order="T_B"), (4.57, "USDT")),
+              paid(fill_of("sell", 0.05, 91800.0, opened + timedelta(hours=1), order="T_A"), (2.29, "USDT")),
+              paid(fill_of("sell", 0.05, 92100.0, opened + timedelta(hours=2), order="H"), (2.30, "USDT"))]
+    b_trade = sample["trade"].model_copy(update={"id": 99, "created_at": opened + timedelta(minutes=4)})
+    b_pos = pos.model_copy(deep=True, update={"realized_pnl": 15.0})
+    b_pos.data = {"opened_at": ms(opened + timedelta(minutes=5)), "entry_order_id": "E_B",
+                  "tp_order_ids": [{"id": "T_B"}], "exits": [{"order_id": "T_B", "qty": 0.1, "price": 91500.0}]}
+    rows = [(sample["trade"], pos, rec.closed), (b_trade, b_pos, opened + timedelta(minutes=31))]
+    foreign, shared = tc.venue_neighbours(pos, rec, sample["trade"].id, rows, NOW)
+    assert {"E_B", "T_B"} <= foreign and "T_A" not in foreign and shared
+    # B held BTC long meanwhile: the fill by hand cannot be told to be A's - no card, never a guessed number
+    with pytest.raises(tc.CardProblem, match="ayırt edilemiyor"):
+        tc.venue_close(pos, rec, trades, NOW, "USDT", foreign=foreign, shared=shared)
+    # without that overlap: B's fills are left out, A's own target first, then the hand close
+    found = tc.venue_close(pos, rec, trades, NOW, "USDT", foreign=foreign)
+    money = 0.05 * 800.0 + 0.05 * 1100.0 - 4.55 - 2.29 - 2.30
+    assert found is not None and found.exit_price == pytest.approx(91950.0) and found.money == pytest.approx(money)
+    r = tc.result_r(sample["trade"], pos, 91000.0, 90400.0, found.exit_price, found.money)
+    assert tc.fmt_r(r) == "+1.43R" and found.close_by == tc.CLOSED_ON_VENUE
+    # B on the other side, on another symbol, or over before A opened: no overlap
+    for change in ({"side": Side.SHORT}, {"broker_symbol": "ETH/USDT:USDT"}):
+        assert not tc.venue_neighbours(pos, rec, 12, [(b_trade, b_pos.model_copy(update=change), None)], NOW)[1]
+    early = b_trade.model_copy(update={"created_at": opened - timedelta(hours=3)})
+    gone = b_pos.model_copy(deep=True)
+    gone.data["opened_at"] = ms(opened - timedelta(hours=3))
+    assert not tc.venue_neighbours(pos, rec, 12, [(early, gone, opened - timedelta(hours=1))], NOW)[1]
+    # B still open, or its end not known: overlapping
+    assert tc.venue_neighbours(pos, rec, 12, [(early, gone.model_copy(update={"status": PositionStatus.OPEN}),
+                                                None)], NOW)[1]
+    assert tc.venue_neighbours(pos, rec, 12, [(early, gone, None)], NOW)[1]
 
 
 def test_a_complete_result_of_the_bots_is_not_read_from_the_fills() -> None:
