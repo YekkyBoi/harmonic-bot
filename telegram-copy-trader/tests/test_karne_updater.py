@@ -41,8 +41,8 @@ from copytrader import karne
 FONTS = ["CormorantGaramond_600SemiBold.ttf", "CormorantGaramond_600SemiBold_Italic.ttf", "Inter_500Medium.ttf",
          "Montserrat_400Regular.ttf", "Montserrat_500Medium.ttf", "Montserrat_600SemiBold.ttf",
          "OFL-CormorantGaramond.txt", "OFL-Inter.txt", "OFL-Montserrat.txt"]
-KARNE_FILES = ["__init__.py", "__main__.py", "data.py", "design.py", "render.py", "service.py", "uktime.py",
-               *[f"fonts/{name}" for name in FONTS]]
+KARNE_FILES = ["__init__.py", "__main__.py", "data.py", "design.py", "render.py", "service.py", "tradecard.py",
+               "tradecard_design.py", "tradecard_service.py", "uktime.py", *[f"fonts/{name}" for name in FONTS]]
 PILLOW_CHECK = ("-c import os, sys; k = os.path.abspath('karne_paketleri'); sys.path.insert(0, k); import PIL; "
                 "from PIL import Image, ImageDraw, ImageFilter, ImageFont, features; "
                 "raise SystemExit(0 if features.check('freetype2') and "

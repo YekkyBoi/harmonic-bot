@@ -40,8 +40,9 @@ def walk(start: datetime, n: int, price: float, seed: int, tf_min: int = 15, vol
     return out
 
 
-def plan(asset: str, side: Side, entry: float, stop: float, tps: list[float], *, entry_type: EntryType = EntryType.MARKET,
-         quote: str | None = None, tf: int | None = None, risk_r: float = 1.0) -> TradePlan:
+def plan(asset: str, side: Side, entry: float, stop: float, tps: list[float], *,
+         entry_type: EntryType = EntryType.MARKET, quote: str | None = None, tf: int | None = None,
+         risk_r: float = 1.0) -> TradePlan:
     return TradePlan(plan_id="p1", base_asset=asset, quote_asset=quote, side=side, entry_type=entry_type,
                      entry_price=entry, stop_loss=stop, take_profits=[TakeProfit(price=p, close_fraction=1.0 / len(tps))
                                                                       for p in tps],
@@ -50,7 +51,8 @@ def plan(asset: str, side: Side, entry: float, stop: float, tps: list[float], *,
 
 
 def trade(no: int, p: TradePlan, status: TradeStatus, created: datetime, stop_now: float | None = None) -> TradeRecord:
-    return TradeRecord(id=no, plan=p, status=status, current_stop_loss=stop_now if stop_now is not None else p.stop_loss,
+    stop = stop_now if stop_now is not None else p.stop_loss
+    return TradeRecord(id=no, plan=p, status=status, current_stop_loss=stop,
                        current_take_profits=list(p.take_profits), created_at=created, updated_at=created)
 
 

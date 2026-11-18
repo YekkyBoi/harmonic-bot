@@ -538,7 +538,8 @@ def card_data(
         "asset": asset,
         "side": trade.plan.side.value,
         "account": account,
-        "subtitle": f"{shown_symbol(pos.broker_symbol)}  ·  {int(tf_min)} dakika  ·  {(wall_fill or wall_anchor):%d.%m.%Y}",
+        "subtitle": (f"{shown_symbol(pos.broker_symbol)}  ·  {int(tf_min)} dakika  ·  "
+                     f"{(wall_fill or wall_anchor):%d.%m.%Y}"),
         "hero": fmt_r(r_out) if r_out is not None else None,
         "chips": chips,
         "bars": [list(b) for b in drawn],

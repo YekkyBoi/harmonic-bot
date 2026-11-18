@@ -169,7 +169,8 @@ class TradeCardService:
             words = (args or "").strip()
             if words:
                 if not _ONE_NUMBER.match(words):
-                    return f"Kullanım: <code>/{esc(account)}{COMMAND_SUFFIX}</code> (bu haftanın listesi), sonra numara."
+                    return (f"Kullanım: <code>/{esc(account)}{COMMAND_SUFFIX}</code> (bu haftanın listesi), "
+                            "sonra numara.")
                 if not self.list_live() or self._list is None or self._list[1] != account:
                     return NO_LIST.format(cmd=esc(f"{account}{COMMAND_SUFFIX}"))
                 return await self.pick(words)

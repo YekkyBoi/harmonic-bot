@@ -509,12 +509,14 @@ def test_the_records_of_an_exchange_position() -> None:
     fill, close = datetime(2026, 11, 16, 15, 33, tzinfo=UTC), datetime(2026, 11, 16, 21, 52, tzinfo=UTC)
     pos.data.update(opened_at=ms(fill), closed_at=ms(close), closed_reason="manual_close",
                     exits=[{"price": 91500.0, "qty": 0.1, "kind": "close"}])
-    events = [{"ts": fill - timedelta(seconds=2), "kind": "order_send", "payload": {"trade_id": 12, "broker": "binance"}},
+    events = [{"ts": fill - timedelta(seconds=2), "kind": "order_send",
+               "payload": {"trade_id": 12, "broker": "binance"}},
               {"ts": close, "kind": "pozkapat", "payload": {"closes": [["binance", 12]]}},
               {"ts": close, "kind": "manage_done", "payload": {"trade_id": 12, "action": "move_sl", "plan": {},
                                                                "outcomes": [{"broker": "fx", "kind": "ok"}]}}]
     rec = tc.read_records(t, pos, None, events)
-    assert (rec.filled, rec.closed, rec.exit_price, rec.reason, rec.close_by) == (fill, close, 91500.0, "close", "owner")
+    assert (rec.filled, rec.closed, rec.exit_price) == (fill, close, 91500.0)
+    assert (rec.reason, rec.close_by) == ("close", "owner")
     assert rec.moves == []                                             # another account's stop move
 
 
