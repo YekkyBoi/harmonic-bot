@@ -1693,7 +1693,7 @@ def test_update_failure_before_the_check_restores_the_old_installation(
     assert sorted(set(after) - set(before) - {"guncelle.py", "bekci.py", "config.example.yaml",
                                               "config.tickmill.example.yaml", "pyproject.toml", "docs/GUNCELLEME.md",
                                               "docs/ARKADAS_METAAPI.md", "docs/OWNER_TICKMILL_EKLE.md",
-                                              "docs/SUNUCU_CLAUDE.md"}
+                                              "docs/SUNUCU_CLAUDE.md", "docs/TASIMA.md", "tasi.py"}
                   ) == sorted(p.name for p in bot.glob("guncelleme_*.log"))     # nothing else: no lock file left either
 
 
@@ -2678,3 +2678,22 @@ def test_migrate_warns_when_the_tickmill_override_folder_is_not_named_tickmill(t
     assert any("type: mt5_bridge" in line for line in lines)
     assert (f"tickmill: dikkat, {exe} klasörünün adında 'Tickmill' geçmiyor; bot bu terminale yalnızca içinde bir "
             "Tickmill hesabı açıksa bağlanır.") in notes
+
+
+def test_update_and_way_back_never_start_a_bot_that_was_moved_to_another_server(
+    g: Any, tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    bot = old_bot(tmp_path)
+    data = g.veri_klasoru(bot)
+    data.mkdir(parents=True, exist_ok=True)
+    (data / "TASINDI.txt").write_text("taşındı\n", encoding="utf-8")
+    code, _runner, started = update(g, bot)
+    out = capsys.readouterr().out
+    assert code == 0 and started == []
+    assert "9. Bot başlatılmadı (Yeni sürüm kurulu)" in out and "başka bir sunucuya taşındı" in out
+    code, _runner, started = update(g, bot, "--geri-al")
+    out = capsys.readouterr().out
+    assert started == [] and "6. Bot başlatılmadı (ESKİ sürüm kurulu)" in out and "başka bir sunucuya taşındı" in out
+    (data / "TASINDI.txt").unlink()
+    code, _runner, started = update(g, bot)
+    assert len(started) == 1

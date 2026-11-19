@@ -724,6 +724,61 @@ def migrate_config(path: str | os.PathLike[str] = "config.yaml", *, notes: list[
             notes.extend(remarks)
 
 
+def set_broker_value(path: str | os.PathLike[str], broker: str, key: str, value: str, *,
+                     now: datetime | None = None) -> Path:
+    """Replace the value of ONE existing key of ONE broker block (used by tasi.py when a MetaTrader terminal sits
+    at another path on the new server). Text edit only: every other byte of the file stays as it is; there is no
+    PyYAML rewrite fallback. ``config.yaml.yedek-<timestamp>`` is written first and the new file must load through
+    the app's loader with the new value, else the old content is put back. Returns the backup's path; raises
+    :class:`MigrationError` (nothing changed) when the key is missing, is a ``${VAR}`` placeholder or the file
+    cannot be edited safely."""
+    p = Path(path)
+    raw_bytes = p.read_bytes()
+    try:
+        text = raw_bytes.decode("utf-8")
+        data = yaml.safe_load(text)
+    except (UnicodeDecodeError, yaml.YAMLError) as exc:
+        raise MigrationError(f"{p.name} okunamadı ({_short_error(exc)}); hiçbir şey değiştirilmedi") from exc
+    brokers = data.get("brokers") if isinstance(data, dict) and isinstance(data.get("brokers"), list) else []
+    index = next((i for i, b in enumerate(brokers) if isinstance(b, dict) and str(b.get("name")) == broker), None)
+    if index is None:
+        raise MigrationError(f"'{broker}' adlı hesap {p.name} içinde yok; hiçbir şey değiştirilmedi")
+    current = brokers[index].get(key, _MISSING)
+    if current is _MISSING or current is None:
+        raise MigrationError(f"{broker}: '{key}' satırı yok; hiçbir şey değiştirilmedi")
+    if _is_placeholder(current):
+        raise MigrationError(f"{broker}: '{key}' değeri bir ortam değişkeninden (.env) okunuyor; hiçbir şey "
+                             "değiştirilmedi")
+
+    def check(c: AppConfig) -> bool:
+        return str(getattr(_broker(c, broker), key, None)) == str(value)
+
+    changes = [Change(("brokers", index), key, value, f"{broker}: {key}", check)]
+    try:
+        new_text = _edit_text(text, changes)
+    except _TextEditUnsupported as exc:
+        raise MigrationError(f"{p.name} güvenle düzenlenemedi ({exc}); hiçbir şey değiştirilmedi") from exc
+    problem = _verify(text, new_text, changes)
+    if problem:
+        raise MigrationError(f"{p.name} güvenle düzenlenemedi ({problem}); hiçbir şey değiştirilmedi")
+    backup = _backup_path(p, now or datetime.now())
+    try:
+        backup.write_bytes(raw_bytes)
+        _write_atomic(p, new_text.encode("utf-8"))
+    except OSError as exc:
+        raise MigrationError(f"{p.name} yazılamadı ({exc}); hiçbir şey değiştirilmedi") from exc
+    try:
+        if not check(load_config(p)):
+            raise MigrationError(f"yeni değer etkili olmadı: {key}")
+    except BaseException as exc:
+        _write_atomic(p, raw_bytes)
+        if isinstance(exc, (KeyboardInterrupt, SystemExit)):
+            raise
+        raise MigrationError(
+            f"düzenlenen {p.name} yüklenemedi ({_short_error(exc)}); eski hali geri konuldu") from exc
+    return backup
+
+
 def run_cli(path: str, out: Callable[[str], None] = print) -> int:
     """The ``migrate`` command: one line per change. Exit code 0 (also when nothing had to change), 2 on failure."""
     notes: list[str] = []
@@ -740,4 +795,4 @@ def run_cli(path: str, out: Callable[[str], None] = print) -> int:
     return 0
 
 
-__all__ = ["Change", "MigrationError", "migrate_config", "plan_changes", "run_cli"]
+__all__ = ["Change", "MigrationError", "migrate_config", "plan_changes", "run_cli", "set_broker_value"]
