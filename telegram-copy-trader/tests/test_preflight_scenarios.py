@@ -459,10 +459,12 @@ class Prod:
     @classmethod
     async def create(cls, tmp_path: Path, monkeypatch: pytest.MonkeyPatch, *,
                      tickmill_symbols: tuple[str, ...] = TICKMILL_LISTED, edit: Any = None,
-                     model: ScriptedModel | None = None, replica: str = "prod") -> "Prod":
+                     model: ScriptedModel | None = None, replica: str = "prod",
+                     more: Any = None) -> "Prod":
         """``edit(cfg)``: change the loaded config before the engine is built. ``model``: read the messages with
         the real ClaudeSignalParser on this scripted model instead of the FakeParser. ``replica``: which config
-        (REPLICAS: "prod" = PROD_YAML, "live" = LIVE_YAML)."""
+        (REPLICAS: "prod" = PROD_YAML, "live" = LIVE_YAML). ``more(p, by)``: further brokers of blocks the edit
+        added ({name: adapter}, ``by``: the loaded blocks by name), started after the replica's four."""
         p = cls()
         p.replica = replica
         p.cfg = load_prod_config(tmp_path, monkeypatch, replica)
@@ -483,6 +485,8 @@ class Prod:
         tickmill = MetaApiBroker(by["tickmill"], connection=p.tickmill)
         tickmill.retry_delay_sec = 0
         p.brokers = {"binance": binance, "breakout": breakout, "fx": fx, "tickmill": tickmill}
+        extra = dict(more(p, by)) if more is not None else {}
+        p.brokers.update(extra)
         p.db = Database(":memory:")
         await p.db.open()
         p.ref = Reference(p.binance)
@@ -494,7 +498,7 @@ class Prod:
         holder.append(p.engine)
         await p.engine.start(monitor=False)
         assert p.engine.failed_brokers == {}
-        assert [b.name for b in p.engine.brokers] == ["binance", "breakout", "fx", "tickmill"]
+        assert [b.name for b in p.engine.brokers] == ["binance", "breakout", "fx", "tickmill", *extra]
         p.notifier.notifications.clear()
         p.ref.calls.clear()
         return p
