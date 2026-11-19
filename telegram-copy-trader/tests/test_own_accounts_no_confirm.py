@@ -68,6 +68,7 @@ def server_config_after_update(tmp_path: Path, monkeypatch: pytest.MonkeyPatch, 
     folder.mkdir()
     path = folder / "config.yaml"
     path.write_text(text, encoding="utf-8")
+    monkeypatch.chdir(folder)              # (load_config also reads a ".env" of the current directory: none here)
     lines = migrate.migrate_config(path, terminal=(None, None))
     assert [ln.split(":")[0] for ln in lines if ln.endswith("(confirm_open: false)")] == [
         "tickmill", "binance", "fx", "fx2"]
@@ -491,6 +492,30 @@ async def test_f_no_target_kripto_limit_binance_tickmills_virtual_entry_and_brea
     (note,) = [t for t in p.texts() if "Elle işlem (breakout)" in t]
     assert "TP: 76000" in note
     assert (len(p.binance.entry_orders()), len(p.tickmill_orders())) == (1, 1)
+
+
+async def test_f_no_target_kripto_market_binance_gets_one_target_order_later_tickmill_its_shifted_target(
+    world
+) -> None:
+    p = world
+    mid = await p.say(btc(EntryType.MARKET, 74000.0, 73300.0, 75500.0).model_copy(
+        update={"take_profits": [], "confidence": 0.75}), KRIPTO, "BTC LONG")
+    (conf,) = p.notifier.confirmations
+    assert p.asked() == [["no_take_profit", "low_confidence"]]
+    assert conf.early is not None and conf.early["brokers"] == ["binance", "tickmill"]
+    assert [(o["type"], o["amount"]) for o in p.binance.entry_orders()] == [("market", 0.012)]
+    assert [o["params"]["stopLossPrice"] for o in p.binance.trigger_orders("stopLossPrice")] == [73300.0]
+    assert p.binance.trigger_orders("takeProfitPrice") == []                        # no target order
+    assert p.tickmill_orders() == [("market_buy", "BTCUSD", 0.08, 73250.0, None)]   # (offset -50)
+    await p.say(move_tp(mid, 76000.0), KRIPTO, "TP 76000", reply_to=mid)
+    assert len(p.notifier.confirmations) == 1
+    assert [(o["amount"], o["params"]["takeProfitPrice"]) for o in p.binance.trigger_orders("takeProfitPrice")] == [
+        (0.012, 76000.0)]                                                          # the whole position, once
+    assert len(p.binance.trigger_orders("stopLossPrice")) == 1                      # the stop is not sent again
+    assert tickmill_changes(p) == [("70001", 73250.0, 75950.0)]                     # shifted by its offset
+    rows = await p.positions(1)
+    assert {n: [tp.price for tp in r.take_profits] for n, r in rows.items()} == {
+        "binance": [76000.0], "tickmill": [75950.0]}
 
 
 async def test_f_the_real_parser_drops_an_unreadable_target_and_the_signal_opens_without_one(
