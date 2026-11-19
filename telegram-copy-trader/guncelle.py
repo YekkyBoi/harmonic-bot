@@ -72,7 +72,7 @@ from typing import Any
 PAKET = "copytrader"
 # Top-level files / folders of the new version that replace the installed ones (everything else stays).
 UST_DOSYALAR = ("requirements.txt", "config.example.yaml", "config.tickmill.example.yaml", "guncelle.py",
-                "bekci.py", "README.md", "pyproject.toml")
+                "bekci.py", "tasi.py", "README.md", "pyproject.toml")
 UST_KLASORLER = ("docs",)
 YENI_GEREKLI = (f"{PAKET}/__init__.py", f"{PAKET}/__main__.py", f"{PAKET}/migrate.py", f"{PAKET}/selftest.py",
                 "requirements.txt", "guncelle.py")
