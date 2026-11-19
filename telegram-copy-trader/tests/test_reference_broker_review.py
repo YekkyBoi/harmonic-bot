@@ -633,7 +633,9 @@ def test_the_live_config_after_this_update_has_the_friends_settings(tmp_path: Pa
     for name in ("binance", "fx"):
         b = next(x for x in cfg.brokers if x.name == name)
         assert (b.confirm_open, b.fees_in_risk, b.lot_rounding, b.reference_broker, b.size_from_signal_entry) == (
-            True, None, "down", None, False)
+            False, None, "down", None, False)                       # (step 11: the owner's own accounts too)
+    breakout = next(x for x in cfg.brokers if x.name == "breakout")
+    assert breakout.confirm_open is True                           # (still asked)
     assert migrate.migrate_config(path, terminal=(None, None)) == []
 
 

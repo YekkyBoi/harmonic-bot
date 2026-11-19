@@ -140,7 +140,9 @@ N_TICKMILL = (1 if KNOWS_LOT_ROUNDING else 0) + len(TICKMILL_ADDED)
 # Settings the production replica needs: binance x2, notifier x2, risk x2, the kripto topic (+ fx open risk)
 # (+ tickmill: risk_usd 45 -> 50 and the TICKMILL_ADDED lines; no Tickmill terminal on the test machine: it stays on
 # MetaApi, see tests/test_mt5_bridge_migrate.py).
-N_CHANGES = (8 if KNOWS_OPEN_RISK else 7) + N_TICKMILL
+# Step 11: the owner's own binance and fx open an unsure signal at once too (confirm_open: false; no fx2 in the replica).
+N_OWN = 2 if KNOWS_STEP9 else 0
+N_CHANGES = (8 if KNOWS_OPEN_RISK else 7) + N_TICKMILL + N_OWN
 # The production text as the friend's 1R change leaves it (the only value replaced in place in the tickmill block).
 PROD_AFTER = PROD_YAML.replace("    risk_usd: 45\n", "    risk_usd: 50\n") if KNOWS_LOT_ROUNDING else PROD_YAML
 PLACEHOLDER = re.compile(r"\$\{[^}]*\}")
@@ -206,9 +208,11 @@ def test_migrate_prod_replica_changes_only_the_wanted_keys(tmp_path: Path) -> No
         ["explicit_market_drift: follow", "notify_on_execution: true", "notify_on_ignored: true",
          "daily_loss_limit_pct: 0", "no_hedge: true", "risk:", "max_open_trades: 25", "allow_min_qty_round_up: true"]
         + (["daily_loss_include_open_risk: true"] if KNOWS_OPEN_RISK else [])
-        + TICKMILL_ADDED)
-    # the two binance settings sit at the end of the binance block, in the block's own indentation
-    assert "    max_leverage: 125\n    daily_loss_limit_pct: 0\n    no_hedge: true\n  - name: breakout\n" in new_text
+        + TICKMILL_ADDED + ["confirm_open: false"] * N_OWN)
+    # the binance settings sit at the end of the binance block, in the block's own indentation
+    assert ("    max_leverage: 125\n    daily_loss_limit_pct: 0\n    no_hedge: true\n"
+            + ("    confirm_open: false\n" if N_OWN else "") + "  - name: breakout\n") in new_text
+    assert any("'fx2' adlı broker yok; confirm_open ayarı atlandı" in n for n in notes) is bool(N_OWN)
     # placeholders byte for byte, no secret written
     assert PLACEHOLDER.findall(new_text) == PLACEHOLDER.findall(PROD_YAML)
     assert "${METAAPI_TOKEN:-}" in new_text and "${METAAPI_ACCOUNT_ID:-}" in new_text
@@ -257,12 +261,13 @@ def test_migrate_existing_keys_with_other_values_are_changed_in_place(tmp_path: 
     assert len(lines) == N_CHANGES
     assert "10 → 25" in "\n".join(lines)
     new = path.read_text(encoding="utf-8")
-    assert "    daily_loss_limit_pct: 0   # eski değer\n    no_hedge: true\n  - name: breakout\n" in new   # value replaced, comment kept
+    assert ("    daily_loss_limit_pct: 0   # eski değer\n    no_hedge: true\n" + ("    confirm_open: false\n" if N_OWN else "")
+            + "  - name: breakout\n") in new   # value replaced, comment kept
     assert "  notify_on_execution: true    # her işlemi bildir\n" in new and "  notify_on_ignored: true\n" in new
     assert "  max_open_trades: 25 # eski\n" in new and "  allow_min_qty_round_up: true\n" in new
     assert "      explicit_market_drift: follow\n" in new
     assert len(new.splitlines()) == len(text.splitlines()) + (1 if KNOWS_OPEN_RISK else 0) + len(
-        TICKMILL_ADDED)                                                   # nothing else added
+        TICKMILL_ADDED) + N_OWN                                           # nothing else added
     assert new.count("\nrisk:") == 1                                      # the existing section was used, no second one
 
 
@@ -275,6 +280,9 @@ def test_migrate_leaves_alone_what_is_already_as_wanted(tmp_path: Path) -> None:
     text = text.replace("    daily_loss_limit_pct: 3\n", "    daily_loss_limit_pct: 3\n    daily_loss_include_open_risk: true\n"
                         if KNOWS_OPEN_RISK else "    daily_loss_limit_pct: 3\n")
     text += "risk:\n  max_open_trades: 40\n  allow_min_qty_round_up: true\n"
+    if N_OWN:                   # (the owner's binance and fx: confirm_open already written)
+        text = text.replace("    no_hedge: yes\n", "    no_hedge: yes\n    confirm_open: false\n")
+        text = text.replace("    daily_loss_limit_pct: 3\n", "    daily_loss_limit_pct: 3\n    confirm_open: false\n")
     if KNOWS_LOT_ROUNDING:      # (lot_rounding already there: the friend's 45 is a value written by hand, it stays)
         text = text.replace("    risk_usd: 45\n", "    risk_usd: 45\n" + "".join(f"    {line}\n" for line in TICKMILL_ADDED))
     path = prod_file(tmp_path, text)
@@ -311,7 +319,7 @@ def test_migrate_skips_a_key_the_installed_config_model_does_not_know(tmp_path: 
     path = prod_file(tmp_path)
     notes: list[str] = []
     lines = m.migrate_config(path, notes=notes)
-    assert len(lines) == 7 + N_TICKMILL
+    assert len(lines) == 7 + N_TICKMILL + N_OWN
     assert "daily_loss_include_open_risk" not in path.read_text(encoding="utf-8")
     assert any("daily_loss_include_open_risk" in n and "tanımıyor" in n for n in notes)
     load_config(path)                                                    # still a valid file
@@ -2544,7 +2552,7 @@ def test_migrate_step_9_after_an_earlier_update_turns_nearest_into_up_and_adds_t
         50, "up", False, False, "fx")
     assert t.lot_rounding_max_over == 10.0
     fx = broker_of(load_config(path), "fx")
-    assert (fx.confirm_open, fx.fees_in_risk, fx.lot_rounding, fx.reference_broker) == (True, None, "down", None)
+    assert (fx.confirm_open, fx.fees_in_risk, fx.lot_rounding, fx.reference_broker) == (False, None, "down", None)
     assert m.migrate_config(path, terminal=none) == []                                 # idempotent
 
 
@@ -2561,6 +2569,33 @@ def test_migrate_step_10_after_the_previous_update_adds_only_size_from_signal_en
     assert tickmill_block(load_config(path)).size_from_signal_entry is True
     assert broker_of(load_config(path), "fx").size_from_signal_entry is False      # only tickmill
     assert m.migrate_config(path, terminal=none) == []                             # idempotent
+
+
+@pytest.mark.skipif(not KNOWS_STEP9, reason="this version has no confirm_open")
+def test_migrate_step_11_the_owners_binance_fx_and_fx2_open_without_asking_breakout_stays(tmp_path: Path) -> None:
+    m = migrate_mod()
+    none = (None, None)
+    fx2 = ("  - name: fx2\n    type: mt5_bridge\n    enabled: true\n    optional: true\n    friend_account: false\n"
+           "    terminal_path: C:\\\\Program Files\\\\BEM Funding MT5 Terminal\\\\terminal64.exe\n"
+           "    broker_company: BEM\n    risk_usd: 100\n")
+    text = PROD_YAML.replace("  - name: tickmill\n", fx2 + "  - name: tickmill\n")
+    path = prod_file(tmp_path, text)
+    notes: list[str] = []
+    lines = m.migrate_config(path, notes=notes, terminal=none)
+    own = [line for line in lines if line.endswith("(confirm_open: false)") and not line.startswith("tickmill")]
+    assert [line.split(":")[0] for line in own] == ["binance", "fx", "fx2"]
+    assert own[0] == ("binance: bot emin olamayıp 'açayım mı?' diye sorduğunda bu hesapta da işlem beklemeden, "
+                      "okunduğu gibi açılacak (confirm_open: false)")
+    assert not any("adlı broker yok; confirm_open" in n for n in notes)
+    cfg = load_config(path)
+    assert [broker_of(cfg, n).confirm_open for n in ("binance", "fx", "fx2", "tickmill", "breakout")] == [
+        False, False, False, False, True]
+    assert m.migrate_config(path, terminal=none) == []                                 # idempotent
+    # a value written by hand stays
+    path.write_text(path.read_text(encoding="utf-8").replace(
+        "    risk_usd: 100\n    confirm_open: false\n", "    risk_usd: 100\n    confirm_open: true\n", 1), encoding="utf-8")
+    assert m.migrate_config(path, terminal=none) == []
+    assert broker_of(load_config(path), "fx2").confirm_open is True
 
 
 @pytest.mark.skipif(not KNOWS_STEP9, reason="this version has no confirm_open / fees_in_risk / reference_broker")

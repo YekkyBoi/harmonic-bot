@@ -40,6 +40,9 @@ MAX_OPEN_TRADES = 25              # risk.max_open_trades is raised to this when 
 BINANCE_BROKER = "binance"        # broker names of the owner's config
 FX_BROKER = "fx"
 TICKMILL_BROKER = "tickmill"      # the friend's account
+FX2_BROKER = "fx2"                # the owner's BEM Funding account
+# The owner's own accounts that open an unsure signal without his answer (step 11; the manual breakout account is not)
+OWN_NO_CONFIRM_BROKERS = (BINANCE_BROKER, FX_BROKER, FX2_BROKER)
 TICKMILL_COMPANY = "Tickmill"
 # The friend's two requests the owner approved: 1R 45 -> 50 USD (only from exactly 45, and only together with the
 # first lot_rounding of the block: a later manual 45 stays), and sizes rounded to the NEAREST lot step - rounded UP
@@ -397,6 +400,20 @@ def plan_changes(raw: dict[str, Any], config: AppConfig, *,
                 "(varsayılan 10) üstüne çıkar (size_from_signal_entry: true)",
                 lambda c: getattr(_broker(c, TICKMILL_BROKER), "size_from_signal_entry", None) is True,
                 TICKMILL_BROKER, wanted=lambda v: True)
+
+    # 11. The owner's decision: his own accounts Binance, FundingPips (fx) and BEM (fx2) take a signal the bot would ask
+    #     about at once too (the manual breakout account is still asked). Only when the key is not there yet (a
+    #     value written by hand stays); a missing block is said in a note.
+    for name in OWN_NO_CONFIRM_BROKERS:
+        i = broker_index(name)
+        if i is None or _broker(config, name) is None:
+            notes.append(f"'{name}' adlı broker yok; confirm_open ayarı atlandı")
+            continue
+        setting(("brokers", i), brokers[i], type(_broker(config, name)), "confirm_open", False,
+                f"{name}: bot emin olamayıp 'açayım mı?' diye sorduğunda bu hesapta da işlem beklemeden, okunduğu "
+                "gibi açılacak (confirm_open: false)",
+                lambda c, name=name: getattr(_broker(c, name), "confirm_open", None) is False,
+                name, wanted=lambda v: True)
     return changes, notes
 
 
