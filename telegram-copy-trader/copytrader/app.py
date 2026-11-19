@@ -393,15 +393,23 @@ def card_account_names(config: AppConfig) -> list[str]:
             if b.name in real or (getattr(b, "type", None) == "manual" and not is_friend_account(b))]
 
 
+def friend_card_account_names(config: AppConfig) -> list[str]:
+    """The friend's accounts his own trade card is made for (/tickmillkart, in his chat; the owner may use it too):
+    his accounts that trade real money (:func:`real_account_names` with ``friend=True``); none in dry-run."""
+    return real_account_names(config, friend=True)
+
+
 def build_tradecard(config: AppConfig, db: Any, notifier: Any, engine: Any, listener: Any,
                     data_dir: str | os.PathLike[str]) -> Any:
-    """The owner's trade card service (copytrader.karne.tradecard_service): reads the database, the candles of the
-    public exchange or - read only - of the account's own MetaTrader terminal, draws in another process."""
+    """The trade card service (copytrader.karne.tradecard_service): reads the database, the candles of the public
+    exchange or - read only - of the account's own MetaTrader terminal (also through the mt5_bridge helper), draws
+    in another process. The owner's accounts, and the friend's (his /<account>kart in his own chat)."""
     from .karne.tradecard_service import TradeCardService
     from .telegram.group_mirror import trading_path_busy
 
     names = card_account_names(config)
-    configs = {b.name: b for b in config.enabled_brokers if b.name in names}
+    friend_names = [n for n in friend_card_account_names(config) if n not in names]
+    configs = {b.name: b for b in config.enabled_brokers if b.name in names or b.name in friend_names}
     sources: dict[str, tuple[str, str | None]] = {}
     for name, cfg in configs.items():
         kind = getattr(cfg, "type", None)
@@ -416,7 +424,8 @@ def build_tradecard(config: AppConfig, db: Any, notifier: Any, engine: Any, list
         return next((b for b in list(getattr(engine, "brokers", None) or []) if b.name == name), None)
 
     return TradeCardService(
-        db, notifier, data_dir, accounts=names, aliases={n: list(c.aliases) for n, c in configs.items()},
+        db, notifier, data_dir, accounts=names, friend_accounts=friend_names,
+        aliases={n: list(c.aliases) for n, c in configs.items()},
         sources=sources, broker=broker_of, oracle=getattr(engine, "reference_prices", None),
         manual=[n for n, c in configs.items() if getattr(c, "type", None) == "manual"],
         busy=lambda: trading_path_busy(listener, notifier, engine))
@@ -818,6 +827,6 @@ async def run(config_path: str | os.PathLike[str] = "config.yaml") -> bool:
 
 
 __all__ = ["App", "STOP_REQUEST_FILE", "build_app", "clear_stop_request", "config_secrets", "make_parser",
-           "mask_secrets", "parser_deadline_sec", "card_account_names", "build_tradecard", "read_stop_request", "real_account_names", "run", "serve",
+           "mask_secrets", "parser_deadline_sec", "card_account_names", "friend_card_account_names", "build_tradecard", "read_stop_request", "real_account_names", "run", "serve",
            "setup_logging",
            "stop_request_path", "watch_event_loop", "watch_stop_request", "write_stop_request"]

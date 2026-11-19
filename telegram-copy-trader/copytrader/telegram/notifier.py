@@ -173,7 +173,9 @@ HELP_TEXT = (
     "/karne — bu haftanın karnesi, şu ana kadar (haftalık karne her pazar 22:00'de, İngiltere saatiyle, kendiliğinden "
     "gelir); /karne hepsi — bugüne kadarki tüm işlemler\n"
     "/binancekart · /fxkart · /fx2kart · /breakoutkart (hesap adı + kart) — o hesabın bu haftaki işlemlerinin "
-    "numaralı listesi; numara yazınca işlemin kartı (resim) gelir: açık işlemde giriş kartı, kapanmışta sonuç kartı\n"
+    "numaralı listesi; numara yazınca işlemin kartı (resim) gelir: açık işlemde giriş kartı, kapanmışta sonuç kartı. "
+    "/tickmillkart da çalışır (arkadaşınız da kendi sohbetinde kendi hesabı için kullanabilir; kart yalnızca isteyen "
+    "sohbete gelir)\n"
     "/yardim — bu mesaj\n\n"
     "Onay mesajlarında: ✅ Onayla · ✏️ Düzelt (doğrusunu yazarsınız) · ❌ İptal\n"
     "Bir onay mesajını yanıtlayarak da düzeltme yazabilirsiniz."
@@ -202,6 +204,7 @@ FRIEND_HELP = (
     "/pozkapat — açık pozisyonlarınızın numaralı listesi; sonra numara yazın (ör. <code>2</code> ya da "
     "<code>1-3</code> = 1. ve 3.). Kısa yollar: <code>/pozkapat xau</code> · <code>/pozkapat hepsi</code>\n"
     "/karne — bu haftanın karneniz; <code>/karne hepsi</code> — bugüne kadarki tüm işlemleriniz\n"
+    "{cards}"
     "/yardim — bu mesaj\n\n"
     "Yaptığınız kapatmalar bot sahibine de bildirilir."
 )
@@ -212,6 +215,9 @@ FRIEND_COMMANDS = {
     "pozkapat": "pozkapat",
     "karne": "karne",
 }
+# The friend's trade card line of FRIEND_HELP ({commands}: his own /<account>kart only)
+FRIEND_CARD_HELP = ("{commands} — bu haftaki işlemlerinizin numaralı listesi; numara yazınca o işlemin kartı (resim) "
+                    "gelir: açık işlemde giriş kartı, kapanmışta sonuç kartı. Liste 5 dk geçerli.\n")
 FRIEND_NO_ACCOUNT = "Bu botta size ait bir hesap tanımlı değil."
 FRIEND_BUTTON_REFUSED = "Bu düğme yalnızca bot sahibi içindir."
 FRIEND_HELLO = (
@@ -245,6 +251,7 @@ FRIEND_FLOOD_TRIES = 1            # an ordinary message is sent once more after 
 OWNER_FILE_TIMEOUT_SEC = 120.0    # the whole upload (a card is under 1 MB); no answer by then: left to Telethon
 OWNER_FILE_PAUSE_SEC = 30.0       # the upload waits this long (before it and between its parts) for an idle trading path
 OWNER_FILE_POLL_SEC = 0.2
+FRIEND_PHOTO_WAIT_SEC = 15.0      # the friend's trade card waits this long for his waiting messages to go first
 OWNER_FILE_NO_AES = ("Telegram'a dosya göndermek için hızlı şifreleme paketi (cryptg) kurulu değil; kurmak için botun "
                      "klasöründe: python -m pip install cryptg")
 KARNE_OFF_TEXT = "ℹ️ Karne bu kurulumda kullanılamıyor."
@@ -1172,6 +1179,9 @@ class BotNotifier:
             self._friend_msgs.clear()
             self._friend_routed.clear()
             self._friend_wake.set()
+            forget = getattr(self._tradecard, "forget", None)
+            if callable(forget):
+                forget(friend=True)             # (the earlier friend's card list is not the new one's)
         self._friend = new
 
     @property
@@ -1404,15 +1414,49 @@ class BotNotifier:
                          "(Bu uyarı en fazla saatte bir gönderilir.)", mirror=False)
 
     async def _handle_friend_text(self, text: str) -> None:
-        """A message of the friend: /yardim, /pozisyonlar, /bakiye, /pozkapat and /karne, each for HIS accounts only
+        """A message of the friend: /yardim, /pozisyonlar, /bakiye, /pozkapat, /karne and /<his account>kart (with a
+        number for its list), each for HIS accounts only
         (the engine's ``friend_account_names``). Everything else is refused (a line now and then), never executed."""
         m = _COMMAND_RE.match(text or "")
         command = FRIEND_COMMANDS.get(m.group(1).lower()) if m else None
         engine = self._engine
+        card = self._tradecard
+        friend = self._friend
+        if (m is None and engine is not None and card is not None and friend is not None
+                and _PK_PICK_RE.match(text or "") and card.list_live(friend=True)):
+            # A number for HIS trade card list (never the owner's): never while his /pozkapat list waits too (an
+            # expired one does not count).
+            pk_entry = self._pk_lists.get(friend)
+            if pk_entry is not None and time.monotonic() - pk_entry[0] > POZKAPAT_TTL_SEC:
+                self._pk_lists.pop(friend, None)
+                pk_entry = None
+            if pk_entry is not None:
+                numbers = re.findall(r"\d+", text)
+                reply = CARD_OR_CLOSE_TEXT.format(n=esc(numbers[0] if numbers else "1"),
+                                                  card=esc(card.list_command(friend=True)))
+            else:
+                reply = await card.pick(text, friend=True, chat=friend)
+            if self._friend == friend:
+                self._friend_put(_FriendMessage(text=reply or "✔️"))
+            return
         if (m is None and engine is not None and _PK_PICK_RE.match(text or "") and self._friend is not None
                 and self._friend in self._pk_lists):
             self._friend_put(_FriendMessage(text=await self._pozkapat_pick(engine, text, friend=True) or "✔️"))
             return
+        if command is None and m is not None and card is not None and friend is not None:
+            account = card.command_account(m.group(1), friend=True)
+            if account is not None and engine is None:
+                self._friend_put(_FriendMessage(text="Sistem henüz hazır değil; biraz sonra tekrar deneyin."))
+                return
+            if account is not None:
+                # /<his account>kart: his own trade card (any other account's card command is refused as before)
+                log.info("The friend's command /%s %s", m.group(1), m.group(2).strip())
+                reply = await card.command(account, m.group(2).strip(), friend=True, chat=friend)
+                if self._friend != friend:
+                    log.warning("The friend's chat changed while his card command ran; its answer was not sent")
+                    return
+                self._friend_put(_FriendMessage(text=reply or "✔️"))
+                return
         if command is None:
             self._friend_refuse()
             return
@@ -1427,7 +1471,9 @@ class BotNotifier:
             return
         log.info("The friend's command /%s %s", command, args)
         if command == "help":
-            reply = FRIEND_HELP.format(accounts=esc(", ".join(names)))
+            cards = card.commands_text(friend=True) if card is not None else ""
+            reply = FRIEND_HELP.format(accounts=esc(", ".join(names)),
+                                       cards=FRIEND_CARD_HELP.format(commands=cards) if cards else "")
         elif command == "positions":
             reply = await engine.positions_text(accounts=set(names))
         elif command == "balance":
@@ -1570,12 +1616,14 @@ class BotNotifier:
     # ---- the owner's trade card (/<account>kart; copytrader.karne.tradecard_service) ----------------------
     def set_tradecard(self, service: Any) -> None:
         """The app's TradeCardService: ``/<account>kart`` asks it for the numbered list, a number picks; it sends the
-        picture through :meth:`send_owner_photo` and its lines through :meth:`tell_owner` (the owner's alone)."""
+        picture through :meth:`send_owner_photo` and its lines through :meth:`tell_owner` (the owner's alone) - or,
+        when the friend asked in his own chat (his own accounts only), through :meth:`send_friend_photo` and
+        :meth:`tell_friend`."""
         self._tradecard = service
 
     async def _card_command(self, card: Any, name: str, args: str) -> None:
-        """``/<account>kart [N]`` of the owner (only the owner gets here). Its answers are never copied to the
-        friend."""
+        """``/<account>kart [N]`` of the owner (the friend's own goes through :meth:`_handle_friend_text`). Its
+        answers are never copied to the friend."""
         if self._engine is None:
             await self._send("⏳ Sistem henüz hazır değil, biraz sonra tekrar deneyin.", mirror=False)
             return
@@ -1592,6 +1640,23 @@ class BotNotifier:
         friend), only not as a file. Returns None when Telegram confirmed it, else the reason in Turkish."""
         return await self._send_document(self._owner, path, caption=caption, busy=busy, photo=True)
 
+    async def send_friend_photo(self, path: str, *, caption: str = "", busy: Callable[[], bool] | None = None,
+                                chat: int | None = None) -> str | None:
+        """:meth:`send_owner_photo` for the FRIEND's chat (his own trade card, asked by him there): only while
+        ``chat`` (the chat that asked) is still his friend chat, and never while his messages wait (they go first:
+        waited for at most FRIEND_PHOTO_WAIT_SEC). Returns None when Telegram confirmed it, else the reason."""
+        friend = self._friend
+        if friend is None or (chat is not None and chat != friend):
+            return "arkadaş sohbeti değişti" if friend is not None else "arkadaş sohbeti ayarlı değil"
+        deadline = time.monotonic() + FRIEND_PHOTO_WAIT_SEC
+        while self._friend_queue and time.monotonic() < deadline and not self._shut:
+            await asyncio.sleep(OWNER_FILE_POLL_SEC)
+        if self._friend != friend:
+            return "arkadaş sohbeti değişti"
+        if self._friend_queue:
+            return "sohbete giden mesajlar sırada bekliyor"
+        return await self._send_document(friend, path, caption=caption, busy=busy, photo=True)
+
     # ---- the owner's report card (/karne; copytrader.karne) ------------------------------------------------
     def set_karne(self, karne: Any) -> None:
         """The app's KarneService: ``/karne`` asks it for a card; it sends through :meth:`send_owner_document` and
@@ -1607,10 +1672,10 @@ class BotNotifier:
         """The owner has set his friend's chat (/arkadas)."""
         return self._friend is not None
 
-    async def tell_friend(self, text: str) -> None:
-        """HTML for the friend alone (his own report card's text, its problems). Never raises; nothing when no friend
-        is set."""
-        if self._friend is not None and text and text.strip():
+    async def tell_friend(self, text: str, *, chat: int | None = None) -> None:
+        """HTML for the friend alone (his own report card's / trade card's text, its problems). Never raises;
+        nothing when no friend is set, or when ``chat`` (the chat that asked) is not his friend chat any more."""
+        if self._friend is not None and (chat is None or chat == self._friend) and text and text.strip():
             self._friend_put(_FriendMessage(text=text))
 
     async def send_friend_document(self, path: str, *, caption: str = "", name: str | None = None,

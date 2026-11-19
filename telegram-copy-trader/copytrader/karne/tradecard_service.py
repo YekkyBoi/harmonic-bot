@@ -1,14 +1,18 @@
-"""The owner's trade card on Telegram: ``/<hesap>kart`` (``/binancekart``, ``/fxkart`` - or an alias, ``/fx1kart`` -,
+"""The trade card on Telegram: ``/<hesap>kart`` (``/binancekart``, ``/fxkart`` - or an alias, ``/fx1kart`` -,
 ``/fx2kart``, ``/breakoutkart``...) lists THIS WEEK's trades of that account, numbered ("1- BTC LONG · #12 · ..."); the
 owner answers with a number and gets one picture: the ENTRY card while that account's position is open or pending,
 the RESULT card once it is closed (see :mod:`.tradecard` for what the card says). Only on command, never by itself.
 
-* **Owner only.** The accounts are the owner's own (real money and his hand-traded ones; never the friend's); the
-  friend's chat has its own commands (telegram.notifier.FRIEND_COMMANDS) and this is not one of them; no reply, no
-  card and no error of this feature is ever copied to the friend.
-* **The numbered list** works like /pozkapat's: one per owner, CARD_LIST_TTL_SEC long, one use; a plain number
-  answers it. A number is never taken from it while a correction is awaited (the number is the correction), and
-  never while a /pozkapat list is waiting too (the bot then asks for ``/pozkapat 2`` or ``/binancekart 2``: a number
+* **Who asks, who sees.** The owner's card accounts are his own (real money and his hand-traded ones) plus the
+  friend's (``friend_accounts``: ``/tickmillkart`` works for him too). The owner's friend (``friend=True``: his own
+  chat, telegram.notifier) gets the card of HIS accounts only (``/tickmillkart``); any other account's command is
+  never his (the notifier refuses it as before) and nothing he reads names another account (no list, no default
+  command, no "these are the accounts" line of the owner's). Every answer, line and card goes to the chat that
+  asked (``tell_owner`` / ``send_owner_photo`` or ``tell_friend`` / ``send_friend_photo``); nothing is ever sent
+  by itself and nothing of the owner's is copied to the friend.
+* **The numbered list** works like /pozkapat's: one per chat (the owner's and the friend's are kept apart),
+  CARD_LIST_TTL_SEC long, one use; a plain number answers it. A number is never taken from it while a correction
+  is awaited (the number is the correction), and never while that chat's /pozkapat list is waiting too (the bot then asks for ``/pozkapat 2`` or ``/binancekart 2``: a number
   meant for a card must never close a position). ``/binancekart 2`` picks from that account's list explicitly.
 * **Never in the way of trading.** Database reads; candles from the public exchange (ccxt) or - read only - from
   the account's own MetaTrader terminal through the adapter's worker thread with its time limit
@@ -20,7 +24,8 @@ the RESULT card once it is closed (see :mod:`.tradecard` for what the card says)
   the terminal gets another call (``trade_chart``'s "busy"). The picture is drawn by ANOTHER process
   (:mod:`.render`: time limit, below normal priority, killed on overrun); the upload through the notifier's bounded
   file request (paused while the trading path is busy). The command answers at once; the card is made by a task of
-  this service, one card at a time. Every failure is a short text for the owner; nothing raises into the bot.
+  this service, one card at a time (whoever asked: a second card waits, BUSY). Every failure is a short text for
+  the chat that asked; nothing raises into the bot.
   :meth:`stop` ends within STOP_WAIT_SEC.
 * **A ccxt position closed by hand on the exchange** (closed, no exit price of the bot's on record, or part of it
   closed by the bot and the rest by hand: :func:`.tradecard.venue_wanted`): its close
@@ -85,6 +90,26 @@ CANDLES_FAILED = "mumlar okunamadı"
 BUSY_TRADING = "⏳ Şu an hesapta işlem yürütülüyor, kartı birazdan tekrar isteyin."
 
 
+# What the FRIEND reads instead of a free-text reason (an exception's or a terminal's text, a drawing error, the
+# notifier's reason): such a text may name another account or the owner's set-up; it goes to the log only.
+FRIEND_UNEXPECTED = "beklenmeyen bir hata; bot sahibine haber verin"
+FRIEND_NOT_SENT = "Telegram'a gönderilemedi; biraz sonra tekrar deneyin"
+
+
+def _detail(exc: BaseException, friend: bool) -> str:
+    """An unexpected error's text for the asker (HTML-safe); the friend's: a fixed phrase (the detail is logged)."""
+    return FRIEND_UNEXPECTED if friend else esc(str(exc) or type(exc).__name__)
+
+
+def _problem(exc: tc.CardProblem, friend: bool) -> str:
+    """A CardProblem's reason (fixed phrases of this feature); the friend's without a free-text detail after it
+    (``CANDLES_FAILED: <the terminal's text>``)."""
+    text = str(exc)
+    if friend and text.startswith(f"{CANDLES_FAILED}:"):
+        return CANDLES_FAILED
+    return text
+
+
 class _TradingBusy(Exception):
     """The MetaTrader read was not made: the trading path is working (the owner reads BUSY_TRADING)."""
 
@@ -97,6 +122,7 @@ class TradeCardService:
         data_dir: str | Path,
         *,
         accounts: Sequence[str],
+        friend_accounts: Sequence[str] = (),
         aliases: Mapping[str, Sequence[str]] | None = None,
         sources: Mapping[str, tuple[str, str | None]] | None = None,
         broker: Callable[[str], Any] | None = None,
@@ -110,6 +136,7 @@ class TradeCardService:
         idle_wait_sec: float = CHART_IDLE_WAIT_SEC,
     ) -> None:
         """``accounts``: the owner's accounts a card is made for, in the order they are shown (never the friend's);
+        ``friend_accounts``: the friend's accounts (his /<account>kart in his own chat; the owner may use them too);
         ``aliases``: their other names (config ``aliases``); ``sources``: where each one's candles come from -
         ("ccxt", exchange id) or ("mt5", None) (the adapter's own read-only ``trade_chart``); ``broker(name)``: the
         live adapter of an account; ``oracle``: the engine's ReferencePriceOracle (public candles); ``manual``: the
@@ -120,7 +147,9 @@ class TradeCardService:
         self._notifier = notifier
         self._folder = Path(data_dir) / TEMP_DIR
         self._accounts = list(dict.fromkeys(accounts))
-        self._aliases = {name: list((aliases or {}).get(name, [])) for name in self._accounts}
+        self._friend_accounts = [n for n in dict.fromkeys(friend_accounts) if n not in self._accounts]
+        self._aliases = {name: list((aliases or {}).get(name, []))
+                         for name in [*self._accounts, *self._friend_accounts]}
         self._sources = dict(sources or {})
         self._broker = broker or (lambda _name: None)
         self._oracle = oracle
@@ -131,9 +160,10 @@ class TradeCardService:
         self._pillow = pillow
         self._monotonic = monotonic
         self._idle_wait = float(idle_wait_sec)
-        # the owner's numbered list: (made at, account, [(trade id, label)]); in memory only, one use
-        self._list: tuple[float, str, list[tuple[int, str]]] | None = None
-        self._job: asyncio.Task[None] | None = None
+        # the numbered list of each chat (key: "owner" / "friend"): (made at, account, [(trade id, label)]); in memory
+        # only, one use
+        self._lists: dict[str, tuple[float, str, list[tuple[int, str]]]] = {}
+        self._job: asyncio.Task[None] | None = None      # one card at a time (whoever asked)
         self._stopping = False
 
     # ---- names ----------------------------------------------------------------------------------------
@@ -141,74 +171,109 @@ class TradeCardService:
     def accounts(self) -> list[str]:
         return list(self._accounts)
 
-    def account_for(self, word: str) -> str | None:
-        """The owner's account a command word names ("fx1" -> "fx"), compared without Turkish letters and case;
-        None: not one of the accounts a card is made for (the friend's, an unknown one)."""
+    @property
+    def friend_accounts(self) -> list[str]:
+        return list(self._friend_accounts)
+
+    def _allowed(self, friend: bool) -> list[str]:
+        """The accounts a card is made for in that chat: the friend's own only; the owner's and the friend's."""
+        return list(self._friend_accounts) if friend else [*self._accounts, *self._friend_accounts]
+
+    @staticmethod
+    def _key(friend: bool) -> str:
+        return "friend" if friend else "owner"
+
+    def account_for(self, word: str, *, friend: bool = False) -> str | None:
+        """The account a command word names ("fx1" -> "fx"), compared without Turkish letters and case; None: not
+        one of the accounts a card is made for in that chat (``friend``: only the friend's own)."""
         key = fold_ascii(word or "")
         if not key:
             return None
-        for name in self._accounts:
+        for name in self._allowed(friend):
             if key == fold_ascii(name) or any(key == fold_ascii(a) for a in self._aliases.get(name, [])):
                 return name
         return None
 
-    def command_account(self, command: str) -> str | None:
+    def command_account(self, command: str, *, friend: bool = False) -> str | None:
         """The account of a command name ("binancekart" -> "binance"); None when it is not a card command of an
-        account of the owner."""
+        account of that chat (``friend``: the friend's own accounts only)."""
         key = fold_ascii(command or "")
         if not key.endswith(COMMAND_SUFFIX) or len(key) <= len(COMMAND_SUFFIX):
             return None
-        return self.account_for(key[: -len(COMMAND_SUFFIX)])
+        return self.account_for(key[: -len(COMMAND_SUFFIX)], friend=friend)
 
     def is_card_command(self, command: str) -> bool:
         """A command of the form /<word>kart (the owner's or not)."""
         key = fold_ascii(command or "")
         return key.endswith(COMMAND_SUFFIX) and len(key) > len(COMMAND_SUFFIX)
 
-    def commands_text(self) -> str:
-        return " · ".join(f"/{esc(name)}{COMMAND_SUFFIX}" for name in self._accounts)
+    def commands_text(self, *, friend: bool = False) -> str:
+        """The card commands of that chat ("/binancekart · /fxkart ..."; ``friend``: his own only)."""
+        return " · ".join(f"/{esc(name)}{COMMAND_SUFFIX}" for name in self._allowed(friend))
 
     def not_an_account(self, command: str) -> str:
-        """The answer to /<word>kart whose word is not one of the owner's accounts."""
-        if not self._accounts:
+        """The OWNER's answer to /<word>kart whose word is not one of the card accounts (never the friend's: the
+        notifier refuses his as before)."""
+        if not self._allowed(False):
             return "ℹ️ İşlem kartı için hesabınız yok."
         return f"❓ /{esc(command)}: işlem kartı yalnızca sizin hesaplarınız için: {self.commands_text()}"
 
     # ---- the numbered list ----------------------------------------------------------------------------
-    def list_live(self) -> bool:
-        """A numbered card list waits for a number (and is not older than CARD_LIST_TTL_SEC)."""
-        if self._list is not None and self._monotonic() - self._list[0] > CARD_LIST_TTL_SEC:
-            self._list = None
-        return self._list is not None
+    def _live(self, friend: bool) -> tuple[float, str, list[tuple[int, str]]] | None:
+        key = self._key(friend)
+        entry = self._lists.get(key)
+        if entry is not None and self._monotonic() - entry[0] > CARD_LIST_TTL_SEC:
+            self._lists.pop(key, None)
+            entry = None
+        return entry
 
-    def list_command(self) -> str:
-        """The command of the live list ("binancekart"), for the owner's explicit choice."""
-        account = self._list[1] if self._list is not None else (self._accounts[0] if self._accounts else "hesap")
-        return f"{account}{COMMAND_SUFFIX}"
+    def list_live(self, *, friend: bool = False) -> bool:
+        """A numbered card list of that chat waits for a number (and is not older than CARD_LIST_TTL_SEC)."""
+        return self._live(friend) is not None
 
-    async def command(self, account: str, args: str = "") -> str:
+    def forget(self, *, friend: bool = False) -> None:
+        """That chat's list is dropped (the owner changed his friend: the earlier friend's list is not the new
+        one's)."""
+        self._lists.pop(self._key(friend), None)
+
+    def _default_command(self, friend: bool) -> str:
+        allowed = self._allowed(friend)
+        return f"{allowed[0] if allowed else 'hesap'}{COMMAND_SUFFIX}"
+
+    def list_command(self, *, friend: bool = False) -> str:
+        """The command of that chat's live list ("binancekart"), for an explicit choice (only an account of that
+        chat: the friend never reads an account of the owner's)."""
+        entry = self._live(friend)
+        return f"{entry[1]}{COMMAND_SUFFIX}" if entry is not None else self._default_command(friend)
+
+    async def command(self, account: str, args: str = "", *, friend: bool = False, chat: int | None = None) -> str:
         """``/<account>kart`` (args empty): the numbered list of the account's trades this week; ``/<account>kart
-        N``: the card of number N of that account's list. HTML for the owner; never raises."""
+        N``: the card of number N of that account's list. ``friend``: asked in the friend's chat ``chat`` (his own
+        accounts only; another one is refused without naming any). HTML for the chat that asked; never raises."""
         try:
             if self._stopping:
                 return STOPPING
+            if account not in self._allowed(friend):
+                return "ℹ️ Bu hesap için işlem kartı yok."
             words = (args or "").strip()
             if words:
                 if not _ONE_NUMBER.match(words):
                     return (f"Kullanım: <code>/{esc(account)}{COMMAND_SUFFIX}</code> (bu haftanın listesi), "
                             "sonra numara.")
-                if not self.list_live() or self._list is None or self._list[1] != account:
+                entry = self._live(friend)
+                if entry is None or entry[1] != account:
                     return NO_LIST.format(cmd=esc(f"{account}{COMMAND_SUFFIX}"))
-                return await self.pick(words)
+                return await self.pick(words, friend=friend, chat=chat)
+            key = self._key(friend)
             now = self._now()
             since = tc.week_start(now)
             rows = tc.listed(await self._db.account_trades(account, since))
             if not rows:
-                self._list = None
+                self._lists.pop(key, None)
                 return NO_TRADES.format(account=esc(account))
             rows = rows[-LIST_MAX:]
             items = [(trade.id, tc.list_label(trade, pos)) for trade, pos, _closed in rows]
-            self._list = (self._monotonic(), account, items)
+            self._lists[key] = (self._monotonic(), account, items)
             lines = [f"{i}- {esc(label)}" for i, (_tid, label) in enumerate(items, start=1)]
             return (f"🃏 <b>{esc(account)}</b> · bu haftanın işlemleri (pazar 22:00'den beri, İngiltere saati):\n"
                     + "\n".join(lines)
@@ -216,20 +281,23 @@ class TradeCardService:
                     f"kapanmışta sonuç kartı gelir. Liste {int(CARD_LIST_TTL_SEC // 60)} dk geçerli.")
         except asyncio.CancelledError:
             raise
-        except Exception as exc:      # noqa: BLE001 - told to the owner, never raised into the bot
+        except Exception as exc:      # noqa: BLE001 - told to the asker, never raised into the bot
             logger.exception("Trade card: /%skart failed", account)
-            return FAILED.format(why=esc(str(exc) or type(exc).__name__))
+            return FAILED.format(why=_detail(exc, friend))
 
-    async def pick(self, text: str) -> str:
-        """A number of the live list: that trade's card is made (by a task of its own; the answer is at once). One
-        use: the list is gone once a card was started from it. Never raises."""
+    async def pick(self, text: str, *, friend: bool = False, chat: int | None = None) -> str:
+        """A number of that chat's live list (``friend``: the friend's): that trade's card is made (by a task of its
+        own; the answer is at once) and goes to that chat only (``chat``: the friend's chat when he asked - a card
+        is never sent to a chat that is not his any more). One use: the list is gone once a card was started from
+        it. Never raises."""
         try:
             if self._stopping:
                 return STOPPING
-            if not self.list_live() or self._list is None:
-                first = self._accounts[0] if self._accounts else "hesap"
-                return NO_LIST.format(cmd=esc(f"{first}{COMMAND_SUFFIX}"))
-            made, account, items = self._list
+            key = self._key(friend)
+            entry = self._live(friend)
+            if entry is None:
+                return NO_LIST.format(cmd=esc(self._default_command(friend)))
+            made, account, items = entry
             m = _ONE_NUMBER.match(text or "")
             if m is None:
                 return ONE_NUMBER
@@ -238,9 +306,9 @@ class TradeCardService:
                 return NOT_ON_LIST.format(n=n, count=len(items))
             if self._job is not None and not self._job.done():
                 return BUSY                     # (nothing was done: the list stays for the rest of its time)
-            self._list = None                   # one use only (before anything else)
+            self._lists.pop(key, None)          # one use only (before anything else)
             trade_id = items[n - 1][0]
-            job = asyncio.ensure_future(self._make(account, trade_id))
+            job = asyncio.ensure_future(self._make(account, trade_id, friend=friend, chat=chat))
             job.set_name(f"tradecard-{account}-{trade_id}")
             job.add_done_callback(self._job_done)
             self._job = job
@@ -249,7 +317,7 @@ class TradeCardService:
             raise
         except Exception as exc:      # noqa: BLE001
             logger.exception("Trade card: picking from the list failed")
-            return FAILED.format(why=esc(str(exc) or type(exc).__name__))
+            return FAILED.format(why=_detail(exc, friend))
 
     def _job_done(self, job: asyncio.Task[None]) -> None:
         if not job.cancelled() and job.exception() is not None:
@@ -258,7 +326,7 @@ class TradeCardService:
     async def stop(self) -> None:
         """No more cards; a card that is being made is given up (its drawing process is killed)."""
         self._stopping = True
-        self._list = None
+        self._lists.clear()
         job = self._job
         if job is not None and not job.done():
             job.cancel()
@@ -268,22 +336,25 @@ class TradeCardService:
     def _now(self) -> datetime:
         return as_utc(self._clock())
 
-    async def _make(self, account: str, trade_id: int) -> None:
+    async def _make(self, account: str, trade_id: int, *, friend: bool = False, chat: int | None = None) -> None:
+        to = (friend, chat)
         try:
+            if account not in self._allowed(friend):            # (never: the list held only that chat's accounts)
+                raise tc.CardProblem("bu hesap için kart yok")
             data, caption = await self.build(account, trade_id)
-            await self._draw_and_send(data, caption)
+            await self._draw_and_send(data, caption, to=to)
         except _TradingBusy:
-            await self._tell(BUSY_TRADING)
+            await self._tell(BUSY_TRADING, to=to)
         except tc.CardProblem as exc:
-            await self._tell(FAILED.format(why=str(exc)))
+            await self._tell(FAILED.format(why=_problem(exc, friend)), to=to)
         except asyncio.CancelledError:
             if self._stopping or not stray_cancel():
                 raise
             logger.error("Trade card: a CancelledError nobody asked for ended the card", exc_info=True)
-            await self._tell(FAILED.format(why="CancelledError"))
-        except Exception as exc:      # noqa: BLE001 - told to the owner, never raised into the bot
+            await self._tell(FAILED.format(why="CancelledError"), to=to)
+        except Exception as exc:      # noqa: BLE001 - told to the asker, never raised into the bot
             logger.exception("Trade card of trade %s on %s could not be made", trade_id, account)
-            await self._tell(FAILED.format(why=esc(str(exc) or type(exc).__name__)))
+            await self._tell(FAILED.format(why=_detail(exc, friend)), to=to)
 
     async def build(self, account: str, trade_id: int) -> tuple[dict[str, Any], str]:
         """The card's data (tradecard.card_data) and the photo's caption, from a FRESH read of the account's
@@ -440,22 +511,27 @@ class TradeCardService:
                 raise _TradingBusy()
             await asyncio.sleep(min(CHART_IDLE_POLL_SEC, left))
 
-    async def _draw_and_send(self, data: dict[str, Any], caption: str) -> None:
+    async def _draw_and_send(self, data: dict[str, Any], caption: str,
+                             to: tuple[bool, int | None] = (False, None)) -> None:
+        friend, chat = to
         if not self._pillow():
-            await self._tell(NO_PILLOW)
+            await self._tell(NO_PILLOW, to=to)
             return
         picture = await self._renderer(data, self._folder)
         if not picture.ok:
             why = (f"{RENDER_TIMEOUT_SEC:.0f} sn içinde bitmedi" if picture.status == TIMEOUT
                    else "Pillow kurulu değil" if picture.status == "no_pillow"
+                   else "çizim hatası" if friend
                    else f"çizim hatası: <code>{esc(picture.detail[:200])}</code>")
-            await self._tell(NO_PICTURE.format(why=why))
+            await self._tell(NO_PICTURE.format(why=why), to=to)
             return
-        send = getattr(self._notifier, "send_owner_photo", None)
+        send = getattr(self._notifier, "send_friend_photo" if friend else "send_owner_photo", None)
         problem: str | None
         try:
             if not callable(send):
                 problem = "bildirim botu fotoğraf gönderemiyor"
+            elif friend:
+                problem = await send(str(picture.path), caption=caption, busy=self._busy, chat=chat)
             else:
                 problem = await send(str(picture.path), caption=caption, busy=self._busy)
         except asyncio.CancelledError:
@@ -466,14 +542,23 @@ class TradeCardService:
         finally:
             remove_picture(picture.path)
         if problem is not None:
-            await self._tell(NOT_SENT.format(why=esc(problem)))
+            if friend:
+                logger.warning("Trade card: the friend's card was not sent: %s", problem)
+            await self._tell(NOT_SENT.format(why=FRIEND_NOT_SENT if friend else esc(problem)), to=to)
 
-    async def _tell(self, text: str) -> None:
-        """A line for the owner alone (never the friend); never raises."""
+    async def _tell(self, text: str, to: tuple[bool, int | None] = (False, None)) -> None:
+        """A line for the chat that asked alone (the owner's: never copied to the friend; the friend's: only while
+        ``chat`` is still his); never raises."""
+        friend, chat = to
         with contextlib.suppress(Exception):
-            tell = getattr(self._notifier, "tell_owner", None)
-            if callable(tell):
-                await tell(text)
+            if friend:
+                tell = getattr(self._notifier, "tell_friend", None)
+                if callable(tell):
+                    await tell(text, chat=chat)
+            else:
+                tell = getattr(self._notifier, "tell_owner", None)
+                if callable(tell):
+                    await tell(text)
 
 
 __all__ = ["BUSY_TRADING", "CARD_LIST_TTL_SEC", "CCXT_TIMEFRAMES", "COMMAND_SUFFIX", "MT5_TIMEFRAMES",
