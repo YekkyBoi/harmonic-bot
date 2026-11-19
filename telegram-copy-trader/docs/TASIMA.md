@@ -34,7 +34,8 @@ klasöründe şunu çalıştırın:
 .\venv\Scripts\python.exe tasi.py paketle
 ```
 
-Bot çalışıyorsa hiçbir şey yapılmaz ve nasıl durdurulacağı yazar. Bitince ekranda paketin yeri yazar:
+Bot çalışıyorsa hiçbir şey yapılmaz ve nasıl durdurulacağı yazar. Kurulu sürüm eskiyse "Önce güncelleyin"
+yazar. Bitince ekranda paketin yeri yazar:
 bot klasöründe `copytrader-tasima-<tarih>-<saat>.zip`. İçinde `venv`, `yedek` (eski sürümlerin yedekleri) ve 7
 günden eski kayıt dosyaları yoktur; yedekleri de almak için komutun sonuna ` --yedekli` ekleyin.
 
@@ -123,9 +124,10 @@ adımlardan devam edilir.
 
 Ekranda yazan her şey bot klasöründeki `tasima_<tarih-saat>.log` dosyasına da yazılır.
 
-**Çıkış kodları** (otomatik kullanım için, guncelle.py ile aynı): `0` tamam; `1` elle yapılacak bir şey var
-(ekranda yazar), bot başlatılmadı; `2` hiçbir şey yapılmadı (bot çalışıyor, paket bozuk, klasör dolu, yanlış
-komut); `130` Ctrl+C ile durduruldu.
+**Çıkış kodları** (otomatik kullanım için): `0` tamam; `1` elle yapılacak bir şey var (ekranda yazar), bot
+başlatılmadı; `2` hiçbir şey yapılmadı (bot çalışıyor, paket bozuk, klasör dolu, yanlış komut); `3` kuruldu ve
+bot başlatıldı (`--baslatma` ile başlatılmadı), ama bazı adımlar SORUN yazıyor (sağlık kontrolü, bağlanamayan
+isteğe bağlı hesap, bekçi): özetteki o satırlara bakın; `130` Ctrl+C ile durduruldu.
 
 Diğer seçenekler: `--hedef "C:\klasör"` (klasörü sormadan kullan), `--evet` (soruları evet diye yanıtla),
 `--baslatma` (botu başlatma), `--bekci-yok` (bekçiyi kurma).
@@ -180,6 +182,8 @@ $LASTEXITCODE
 ```
 
 - `0`: kuruldu, kontroller geçti; 3. adıma geçin.
+- `3`: kuruldu, ama özette SORUN satırları var (sağlık kontrolü ya da bağlanamayan isteğe bağlı hesap, ör.
+  tickmill). Bu satırları olduğu gibi sahibine iletin; sahibi isterse 3. adıma geçin.
 - `1`: ekrandaki SORUN satırlarını sahibine iletin. 7. adım bir terminalin başka bir klasörde bulunduğunu ve
   onay verilmediğini yazıyorsa sahibine sorun; "evet" derse aynı komutu sonuna ` --evet` ekleyerek tekrar
   çalıştırın. Eksik terminal yazıyorsa sahibi kurup giriş yapınca komutu tekrar çalıştırın.

@@ -39,7 +39,8 @@ deleted), ``--evet`` (answer the questions with yes: the target folder, a termin
 
 Exit codes (as guncelle.py): 0 TAMAM; 1 SORUN: something needs doing by hand (the screen says what), the bot was
 not started; 2 nothing was done (the bot is running, the package is damaged, the folder is in the way, wrong
-command); 130 stopped with Ctrl+C.
+command); 3 (kur only) installed and started (not started with --baslatma), but a step says SORUN (selftest, an
+optional account that did not connect, the watchman): the owner should read those lines; 130 stopped with Ctrl+C.
 """
 
 from __future__ import annotations
@@ -69,6 +70,9 @@ ZIP_ON_EKI = "copytrader-tasima-"
 KURULUM_IZI = "tasima_kurulum.json"            # in the new bot folder: which package was extracted into it
 BICIM = 1                                      # version of the manifest layout
 CIKIS_TAMAM, CIKIS_SORUN, CIKIS_REDDEDILDI, CIKIS_KESILDI = 0, 1, 2, 130
+CIKIS_UYARILI = 3       # kur: installed (and started unless --baslatma) but some step says SORUN (selftest, an
+                        # optional account that did not connect, the watchman): tell the owner
+MOVED_FILE_ADI = "TASINDI.txt"   # copytrader/__main__.py MOVED_FILE: a bot version that knows the moved mark
 ONAY = "EVET"
 GUNLUK_OMRU_GUN = 7                            # log files older than this stay behind
 PARCA = 1024 * 1024
@@ -382,33 +386,48 @@ def paket_dosyalari(hedef: Path, veri_goreli: str | None, yedekli: bool, haric: 
     sonuc: list[tuple[Path, str]] = []
     eski_gunluk = 0
     haric_anahtar = {os.path.normcase(os.path.abspath(y)) for y in haric}
-    for kok, klasorler, dosyalar in os.walk(hedef):
-        kok_yol = Path(kok)
-        goreli_kok = kok_yol.relative_to(hedef)
-        klasorler[:] = sorted(k for k in klasorler if k != "__pycache__"
-                              and not (goreli_kok == Path(".") and k in haric_ust)
-                              and not (kok_yol / k).is_symlink())
-        for ad in sorted(dosyalar):
-            yol = kok_yol / ad
-            arc = (goreli_kok / ad).as_posix()
-            if yol.is_symlink() or ad.endswith((".pyc", ".pyo")):
-                continue
-            if os.path.normcase(os.path.abspath(yol)) in haric_anahtar:
-                continue
-            if goreli_kok == Path(".") and ad.startswith(ZIP_ON_EKI) and (ad.endswith(".zip")
-                                                                          or ad.endswith(".zip.part")):
-                continue
-            if veri_onek and arc.startswith(veri_onek) and arc[len(veri_onek):] in TASINMAYAN_VERI:
-                continue
-            if gunluk_dosyasi_mi(ad):
-                try:
-                    if yol.stat().st_mtime < sinir:
-                        eski_gunluk += 1
-                        continue
-                except OSError:
+    veri_bag = hedef / veri_goreli if veri_onek else None
+    # The data folder itself may be a link (symlink / junction) to another drive: it is followed (only it)
+    veri_bagli = veri_bag is not None and (veri_bag.is_symlink() or _junction_mi(veri_bag))
+    yuruyusler = [(hedef, PurePosixPath("."))]
+    if veri_bagli:
+        yuruyusler.append((veri_bag, PurePosixPath(veri_goreli)))
+    for disk_kok, arc_kok in yuruyusler:
+        for kok, klasorler, dosyalar in os.walk(disk_kok):
+            kok_yol = Path(kok)
+            goreli_kok = PurePosixPath(arc_kok, kok_yol.relative_to(disk_kok).as_posix())
+            klasorler[:] = sorted(k for k in klasorler if k != "__pycache__"
+                                  and not (goreli_kok == PurePosixPath(".") and k in haric_ust)
+                                  and not (kok_yol / k).is_symlink() and not _junction_mi(kok_yol / k))
+            for ad in sorted(dosyalar):
+                yol = kok_yol / ad
+                arc = (goreli_kok / ad).as_posix()
+                if yol.is_symlink() or ad.endswith((".pyc", ".pyo")):
                     continue
-            sonuc.append((yol, arc))
+                if os.path.normcase(os.path.abspath(yol)) in haric_anahtar:
+                    continue
+                if goreli_kok == PurePosixPath(".") and ad.startswith(ZIP_ON_EKI) and (ad.endswith(".zip")
+                                                                              or ad.endswith(".zip.part")):
+                    continue
+                if veri_onek and arc.startswith(veri_onek) and arc[len(veri_onek):] in TASINMAYAN_VERI:
+                    continue
+                if gunluk_dosyasi_mi(ad):
+                    try:
+                        if yol.stat().st_mtime < sinir:
+                            eski_gunluk += 1
+                            continue
+                    except OSError:
+                        continue
+                sonuc.append((yol, arc))
     return sonuc, eski_gunluk
+
+
+def _junction_mi(yol: Path) -> bool:
+    """A Windows junction (not a symlink to Python before 3.12's is_junction)."""
+    try:
+        return bool(getattr(yol, "is_junction", lambda: False)())
+    except OSError:
+        return False
 
 
 def guvensiz_ad(ad: str) -> bool:
@@ -523,6 +542,15 @@ def paketle(hedef: Path, secenek: argparse.Namespace, gunluk: Gunluk, surecler: 
                     f"burası botun klasörü değil ({', '.join(eksik)} yok). Komutu botun klasöründe çalıştırın.")
         return CIKIS_REDDEDILDI
     try:
+        bilir = MOVED_FILE_ADI in (hedef / PAKET / "__main__.py").read_text(encoding="utf-8", errors="replace")
+    except OSError:
+        bilir = False
+    if not bilir:
+        gunluk.adim(1, "Bot klasörü kontrol edildi", False,
+                    "kurulu bot sürümü eski: taşındıktan sonra bu sunucuda kendiliğinden başlamayı engelleyemez. "
+                    "Önce güncelleyin (docs/GUNCELLEME.md), sonra bu komutu tekrar çalıştırın. Hiçbir şey yapılmadı.")
+        return CIKIS_REDDEDILDI
+    try:
         g = guncelle_yukle(hedef)
     except Exception as exc:   # noqa: BLE001
         gunluk.adim(1, "Bot klasörü kontrol edildi", False, f"guncelle.py yüklenemedi ({exc}).")
@@ -585,6 +613,17 @@ def paketle(hedef: Path, secenek: argparse.Namespace, gunluk: Gunluk, surecler: 
     gecici = zip_yolu.with_name(zip_yolu.name + ".part")
     haric = {gunluk.yol} if gunluk.yol else set()
     dosyalar, eski_gunluk = paket_dosyalari(hedef, veri_goreli, secenek.yedekli, haric)
+    paketlenen = {arc for _yol, arc in dosyalar}
+    veri_on = "" if veri_goreli in (None, ".") else veri_goreli.rstrip("/") + "/"
+    oturum_arc = (oturum_goreli or "") + ".session"
+    eksik_veri = [ad for ad, gerekli in ((f"{veri_on}copytrader.db", True),
+                                         (oturum_arc, oturum_dosyasi.is_file())) if gerekli and ad not in paketlenen]
+    if eksik_veri:
+        gunluk.adim(4, "Paket yazıldı", False,
+                    f"pakete girmeyen gerekli dosya: {', '.join(eksik_veri)} (veritabanı ya da Telegram oturumu). "
+                    "Veri klasörü başka bir yere bağlantı olabilir ya da okunamıyor. Hiçbir şey yapılmadı; ekran "
+                    "görüntüsünü gönderin.")
+        return CIKIS_SORUN
     tasi_kaydi: str | None = None
     kayitlar: list[dict[str, Any]] = []
     try:
@@ -615,7 +654,7 @@ def paketle(hedef: Path, secenek: argparse.Namespace, gunluk: Gunluk, surecler: 
                           "son_guncelleme_gunlugu": max((p.name for p in hedef.glob("guncelleme_*.log")), default=None)},
                 "tasi_py_sha256": tasi_kaydi,
                 "data_dir": veri_goreli,
-                "telegram_oturumu": {"yol": (oturum_goreli or "") + ".session", "var": oturum_dosyasi.is_file()},
+                "telegram_oturumu": {"yol": oturum_arc, "var": oturum_arc in paketlenen},
                 "mt5_terminalleri": terminaller,
                 "metaapi_hesaplari": metaapi,
                 "pip_paketleri": pip_paketleri,
@@ -794,9 +833,10 @@ def varsayilan_hedef(manifest: dict[str, Any]) -> Path:
     return Path(r"C:\copytrader") if os.name == "nt" else Path.home() / "copytrader"
 
 
-def disari_ac(zip_yolu: Path, manifest: dict[str, Any], hedef: Path) -> None:
-    """Extract every listed file into a fresh folder beside ``hedef``, check each sha256, then give the folder
-    its name. Raises Hata (the half-extracted folder is removed)."""
+def disari_ac(zip_yolu: Path, manifest: dict[str, Any], hedef: Path, iz: str = "") -> None:
+    """Extract every listed file into a fresh folder beside ``hedef``, check each sha256, write ``iz`` (the
+    install mark, KURULUM_IZI) into it, then give the folder its name: a folder with the name is always complete
+    and marked, so a later run goes on from it. Raises Hata (the half-extracted folder is removed)."""
     gecici = hedef.with_name(hedef.name + ".tasima-gecici")
     if gecici.exists():
         shutil.rmtree(gecici)
@@ -822,6 +862,8 @@ def disari_ac(zip_yolu: Path, manifest: dict[str, Any], hedef: Path) -> None:
                     os.utime(cikti, (zaman, zaman))
                 except (OverflowError, ValueError, OSError):
                     pass
+        if iz:
+            (gecici / KURULUM_IZI).write_text(iz, encoding="utf-8")
         if hedef.exists():
             hedef.rmdir()                     # only an empty folder gets here
         _yeniden_adlandir(gecici, hedef)
@@ -877,6 +919,21 @@ def _paket_surumu(pip_paketleri: list[str], ad: str) -> str | None:
         if m and m.group(1).replace("_", "-").casefold() == ad.replace("_", "-").casefold():
             return m.group(2)
     return None
+
+
+_NUMARALAR = (
+    (re.compile(r"(?i)\b(login\s*[=:]\s*)\d+"), r"\1***"),                       # login=12345678
+    (re.compile(r"(farklı bir hesaba bağlı \()[^,)]+(, beklenen )[^)]+"), r"\1***\2***"),
+    (re.compile(r"(Sahip kullanıcı ID:\s*)\S+"), r"\1***"),                          # the owner's Telegram id
+    (re.compile(r"(?<![\d.,])\d{6,}(?![\d.,]*\d)"), "***"),                          # any other long number
+)
+
+
+def numaralari_gizle(metin: str) -> str:
+    """A line of check / selftest output without account numbers and the owner's Telegram id (balances stay)."""
+    for kalip, yerine in _NUMARALAR:
+        metin = kalip.sub(yerine, metin)
+    return metin
 
 
 def bagli_olmayan_istege_bagli(satirlar: list[str]) -> list[str]:
@@ -977,13 +1034,12 @@ def kur(zip_yolu: Path, secenek: argparse.Namespace, gunluk: Gunluk, *, calistir
     else:
         gunluk.yaz("   Dosyalar açılıyor ve tek tek kontrol ediliyor...")
         try:
-            disari_ac(zip_yolu, manifest, hedef)
-            (hedef / KURULUM_IZI).write_text(json.dumps({
+            disari_ac(zip_yolu, manifest, hedef, json.dumps({
                 "paket_kimligi": kimlik, "paket": zip_yolu.name,
-                "acildi": datetime.now(timezone.utc).isoformat(timespec="seconds")}, indent=1), encoding="utf-8")
+                "acildi": datetime.now(timezone.utc).isoformat(timespec="seconds")}, indent=1))
         except (Hata, OSError, KeyError, zipfile.BadZipFile) as exc:
-            gunluk.adim(3, "Dosyalar açıldı", False, f"{exc}. Klasör yerinde bırakılmadı; paketi yeniden kopyalayıp "
-                                                       "tekrar deneyin.")
+            gunluk.adim(3, "Dosyalar açıldı", False, f"{exc}. Yarım açılan dosyalar silindi, bot klasörü "
+                                                       "oluşturulmadı; paketi yeniden kopyalayıp tekrar deneyin.")
             return CIKIS_SORUN
         gunluk.adim(3, f"Dosyalar açıldı ve kontrol edildi ({len(manifest['dosyalar'])} dosya)")
     gunluk.ac(hedef / f"tasima_{zaman}.log")
@@ -1016,6 +1072,7 @@ def kur(zip_yolu: Path, secenek: argparse.Namespace, gunluk: Gunluk, *, calistir
         satirlar: list[str] = []
 
         def satir(metin: str) -> None:
+            metin = numaralari_gizle(metin)
             satirlar.append(metin)
             (gunluk.yaz if ekranda else gunluk.dosyaya)(f"   | {metin}")
 
@@ -1207,7 +1264,7 @@ def kur(zip_yolu: Path, secenek: argparse.Namespace, gunluk: Gunluk, *, calistir
             g.guncelleme_kilidi_kaldir(veri)
             gunluk.adim(11, "Bot başlatılmadı (--baslatma)")
             gunluk.yaz(f"   Başlatmak için bot klasöründe: {python} -m {PAKET} run")
-            return CIKIS_TAMAM
+            return CIKIS_UYARILI if any(not tamam for _m, tamam, _n in gunluk.ozet) else CIKIS_TAMAM
         bulgu, _ = g.bot_calisiyor_mu(hedef, surecler)
         if bulgu is not None:
             g.guncelleme_kilidi_kaldir(veri)
@@ -1234,7 +1291,7 @@ def kur(zip_yolu: Path, secenek: argparse.Namespace, gunluk: Gunluk, *, calistir
             return CIKIS_SORUN
         gunluk.adim(11, f"Bot başlatıldı ve çalışıyor (PID {sahip.get('pid')})")
         gunluk.yaz("   Açılan bot penceresini KAPATMAYIN. Telegram'a \"🚀 Kopya-trade motoru başladı\" mesajı gelmeli.")
-        return CIKIS_TAMAM
+        return CIKIS_UYARILI if any(not tamam for _m, tamam, _n in gunluk.ozet) else CIKIS_TAMAM
     except BaseException:
         g.guncelleme_kilidi_kaldir(veri)
         raise

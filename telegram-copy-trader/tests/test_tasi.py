@@ -25,7 +25,7 @@ REPO = Path(__file__).resolve().parents[1]
 
 ENV_SECRETS = {
     "TG_API_ID": "12345", "TG_API_HASH": "a1b2c3d4e5f6GIZLIhash", "TG_BOT_TOKEN": "123456:GIZLI-bot-token-value",
-    "TG_OWNER_ID": "42", "ANTHROPIC_API_KEY": "sk-ant-GIZLI-anahtar-0001", "BINANCE_API_KEY": "GIZLI-binance-key",
+    "TG_OWNER_ID": "5123498765", "ANTHROPIC_API_KEY": "sk-ant-GIZLI-anahtar-0001", "BINANCE_API_KEY": "GIZLI-binance-key",
     "BINANCE_API_SECRET": "GIZLI-binance-secret", "MT5_LOGIN": "88123457", "MT5_PASSWORD": "GIZLI-mt5-pass",
     "MT5_SERVER": "FundingPips-Live",
 }
@@ -446,7 +446,7 @@ def test_baslatma_and_a_failing_watchman_registration(world: World, capsys) -> N
     def gorev(komut: list[str], **_kw: Any) -> Done:
         return Done()
 
-    assert world.run("kur", str(zip_path), "--hedef", str(target), "--baslatma", gorev=gorev) == 0
+    assert world.run("kur", str(zip_path), "--hedef", str(target), "--baslatma", gorev=gorev) == 3
     out = capsys.readouterr().out
     assert "Bekçi kurulamadı" in out and "10. Bekçi: SORUN" in out and "11. Bot başlatılmadı (--baslatma)" in out
     assert not world.started
@@ -456,15 +456,28 @@ def test_no_secret_is_ever_printed_logged_or_put_in_the_manifest(world: World, c
     zip_path = world.paketle()
     world.move_terminals()
     target = world.tmp / "yeni" / "copytrader"
-    assert world.run("kur", str(zip_path), "--hedef", str(target), "--evet") == 0
+
+    def calistir(komut: list[str], klasor: Path, sure: float, satir: Any) -> int:
+        world.commands.append(komut)
+        if komut[-1] in ("check", "selftest"):
+            satir(f"Sahip kullanıcı ID: {ENV_SECRETS['TG_OWNER_ID']}")
+            satir(f"✅ fx (mt5): hesap değeri 12,345.67 USD, serbest 12,000.00 USD")
+            satir(f"❌ fx2: bağlanılamadı: MT5 terminali farklı bir hesaba bağlı ({LITERAL_LOGIN}, beklenen "
+                  f"{ENV_SECRETS['MT5_LOGIN']}).")
+            satir(f"WARNING copytrader.brokers.mt5: initialize(login={PIN_LOGIN}, server=FundingPips-Live)")
+            satir(f"hesap {ENV_SECRETS['MT5_LOGIN']} hazır")
+        return 0
+
+    assert world.run("kur", str(zip_path), "--hedef", str(target), "--evet", calistir=calistir) == 0
     assert world.run("kontrol", str(zip_path)) == 0
     out = capsys.readouterr().out
     logs = "".join(p.read_text(encoding="utf-8") for p in [*world.bot.glob("tasima_*.log"),
                                                            *target.glob("tasima_*.log")])
     with zipfile.ZipFile(zip_path) as z:
         manifest = z.read("tasima_manifest.json").decode("utf-8")
-    secrets = [v for k, v in ENV_SECRETS.items() if k not in ("TG_API_ID", "TG_OWNER_ID", "MT5_SERVER")]
+    secrets = [v for k, v in ENV_SECRETS.items() if k not in ("TG_API_ID", "MT5_SERVER")]
     secrets += [LITERAL_PASSWORD, LITERAL_LOGIN, str(PIN_LOGIN), world.env_text.strip()]
+    assert "hesap değeri 12,345.67 USD" in out and "farklı bir hesaba bağlı (***, beklenen ***)" in out
     for secret in secrets:
         assert secret not in out, secret
         assert secret not in logs, secret
@@ -544,7 +557,7 @@ def test_an_optional_account_that_did_not_connect_is_named_and_the_bot_still_sta
             satir("Sorun yok (isteğe bağlı tickmill bağlı değil).")
         return 0
 
-    assert world.run("kur", str(zip_path), "--hedef", str(target), calistir=calistir) == 0
+    assert world.run("kur", str(zip_path), "--hedef", str(target), calistir=calistir) == 3
     out = capsys.readouterr().out
     assert "8. Ayarlar ve hesap bağlantıları kontrol edildi: SORUN" in out
     assert "Bağlanamayan isteğe bağlı hesap: tickmill." in out.split("=== ÖZET ===")[-1]
@@ -610,3 +623,91 @@ def test_run_refuses_to_start_on_a_server_the_bot_was_moved_away_from(world: Wor
     (world.bot / "data" / "TASINDI.txt").unlink()
     code, calls = run_bot_command(world, monkeypatch)
     assert code == 0 and len(calls) == 1 and not (world.bot / "data" / "bot.lock").exists()
+
+
+def test_a_linked_data_folder_is_packed_and_the_mark_lands_in_it(world: World) -> None:
+    real = world.tmp / "baska_disk" / "data"
+    real.parent.mkdir()
+    (world.bot / "data").rename(real)
+    (world.bot / "data").symlink_to(real, target_is_directory=True)
+    zip_path = world.paketle()
+    with zipfile.ZipFile(zip_path) as z:
+        names = set(z.namelist())
+        manifest = json.loads(z.read("tasima_manifest.json"))
+    assert {"data/copytrader.db", "data/telegram_user.session", "data/mt5_terminal_fx.json"} <= names
+    assert manifest["telegram_oturumu"]["var"] is True and (real / "TASINDI.txt").is_file()
+    assert "data/TASINDI.txt" not in names
+
+
+def test_paketle_refuses_when_the_database_would_not_travel(world: World, tasi: ModuleType,
+                                                             monkeypatch: pytest.MonkeyPatch, capsys) -> None:
+    real = tasi.paket_dosyalari
+
+    def without_db(*a: Any, **kw: Any) -> Any:
+        files, old = real(*a, **kw)
+        return [(p, arc) for p, arc in files if arc != "data/copytrader.db"], old
+
+    monkeypatch.setattr(tasi, "paket_dosyalari", without_db)
+    assert world.run("paketle", "--hedef", str(world.bot)) == tasi.CIKIS_SORUN
+    assert "pakete girmeyen gerekli dosya: data/copytrader.db" in capsys.readouterr().out
+    assert not list(world.bot.glob("copytrader-tasima-*")) and not (world.bot / "data" / "TASINDI.txt").exists()
+
+
+def test_paketle_refuses_an_old_bot_version_that_does_not_know_the_moved_mark(world: World, capsys) -> None:
+    main = world.bot / "copytrader" / "__main__.py"
+    main.write_text(main.read_text(encoding="utf-8").replace("TASINDI.txt", "BASKA.txt"), encoding="utf-8")
+    assert world.run("paketle", "--hedef", str(world.bot)) == world.tasi.CIKIS_REDDEDILDI
+    assert "Önce güncelleyin" in capsys.readouterr().out
+    assert not list(world.bot.glob("copytrader-tasima-*")) and not (world.bot / "data" / "TASINDI.txt").exists()
+
+
+def test_the_install_mark_is_in_the_folder_before_it_gets_its_name(world: World, tasi: ModuleType,
+                                                                   monkeypatch: pytest.MonkeyPatch, capsys) -> None:
+    zip_path = world.paketle()
+    target = world.tmp / "yeni" / "copytrader"
+    real_rename = tasi._yeniden_adlandir
+
+    def rename_then_stop(old: Path, new: Path) -> None:
+        assert (old / tasi.KURULUM_IZI).is_file()
+        real_rename(old, new)
+        raise KeyboardInterrupt
+
+    monkeypatch.setattr(tasi, "_yeniden_adlandir", rename_then_stop)
+    assert world.run("kur", str(zip_path), "--hedef", str(target)) == tasi.CIKIS_KESILDI
+    monkeypatch.setattr(tasi, "_yeniden_adlandir", real_rename)
+    assert world.run("kur", str(zip_path), "--hedef", str(target)) == 0
+    assert "daha önce açılmış" in capsys.readouterr().out
+
+
+def test_a_failed_extraction_leaves_no_folder(world: World, tasi: ModuleType, monkeypatch: pytest.MonkeyPatch,
+                                              capsys) -> None:
+    zip_path = world.paketle()
+    target = world.tmp / "yeni" / "copytrader"
+
+    def fail(old: Path, new: Path) -> None:
+        raise OSError("disk dolu")
+
+    monkeypatch.setattr(tasi, "_yeniden_adlandir", fail)
+    assert world.run("kur", str(zip_path), "--hedef", str(target)) == tasi.CIKIS_SORUN
+    assert "Yarım açılan dosyalar silindi" in capsys.readouterr().out
+    assert not target.exists() and not list(target.parent.glob("*.tasima-gecici"))
+
+
+def test_a_selftest_problem_gives_exit_code_3(world: World, capsys) -> None:
+    zip_path = world.paketle()
+    target = world.tmp / "yeni" / "copytrader"
+
+    def calistir(komut: list[str], klasor: Path, sure: float, satir: Any) -> int:
+        return 1 if komut[-1] == "selftest" else 0
+
+    assert world.run("kur", str(zip_path), "--hedef", str(target), calistir=calistir) == 3
+    assert "9. Sağlık kontrolü: SORUN" in capsys.readouterr().out and world.started == [target]
+
+
+def test_numbers_are_masked_but_balances_stay(tasi: ModuleType) -> None:
+    g = tasi.numaralari_gizle
+    assert g("initialize(login=88123457, server=X)") == "initialize(login=***, server=X)"
+    assert g("farklı bir hesaba bağlı (77001234, beklenen 88123457)") == "farklı bir hesaba bağlı (***, beklenen ***)"
+    assert g("Sahip kullanıcı ID: 42") == "Sahip kullanıcı ID: ***"
+    assert g("hesap değeri 1,234,567.89 USD, serbest 123456.78 USD") == "hesap değeri 1,234,567.89 USD, serbest 123456.78 USD"
+    assert g("kaynak sohbet: [-1003782294463]") == "kaynak sohbet: [-***]"
