@@ -38,6 +38,10 @@ Bot çalışıyorsa hiçbir şey yapılmaz ve nasıl durdurulacağı yazar. Biti
 bot klasöründe `copytrader-tasima-<tarih>-<saat>.zip`. İçinde `venv`, `yedek` (eski sürümlerin yedekleri) ve 7
 günden eski kayıt dosyaları yoktur; yedekleri de almak için komutun sonuna ` --yedekli` ekleyin.
 
+Paket bitince eski sunucuya `data\TASINDI.txt` dosyası yazılır. Bu dosya durdukça bot bu sunucuda başlamaz
+(`copytrader run` da güncelleme de botu başlatmaz, nedenini yazar). Bu dosya pakete girmez; yeni sunucuda bot
+normal başlar.
+
 **4. Eski sunucunun bekçisini kaldırın** (yoksa 30 dakikada bir "Bot çalışmıyor" yazar). PowerShell'i "Yönetici
 olarak çalıştır" ile açıp:
 
@@ -132,8 +136,9 @@ Diğer seçenekler: `--hedef "C:\klasör"` (klasörü sormadan kullan), `--evet`
 - Yeni sunucuda bot birkaç gün sorunsuz çalıştıktan sonra eski sunucudaki bot klasörünü silin (en azından
   `.env`, `data\` klasörü ve paket dosyası) ya da sunucuyu kapatın.
 - Paket dosyasını (`copytrader-tasima-....zip`) **iki sunucudan da** silin; Geri Dönüşüm Kutusu'nu da boşaltın.
-- **Geri dönüş:** yeni sunucuda bot hiç başlamadıysa eski sunucuda botu yeniden başlatabilirsiniz
-  (`.\venv\Scripts\python.exe -m copytrader run`, bekçi için `.\venv\Scripts\python.exe guncelle.py --bekci-kur`).
+- **Geri dönüş:** yeni sunucuda bot hiç başlamadıysa eski sunucuda botu yeniden başlatabilirsiniz: önce
+  `data\TASINDI.txt` dosyasını silin, sonra `.\venv\Scripts\python.exe -m copytrader run` (bekçi için
+  `.\venv\Scripts\python.exe guncelle.py --bekci-kur`).
   Yeni sunucuda bot bir kez çalıştıysa eskisine dönmeyin: eski veritabanında o arada açılan işlemler yoktur.
   Önce yeni sunucudaki botu durdurun ve ekran görüntüsünü gönderin.
 

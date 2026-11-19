@@ -2,7 +2,7 @@
 
 login      - first Telegram login (prints the session string)
 chats      - list chats to find the source group id
-run        - run the bot (holds <data_dir>/bot.lock while it runs)
+run        - run the bot (holds <data_dir>/bot.lock while it runs; refuses while <data_dir>/TASINDI.txt exists)
 stop       - ask the running bot to shut down as on Ctrl+C (writes <data_dir>/stop.request) and wait for it
 check      - check config + broker connections (never trades)
 parse      - show how a message would be understood (never trades)
@@ -132,6 +132,21 @@ LOCK_FILE = "bot.lock"
 BOOT_SLACK_SEC = 300.0      # a lock is "from before the last system start" only when it is older by this much
 STOP_HINT = ('Önce çalışan botu kendi penceresinde Ctrl+C ile durdurun ve "Durduruldu." yazısını bekleyin '
              "(pencere yanıt vermiyorsa o pencereyi kapatın).")
+
+
+# Written by ``tasi.py paketle`` on the OLD server once the bot was packed for a new one (never part of the package):
+# while it is there, ``run`` refuses to start (two bots on the same accounts would open every trade twice).
+MOVED_FILE = "TASINDI.txt"
+
+
+def moved_text(data_dir: str | os.PathLike[str]) -> str | None:
+    """The refusal when ``<data_dir>/TASINDI.txt`` exists, else None."""
+    path = Path(data_dir).expanduser() / MOVED_FILE
+    if not path.is_file():
+        return None
+    return (f"Bu bot başka bir sunucuya taşındı ({path} dosyasına bakın); burada başlatılmadı. Burada da çalışırsa "
+            "her işlem iki kez açılır. Bu sunucuyu gerçekten yeniden kullanmak istiyorsanız (ve yeni sunucudaki bot "
+            f"kapalıysa) {path} dosyasını silip tekrar başlatın.")
 
 
 def lock_hint(data_dir: str | os.PathLike[str]) -> str:
@@ -374,6 +389,10 @@ async def cmd_run(args: argparse.Namespace) -> int:
     from . import app as app_mod
 
     data_dir = load_config(args.config).data_dir
+    moved = moved_text(data_dir)
+    if moved is not None:
+        print(moved)
+        return EXIT_CONFIG
     lock: Path | None = None
     try:
         lock = acquire_lock(data_dir)              # a second bot on the same data is refused (BotRunningError)

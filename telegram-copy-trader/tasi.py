@@ -76,7 +76,9 @@ PARCA = 1024 * 1024
 HARIC_UST = ("venv", ".venv", "karne_paketleri", f"{PAKET}.eski", f"{PAKET}.yeni", ".pytest_cache")
 YEDEK = "yedek"
 # Run-time marks in the data folder: they describe THIS server's processes, never the new one's
-TASINMAYAN_VERI = ("bot.lock", "stop.request", "guncelleme.lock", "bekci.dene", "bekci.json")
+# The mark paketle leaves on the OLD server: there ``copytrader run`` (and guncelle.py) refuse to start the bot.
+TASINDI = "TASINDI.txt"
+TASINMAYAN_VERI = ("bot.lock", "stop.request", "guncelleme.lock", "bekci.dene", "bekci.json", TASINDI)
 GEREKLI = ("config.yaml", ".env", f"{PAKET}/__main__.py", "requirements.txt", "guncelle.py", "bekci.py")
 TERMINAL_EXE = "terminal64.exe"
 PIN_ON_EKI = "mt5_terminal_"
@@ -650,6 +652,16 @@ def paketle(hedef: Path, secenek: argparse.Namespace, gunluk: Gunluk, surecler: 
         gunluk.adim(5, "Paket doğrulandı", False, f"dosyanın adı verilemedi ({exc}).")
         return CIKIS_SORUN
     gunluk.adim(5, "Paket doğrulandı (her dosya yeniden okunup karşılaştırıldı)")
+    try:
+        veri_yol.mkdir(parents=True, exist_ok=True)
+        (veri_yol / TASINDI).write_text(
+            f"Bu bot {simdi.strftime('%d.%m.%Y %H:%M')} tarihinde başka bir sunucuya taşındı (paket: {zip_yolu.name}).\n"
+            "Bu dosya durdukça bot bu sunucuda başlatılmaz: iki sunucuda birden çalışırsa her işlem iki kez açılır.\n"
+            "Bu sunucuyu gerçekten yeniden kullanmak istiyorsanız (ve yeni sunucudaki bot kapalıysa) bu dosyayı "
+            "silin.\n", encoding="utf-8")
+        gunluk.yaz(f"   Bu sunucuda bot artık başlatılmaz ({Path(veri_goreli or 'data') / TASINDI} dosyası yazıldı).")
+    except OSError as exc:
+        gunluk.yaz(f"   UYARI: {TASINDI} yazılamadı ({exc}); bu sunucuda botu kendiniz başlatmayın.")
     gunluk.yaz()
     gunluk.yaz(f"Paket hazır: {zip_yolu}")
     gunluk.yaz(f"Boyutu: {zip_yolu.stat().st_size / 1024 / 1024:.1f} MB")

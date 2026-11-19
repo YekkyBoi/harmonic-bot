@@ -565,3 +565,48 @@ def test_a_windows_config_keeps_its_line_endings_byte_for_byte(world: World) -> 
     for old, exe in ((world.fx2_exe, world.new_fx2), (world.tickmill_exe, world.new_tickmill)):
         expected = expected.replace(f"terminal_path: {old}".encode(), f"terminal_path: {json.dumps(str(exe))}".encode())
     assert new == expected and b"\r\n" in new and new.count(b"\n") == new.count(b"\r\n")
+
+
+def test_paketle_leaves_the_moved_mark_on_the_old_server_and_never_packs_it(world: World, capsys) -> None:
+    zip_path = world.paketle()
+    mark = world.bot / "data" / "TASINDI.txt"
+    text = mark.read_text(encoding="utf-8")
+    assert zip_path.name in text and "başka bir sunucuya taşındı" in text and "iki kez" in text
+    with zipfile.ZipFile(zip_path) as z:
+        assert "data/TASINDI.txt" not in z.namelist()
+    zip_path.unlink()
+    with zipfile.ZipFile(world.paketle()) as z:              # packed again (the mark is there now): still left out
+        assert "data/TASINDI.txt" not in z.namelist()
+    target = world.tmp / "yeni" / "copytrader"
+    assert world.run("kur", str(zip_path.parent / next(world.bot.glob("copytrader-tasima-*.zip")).name),
+                     "--hedef", str(target)) == 0
+    assert not (target / "data" / "TASINDI.txt").exists() and world.started == [target]
+
+
+def run_bot_command(world: World, monkeypatch: pytest.MonkeyPatch) -> tuple[int, list[str]]:
+    from copytrader import __main__ as cli
+    from copytrader import app as app_mod
+
+    for name, value in ENV_SECRETS.items():
+        monkeypatch.setenv(name, value)
+    monkeypatch.chdir(world.bot)
+    calls: list[str] = []
+
+    async def fake_run(config: str) -> bool:
+        calls.append(config)
+        assert (world.bot / "data" / "bot.lock").is_file()
+        return False
+
+    monkeypatch.setattr(app_mod, "run", fake_run)
+    return cli.main(["run", "--config", str(world.bot / "config.yaml")]), calls
+
+
+def test_run_refuses_to_start_on_a_server_the_bot_was_moved_away_from(world: World, monkeypatch, capsys) -> None:
+    (world.bot / "data" / "TASINDI.txt").write_text("taşındı\n", encoding="utf-8")
+    code, calls = run_bot_command(world, monkeypatch)
+    out = capsys.readouterr().out
+    assert code == 2 and calls == [] and not (world.bot / "data" / "bot.lock").exists()
+    assert "başka bir sunucuya taşındı" in out and "iki kez" in out and "TASINDI.txt dosyasını silip" in out
+    (world.bot / "data" / "TASINDI.txt").unlink()
+    code, calls = run_bot_command(world, monkeypatch)
+    assert code == 0 and len(calls) == 1 and not (world.bot / "data" / "bot.lock").exists()

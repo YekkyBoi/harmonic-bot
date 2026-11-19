@@ -86,6 +86,9 @@ GOREV_ADI = "CopytraderBekci"
 BEKCI_DOSYASI = "bekci.py"
 BEKCI_DURUMU, BEKCI_DENEME = "bekci.json", "bekci.dene"
 GUNCELLEME_KILIDI = "guncelleme.lock"   # in the data folder; younger than KILIT_OMRU: "an update is running"
+# Written by tasi.py paketle on the OLD server after a move (MOVED_FILE of copytrader/__main__.py): the bot is not
+# started here while it is there (two bots on the same accounts would open every trade twice).
+TASINDI_DOSYASI = "TASINDI.txt"
 KILIT_OMRU = 1800.0                     # seconds (GUNCELLEME_SURESI of bekci.py)
 BASLANGIC_PAYI = 120.0                  # seconds the update lock still counts after the bot was started
 BEKCI_BEKLEME = 30.0                    # seconds to wait for the test message of the freshly registered task
@@ -387,6 +390,16 @@ def veri_klasoru(hedef: Path) -> Path:
         pass
     yol = Path(deger).expanduser()
     return yol if yol.is_absolute() else hedef / yol
+
+
+def tasindi_metni(veri: Path) -> str | None:
+    """Why the bot is not started here when ``<veri>/TASINDI.txt`` exists (see copytrader/__main__.py moved_text)."""
+    yol = veri / TASINDI_DOSYASI
+    if not yol.is_file():
+        return None
+    return (f"Bu bot başka bir sunucuya taşındı ({yol} dosyasına bakın); burada başlatılmadı. Burada da çalışırsa "
+            "her işlem iki kez açılır. Bu sunucuyu gerçekten yeniden kullanmak istiyorsanız (ve yeni sunucudaki bot "
+            f"kapalıysa) {yol} dosyasını silip botu başlatın.")
 
 
 def kilit_sahibi(veri: Path) -> dict[str, Any] | None:
@@ -1235,6 +1248,8 @@ def _geri_al(hedef: Path, secenek: argparse.Namespace, gunluk: Gunluk, python: s
 
     if secenek.baslatma:
         gunluk.adim(6, "Bot başlatılmadı (ESKİ sürüm kurulu)")
+        if getattr(secenek, "tasindi", None):
+            gunluk.yaz(f"   {secenek.tasindi}")
         gunluk.yaz(f"   Başlatmak için: {python} -m {PAKET} run")
         gunluk.kapat()
         return CIKIS_TAMAM
@@ -1279,6 +1294,9 @@ def main(
     yeni = Path(os.path.abspath(yeni_agac if yeni_agac is not None else Path(__file__).parent))
     python = sys.executable
     zaman = datetime.now().strftime("%Y%m%d-%H%M%S")
+    secenek.tasindi = tasindi_metni(veri_klasoru(hedef))
+    if secenek.tasindi:
+        secenek.baslatma = True                   # moved to another server: never started here
 
     if secenek.bekci_kur:
         return yalniz_bekci(hedef, python, gorev, gunluk)
@@ -1525,6 +1543,8 @@ def main(
     if secenek.baslatma:
         guncelleme_kilidi_kaldir(veri)
         gunluk.adim(9, f"Bot başlatılmadı ({surum} kurulu)")
+        if getattr(secenek, "tasindi", None):
+            gunluk.yaz(f"   {secenek.tasindi}")
         gunluk.yaz(f"   Başlatmak için: {python} -m {PAKET} run")
         gunluk.kapat()
         return CIKIS_TAMAM if eski_surum is None else CIKIS_GERI_ALINDI
