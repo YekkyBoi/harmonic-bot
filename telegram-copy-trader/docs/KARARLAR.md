@@ -73,7 +73,8 @@ Diğer konular (Sohbet, Analiz, Duyuru...) yok sayılır.
 
 ## 7. Kartlar ve karne
 
-- Komutlar: `/binancekart`, `/fxkart`, `/fx2kart`, `/breakoutkart` (Tickmill yok, arkadaş için değil). Otomatik kart gönderilmez.
+- Komutlar: `/binancekart`, `/fxkart`, `/fx2kart`, `/breakoutkart`, `/tickmillkart`. Otomatik kart gönderilmez; kart yalnızca isteyen sohbete gelir.
+- `/tickmillkart`: arkadaş kendi sohbetinde kullanır (sahibi de kendi sohbetinde kullanabilir). Arkadaş yalnızca Tickmill işlemlerini ve kartlarını görür; diğer hesapların komutları ona kapalıdır, gördüğü hiçbir yazıda ve kartta başka hesap adı geçmez. Numara listeleri sohbet başına ayrıdır (sahibinin listeleri ve `/pozkapat` listeleri karışmaz). Mumlar Tickmill terminalinden köprü (mt5_bridge) üzerinden, fx2'deki gibi salt okunur ve işlem yolu boşken okunur. Aynı anda tek kart hazırlanır (kim isterse istesin).
 - Komut bu haftanın işlemlerini numaralı listeler; numara yazılınca kart gelir (açık işlemde giriş kartı, kapanmışta sonuç kartı). Liste 5 dakika geçerli.
 - Zaman dilimi sinyal görselinin başlığından okunur, yoksa 15 dakika.
 - Tasarım (palet 26): yükselen mum #EDEFF2, düşen #D7263D; stop bölgesi kırmızı, hedef bölgesi açık gri. Etiket, renkli işaret, "ÖRNEK" yazısı yok. Oklar TradingView tarzı, ince.

@@ -1,6 +1,6 @@
 """The owner's trade card (/<hesap>kart): one picture of one of his trades on one account.
 
-Part 1 (no Pillow): the command, owner only (never the friend, never the friend's account), the week's numbered list
+Part 1 (no Pillow): the command, owner only here (the friend's own card: test_tickmillkart.py), the week's numbered list
 and its pick (TTL, one use, never confused with /pozkapat's list or an awaited correction), the entry / result card
 choice, the card's figures (the ORIGINAL stop, the close price, R, the candles after the close), the chart's bar size
 (the parser's new field, 15 by default), the MetaTrader candles (fake terminal, also through the bridge's helper
@@ -1504,8 +1504,9 @@ async def test_aliases_and_unknown_or_friend_accounts(chat: Any) -> None:
     assert chat.friend == []
 
 
-async def test_the_friend_cannot_use_it(chat: Any) -> None:
-    assert "kart" not in " ".join(notifier_mod.FRIEND_COMMANDS) and "kart" not in notifier_mod.FRIEND_HELP
+async def test_the_friend_cannot_use_the_owners_cards(chat: Any) -> None:
+    # (this service has no account of the friend's: his own /tickmillkart is in test_tickmillkart.py)
+    assert "kart" not in " ".join(notifier_mod.FRIEND_COMMANDS)
     await chat.n.handle_message(MsgEvent("/tickmillkart", sender_id=FRIEND))
     await chat.n.handle_message(MsgEvent("/binancekart", sender_id=FRIEND))
     assert chat.friend == [notifier_mod.FRIEND_REFUSED]                  # (one refusal line now and then)
@@ -1573,9 +1574,12 @@ def test_the_card_accounts_are_the_owners_real_and_hand_traded_ones() -> None:
     service = app_mod.build_tradecard(config(), None, SimpleNamespace(), SimpleNamespace(brokers=[]), None, "/tmp")
     assert service.accounts == ["binance", "fx", "fx2", "breakout"]
     assert service.command_account("fx1kart") == "fx" and service.command_account("FX2KART") == "fx2"
-    assert service.command_account("tickmillkart") is None and service.command_account("paperkart") is None
+    assert service.command_account("paperkart") is None
+    # the friend's account: his own /tickmillkart (the owner may use it too; see test_tickmillkart.py)
+    assert service.friend_accounts == ["tickmill"] and service.command_account("tickmillkart") == "tickmill"
+    assert service.command_account("binancekart", friend=True) is None
     assert service._sources == {"binance": ("ccxt", "binanceusdm"), "fx": ("mt5", None), "fx2": ("mt5", None),
-                                "breakout": ("ccxt", "binanceusdm")}
+                                "breakout": ("ccxt", "binanceusdm"), "tickmill": ("mt5", None)}
 
 
 async def test_the_apps_card_service_refuses_the_read_while_an_order_flow_runs(tmp_path: Path) -> None:

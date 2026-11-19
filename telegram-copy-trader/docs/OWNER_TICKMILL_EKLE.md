@@ -234,6 +234,21 @@ Her sinyal için kısa bir not gelir:
 
 Binance, Breakout ve FundingPips kopyaları **normal açılır**.
 
+## Arkadaşının komutları
+
+Arkadaşın (`/arkadas` ile eklediğin sohbet) bota kendi sohbetinden şu komutları yazabilir. Hepsi yalnızca
+kendi hesabı (`tickmill`) içindir; senin hesaplarını görmez. Tam listeyi ona `/yardim` gösterir.
+
+- `/pozisyonlar`, `/bakiye`, `/pozkapat`, `/karne`
+- `/tickmillkart`: bu haftaki Tickmill işlemlerinin numaralı listesi. Numara yazınca o işlemin kartı (resim)
+  gelir: açık işlemde giriş kartı, kapanmışta sonuç kartı. Liste 5 dakika geçerli, bir kez kullanılır.
+  - Kart senin kartlarınla aynıdır (aynı tasarım, R komisyon dahil, zaman dilimi sinyal görselinden ya da 15 dakika).
+  - Kartta ve yazılarda başka hesap adı geçmez. `/binancekart` gibi senin komutların ona kapalıdır.
+  - Kart yalnızca isteyen sohbete gelir; kendiliğinden gönderilmez. Sen de kendi sohbetinde `/tickmillkart`
+    yazabilirsin.
+  - Mumlar Tickmill terminalinden okunur (yalnızca `type: mt5_bridge` ile; MetaApi ile bağlıysa kart yapılamaz,
+    nedeni yazılır). İşlem yürütülürken okunmaz; o zaman "kartı birazdan tekrar isteyin" yazar.
+
 ## Önce küçük dene
 
 `dry_run` ayarı tüm brokerları etkiler. Canlı çalışan botunda bunu değiştirme. Tickmill'i canlıda küçük riskle (`risk_usd: 5`) izlemek daha güvenlidir. Arkadaşın demo hesapla başlarsa daha da güvenli olur.
