@@ -1000,6 +1000,19 @@ def reference_leg_never_placed(pos: BrokerPosition, ref: str) -> bool:
     return pos.broker == ref and pos.status is PositionStatus.FAILED and not reference_leg_filled(pos)
 
 
+def leg_never_held(pos: BrokerPosition) -> bool:
+    """A position of an account that never held the trade, with nothing filled: its order was refused / could not be
+    completed (FAILED), or it was a waiting virtual entry that ended (cancelled / failed) on its own rules - stop or
+    first target passed, expiry, a refused fire. Such a row never tells another account's waiting entry that the
+    trade has ended. (A resting broker limit that expired or was cancelled is CANCELLED without the virtual flag: it
+    still counts.)"""
+    if reference_leg_filled(pos):
+        return False
+    if pos.status is PositionStatus.FAILED:
+        return True
+    return pos.status is PositionStatus.CANCELLED and bool((pos.data or {}).get("virtual_trigger"))
+
+
 def waiting_entry_text(pos: BrokerPosition, *, owner: bool) -> str:
     """What a waiting virtual entry waits for (HTML, one phrase for /pozisyonlar). ``owner`` False (the friend's view
     of his account): the reference account is never named."""
@@ -5483,7 +5496,9 @@ class Engine:
             # (a leg of the reference account that never got onto that account - failed, nothing filled - is no leg:
             # it does not end the trade; the entry then waits for that account's price, see _reference_broker_check)
             rows = [p for p in rows if not reference_leg_never_placed(p, ref_name)]
-        real = [p for p in rows if p.broker != pos.broker and not is_virtual_pending(p)]
+        # (a leg of another account that never held the trade - its order refused, or a waiting entry of its own that
+        # ended on its own rule without a fill - says nothing about the trade: it never ends this entry)
+        real = [p for p in rows if p.broker != pos.broker and not is_virtual_pending(p) and not leg_never_held(p)]
         if real and not any(p.status in ACTIVE_POSITION for p in real):
             if any(p.status is PositionStatus.CLOSED for p in real):
                 return await self._virtual_end(

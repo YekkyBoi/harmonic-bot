@@ -645,3 +645,93 @@ def test_vantage_is_on_the_owners_karne_and_cards_never_the_friends(tmp_path: Pa
     assert service._sources["vantage"] == ("mt5", None)
     assert "/vantagekart" in service.commands_text() and "vantage" not in service.commands_text(friend=True)
     assert "/vantagekart" in notifier_mod.HELP_TEXT
+
+
+# =================================================================================================================
+# one account's leg that never held the trade never ends another's waiting entry
+# =================================================================================================================
+def fx_watchable(p: Prod, ticks: list[tuple[float, float, float]] | None = None) -> None:
+    """fx's terminal as tickmill watches it (its tick history: (server time, bid, ask))."""
+    rows = [{"time": int(t), "time_msc": int(t * 1000), "bid": b, "ask": a} for t, b, a in ticks or []]
+    p.terminal.copy_ticks_from = (                                  # type: ignore[attr-defined]
+        lambda symbol, date_from, count, flags: [r for r in rows if r["time"] >= date_from][:count])
+
+
+def fx_tick(p: Prod, bid: float, ask: float, at: float) -> None:
+    p.terminal.ticks["EURUSD"] = SimpleNamespace(bid=bid, ask=ask, last=0.0, time=int(at), time_msc=int(at * 1000))
+
+
+async def eur_limit_with_fx_refused(p: Prod) -> None:
+    """An EUR long limit on the fx route whose fx order was refused (FAILED, nothing filled): tickmill then watches
+    fx's price, vantage its own."""
+    p.vantage.tick("EURUSD+", 1.16195, 1.16205, T0)
+    fx_tick(p, 1.16195, 1.16205, T0)
+    fx_watchable(p)
+    await p.say(fx_pair("EURUSD", Side.LONG, 1.1610, 1.1590, 1.1650, entry_type=EntryType.LIMIT), FX, "EUR Limit")
+    fx = (await p.positions(1))["fx"]
+    await p.db.save_broker_position(1, fx.model_copy(update={"status": PositionStatus.FAILED}))
+
+
+async def waiting(p: Prod) -> dict[str, bool]:
+    return {n: is_virtual_pending(pos) for n, pos in (await p.positions(1)).items() if n in ("tickmill", "vantage")}
+
+
+async def test_fx_refused_vantage_and_tickmill_both_keep_waiting_on_their_own_prices(world) -> None:
+    p = world
+    await eur_limit_with_fx_refused(p)
+    for _ in range(3):
+        await p.engine.monitor.run_virtual_once()
+    assert await waiting(p) == {"tickmill": True, "vantage": True}
+    assert not any("girişleri dolmadan sona erdi" in t for t in p.texts())
+    p.vantage.tick("EURUSD+", 1.16090, 1.16098, T0 + 2)              # Vantage touches: only vantage opens
+    await p.engine.monitor.run_virtual_once()
+    assert [o[:2] for o in vorders(p)] == [("BUY", "EURUSD+")] and p.tickmill_orders() == []
+    assert (await waiting(p))["tickmill"] is True
+    fx_tick(p, 1.16090, 1.16098, T0 + 4)                             # fx's price touches: tickmill opens
+    p.tickmill.set_price("EURUSD", 1.16105, 1.16115)
+    await p.engine.monitor.run_virtual_once()
+    assert [o[0] for o in p.tickmill_orders()] == ["market_buy"]
+
+
+async def test_vantage_cancelled_by_its_own_stop_rule_never_cancels_tickmill(world) -> None:
+    p = world
+    await eur_limit_with_fx_refused(p)
+    await p.engine.monitor.run_virtual_once()
+    p.vantage.history([(T0 + 0.5, 1.15880, 1.15890)])                # through vantage's stop (fx untouched)
+    p.vantage.tick("EURUSD+", 1.16300, 1.16310, T0 + 1.5)
+    for _ in range(3):
+        await p.engine.monitor.run_virtual_once()
+    positions = await p.positions(1)
+    assert positions["vantage"].status is PositionStatus.CANCELLED
+    assert is_virtual_pending(positions["tickmill"])
+
+
+async def test_tickmill_cancelled_by_its_own_stop_rule_never_cancels_vantage(world) -> None:
+    p = world
+    await eur_limit_with_fx_refused(p)
+    await p.engine.monitor.run_virtual_once()
+    fx_watchable(p, [(T0 + 0.5, 1.15880, 1.15890)])                   # through the stop on fx's price
+    fx_tick(p, 1.16300, 1.16310, T0 + 1.5)
+    for _ in range(3):
+        await p.engine.monitor.run_virtual_once()
+    positions = await p.positions(1)
+    assert positions["tickmill"].status is PositionStatus.CANCELLED
+    assert is_virtual_pending(positions["vantage"]) and vorders(p) == []
+
+
+async def test_fx_skipping_the_signal_leaves_both_waiting(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    """fx's own rule leaves the signal out (no row is saved for it): nothing has ended."""
+    def fx_without_eur(cfg: AppConfig) -> None:
+        next(b for b in cfg.brokers if b.name == "fx").allowed_assets = ["XAU"]
+    p = await vantage_world(tmp_path, monkeypatch, edit=fx_without_eur)
+    try:
+        p.vantage.tick("EURUSD+", 1.16195, 1.16205, T0)
+        fx_tick(p, 1.16195, 1.16205, T0)
+        fx_watchable(p)
+        await p.say(fx_pair("EURUSD", Side.LONG, 1.1610, 1.1590, 1.1650, entry_type=EntryType.LIMIT), FX, "EUR")
+        assert "fx" not in await p.positions(1) and p.fx_orders() == []
+        for _ in range(3):
+            await p.engine.monitor.run_virtual_once()
+        assert await waiting(p) == {"tickmill": True, "vantage": True}
+    finally:
+        await p.close()
