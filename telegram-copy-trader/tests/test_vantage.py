@@ -249,6 +249,30 @@ def test_migrate_adds_the_block_and_both_routes_once(tmp_path: Path, monkeypatch
     assert sorted(p.name for p in path.parent.iterdir() if "yedek" in p.name) == backups
 
 
+@pytest.mark.parametrize("with_env_file", [True, False])
+def test_the_servers_migrate_reads_the_three_lines_from_the_env_file(tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+                                                                     with_env_file: bool) -> None:
+    """As on the server: ``python -m copytrader migrate`` (run_cli) with no environment given; the config loader
+    loads the .env beside config.yaml."""
+    path = _write(tmp_path, monkeypatch, _server_yaml())
+    if with_env_file:
+        (path.parent / ".env").write_text("".join(f"{k}={v}\n" for k, v in VANTAGE_ENV.items()), encoding="utf-8")
+    monkeypatch.setattr(migrate, "vantage_terminal", lambda env=None, roots=None: (VANTAGE_EXE, None))
+    import os
+    for name in VANTAGE_ENV:            # (load_config writes the .env values into os.environ: undone after the test)
+        monkeypatch.setenv(name, "")
+        monkeypatch.delenv(name)
+    out: list[str] = []
+    assert migrate.run_cli(str(path), out.append) == 0
+    text = "\n".join(out)
+    assert ("vantage: Vantage MT5 hesabı eklendi" in text) is with_env_file
+    assert ("Vantage eklenmedi: .env'de VANTAGE_LOGIN/PASSWORD/SERVER yok" in text) is not with_env_file
+    assert ("name: vantage" in path.read_text(encoding="utf-8")) is with_env_file
+    _no_secret(out)
+    for name in VANTAGE_ENV:
+        os.environ.pop(name, None)
+
+
 def test_the_migrated_config_still_loads_when_the_env_lines_are_removed(tmp_path: Path,
                                                                         monkeypatch: pytest.MonkeyPatch) -> None:
     """``${VAR:-}`` placeholders: without the three lines the bot still starts; vantage then attaches to its terminal's
@@ -427,6 +451,27 @@ async def test_vantage_connects_as_the_owners_account_and_its_1r_reads_20_gbp(wo
     assert "vantage 20 GBP" in p.engine._risk_per_r_text() and "fx 100 USD" in p.engine._risk_per_r_text()
     assert "vantage" not in p.engine.friend_account_names()
     assert not any("para birimi" in t for t in p.texts())          # GBP named, GBP reported: no warning
+
+
+async def test_vantage_logs_in_with_the_env_credentials_at_its_own_terminal(world) -> None:
+    p = world
+    _name, args, kwargs = next(c for c in p.vantage.calls if c[0] == "initialize" and c[2].get("password"))
+    assert args == (VANTAGE_EXE,)
+    assert (kwargs["login"], kwargs["password"], kwargs["server"]) == (
+        8001, VANTAGE_ENV["VANTAGE_PASSWORD"], VANTAGE_ENV["VANTAGE_SERVER"])
+    for text in p.texts():
+        assert VANTAGE_ENV["VANTAGE_PASSWORD"] not in text
+
+
+async def test_a_suffixed_symbol_is_taken_when_the_bare_name_cannot_be_traded(world) -> None:
+    p = world
+    bare = make_symbol("EURUSD", trade_mode=MT5.SYMBOL_TRADE_MODE_DISABLED, currency_profit="USD",
+                       currency_base="EUR")
+    p.vantage.symbols["EURUSD"] = bare
+    sym = await p.brokers["vantage"].resolve_symbol("EUR", "USD", tps.MarketType.FOREX, "EURUSD")
+    assert sym is not None and sym.broker_symbol == "EURUSD+"
+    gold = await p.brokers["vantage"].resolve_symbol("XAU", "USD", tps.MarketType.CFD, "XAUUSD")
+    assert gold is not None and gold.broker_symbol == "XAUUSD+"
 
 
 async def test_a_wrong_currency_label_is_told_once_at_connect(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
