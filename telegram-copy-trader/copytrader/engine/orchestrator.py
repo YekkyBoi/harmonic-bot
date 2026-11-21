@@ -56,6 +56,7 @@ from typing import Any, Literal, TypeVar
 from ..brokers.base import (OUTCOME_UNKNOWN_MARK, Broker, BrokerError, BrokerUnavailableError, OrderOutcomeUnknownError,
                             outcome_unknown)
 from ..config import (AppConfig, RiskConfig, TopicRoute, effective_risk, fold_ascii, is_friend_account, match_topic,
+                      risk_currency,
                       route_thresholds)
 from ..errors import ParserError
 from ..interfaces import (
@@ -957,6 +958,22 @@ def virtual_entry_wanted(broker: Broker, plan: TradePlan, route_kind: str | None
     )
 
 
+def own_touch_wanted(broker: Broker, plan: TradePlan) -> bool:
+    """True when ``plan`` is a LIMIT entry (crypto or forex / CFD alike) on a MetaTrader broker set to
+    ``entry_trigger: own_touch``: no broker order; the entry waits for that account's OWN live price to reach the
+    level (a virtual entry carrying ``data["reference_broker"]`` = the account itself, see _reference_broker_check)."""
+    return (
+        getattr(broker.config, "entry_trigger", "broker_limit") == "own_touch"
+        and plan.entry_type is EntryType.LIMIT
+        and bool(plan.entry_price)
+    )
+
+
+def own_touch_entry(pos: BrokerPosition) -> bool:
+    """A waiting virtual entry that watches its own account's price (``entry_trigger: own_touch``)."""
+    return str((pos.data or {}).get("reference_broker") or "") == pos.broker
+
+
 def broker_virtual_wanted(broker: Broker, plan: TradePlan, route_kind: str | None = None) -> bool:
     """True when ``plan`` is a forex / CFD LIMIT entry (not a crypto plan for its route, :func:`is_crypto_plan`) on a
     broker with ``reference_broker``: no broker order; the entry waits for that other account's leg of the trade to
@@ -994,6 +1011,8 @@ def waiting_entry_text(pos: BrokerPosition, *, owner: bool) -> str:
     if ref_id:
         return f"{esc(ref_label(ref_id))} fiyatı {level} seviyesine değince"
     ref = str(d.get("reference_broker") or "")
+    if own_touch_entry(pos):
+        return f"giriş {level} · {esc(ref)} fiyatı seviyeye gelince"
     where = (f"{esc(ref)} hesabındaki giriş dolunca (emri yoksa {esc(ref)} fiyatı seviyeye gelince)" if owner
              else "referans hesaptaki giriş dolunca ya da fiyat seviyeye gelince")
     return f"giriş {level} · {where}"
@@ -1787,7 +1806,8 @@ class Engine:
         )
 
     def _risk_per_r_text(self) -> str:
-        """'binance 10 USD, breakout 50 USD' when brokers use fixed amounts, else 'bakiyenin %2'si'."""
+        """'binance 10 USD, breakout 50 USD' when brokers use fixed amounts (in each one's risk_currency, USD when
+        not written), else 'bakiyenin %2'si'."""
         pct = f"bakiyenin {fmt.fmt_pct(self.config.risk.risk_per_r_pct, possessive=True)}"
         cfgs = [b for b in self.config.brokers if b.enabled]
         if not any(getattr(b, "risk_usd", None) for b in cfgs):
@@ -1795,7 +1815,7 @@ class Engine:
         parts = []
         for b in cfgs:
             fixed = getattr(b, "risk_usd", None)
-            parts.append(f"{b.name} {fixed:g} USD" if fixed else f"{b.name} {pct}")
+            parts.append(f"{b.name} {fixed:g} {risk_currency(b)}" if fixed else f"{b.name} {pct}")
         return ", ".join(parts)
 
     async def connect_brokers(self) -> None:
@@ -1915,6 +1935,24 @@ class Engine:
             self._currency[broker.name] = ""      # like any other failed read: connected, currency unknown
         except Exception:
             self._currency[broker.name] = ""
+        await self._check_risk_currency(broker)
+
+    async def _check_risk_currency(self, broker: Broker) -> None:
+        """A MetaTrader account with a fixed 1R (``risk_usd``) whose terminal reports another currency than the one
+        its texts name (``risk_currency``, USD when not written): the owner is told once per connect. Sizing is not
+        affected (the terminal sizes in its own currency); only the texts would name the wrong currency."""
+        cfg = broker.config
+        if getattr(cfg, "type", None) not in ("mt5", "mt5_bridge", "metaapi") or not getattr(cfg, "risk_usd", None):
+            return
+        actual = str(self._currency.get(broker.name) or "").strip().upper()
+        named = risk_currency(cfg).upper()
+        if not actual or actual == named:
+            return
+        await self._notify(
+            f"⚠️ {esc(broker.name)}: hesabın para birimi {esc(actual)}, config.yaml'da 1R {fmt.fmt_number(cfg.risk_usd)} "
+            f"{esc(named)} yazıyor. Lot hesabı hesabın kendi para biriminde yapılır: stopta kayıp "
+            f"{fmt.fmt_number(cfg.risk_usd)} {esc(actual)} olur. Doğruysa bu hesaba risk_currency: {esc(actual)} "
+            "yazılabilir (yalnızca mesajlardaki para birimi düzelir).", Severity.WARNING)
 
     @staticmethod
     def _is_optional(broker: Broker) -> bool:
@@ -4806,6 +4844,8 @@ class Engine:
         Fails closed: unavailable reference or a too big difference -> a problem text and no offset. (The texts for
         ``ref_broker`` never name that account: the friend may be told them.)"""
         cfg = broker.config
+        if ref_broker and ref_broker == broker.name:
+            return None, None       # entry_trigger own_touch: this account's own price, the levels as they are
         if ref_broker:
             ref_id = ""
             ref = ref_price if ref_price is not None else await self._reference_broker_mid(ref_broker, plan, raw_symbol)
@@ -4915,6 +4955,9 @@ class Engine:
             if conflict:
                 return BrokerOutcome(name, "skipped", f"{esc(name)}: {conflict}", benign=True)
             kind = self._plan_kind(plan)
+            if virtual is None and own_touch_wanted(broker, plan):
+                # (never a broker limit on this account: it waits for its own price to reach the entry)
+                return await self._register_virtual(broker, plan, trade, sym, raw_symbol, flow, ref_broker=name)
             if virtual is None and virtual_entry_wanted(broker, plan, kind):
                 return await self._register_virtual(broker, plan, trade, sym, raw_symbol, flow)
             if virtual is None and broker_virtual_wanted(broker, plan, kind):
@@ -5251,9 +5294,15 @@ class Engine:
             )
             await self._save_leg_position(trade.id, pos, flow)
             # (the owner's texts only: this outcome has a position, so it is never forwarded to the friend)
-            text = (f"{esc(name)}: sanal tetik kuruldu (limit emir konmadı): {esc(ref_broker)} hesabındaki giriş emri "
-                    f"dolunca, orada emir yoksa {esc(ref_broker)} fiyatı {fmt_price(plan.entry_price)} seviyesine "
-                    f"gelince {esc(name)}'da piyasa emriyle açılacak (en çok {fmt.fmt_number(hours)} saat beklenir)")
+            if ref_broker == name:
+                text = (f"{esc(name)}: sanal tetik kuruldu (limit emir konmadı): {esc(name)} fiyatı "
+                        f"{fmt_price(plan.entry_price)} seviyesine gelince piyasa emriyle açılacak (en çok "
+                        f"{fmt.fmt_number(hours)} saat beklenir)")
+            else:
+                text = (f"{esc(name)}: sanal tetik kuruldu (limit emir konmadı): {esc(ref_broker)} hesabındaki giriş "
+                        f"emri dolunca, orada emir yoksa {esc(ref_broker)} fiyatı {fmt_price(plan.entry_price)} "
+                        f"seviyesine gelince {esc(name)}'da piyasa emriyle açılacak (en çok {fmt.fmt_number(hours)} "
+                        "saat beklenir)")
             if not self.config.notifier.notify_on_execution:
                 await self._notify(f"🧭 #{trade.id} {esc(plan.base_asset)} {plan.side.value.upper()}: {text}",
                                    Severity.INFO)
@@ -5565,7 +5614,9 @@ class Engine:
             symbol there) -> it waits, the owner told (throttled); virtual_trigger_max_hours still ends it."""
         d = pos.data
         ref = str(d.get("reference_broker") or "")
-        legs = [p for p in rows if p.broker == ref]
+        # (entry_trigger own_touch: the reference is this account itself - it has no other leg in the trade; its own
+        # price decides)
+        legs = [p for p in rows if p.broker == ref and ref != pos.broker]
         filled = any(reference_leg_filled(p) for p in legs)
         mult = price_multiplier(d)
         level_px = float(d.get("trigger_price") or 0.0) / mult           # the signal's scale

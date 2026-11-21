@@ -34,7 +34,8 @@ not ship. Running it twice is harmless.
 Options: ``--hedef <folder>`` (bot folder, default: current directory), ``--baslatma`` (do not start the
 bot), ``--kontrol-yok`` (skip steps 7 and 8; for tests), ``--bekci-yok`` (do not register the watchman),
 ``--tickmill-terminal <terminal64.exe>`` (step 6 switches the friend's tickmill account to that MetaTrader 5
-terminal instead of looking for one in Program Files; ``yok``: it stays on MetaApi).
+terminal instead of looking for one in Program Files; ``yok``: it stays on MetaApi), ``--vantage-terminal
+<terminal64.exe>`` (step 6 adds the owner's vantage account with that terminal instead of looking for it).
 
 ``--bekci-kur`` only registers the watchman (no update, no zip; the bot may keep running): for a window that was
 not opened as administrator at update time, or after the bot folder was moved.
@@ -120,6 +121,8 @@ CIKIS_TAMAM, CIKIS_GERI_ALINDI, CIKIS_REDDEDILDI, CIKIS_KESILDI = 0, 1, 2, 130
 # Step 6 (``copytrader migrate``) looks for the Tickmill MetaTrader 5 terminal in Program Files; ``--tickmill-terminal``
 # names it instead (or "yok": tickmill stays on MetaApi). Handed over in this variable (copytrader/migrate.py).
 TICKMILL_DEGISKENI = "COPYTRADER_TICKMILL_TERMINAL"
+# ... and for the owner's Vantage account (``--vantage-terminal``; the search: a Program Files folder named "Vantage...")
+VANTAGE_DEGISKENI = "COPYTRADER_VANTAGE_TERMINAL"
 
 # "python -m copytrader run" (also the console script "copytrader run"), however it is quoted / spaced.
 BOT_KOMUTU = re.compile(r"""(?:-m\s+copytrader(?:\.__main__)?|[\\/]copytrader(?:\.exe)?["']?)\s+run(?:\s|$)""",
@@ -1078,6 +1081,8 @@ def _secenekler(argv: list[str] | None) -> argparse.Namespace:
                    help="güncelleme yapma: son güncellemeden önceki sürümü ve config.yaml'ı yedekten geri koy")
     p.add_argument("--tickmill-terminal", default=None, dest="tickmill_terminal", metavar="YOL",
                    help="6. adım: Tickmill MT5 terminalinin terminal64.exe yolu (aranmaz); 'yok' = MetaApi'de kal")
+    p.add_argument("--vantage-terminal", default=None, dest="vantage_terminal", metavar="YOL",
+                   help="6. adım: Vantage MT5 terminalinin terminal64.exe yolu (aranmaz)")
     return p.parse_args(argv)
 
 
@@ -1288,6 +1293,8 @@ def main(
     secenek = _secenekler(argv)
     if secenek.tickmill_terminal:
         os.environ[TICKMILL_DEGISKENI] = secenek.tickmill_terminal     # read by step 6 (copytrader migrate)
+    if secenek.vantage_terminal:
+        os.environ[VANTAGE_DEGISKENI] = secenek.vantage_terminal       # read by step 6 (copytrader migrate)
     gunluk = Gunluk()
     hedef = Path(secenek.hedef).expanduser() if secenek.hedef else Path.cwd()
     hedef = Path(os.path.abspath(hedef))

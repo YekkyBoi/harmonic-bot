@@ -37,22 +37,23 @@ Gizli bilgiler (API anahtarları, şifreler, Telegram oturumu, hesap numaraları
 | `binance` | Binance vadeli (ccxt) | 25 USD | Günlük zarar freni yok (0). Ters yönlü işlem açılmaz (no_hedge). |
 | `breakout` | Breakout (elle uygulanan) | 50 USD | Bot talimat verir. |
 | `fx` | FundingPips (MT5) | 100 USD | Günlük %3, açık riskler dahil. Kripto konusunda da var; referans fiyat Binance vadeli. ETH en fazla 1 lot (risk düşük kalır, kabul edildi). SOL bu hesapta yok: SOL sinyalinde atlanır, diğer hesaplarda açılır; güncellemede "SOL bulunamadı" uyarısı bilinen durumdur. |
-| `tickmill` | Arkadaşın Tickmill hesabı (MT5, yardımcı süreç) | 50 USD | Ayrıntılar aşağıda (bölüm 5). |
+| `tickmill` | Arkadaşın Tickmill hesabı (MT5, yardımcı süreç) | 50 USD | Ayrıntılar aşağıda (bölüm 6). |
 | `fx2` | BEM (MT5, yardımcı süreç) | 1000 USD | Günlük %2,5, açık riskler dahil. no_hedge. Grubun TP'si korunur, grup kapatınca kapanır. 1,8R'de otomatik kapatma YOK (sahibi böyle kalsın dedi). Tutarlılık kuralı bot tarafından takip edilmez. |
+| `vantage` | Sahibinin kendi Vantage hesabı (MT5, yardımcı süreç, hesap para birimi GBP) | 20 GBP | Gerçek hesap. Günlük zarar freni yok (0). Ayrıntılar aşağıda (bölüm 7). |
 
 ## 4. Konular (hangi sinyal nereye gider)
 
 | Telegram konusu | Hesaplar |
 |---|---|
-| Kasım Ayı Kripto İşlemleri (`kripto`) | binance, breakout, tickmill, fx |
-| Kasım Ayı Fx İşlemleri (`fx`) | fx, tickmill |
+| Kasım Ayı Kripto İşlemleri (`kripto`) | binance, breakout, tickmill, fx, vantage |
+| Kasım Ayı Fx İşlemleri (`fx`) | fx, tickmill, vantage |
 | Kasım Challenge 2 (`challenge2`, her tür varlık) | fx2 |
 
 Diğer konular (Sohbet, Analiz, Duyuru...) yok sayılır.
 
 ## 5. Onay sorusu ("AÇAYIM MI?")
 
-- **binance, fx, fx2, tickmill:** bot sinyali okurken emin olamasa da (güven düşük, TP yok/okunamadı, yüksek R...) **sormadan açar** (`confirm_open: false`).
+- **binance, fx, fx2, tickmill, vantage:** bot sinyali okurken emin olamasa da (güven düşük, TP yok/okunamadı, yüksek R...) **sormadan açar** (`confirm_open: false`).
 - **breakout:** soru sorulmaya devam eder.
 - Hiçbir hesapta açılmayanlar: stopu olmayan sinyal, aynı sinyalin tekrarı, açık işlemin tersi, hedefi girişin yanlış tarafında olan sinyal.
 - FundingPips ve BEM'in günlük zarar kuralı (açık risk dahil) aşırı riskli sinyali yine reddeder. Binance'in günlük sınırı yoktur.
@@ -71,9 +72,18 @@ Diğer konular (Sohbet, Analiz, Duyuru...) yok sayılır.
 - Arkadaş, Tickmill için kendi komutlarını ve kendi karnesini kullanır; diğer hesapları görmez.
 - Uyarı (sahibine iletildi): Tickmill bakiyesi küçük (yaklaşık 126 USD), 1R = 50 USD bakiyenin çok büyük bir kısmı.
 
-## 7. Kartlar ve karne
+## 7. Vantage (sahibinin kendi hesabı) – özel kurallar
 
-- Komutlar: `/binancekart`, `/fxkart`, `/fx2kart`, `/breakoutkart`, `/tickmillkart`. Otomatik kart gönderilmez; kart yalnızca isteyen sohbete gelir.
+- Vantage MT5, sunucuda kendi terminaliyle (yardımcı süreç, `type: mt5_bridge`). Giriş bilgisi yalnızca `.env`'de: `VANTAGE_LOGIN`, `VANTAGE_PASSWORD`, `VANTAGE_SERVER`. Kurulum: `docs/VANTAGE_EKLE.md`. Hesap güncellemede (migrate 12. adım) bu üç satır `.env`'de varsa ve terminal bulunursa bir kez eklenir.
+- **1R = 20 GBP** (hesap para birimi GBP; lot hesabı terminalin kendi para biriminde yapılır, `risk_currency: GBP` yalnızca mesajlar içindir).
+- **Soru yok** (`confirm_open: false`). **Günlük zarar freni yok** (`daily_loss_limit_pct: 0`).
+- **Limit emir atılmaz, Vantage'ın kendi fiyatı tetikler** (`entry_trigger: own_touch`), kriptoda da fx'te de: Vantage fiyatı giriş seviyesine gelince piyasa emriyle açılır; seviyeler sinyaldeki gibi (kaydırma yok). Seviyeye değip hızla uzaklaşan fiyat kovalanmaz; girişe değmeden stopa ya da ilk hedefe giderse bekleyen giriş iptal edilir. İşlem diğer hesaplarda biterse (kapandı ya da girişleri dolmadan sona erdi) Vantage'ın bekleyen girişi de iptal edilir.
+- Piyasa emirli sinyaller hemen açılır. Lot gerçek giriş fiyatına göre, aşağı yuvarlanır (`lot_rounding: down`, varsayılan).
+- `optional: true` + `friend_account: false`: terminal kapalıysa bot onsuz çalışır (uyarı gelir, o arada gelen sinyaller Vantage'da o an açılmaz; bağlanınca `/sonradan` ayarına göre şartlar uygunsa kendiliğinden açılır ya da sahibine sorulur); hesap sahibinindir: karnesinde ve kartlarında görünür, arkadaş hiçbir yerde görmez.
+
+## 8. Kartlar ve karne
+
+- Komutlar: `/binancekart`, `/fxkart`, `/fx2kart`, `/vantagekart`, `/breakoutkart`, `/tickmillkart`. Otomatik kart gönderilmez; kart yalnızca isteyen sohbete gelir.
 - `/tickmillkart`: arkadaş kendi sohbetinde kullanır (sahibi de kendi sohbetinde kullanabilir). Arkadaş yalnızca Tickmill işlemlerini ve kartlarını görür; diğer hesapların komutları ona kapalıdır, gördüğü hiçbir yazıda ve kartta başka hesap adı geçmez. Numara listeleri sohbet başına ayrıdır (sahibinin listeleri ve `/pozkapat` listeleri karışmaz). Mumlar Tickmill terminalinden köprü (mt5_bridge) üzerinden, fx2'deki gibi salt okunur ve işlem yolu boşken okunur. Aynı anda tek kart hazırlanır (kim isterse istesin).
 - Komut bu haftanın işlemlerini numaralı listeler; numara yazılınca kart gelir (açık işlemde giriş kartı, kapanmışta sonuç kartı). Liste 5 dakika geçerli.
 - Zaman dilimi sinyal görselinin başlığından okunur, yoksa 15 dakika.
@@ -81,18 +91,18 @@ Diğer konular (Sohbet, Analiz, Duyuru...) yok sayılır.
 - Kartta yazan R = **cebe giren net para** (komisyon dahil) ÷ ilk risk. Elle kapatılan kısım da sayılır (Binance'te borsadaki işlem geçmişinden okunur). Aynı anda aynı yönde aynı coinde botun başka işlemi varsa ve elle kapatılan kısım ayırt edilemiyorsa kart verilmez, nedeni yazılır.
 - Kutu kapanışta biter; mumlar TP ya da stop dokunuşuna kadar devam eder.
 
-## 8. Bekçi
+## 9. Bekçi
 
 - Bot durursa Telegram'dan haber verir.
 - Disk 5 GB'ın altına inerse uyarır ve 30 dakikada bir hatırlatır ("geri geldi" mesajı yok).
 - Sunucudaki disk dolmasının sebebi şimdiye kadar hep arkadaşın video kayıtları oldu; sahibi bunlara dokunulmasını istemedi.
 
-## 9. Güncelleme
+## 10. Güncelleme
 
 - Kod GitHub'daki `claude/telegram-crypto-automation-o6xo7l` dalındadır.
 - Sunucuda güncelleme `docs/SUNUCU_CLAUDE.md` adımlarıyla yapılır: zip indir → `python -m copytrader stop` → `python guncelle.py --baslatma --bekci-yok` → botu ayrı pencerede başlat → kontrol (Telegram'da "🚀 Kopya-trade motoru başladı").
 - Ayar değişiklikleri güncelleme sırasında `copytrader/migrate.py` tarafından yazılır (yedek alınır). Bu adımlar her güncellemede çalışır: elle silinen bir satır geri gelir; kapatmak için tersini yazmak gerekir.
 
-## 10. Taşıma
+## 11. Taşıma
 
 Yeni sunucuya geçiş: `docs/TASIMA.md`.

@@ -173,7 +173,7 @@ risk:
 #                    işlem AÇILMAZ ve uyarı gelir (varsayılan 1.0). Referans fiyat alınamazsa da işlem
 #                    güvenlik gereği açılmaz; seviyeler asla kaydırılmadan kullanılmaz.
 #                    Örnek:  reference_exchange: binanceusdm / offset_mode: additive / max_offset_pct: 1.0
-#   entry_trigger    LIMIT girişli KRİPTO sinyallerinde giriş nasıl beklenir (reference_exchange gerekir):
+#   entry_trigger    LIMIT girişli KRİPTO sinyallerinde giriş nasıl beklenir (reference_touch: reference_exchange gerekir):
 #                    broker_limit (varsayılan) = brokerda bekleyen limit emri; fark sinyal anında ölçülür.
 #                    reference_touch = SANAL TETİK: brokerda emir YOKTUR. Bot referans borsanın fiyatını
 #                    ~2 sn'de bir izler; SHORT'ta fiyat >= giriş, LONG'da fiyat <= giriş olunca farkı O AN
@@ -181,7 +181,17 @@ risk:
 #                    ilk hedefi geçerse giriş iptal edilir (uyarı gelir). Trader iptal/kapatma yazarsa veya
 #                    süre dolarsa da iptal olur. Bekleyen tetikler yeniden başlatmada korunur ve /pozisyonlar'da
 #                    "bekleyen (sanal tetik)" görünür. Referans fiyat alınamazsa bekler (uyarı gelir), farksız açmaz.
+#                    own_touch = (yalnızca MetaTrader hesabı: type mt5 / mt5_bridge) KENDİ FİYATIYLA SANAL TETİK:
+#                    LIMIT girişli HER sinyalde (kripto da forex / CFD de) bu hesapta limit emir HİÇ KONMAZ; bot bu
+#                    hesabın kendi canlı fiyatını izler (iki bakış arasındaki tikler de görülür) ve LONG'da satış
+#                    fiyatı <= giriş, SHORT'ta alış fiyatı >= giriş olunca bu hesapta MARKET emir açar. Seviyeler
+#                    sinyaldeki gibi kullanılır (kaydırma yok). Fiyat seviyeye değip hızla uzaklaştıysa kovalanmaz,
+#                    dönerse açılır; girişe değmeden stopu ya da ilk hedefi geçerse iptal edilir. reference_exchange
+#                    ve reference_broker ile birlikte yazılmaz.
 #   virtual_trigger_max_hours  sanal tetik bu kadar saat içinde tetiklenmezse iptal edilir (varsayılan 48)
+#   risk_currency    risk_usd'nin (sabit 1R tutarı) para birimi, yalnızca mesajlar için: hesap GBP ise GBP yazın.
+#                    Boş = USD. Lot her zaman hesabın kendi para biriminde hesaplanır (MetaTrader: 1R = risk_usd
+#                    tutarı hesabın para biriminde); hesap başka bir para birimi bildirirse bağlanırken uyarı gelir.
 #   lot_rounding     hesaplanan miktar lot adımına nasıl yuvarlanır: down (varsayılan: stopta kayıp hedefi hiç
 #                    aşmaz) | nearest (0.125 -> 0.13; stopta kayıp hedefi %15'ten fazla aşacaksa aşağı) |
 #                    up (0.4699 -> 0.47: stopta kayıp hedefin ALTINA hiç düşmez; hedefi lot_rounding_max_over'dan

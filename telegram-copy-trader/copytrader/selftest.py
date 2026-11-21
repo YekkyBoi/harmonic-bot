@@ -43,7 +43,7 @@ from types import SimpleNamespace
 from typing import Any
 
 from .brokers.base import Broker
-from .config import AppConfig, match_topic
+from .config import AppConfig, match_topic, risk_currency
 from .models import ActionType, EntryType, MarketType, ParsedAction, Severity, Side, TakeProfit, TradePlan
 from .parsing.symbols import normalize_symbol
 from .telegram.formatting import fmt_price
@@ -196,7 +196,7 @@ def _risk_text(config: AppConfig) -> str:
     for b in config.enabled_brokers:
         fixed = getattr(b, "risk_usd", None)
         if fixed:
-            parts.append(f"{b.name} {fixed:g} USD")
+            parts.append(f"{b.name} {fixed:g} {risk_currency(b)}")
         else:
             pct = config.risk.risk_per_r_pct * float(getattr(b, "risk_multiplier", 1.0) or 1.0)
             parts.append(f"{b.name} bakiyenin %{pct:g} kadarı")
@@ -356,6 +356,13 @@ async def _account(broker: Broker, config: AppConfig, report: _Report, bases: li
     if not equity > 0:
         report.problem(broker.name, f"hesap değeri sıfır ({equity:,.2f} {ccy}); işlem açılamaz")
     details: list[str] = []
+    fixed = getattr(broker.config, "risk_usd", None)
+    named = risk_currency(broker.config)
+    if kind in ("mt5", "mt5_bridge", "metaapi") and fixed and str(ccy or "").strip() \
+            and str(ccy).strip().upper() != named.upper():
+        # (sizing uses the account's own currency: only the texts name the other one)
+        details.append(f"not: hesabın para birimi {ccy}, config.yaml'da 1R = {fixed:g} {named}; stopta kayıp "
+                       f"{fixed:g} {ccy} olur (doğruysa risk_currency: {str(ccy).strip().upper()} yazılabilir)")
     health = await _health_lines(broker, report)
     if health is None:
         # No health check in this adapter: what it noticed while connecting is all there is. (With a health

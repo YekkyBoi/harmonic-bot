@@ -60,8 +60,8 @@ Bu sunucuda botu **bir daha başlatmayın** (geri dönüş için C bölümüne b
 **1. Python 3.12'yi kurun:** python.org > Downloads > Windows > "Windows installer (64-bit)". Kurulumun ilk
 ekranında **"Add python.exe to PATH"** kutusunu işaretleyin.
 
-**2. Üç MetaTrader 5 terminalini kurun ve giriş yapın:** FundingPips (`fx`), BEM (`fx2`) ve arkadaşınızın
-Tickmill terminali (`tickmill`). Hangi hesabın hangi terminali istediğini şu komut gösterir (3. adımdan sonra,
+**2. MetaTrader 5 terminallerini kurun ve giriş yapın:** FundingPips (`fx`), BEM (`fx2`), arkadaşınızın
+Tickmill terminali (`tickmill`) ve eklediyseniz Vantage (`vantage`). Hangi hesabın hangi terminali istediğini şu komut gösterir (3. adımdan sonra,
 Masaüstü'nde): `py -3.12 tasi.py kontrol .\copytrader-tasima-....zip`
 
 - Mümkünse eski sunucudaki kurulum klasörlerini kullanın (kontrol komutu eski yolları yazar). Başka bir klasöre
