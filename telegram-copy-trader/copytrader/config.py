@@ -57,6 +57,11 @@ def fees_in_risk(cfg: Any, risk: Any) -> bool:
     return bool(getattr(risk, "include_fees_in_risk", True)) if risk is not None else True
 
 
+def risk_currency(cfg: Any) -> str:
+    """The currency a broker's fixed 1R (``risk_usd``) is in, for texts: its ``risk_currency``, else USD."""
+    return str(getattr(cfg, "risk_currency", None) or "USD")
+
+
 def is_friend_account(cfg: Any) -> bool:
     """Is this the owner's friend's account (his catch-up questions, his commands, his report card)? Its
     ``friend_account``; not written: an optional account is the friend's, every other one the owner's."""
@@ -273,7 +278,12 @@ class _BrokerBase(_Base):
     symbol_map: dict[str, str] = Field(default_factory=dict)   # "ETH" -> "ETHUSD" (base asset or raw symbol -> broker symbol)
     allowed_assets: list[str] = Field(default_factory=list)     # empty = all assets
     risk_multiplier: float = 1.0                  # scale risk on this broker only (1.0 = 2% per R)
-    risk_usd: float | None = Field(None, gt=0)    # fixed money at risk for 1R on this broker (instead of a % of equity)
+    # fixed money at risk for 1R on this broker (instead of a % of equity), in the ACCOUNT's currency (a MetaTrader
+    # account sizes on its own currency: a GBP account loses risk_usd GBP at the stop)
+    risk_usd: float | None = Field(None, gt=0)
+    # The account's currency, for the texts that name risk_usd ("vantage 20 GBP"); None = USD. Sizing never reads it
+    # (the terminal's own currency is used); the bot warns once at connect when the account reports another one.
+    risk_currency: str | None = None
     no_hedge: bool = False                        # never open the opposite direction of an active position on the same instrument (broker symbol; prop firms / netting)
     daily_loss_limit_pct: float | None = Field(None, ge=0)  # replaces risk.daily_loss_limit_pct for this broker (0 = off)
     # True (prop accounts): the daily limit also counts what is still at risk. A new trade is refused when
@@ -288,7 +298,14 @@ class _BrokerBase(_Base):
     # LIMIT entries on an offset broker: "broker_limit" = resting limit order on the broker (default);
     # "reference_touch" = no broker order: the bot waits for the reference exchange to touch the chart level,
     # then measures the offset right then and opens a MARKET order with the shifted SL/TPs.
-    entry_trigger: Literal["broker_limit", "reference_touch"] = "broker_limit"
+    # "own_touch" (a MetaTrader account, type mt5 / mt5_bridge): no broker limit order for ANY LIMIT entry (crypto and
+    # forex / CFD alike): the bot watches THIS account's own live price (its ticks since the previous look, like
+    # reference_broker) and opens a MARKET order here once it reaches the entry (long: ask <= entry, short:
+    # bid >= entry). The levels are used as the signal gives them (no offset: the same account's price). The rules
+    # of a reference_broker entry apply: a touch the price has run away from is never chased, the stop or the first
+    # target passed before the touch cancels it, virtual_trigger_max_hours ends it. Not with reference_exchange or
+    # reference_broker.
+    entry_trigger: Literal["broker_limit", "reference_touch", "own_touch"] = "broker_limit"
     virtual_trigger_max_hours: float = Field(48.0, gt=0)   # a virtual entry not triggered within this is cancelled
     # Forex / CFD LIMIT entries (plans that are not crypto for their route's kind): the name of ANOTHER enabled
     # MetaTrader account (type mt5 / mt5_bridge) that decides the entry here. Never a broker limit order on this
@@ -325,10 +342,28 @@ class _BrokerBase(_Base):
         name = (v or "").strip()
         return name or None
 
+    @field_validator("risk_currency")
+    @classmethod
+    def _risk_currency_code(cls, v: str | None) -> str | None:
+        code = (v or "").strip().upper()
+        if not code:
+            return None
+        if not re.fullmatch(r"[A-Z]{3,5}", code):
+            raise ValueError(f"risk_currency {v!r} geçersiz; para birimi kodu yazın (ör. GBP, EUR, USD)")
+        return code
+
     @model_validator(mode="after")
     def _touch_needs_reference(self) -> "_BrokerBase":
         if self.entry_trigger == "reference_touch" and not self.reference_exchange:
             raise ValueError(f"broker '{self.name}': entry_trigger: reference_touch için reference_exchange gerekli")
+        if self.entry_trigger == "own_touch":
+            kind = getattr(self, "type", None)
+            if kind not in ("mt5", "mt5_bridge"):
+                raise ValueError(f"broker '{self.name}': entry_trigger: own_touch yalnızca MetaTrader hesaplarında "
+                                 f"(type mt5 ya da mt5_bridge) kullanılabilir; bu hesap type {kind}")
+            if self.reference_exchange or self.reference_broker:
+                raise ValueError(f"broker '{self.name}': entry_trigger: own_touch hesabın kendi fiyatını izler; "
+                                 "reference_exchange ve reference_broker ile birlikte yazılamaz")
         return self
 
 

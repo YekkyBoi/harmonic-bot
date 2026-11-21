@@ -2161,8 +2161,12 @@ class Mt5Broker(MetaTraderLegBroker):
     # ---- which terminal --------------------------------------------------------
     @property
     def _attach_only(self) -> bool:
-        """No credentials in the config: attach to the terminal's own log-in (type mt5_bridge)."""
-        return not getattr(self.cfg, "password", None)
+        """No credentials in the config: attach to the terminal's own log-in (type mt5_bridge). A bridge account logs in
+        itself only with all three of login, password and server (e.g. from .env placeholders); with any of them
+        empty it attaches like one without (never a log-in call that lacks a part)."""
+        cfg = self.cfg
+        return not (getattr(cfg, "password", None) and getattr(cfg, "login", None) is not None
+                    and getattr(cfg, "server", None))
 
     @property
     def _bridge(self) -> bool:

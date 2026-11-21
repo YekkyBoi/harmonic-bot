@@ -71,6 +71,8 @@ yazar.
 | `tickmill` > `type` | `mt5_bridge` | Bilgisayarda Tickmill MT5 terminali bulunursa MetaApi yerine o terminal kullanılır (bir kez; bulunamazsa MetaApi'de kalır ve bunu bir satırla yazar) |
 | `tickmill` > `terminal_path` | bulunan `terminal64.exe` yolu | Program Files içinde adında "Tickmill" geçen klasördeki terminal |
 | `tickmill` > `broker_company` | `Tickmill` | Bot yalnızca Tickmill hesabı açık olan terminale bağlanır |
+| `brokers` > yeni `vantage` bloğu | Vantage MT5 hesabınız | Yalnızca `.env`'de `VANTAGE_LOGIN`, `VANTAGE_PASSWORD`, `VANTAGE_SERVER` satırları varsa ve Program Files içinde adında "Vantage" geçen klasörde terminal bulunursa, bir kez eklenir (yoksa "Vantage eklenmedi: ..." satırı yazar). 1R = 20 GBP, günlük zarar freni yok, soru yok, limit girişte emir konmaz (Vantage'ın kendi fiyatı seviyeye gelince piyasa emri), bağlanamazsa bot onsuz çalışır. Ayrıntı: `docs/VANTAGE_EKLE.md` |
+| kripto ve fx konuları > `brokers` | `vantage` eklenir | Yalnızca vantage bloğu eklenirken (sonradan elle çıkarırsanız geri gelmez) |
 
 ### Tickmill MT5 terminaline geçiş
 

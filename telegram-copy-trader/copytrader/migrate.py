@@ -33,7 +33,7 @@ from typing import Any
 
 import yaml
 
-from .config import AppConfig, NotifierConfig, RiskConfig, TopicRoute, load_config
+from .config import AppConfig, Mt5BridgeBrokerConfig, NotifierConfig, RiskConfig, TopicRoute, load_config
 from .errors import ConfigError
 
 MAX_OPEN_TRADES = 25              # risk.max_open_trades is raised to this when it is lower
@@ -53,6 +53,14 @@ TICKMILL_OLD_RISK_USD, TICKMILL_NEW_RISK_USD = 45, 50
 TICKMILL_TERMINAL_ENV = "COPYTRADER_TICKMILL_TERMINAL"
 TERMINAL_OFF = frozenset({"yok", "off", "metaapi", "kapali", "kapalı", "hayir", "hayır", "no"})
 TERMINAL_EXE = "terminal64.exe"
+# Step 12: the owner's own Vantage MetaTrader 5 account (his decisions: GBP account, 1R = 20 GBP, the kripto and fx
+# topics, no limit order - its own price touching the entry opens it at market -, no question, no daily brake).
+VANTAGE_BROKER = "vantage"
+VANTAGE_COMPANY = "Vantage"
+VANTAGE_ENV = ("VANTAGE_LOGIN", "VANTAGE_PASSWORD", "VANTAGE_SERVER")
+VANTAGE_TERMINAL_ENV = "COPYTRADER_VANTAGE_TERMINAL"   # (guncelle.py --vantage-terminal) the terminal64.exe to use
+VANTAGE_RISK, VANTAGE_CURRENCY = 20, "GBP"
+VANTAGE_ROUTES = ("kripto", "fx")
 
 _PLACEHOLDER = re.compile(r"\$\{[^}]*\}")
 _PLAIN_WORD = re.compile(r"[A-Za-z_][A-Za-z0-9_]*")
@@ -72,9 +80,12 @@ class _TextEditUnsupported(Exception):
 class Change:
     path: tuple[str | int, ...]            # the mapping that gets the key: keys / list indexes from the root
     key: str
-    value: Any                             # bool | int | str
+    value: Any                             # bool | int | str (op "append": also a flat mapping of those)
     text: str                              # Turkish line for the owner
     check: Callable[[AppConfig], bool]     # is the wanted value effective in the loaded config?
+    # "set": ``key`` of the mapping at ``path`` gets ``value``; "append": ``value`` is added at the end of the
+    # (non-empty) LIST that ``key`` of that mapping holds (a scalar, or a flat mapping: a new broker block)
+    op: str = "set"
 
 
 # --------------------------------------------------------------------------- #
@@ -128,6 +139,13 @@ def program_files_roots(env: Any = None) -> list[Path]:
 def find_tickmill_terminals(roots: list[Path]) -> list[Path]:
     """Every terminal64.exe in a folder of ``roots`` whose name contains "Tickmill" (any case), directly in it or
     one folder below it ("Tickmill MT5 Terminal\\terminal64.exe", "Tickmill\\MT5\\terminal64.exe")."""
+    return find_terminals(roots, "tickmill")
+
+
+def find_terminals(roots: list[Path], word: str) -> list[Path]:
+    """Every terminal64.exe in a folder of ``roots`` whose name contains ``word`` (any case), directly in it or one
+    folder below it."""
+    word = word.casefold()
     out: list[Path] = []
     seen: set[str] = set()
 
@@ -148,7 +166,7 @@ def find_tickmill_terminals(roots: list[Path]) -> list[Path]:
             continue
         for sub in subs:
             try:
-                if "tickmill" not in sub.name.casefold() or not sub.is_dir():
+                if word not in sub.name.casefold() or not sub.is_dir():
                     continue
                 add(sub / TERMINAL_EXE)
                 for inner in sorted(sub.iterdir()):
@@ -187,18 +205,46 @@ def tickmill_terminal(env: Any = None, roots: list[Path] | None = None) -> tuple
                   f"bilinmediği için {stay}; {how}.")
 
 
-def _other_accounts_terminal(path: str, config: AppConfig) -> str | None:
-    """The name of the OTHER account whose terminal ``path`` is (its configured terminal_path, or the terminal it
-    was last connected to: its pin in the data folder), else None."""
+def vantage_terminal(env: Any = None, roots: list[Path] | None = None) -> tuple[str | None, str | None]:
+    """(path of the Vantage terminal64.exe, None) or (None, one Turkish line why the vantage account is not added).
+    The override (VANTAGE_TERMINAL_ENV, guncelle.py --vantage-terminal) wins over the search of Program Files for a
+    folder whose name contains "Vantage"."""
+    env = os.environ if env is None else env
+    stay = f"{VANTAGE_BROKER} hesabı eklenmedi"
+    how = (f"terminal başka bir yerdeyse güncellemeyi 'python guncelle.py --vantage-terminal \"<terminal64.exe "
+           f"yolu>\"' ile ya da {VANTAGE_TERMINAL_ENV} ortam değişkeniyle yapın")
+    override = str(env.get(VANTAGE_TERMINAL_ENV) or "").strip().strip('"').strip()
+    if override:
+        exe = Path(override)
+        if exe.is_dir():
+            exe = exe / TERMINAL_EXE
+        if exe.is_file() and exe.name.casefold() == TERMINAL_EXE:
+            return str(exe), None
+        return None, f"Vantage eklenmedi: belirtilen Vantage terminali bulunamadı ({override}); {stay}."
+    found = find_terminals(program_files_roots(env) if roots is None else roots, "vantage")
+    if len(found) == 1:
+        return str(found[0]), None
+    if not found:
+        return None, (f"Vantage eklenmedi: bu bilgisayarda Vantage MT5 terminali bulunamadı (Program Files içinde "
+                      f"adında Vantage geçen klasörde {TERMINAL_EXE} yok). Vantage MT5'i kurup hesabınızla giriş "
+                      f"yapın, sonra güncellemeyi tekrar çalıştırın; {how}.")
+    names = ", ".join(str(f) for f in found)
+    return None, (f"Vantage eklenmedi: birden fazla Vantage MT5 terminali bulundu ({names}); hangisinin "
+                  f"kullanılacağı bilinmediği için {stay}; {how}.")
+
+
+def _other_accounts_terminal(path: str, config: AppConfig, own: str = TICKMILL_BROKER) -> str | None:
+    """The name of the account other than ``own`` whose terminal ``path`` is (its configured terminal_path, or the
+    terminal it was last connected to: its pin in the data folder), else None."""
     from .brokers.mt5_broker import read_pins
     from .config import terminal_key
 
     key = terminal_key(path)
     for b in config.brokers:
-        if b.name != TICKMILL_BROKER and getattr(b, "terminal_path", None) and terminal_key(b.terminal_path) == key:
+        if b.name != own and getattr(b, "terminal_path", None) and terminal_key(b.terminal_path) == key:
             return b.name
     for name, rec in read_pins(str(config.data_dir)).items():
-        if name != TICKMILL_BROKER and rec.get("folder") and terminal_key(str(rec["folder"])) == key:
+        if name != own and rec.get("folder") and terminal_key(str(rec["folder"])) == key:
             return name
     return None
 
@@ -208,12 +254,16 @@ def _same_number(value: Any, number: float) -> bool:
 
 
 def plan_changes(raw: dict[str, Any], config: AppConfig, *,
-                 terminal: tuple[str | None, str | None] | None = None) -> tuple[list[Change], list[str]]:
+                 terminal: tuple[str | None, str | None] | None = None, env: Any = None,
+                 vantage: tuple[str | None, str | None] | None = None) -> tuple[list[Change], list[str]]:
     """(changes, notes) for the raw YAML data ``raw`` whose loaded form is ``config``.
 
     A key the installed config model does not know, or one whose present value is a ``${VAR}`` placeholder,
     is skipped with a note (never written). ``terminal``: the result of :func:`tickmill_terminal` (looked for on
-    this computer when None, and only when the tickmill block can switch)."""
+    this computer when None, and only when the tickmill block can switch). ``env``: the environment step 12 reads
+    the VANTAGE_* variables from (os.environ, with ``.env`` loaded by the config loader, when None; only whether
+    they are there and usable is looked at: no value is ever written or shown). ``vantage``: the result of
+    :func:`vantage_terminal` (looked for when None, and only when the vantage block is to be added)."""
     changes: list[Change] = []
     notes: list[str] = []
 
@@ -414,7 +464,116 @@ def plan_changes(raw: dict[str, Any], config: AppConfig, *,
                 "gibi açılacak (confirm_open: false)",
                 lambda c, name=name: getattr(_broker(c, name), "confirm_open", None) is False,
                 name, wanted=lambda v: True)
+
+    # 12. The owner's own Vantage MetaTrader 5 account, added once (see _vantage_changes).
+    if broker_index(VANTAGE_BROKER) is None:
+        added, why = _vantage_changes(raw, config, changes, os.environ if env is None else env, vantage)
+        changes += added
+        notes += why
     return changes, notes
+
+
+def _vantage_block(path: str) -> dict[str, Any]:
+    """The vantage broker block as step 12 writes it (the owner's decisions; the log-in only as placeholders)."""
+    return {
+        "name": VANTAGE_BROKER, "type": "mt5_bridge", "enabled": True,
+        # optional: the bot starts and trades without it when its terminal is down; friend_account: false - it is the
+        # owner's (an optional account would otherwise count as the friend's: his commands, his report card)
+        "optional": True, "friend_account": False,
+        "terminal_path": path, "broker_company": VANTAGE_COMPANY,
+        "login": "${VANTAGE_LOGIN:-}", "password": "${VANTAGE_PASSWORD:-}", "server": "${VANTAGE_SERVER:-}",
+        "risk_usd": VANTAGE_RISK, "risk_currency": VANTAGE_CURRENCY,
+        "daily_loss_limit_pct": 0, "confirm_open": False, "entry_trigger": "own_touch",
+    }
+
+
+def _vantage_changes(raw: dict[str, Any], config: AppConfig, planned: list[Change], env: Any,
+                     vantage: tuple[str | None, str | None] | None) -> tuple[list[Change], list[str]]:
+    """Step 12: (changes, notes). The vantage block at the end of ``brokers`` and "vantage" at the end of the broker
+    lists of the kripto and fx topics - only together, only when the config has no vantage block, the three
+    VANTAGE_* variables are set in ``env`` (the login a number, the server a Vantage server) and the Vantage terminal
+    is found. The candidate config (``planned`` and these changes applied) must validate first: a block this version
+    could not load is never written (the update's other steps go on). Notes never show a variable's value."""
+    stay = "Vantage eklenmedi"
+    missing = [n for n in VANTAGE_ENV if not str(env.get(n) or "").strip()]
+    if missing:
+        part = "" if len(missing) == len(VANTAGE_ENV) else f" (eksik: {', '.join(missing)})"
+        return [], [f"{stay}: .env'de VANTAGE_LOGIN/PASSWORD/SERVER yok{part}; adımlar: docs/VANTAGE_EKLE.md"]
+    if not str(env.get("VANTAGE_LOGIN")).strip().isdigit():
+        return [], [f"{stay}: .env'deki VANTAGE_LOGIN bir hesap numarası değil (yalnızca rakam olmalı)"]
+    if VANTAGE_COMPANY.casefold() not in str(env.get("VANTAGE_SERVER")).casefold():
+        return [], [f"{stay}: .env'deki VANTAGE_SERVER adında 'Vantage' geçmiyor; bot yalnızca Vantage hesabı açık "
+                    "terminale bağlanır. Sunucu adını MT5'teki giriş penceresinden aynen yazın"]
+    model = Mt5BridgeBrokerConfig
+    if not all(_knows(model, k) for k in ("risk_currency", "friend_account", "entry_trigger")) \
+            or not _knows_value(model, "entry_trigger", "own_touch"):
+        return [], [f"{stay}: bu sürüm gereken ayarları tanımıyor"]
+    path, why = vantage if vantage is not None else vantage_terminal(env)
+    if path is None:
+        return [], [why or f"{stay}: Vantage MT5 terminali bulunamadı"]
+    owner = _other_accounts_terminal(path, config, own=VANTAGE_BROKER)
+    if owner is not None:
+        return [], [f"{stay}: {path} '{owner}' hesabının terminali; Vantage'ın kendi terminal64.exe yolunu verin "
+                    "(guncelle.py --vantage-terminal)"]
+    changes = [Change((), "brokers", _vantage_block(path),
+                      f"{VANTAGE_BROKER}: Vantage MT5 hesabı eklendi (type: mt5_bridge, terminal_path: {path}; giriş "
+                      ".env'deki VANTAGE_LOGIN / VANTAGE_PASSWORD / VANTAGE_SERVER ile); 1R = "
+                      f"{VANTAGE_RISK} {VANTAGE_CURRENCY}, günlük zarar freni yok, 'açayım mı?' diye sormadan açar, "
+                      "limit girişte emir konmaz: Vantage'ın kendi fiyatı giriş seviyesine gelince piyasa emriyle "
+                      "açılır; bağlanamazsa bot onsuz çalışır (optional: true)",
+                      lambda c: getattr(_broker(c, VANTAGE_BROKER), "type", None) == "mt5_bridge"
+                      and getattr(_broker(c, VANTAGE_BROKER), "entry_trigger", None) == "own_touch",
+                      op="append")]
+    notes: list[str] = []
+    telegram = raw.get("telegram")
+    topics = telegram.get("topics") if isinstance(telegram, dict) else None
+    topics = topics if isinstance(topics, list) else []
+    for route in VANTAGE_ROUTES:
+        j = next((k for k, t in enumerate(topics) if isinstance(t, dict) and str(t.get("name")) == route), None)
+        if j is None:
+            notes.append(f"{VANTAGE_BROKER}: '{route}' adlı konu yok; vantage o konuya eklenmedi")
+            continue
+        listed = topics[j].get("brokers")
+        if not listed:
+            notes.append(f"{VANTAGE_BROKER}: '{route}' konusunun broker listesi boş (bütün hesaplar); dokunulmadı, "
+                         "vantage bu konuda zaten işlem açar")
+            continue
+        if not isinstance(listed, list) or not all(isinstance(x, str) for x in listed):
+            notes.append(f"{VANTAGE_BROKER}: '{route}' konusunun broker listesi beklenen biçimde değil; vantage o "
+                         "konuya eklenmedi")
+            continue
+        if VANTAGE_BROKER in listed:
+            continue
+        changes.append(Change(("telegram", "topics", j), "brokers", VANTAGE_BROKER,
+                              f"{route} konusu: sinyaller vantage hesabında da açılacak (brokers: "
+                              f"[{', '.join([*listed, VANTAGE_BROKER])}])",
+                              lambda c, j=j: VANTAGE_BROKER in c.telegram.topics[j].brokers, op="append"))
+    # The candidate must load (with this environment) before anything is planned: never a file the bot cannot start.
+    if not _loads_with(_apply_to_data(raw, [*planned, *changes]), env, VANTAGE_ENV):
+        return [], [f"{stay}: yeni ayarlar bu sürümle doğrulanamadı; hiçbir şey eklenmedi"]
+    return changes, notes
+
+
+def _loads_with(data: Any, env: Any, names: tuple[str, ...]) -> bool:
+    """Does ``data`` (raw YAML data with placeholders) validate as an AppConfig with the variables ``names`` taken
+    from ``env`` (the rest from the process environment)? Nothing is printed: a validation error could quote a
+    value."""
+    from .config import _expand_env
+
+    saved = {n: os.environ.get(n) for n in names}
+    try:
+        for n in names:
+            os.environ[n] = str(env.get(n) or "")
+        AppConfig.model_validate(_expand_env(data))
+        return True
+    except Exception:  # noqa: BLE001 - the caller says it in a note, without the error's text
+        return False
+    finally:
+        for n, value in saved.items():
+            if value is None:
+                os.environ.pop(n, None)
+            else:
+                os.environ[n] = value
 
 
 # --------------------------------------------------------------------------- #
@@ -440,8 +599,20 @@ def _apply_to_data(data: Any, changes: list[Change]) -> Any:
             if child is None and isinstance(step, str) and depth == len(ch.path) - 1:
                 child = node[step] = {}
             node = child
-        node[ch.key] = ch.value
+        if ch.op == "append":
+            node[ch.key].append(_unshare(ch.value))
+        else:
+            node[ch.key] = ch.value
     return out
+
+
+def _placeholders(value: Any) -> list[str]:
+    """The ``${...}`` placeholders in a planned value (a string, or the strings of a mapping / list)."""
+    if isinstance(value, dict):
+        return [p for v in value.values() for p in _placeholders(v)]
+    if isinstance(value, (list, tuple)):
+        return [p for v in value for p in _placeholders(v)]
+    return _PLACEHOLDER.findall(value) if isinstance(value, str) else []
 
 
 def _freeze(obj: Any) -> Any:
@@ -461,7 +632,8 @@ def _verify(old_text: str, new_text: str, changes: list[Change]) -> str | None:
         return f"yeni metin geçerli YAML değil ({str(exc).splitlines()[0]})"
     if _freeze(_apply_to_data(old, changes)) != _freeze(new):
         return "planlanan ayarlar dışında bir fark oluştu"
-    if sorted(_PLACEHOLDER.findall(old_text)) != sorted(_PLACEHOLDER.findall(new_text)):
+    wanted = _PLACEHOLDER.findall(old_text) + [p for ch in changes for p in _placeholders(ch.value)]
+    if sorted(wanted) != sorted(_PLACEHOLDER.findall(new_text)):
         return "${...} yer tutucuları değişti"
     return None
 
@@ -538,6 +710,56 @@ def _child_indent(root: yaml.MappingNode) -> int:
     return 2
 
 
+def _dash_column(text: str, item: yaml.Node) -> int:
+    """Column of the "-" that starts the block sequence item ``item`` (only spaces, the dash and spaces before the
+    item on its line; anything else is a layout the text edit does not handle)."""
+    start = int(item.start_mark.index)
+    line_start = text.rfind("\n", 0, start) + 1
+    before = text[line_start:start]
+    if before.strip() != "-":
+        raise _TextEditUnsupported("liste öğesi beklenen biçimde değil")
+    return before.index("-")
+
+
+def _append_edit(text: str, root: yaml.MappingNode, ch: Change, newline: str) -> tuple[int, int, str]:
+    """The text edit of an "append" change: one more item at the end of the non-empty list ``ch.key`` of the mapping
+    at ``ch.path``, in the list's own style (flow ``[a, b]``: a scalar only; block: a scalar or a flat mapping,
+    indented like the list's first item)."""
+    node = _node_at(root, ch.path) if ch.path else root
+    if not isinstance(node, yaml.MappingNode):
+        raise _TextEditUnsupported(f"{ch.path}: eşleme değil")
+    seq = _value_node(node, ch.key)
+    if not isinstance(seq, yaml.SequenceNode) or not seq.value:
+        raise _TextEditUnsupported(f"{ch.key}: dolu bir liste değil")
+    item = ch.value
+    if isinstance(item, dict) and not all(not isinstance(v, (dict, list)) for v in item.values()):
+        raise _TextEditUnsupported(f"{ch.key}: iç içe değer")
+    if seq.flow_style:
+        if isinstance(item, dict):
+            raise _TextEditUnsupported(f"{ch.key}: satır içi listeye blok eklenmez")
+        close = int(seq.end_mark.index) - 1
+        if close < 0 or text[close] != "]":
+            raise _TextEditUnsupported(f"{ch.key}: satır içi listenin sonu bulunamadı")
+        return close, close, f", {_scalar(item)}"
+    first = seq.value[0]
+    dash = _dash_column(text, first)
+    if isinstance(item, dict):
+        if not isinstance(first, yaml.MappingNode) or first.flow_style or not first.value:
+            raise _TextEditUnsupported(f"{ch.key}: liste öğeleri blok eşleme değil")
+        inner = int(first.value[0][0].start_mark.column)
+        lines = [(" " * dash + "-" + " " * (inner - dash - 1) if n == 0 else " " * inner)
+                 + f"{key}: {_scalar(value)}{newline}" for n, (key, value) in enumerate(item.items())]
+    else:
+        if not isinstance(first, yaml.ScalarNode):
+            raise _TextEditUnsupported(f"{ch.key}: liste öğeleri tek değer değil")
+        inner = int(first.start_mark.column)
+        lines = [" " * dash + "-" + " " * (inner - dash - 1) + f"{_scalar(item)}{newline}"]
+    if inner <= dash:
+        raise _TextEditUnsupported(f"{ch.key}: girinti okunamadı")
+    at, before = _next_line_start(text, _content_end(seq), newline)
+    return at, at, before + "".join(lines)
+
+
 def _edit_text(text: str, changes: list[Change]) -> str:
     """``text`` with ``changes`` applied as text edits (see the module docstring). Raises
     :class:`_TextEditUnsupported` for a layout it does not handle; the caller verifies the result."""
@@ -550,9 +772,15 @@ def _edit_text(text: str, changes: list[Change]) -> str:
     newline = "\r\n" if "\r\n" in text else "\n"
     groups: dict[tuple[str | int, ...], list[Change]] = {}
     for ch in changes:
-        groups.setdefault(ch.path, []).append(ch)
+        if ch.op == "set":
+            groups.setdefault(ch.path, []).append(ch)
 
     edits: list[tuple[int, int, str]] = []        # (start, end, replacement) in the ORIGINAL text
+    for ch in changes:
+        if ch.op == "append":
+            edits.append(_append_edit(text, root, ch, newline))
+        elif ch.op != "set":
+            raise _TextEditUnsupported(f"{ch.op}: bilinmeyen değişiklik türü")
     appended: list[str] = []                      # whole new top-level sections for the end of the file
     for path, group in groups.items():
         node = _node_at(root, path)
@@ -658,11 +886,12 @@ def _backup_path(path: Path, now: datetime) -> Path:
 
 
 def migrate_config(path: str | os.PathLike[str] = "config.yaml", *, notes: list[str] | None = None,
-                   now: datetime | None = None, terminal: tuple[str | None, str | None] | None = None) -> list[str]:
+                   now: datetime | None = None, terminal: tuple[str | None, str | None] | None = None,
+                   env: Any = None, vantage: tuple[str | None, str | None] | None = None) -> list[str]:
     """Update ``path`` in place. Returns one Turkish line per change (empty: the file was already up to date
     and nothing was written). ``notes`` (optional list) receives remarks: skipped settings, the backup's name,
     lost comments. Raises :class:`MigrationError` when the file cannot be migrated; the file on disk is then
-    the old one."""
+    the old one. ``terminal`` / ``env`` / ``vantage``: see :func:`plan_changes`."""
     p = Path(path)
     raw_bytes = p.read_bytes()
     try:
@@ -678,7 +907,7 @@ def migrate_config(path: str | os.PathLike[str] = "config.yaml", *, notes: list[
         raise MigrationError(
             f"{p.name} bu sürümle yüklenemiyor ({_short_error(exc)}); hiçbir şey değiştirilmedi") from exc
 
-    changes, found = plan_changes(data, config, terminal=terminal)
+    changes, found = plan_changes(data, config, terminal=terminal, env=env, vantage=vantage)
     remarks = list(found)
     try:
         if not changes:
