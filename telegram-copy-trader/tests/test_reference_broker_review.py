@@ -625,12 +625,12 @@ def test_the_live_config_after_this_update_has_the_friends_settings(tmp_path: Pa
     tps.load_prod_config(tmp_path, monkeypatch, "live")             # (writes config.yaml, sets the variables)
     path = tmp_path / "config.yaml"
     lines = migrate.migrate_config(path, terminal=(None, None))
-    assert sum(1 for line in lines if line.startswith("tickmill:")) == 8           # (+ step 13: two keys)
+    assert sum(1 for line in lines if line.startswith("tickmill:")) == 7           # (+ step 13)
     cfg = load_config(path)
     t = next(b for b in cfg.brokers if b.name == "tickmill")
     assert (t.confirm_open, t.fees_in_risk, t.lot_rounding, t.lot_rounding_max_over, t.reference_broker,
             t.risk_usd, t.size_from_signal_entry) == (False, False, "up", 10.0, "fx", 50, True)
-    assert (t.fx_entry_rule_everywhere, t.one_position_per_signal) == (True, True)
+    assert t.fx_only_from_fx_topic is True
     for name in ("binance", "fx"):
         b = next(x for x in cfg.brokers if x.name == name)
         assert (b.confirm_open, b.fees_in_risk, b.lot_rounding, b.reference_broker, b.size_from_signal_entry) == (

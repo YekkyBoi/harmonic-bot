@@ -66,12 +66,11 @@ Diğer konular (Sohbet, Analiz, Duyuru...) yok sayılır.
   - Kripto: Binance vadeli fiyatı giriş seviyesine gelince.
   - Fx: FundingPips'teki emir dolunca; FundingPips'te emir yoksa FundingPips fiyatı seviyeye gelince (`reference_broker: fx`).
   - Fiyat girişe gelmeden stopa ya da ilk hedefe giderse bekleyen giriş iptal edilir. Seviyeye değip hızla uzaklaşan fiyat kovalanmaz, geri gelmesi beklenir.
-- **Altın/forex kripto sayılmaz (23.11):**
-  - Sorun: aynı XAU short grafiği hem kripto hem fx konusuna atıldı, "Limit emir" yalnızca fx konusunda yazıyordu. Kripto kuralı (%0,5 yakınlık) yüzünden Tickmill piyasadan sattı.
-  - Sahibinin sözü: "xau kripto mu … işlem limit emirse limit emir uygulanır değilse market açılır … tickmill için".
-  - Kural: kripto konusundan gelen altın/forex Tickmill'de fx kuralıyla girilir. Fiyat girişe stop mesafesinin dörtte birinden uzaksa beklenir; FundingPips'in fiyatı girişe gelince açılır (`fx_entry_rule_everywhere: true`).
-  - Coinler ve sahibinin hesapları bu kuraldan etkilenmez.
-- **Bir sinyal, bir işlem:** aynı sinyal iki konuya atılırsa Tickmill ilk geleni alır, ikincisini atlar. İlk işlem Tickmill'de biterse sonraki tekrar alınır (`one_position_per_signal: true`).
+- **Altın/forex = Fx (23.11):**
+  - Olay: aynı XAU short grafiği iki konuya atıldı (giriş 3610,49, fiyat 3602). Kripto konusu altını "XAUUSDT perp" okudu ve %0,5 yakınlık kuralıyla Tickmill'de piyasadan sattı.
+  - Sahibinin sözü: "Xau zaten kripto değil fx e bağlı olacak … marketse market limit emirse kuralımızı uygulayacaksın tickmill için".
+  - Kural: Tickmill altın/forex/endeksi yalnızca Fx konusundan alır, kripto konusundakini atlar (`fx_only_from_fx_topic: true`). Coinler ve sahibinin hesapları aynı.
+  - Bilinen risk (sahibine söylendi): altın yalnızca kripto konusuna atılırsa Tickmill açmaz.
 - **Lot:** sinyaldeki giriş fiyatına göre hesaplanır (sinyali yazan gibi). Stopta kayıp 1R'nin (50 USD) altına inmez, 1R + 10 USD'yi geçmez (`size_from_signal_entry: true`, `lot_rounding: up`, `fees_in_risk: false`).
 - Kanaldan gelen yönetim mesajları (stop taşı, TP değiştir, kapat) Tickmill'e de uygulanır.
 - Bir onay sorusunda sahibi yönü/pariteyi düzeltirse Tickmill'in ilk işlemi ayrı kalır; onu `/pozkapat` ile elle yönetmek gerekir.

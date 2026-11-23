@@ -335,18 +335,10 @@ class _BrokerBase(_Base):
     # at the stop), and never losing more than 1R + lot_rounding_max_over at the stop from the live entry the order
     # gets (beyond it the largest lot step within it). Signals without an entry price and resting limits: as before.
     size_from_signal_entry: bool = False
-    # true: a forex / metal / index signal (gold too) of a CRYPTO topic is entered on this account the way the fx topic
-    # enters it: market or limit by the FX rule (the FX_* defaults: market only within FX_MARKET_ENTRY_TOLERANCE_PCT
-    # of the entry or FX_MARKET_ENTRY_TOLERANCE_R of the entry-to-stop distance; the signal's own entry type as
-    # there), not by the crypto topic's wider tolerance. A limit then waits like this account's other forex limits
-    # (reference_broker: for that account's PRICE only - its leg of a crypto topic's trade follows the crypto rule).
-    # Coins and the other accounts: unchanged.
-    fx_entry_rule_everywhere: bool = False
-    # true: a signal the trader posts in two topics (gold in the crypto and the fx topic) is taken ONCE here: a new
-    # trade of another topic on the same instrument and side, created within risk.duplicate_window_sec of it, whose
-    # entry matches (the repost tolerance) is skipped on this account while it holds a position (waiting or open)
-    # of the first one. The first to arrive is taken.
-    one_position_per_signal: bool = False
+    # true: a currency / metal / index signal (gold too) of a CRYPTO topic is never taken on this account (a crypto
+    # topic reads "Xau short" as the XAUUSDT perpetual): it takes such signals from its fx topic only - that topic's
+    # reading, its entry rule (market or limit as the signal shows) and its reference_broker's price. Coins: unchanged.
+    fx_only_from_fx_topic: bool = False
 
     @field_validator("reference_broker")
     @classmethod

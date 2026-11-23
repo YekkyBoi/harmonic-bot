@@ -205,13 +205,9 @@ risk:
 #                    sinyaldeki giriş ile stop arasındaki mesafeye göre hesaplanır (aşağı yuvarlanır); canlı
 #                    girişe göre hesaplanan lottan küçük olmaz (stopta kayıp 1R'nin altına düşmez) ve gerçek
 #                    girişten stopta kayıp en çok 1R + lot_rounding_max_over olur. Varsayılan false
-#   fx_entry_rule_everywhere  true = KRİPTO konusundan gelen altın / forex / endeks sinyali bu hesapta fx
-#                    konusunun kuralıyla girilir: piyasa ya da limit, fx'teki gibi seçilir (fiyat girişe %0.03'ten ya
-#                    da stop mesafesinin dörtte birinden yakınsa piyasa, değilse limit). Limitte reference_broker
-#                    hesabının yalnızca FİYATI beklenir. Coinler aynı. Varsayılan false
-#   one_position_per_signal  true = aynı sinyal iki konuya atılırsa (aynı enstrüman ve yön, girişler aynı,
-#                    risk.duplicate_window_sec içinde) bu hesapta yalnızca ilk gelen açılır; ilki bu hesapta bitmişse
-#                    sonraki yine alınır. Varsayılan false
+#   fx_only_from_fx_topic  true = KRİPTO konusuna atılan altın / forex / endeks sinyali bu hesapta açılmaz;
+#                    bu hesap onları yalnızca Fx konusundan alır (oradaki okuma, piyasa/limit kuralı ve
+#                    reference_broker fiyatı). Kripto konusu "Xau short"u XAUUSDT perp okur. Coinler aynı. Varsayılan false
 #   reference_broker (isteğe bağlı) LIMIT girişli FOREX/CFD sinyallerinde (kripto olmayan; konunun türüne
 #                    göre, yukarıdaki kural) bu hesapta limit emir HİÇ KONMAZ: burada adı yazılan BAŞKA bir
 #                    MetaTrader hesabı (type mt5 / mt5_bridge, etkin) referans olur. O hesabın bu işlemde bekleyen
