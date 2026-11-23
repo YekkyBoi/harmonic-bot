@@ -195,6 +195,9 @@ class TradePlan(BaseModel):
     # Bar size (minutes) of the signal's chart picture, as the parser read it (None: not shown, or a plan of an
     # older version). Only the owner's trade card (copytrader.karne.tradecard) uses it: nothing that trades does.
     chart_timeframe_min: int | None = None
+    # A forex / metal / index plan of a CRYPTO topic: the entry type the fx topic's rule gives it (accounts with
+    # fx_entry_rule_everywhere use it instead of ``entry_type``). None: not such a plan, or no account wants it.
+    fx_entry_type: EntryType | None = None
 
 
 _PAIR_METALS = frozenset({"XAU", "XAG", "XPT", "XPD"})

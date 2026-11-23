@@ -987,6 +987,13 @@ def broker_virtual_wanted(broker: Broker, plan: TradePlan, route_kind: str | Non
     )
 
 
+def fx_rule_type_differs(broker: Broker, plan: TradePlan) -> bool:
+    """``broker`` enters forex / metal plans of crypto topics by the fx topic's rule (``fx_entry_rule_everywhere``)
+    and that rule gives ``plan`` another entry type than its own (``plan.fx_entry_type``)."""
+    return (bool(getattr(broker.config, "fx_entry_rule_everywhere", False))
+            and plan.fx_entry_type is not None and plan.fx_entry_type is not plan.entry_type)
+
+
 def reference_leg_filled(pos: BrokerPosition) -> bool:
     """A leg of the reference account (``reference_broker``) whose entry has filled: open, a part of it filled, or
     closed after a fill."""
@@ -1554,6 +1561,33 @@ class Engine:
         names = set(plan.broker_names) or {b.name for b in self.configured_brokers}
         cfgs = [b.config for b in self.configured_brokers if b.name in names]
         return bool(cfgs) and all(getattr(c, "no_hedge", False) for c in cfgs)
+
+    async def _signal_taken_elsewhere(self, broker: Broker, plan: TradePlan, trade: TradeRecord) -> str | None:
+        """``one_position_per_signal``: the Turkish reason when ``broker`` already holds a position (waiting or open)
+        of ANOTHER topic's trade that is this same signal - the same instrument and side, created within
+        risk.duplicate_window_sec, entries within the repost tolerance of either topic (guards.find_duplicate) -
+        else None. A trade of the same topic is the existing repost question's (never decided here)."""
+        window = self.config.risk.duplicate_window_sec
+        if window <= 0 or plan.route is None:
+            return None
+        others: dict[int, TradeRecord] = {}
+        for tid, pos in await self.db.active_broker_positions():
+            if pos.broker != broker.name or tid == trade.id or tid in others:
+                continue
+            other = await self.db.get_trade(tid)
+            if (other is None or other.plan.route is None or other.plan.route == plan.route
+                    or not self._same_instrument(other.plan, plan)):
+                continue
+            others[tid] = other
+        if not others:
+            return None
+        tolerance = max([self._dup_tolerance(plan), *(self._dup_tolerance(t.plan) for t in others.values())])
+        dup = guards.find_duplicate(plan, list(others.values()), window_sec=window, now=self._now(),
+                                    entry_tolerance_pct=tolerance)
+        if dup is None:
+            return None
+        # (the friend reads this too, _friend_open_note: never a name of the owner's - a topic may share one)
+        return f"aynı sinyal diğer konudan zaten alındı (#{dup.id}); bu hesapta ikinci kez açılmadı"
 
     async def _hedge_conflict(
         self, broker: Broker, plan: TradePlan, trade: TradeRecord, broker_symbol: str | None = None
@@ -3382,6 +3416,29 @@ class Engine:
             return await self._evaluate_management(action, chat_id, reply_to, exclude_conf=exclude_conf, route=route)
         return None
 
+    def _fx_rule_wanted(self, route: TopicRoute, plan: TradePlan) -> bool:
+        """A forex / metal / index plan (not a crypto plan for its route) of a CRYPTO topic, and an account of the
+        route that enters such plans by the fx topic's rule (``fx_entry_rule_everywhere``)."""
+        if route.kind != "crypto" or is_crypto_plan(plan, route.kind):
+            return False
+        names = set(route.brokers)
+        return any(getattr(b.config, "fx_entry_rule_everywhere", False)
+                   for b in self.configured_brokers if not names or b.name in names)
+
+    def _fx_rule_entry_type(self, action: ParsedAction, route: TopicRoute, market: float | None, chat_id: int,
+                            now: datetime) -> EntryType | None:
+        """The entry type the fx topic's rule gives this signal of crypto topic ``route`` (the FX_* defaults, the
+        same reading and market price); None when that rule would not open it at all (the plan's own type then)."""
+        base, quote, market_type = asset_of(action)
+        fx_route = TopicRoute(name=route.name, title_contains=list(route.title_contains), brokers=list(route.brokers),
+                              kind="fx")
+        fx_plan, _issues = validator.build_open_plan(
+            action, risk=effective_risk(self.config.risk, fx_route, base=base, market_type=market_type, quote=quote),
+            llm=self.config.llm, market_price=market, source_chat_id=chat_id, now=now, route=route.name,
+            broker_names=list(route.brokers), **self._open_plan_extras(route),
+        )
+        return fx_plan.entry_type if fx_plan is not None else None
+
     def _open_plan_extras(self, route: TopicRoute | None) -> dict[str, Any]:
         """What the validator needs to know about the route besides its name and brokers: its kind (which
         entry-to-stop distance is plausible: a coin, a currency pair, an index) and whether a percentage of
@@ -3412,6 +3469,8 @@ class Engine:
             **self._open_plan_extras(route),
         )
         issues = merge_issues(issues, validator.low_confidence_issues(action, self.config.llm))
+        if plan is not None and route is not None and self._fx_rule_wanted(route, plan):
+            plan.fx_entry_type = self._fx_rule_entry_type(action, route, market, chat_id, now)
         portfolio: list[ValidationIssue] = []
         if plan is not None:
             portfolio = await self._portfolio_issues(plan, chat_id, exclude_conf=exclude_conf,
@@ -4957,6 +5016,13 @@ class Engine:
         name = broker.name
         risk = self._plan_risk(plan)
         sent = False                # an order request went to the broker: it may exist there whatever came back
+        own_type = virtual is None and fx_rule_type_differs(broker, plan)
+        if own_type:
+            # fx_entry_rule_everywhere: a forex / metal plan of a crypto topic is entered here by the fx topic's rule.
+            # The other accounts' legs follow the plan's own type: a reference account's leg says nothing about this
+            # entry (its price does).
+            assert plan.fx_entry_type is not None
+            plan = plan.model_copy(update={"entry_type": plan.fx_entry_type})
         try:
             sym = await broker.resolve_symbol(plan.base_asset, plan.quote_asset, plan.market_type, raw_symbol)
             if sym is None:
@@ -4967,6 +5033,10 @@ class Engine:
             conflict = await self._hedge_conflict(broker, plan, trade, sym.broker_symbol)
             if conflict:
                 return BrokerOutcome(name, "skipped", f"{esc(name)}: {conflict}", benign=True)
+            if virtual is None and getattr(broker.config, "one_position_per_signal", False):
+                taken = await self._signal_taken_elsewhere(broker, plan, trade)
+                if taken is not None:
+                    return BrokerOutcome(name, "skipped", f"{esc(name)}: {taken}", benign=True)
             kind = self._plan_kind(plan)
             if virtual is None and own_touch_wanted(broker, plan):
                 # (never a broker limit on this account: it waits for its own price to reach the entry)
@@ -4976,7 +5046,8 @@ class Engine:
             if virtual is None and broker_virtual_wanted(broker, plan, kind):
                 # (never a broker limit on this account: it waits for the reference account's fill or price)
                 return await self._register_virtual(broker, plan, trade, sym, raw_symbol, flow,
-                                                    ref_broker=str(broker.config.reference_broker))
+                                                    ref_broker=str(broker.config.reference_broker),
+                                                    price_only=own_type)
             entry_type = EntryType.MARKET if virtual is not None else plan.entry_type
             equity = await broker.get_equity()
             ccy = self._currency.get(name, "")
@@ -5266,13 +5337,15 @@ class Engine:
     # ------------------------------------------------------------------ virtual (reference-touch) entries
     async def _register_virtual(
         self, broker: Broker, plan: TradePlan, trade: TradeRecord, sym: Any, raw_symbol: str | None,
-        flow: _OpenFlow | None = None, *, ref_broker: str | None = None,
+        flow: _OpenFlow | None = None, *, ref_broker: str | None = None, price_only: bool = False,
     ) -> BrokerOutcome:
         """``entry_trigger: reference_touch``: no order on the broker. A PENDING position carrying
         ``data["virtual_trigger"]`` is stored (it survives a restart); the monitor watches the reference price.
         ``ref_broker`` (``reference_broker``, a forex / CFD plan): the stored entry carries ``data["reference_broker"]``
         instead and waits for that account's waiting entry of the trade to fill, or - while that account has none -
-        for that account's own price to reach the level (:meth:`_reference_broker_check`). Never a broker limit."""
+        for that account's own price to reach the level (:meth:`_reference_broker_check`). Never a broker limit.
+        ``price_only``: that account's PRICE alone decides (``data["reference_price_only"]``): its leg of this trade
+        was placed by another entry rule (fx_entry_rule_everywhere), so its fill is no touch of this entry."""
         name = broker.name
         mult = price_multiplier(sym.extra)
         entry = float(plan.entry_price or 0.0) * mult
@@ -5303,11 +5376,16 @@ class Engine:
                     "reference_broker": ref_broker, "price_multiplier": mult, "raw_symbol": raw_symbol,
                     "virtual_created_at": self._now().isoformat(), "virtual_max_hours": hours,
                     "virtual_tp_armed": tp_armed,
+                    **({"reference_price_only": True} if price_only and ref_broker != name else {}),
                 },
             )
             await self._save_leg_position(trade.id, pos, flow)
             # (the owner's texts only: this outcome has a position, so it is never forwarded to the friend)
-            if ref_broker == name:
+            if price_only and ref_broker != name:
+                text = (f"{esc(name)}: sanal tetik kuruldu (limit emir konmadı): {esc(ref_broker)} fiyatı "
+                        f"{fmt_price(plan.entry_price)} seviyesine gelince {esc(name)}'da piyasa emriyle açılacak "
+                        f"(en çok {fmt.fmt_number(hours)} saat beklenir)")
+            elif ref_broker == name:
                 text = (f"{esc(name)}: sanal tetik kuruldu (limit emir konmadı): {esc(name)} fiyatı "
                         f"{fmt_price(plan.entry_price)} seviyesine gelince piyasa emriyle açılacak (en çok "
                         f"{fmt.fmt_number(hours)} saat beklenir)")
@@ -5631,7 +5709,9 @@ class Engine:
         ref = str(d.get("reference_broker") or "")
         # (entry_trigger own_touch: the reference is this account itself - it has no other leg in the trade; its own
         # price decides)
-        legs = [p for p in rows if p.broker == ref and ref != pos.broker]
+        # (``reference_price_only``: that account's leg of the trade was placed by another entry rule - a market
+        # fill there is no touch of this entry: its price alone decides)
+        legs = [p for p in rows if p.broker == ref and ref != pos.broker and not d.get("reference_price_only")]
         filled = any(reference_leg_filled(p) for p in legs)
         mult = price_multiplier(d)
         level_px = float(d.get("trigger_price") or 0.0) / mult           # the signal's scale

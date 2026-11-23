@@ -67,6 +67,8 @@ yazar.
 | `binance`, `fx`, `fx2` > `confirm_open` | `false` | Sizin Binance, FundingPips (fx) ve BEM (fx2) hesaplarınızda da bot emin olamayıp "açayım mı?" diye sorduğunda işlem beklemeden, okunduğu gibi açılır; soru yalnızca kalan hesaplar için (ör. breakout) gelir, hepsi açıldıysa soru sorulmaz. Stopsuz sinyal, aynı işlemin tekrarı / ters işlem ve hesapların kendi kuralları (günlük zarar, no_hedge) yine geçerlidir (yalnızca bu satır yoksa yazılır; breakout'a dokunulmaz) |
 | `tickmill` > `fees_in_risk` | `false` | Tickmill'de lot yalnızca stoptaki fiyat kaybına göre hesaplanır, komisyon 1R'nin üstüne ödenir (yalnızca bu satır yoksa yazılır) |
 | `tickmill` > `size_from_signal_entry` | `true` | Piyasa emrinde tickmill'in lotu sinyaldeki giriş fiyatına göre hesaplanır (trader'ın lotu gibi: 100 USD'ye 0.94 lot ise 50 USD'ye 0.47); stopta kayıp 1R'nin altına düşmez, gerçek giriş fiyatından en çok `lot_rounding_max_over` (varsayılan 10) üstüne çıkar. Girişi yazılmamış sinyaller her zamanki gibi (yalnızca bu satır yoksa yazılır) |
+| `tickmill` > `fx_entry_rule_everywhere` | `true` | Kripto konusundan gelen altın / forex sinyali tickmill'de fx konusunun kuralıyla girilir: fiyat girişten uzaksa (stop mesafesinin dörtte birinden fazla) piyasadan açılmaz, fx fiyatı girişe gelince açılır; mesajda "limit" yazmasa da. Coinler ve sizin hesaplarınız aynı kalır (yalnızca bu satır yoksa yazılır) |
+| `tickmill` > `one_position_per_signal` | `true` | Aynı sinyal hem kripto hem fx konusuna atılırsa tickmill'de yalnızca bir kez açılır, ilk gelen alınır (yalnızca bu satır yoksa yazılır) |
 | `tickmill` > `reference_broker` | `fx` | FX konusundaki limit girişlerde tickmill'e limit emir konmaz: fx hesabınızdaki giriş emri dolunca, fx'te emir yoksa fx fiyatı seviyeye gelince tickmill'de piyasa emriyle açılır (yalnızca bu satır yoksa ve `fx` etkin bir MetaTrader hesabıysa yazılır) |
 | `tickmill` > `type` | `mt5_bridge` | Bilgisayarda Tickmill MT5 terminali bulunursa MetaApi yerine o terminal kullanılır (bir kez; bulunamazsa MetaApi'de kalır ve bunu bir satırla yazar) |
 | `tickmill` > `terminal_path` | bulunan `terminal64.exe` yolu | Program Files içinde adında "Tickmill" geçen klasördeki terminal |
@@ -87,11 +89,12 @@ BU sürümde MetaApi'ye geri dönmek için bloktaki `type: mt5_bridge` satırın
 Eski bir sürüme dönmek için yalnızca `.\venv\Scripts\python.exe guncelle.py --geri-al` kullanın: kodla birlikte
 o zamanki `config.yaml` dosyasını da yedekten geri koyar. Eski kodu elle (yalnızca kod dosyalarını) geri koymayın:
 eski sürümler bu güncellemenin eklediği `lot_rounding`, `confirm_open`, `fees_in_risk`, `reference_broker`,
-`size_from_signal_entry`, `terminal_path` ve `broker_company` ayarlarını tanımaz ve bot hiç açılmaz (sizin
+`size_from_signal_entry`, `fx_entry_rule_everywhere`, `one_position_per_signal`, `terminal_path` ve `broker_company`
+ayarlarını tanımaz ve bot hiç açılmaz (sizin
 hesaplarınız dahil). `type: metaapi` yazmak bunu çözmez; elle dönülecekse `config.yaml` da
 güncellemeden önceki yedeğiyle (`config.yaml.yedek-...` ya da `yedek\<tarih>\config.yaml`) değiştirilmelidir.
 Bu ayarlar Tickmill terminali bulunamasa da eklenir (`risk_usd`, `lot_rounding`, `confirm_open`, `fees_in_risk`,
-`reference_broker`, `size_from_signal_entry`).
+`reference_broker`, `size_from_signal_entry`, `fx_entry_rule_everywhere`, `one_position_per_signal`).
 
 Önerilen sıra (sizin fx hesabınız için en güvenlisi): önce Tickmill terminalini KURMADAN bu sürüme güncelleyin ve
 botun fx hesabına bağlandığını görün (bot o anda FundingPips terminalini `data\mt5_terminal_fx.json` dosyasına

@@ -131,12 +131,20 @@ KNOWS_LOT_ROUNDING = "lot_rounding" in _BrokerBase.model_fields
 # The friend's second round (step 9): confirm_open / fees_in_risk / lot_rounding "up" / reference_broker.
 KNOWS_STEP9 = all(k in _BrokerBase.model_fields for k in ("confirm_open", "fees_in_risk", "reference_broker"))
 KNOWS_STEP10 = "size_from_signal_entry" in _BrokerBase.model_fields
+# Step 13 (23.11): tickmill enters kripto-topic gold / forex by the fx rule, and takes a signal of two topics once.
+KNOWS_STEP13 = all(k in _BrokerBase.model_fields for k in ("fx_entry_rule_everywhere", "one_position_per_signal"))
 LOT_ROUNDING = "up" if KNOWS_STEP9 else "nearest"
 # The lines the update adds to the tickmill block of the production replica (risk_usd 45 -> 50 is replaced in place).
 TICKMILL_ADDED = (["confirm_open: false", "fees_in_risk: false", "lot_rounding: up", "reference_broker: fx"]
                   if KNOWS_STEP9 else ["lot_rounding: nearest"] if KNOWS_LOT_ROUNDING else []) + (
-    ["size_from_signal_entry: true"] if KNOWS_STEP10 else [])
+    ["size_from_signal_entry: true"] if KNOWS_STEP10 else []) + (
+    ["fx_entry_rule_everywhere: true", "one_position_per_signal: true"] if KNOWS_STEP13 else [])
 N_TICKMILL = (1 if KNOWS_LOT_ROUNDING else 0) + len(TICKMILL_ADDED)
+
+
+def _step13(line: str) -> bool:
+    """A line of step 13 (its own test: tests/test_fx_rule_everywhere.py)."""
+    return line.endswith(("(fx_entry_rule_everywhere: true)", "(one_position_per_signal: true)"))
 # Settings the production replica needs: binance x2, notifier x2, risk x2, the kripto topic (+ fx open risk)
 # (+ tickmill: risk_usd 45 -> 50 and the TICKMILL_ADDED lines; no Tickmill terminal on the test machine: it stays on
 # MetaApi, see tests/test_mt5_bridge_migrate.py).
@@ -2542,7 +2550,7 @@ def test_migrate_step_9_after_an_earlier_update_turns_nearest_into_up_and_adds_t
     text = PROD_YAML.replace("    risk_usd: 45\n", "    risk_usd: 50\n    lot_rounding: nearest\n")
     path = prod_file(tmp_path, text)
     lines = m.migrate_config(path, terminal=none)
-    tick = [line for line in lines if line.startswith("tickmill:")]
+    tick = [line for line in lines if line.startswith("tickmill:") and not _step13(line)]
     assert len(tick) == 4 + (1 if KNOWS_STEP10 else 0) and not any("risk_usd" in line for line in tick)
     assert any(line.endswith("(lot_rounding: up) — önceki ayar: nearest") for line in tick)
     new = path.read_text(encoding="utf-8")
@@ -2565,7 +2573,7 @@ def test_migrate_step_10_after_the_previous_update_adds_only_size_from_signal_en
                              "    fees_in_risk: false\n    reference_broker: fx\n")
     path = prod_file(tmp_path, text)
     lines = m.migrate_config(path, terminal=none)
-    tick = [line for line in lines if line.startswith("tickmill:")]
+    tick = [line for line in lines if line.startswith("tickmill:") and not _step13(line)]
     assert len(tick) == 1 and tick[0].endswith("(size_from_signal_entry: true)")
     assert tickmill_block(load_config(path)).size_from_signal_entry is True
     assert broker_of(load_config(path), "fx").size_from_signal_entry is False      # only tickmill
@@ -2605,7 +2613,9 @@ def test_migrate_step_9_leaves_every_value_written_by_hand(tmp_path: Path) -> No
     none = (None, None)
     text = PROD_YAML.replace("    risk_usd: 45\n", "    risk_usd: 45\n    lot_rounding: down\n    confirm_open: true\n"
                              "    fees_in_risk: true\n    reference_broker: fx\n"
-                             + ("    size_from_signal_entry: false\n" if KNOWS_STEP10 else ""))
+                             + ("    size_from_signal_entry: false\n" if KNOWS_STEP10 else "")
+                             + ("    fx_entry_rule_everywhere: false\n    one_position_per_signal: false\n"
+                                if KNOWS_STEP13 else ""))
     path = prod_file(tmp_path, text)
     lines = m.migrate_config(path, terminal=none)
     assert not any(line.startswith("tickmill:") for line in lines)

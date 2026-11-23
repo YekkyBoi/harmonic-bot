@@ -470,6 +470,23 @@ def plan_changes(raw: dict[str, Any], config: AppConfig, *,
         added, why = _vantage_changes(raw, config, changes, os.environ if env is None else env, vantage)
         changes += added
         notes += why
+
+    # 13. The owner's decision for tickmill (23.11): gold / forex is never treated as crypto - a signal of the kripto
+    #     topic is entered by the fx topic's rule (limit when the price is away from the entry) - and the same signal
+    #     posted in both topics is taken once. Only when the key is not there yet (a value written by hand stays).
+    i = broker_index(TICKMILL_BROKER)
+    if i is not None and _broker(config, TICKMILL_BROKER) is not None:
+        block, model = brokers[i], type(_broker(config, TICKMILL_BROKER))
+        setting(("brokers", i), block, model, "fx_entry_rule_everywhere", True,
+                f"{TICKMILL_BROKER}: kripto konusundan gelen altın / forex sinyali fx konusunun kuralıyla girilecek "
+                "(fiyat girişten uzaksa piyasa değil, girişi bekler); coinler aynı (fx_entry_rule_everywhere: true)",
+                lambda c: getattr(_broker(c, TICKMILL_BROKER), "fx_entry_rule_everywhere", None) is True,
+                TICKMILL_BROKER, wanted=lambda v: True)
+        setting(("brokers", i), block, model, "one_position_per_signal", True,
+                f"{TICKMILL_BROKER}: aynı sinyal iki konuya atılırsa yalnızca bir kez açılacak, ilk gelen alınır "
+                "(one_position_per_signal: true)",
+                lambda c: getattr(_broker(c, TICKMILL_BROKER), "one_position_per_signal", None) is True,
+                TICKMILL_BROKER, wanted=lambda v: True)
     return changes, notes
 
 
