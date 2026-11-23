@@ -221,3 +221,69 @@ def test_the_update_leaves_it_off_when_tickmill_has_no_fx_topic(tmp_path: Path, 
     m.migrate_config(path, notes=notes, terminal=(None, None))
     assert tickmill_block(load_config(path)).fx_only_from_fx_topic is False
     assert any("fx_only_from_fx_topic yazılmadı" in n for n in notes)
+
+
+# --------------------------------------------------------------------------- #
+# review round: leftovers, questions, notices, unknown routes
+# --------------------------------------------------------------------------- #
+async def test_a_waiting_entry_an_older_version_left_on_kripto_gold_never_fires(tmp_path, monkeypatch) -> None:
+    e = await _make(tmp_path, monkeypatch, on=False)
+    p = e.p
+    try:
+        await e.gold(KRIPTO, "Xau short Limit emir", entry_type="limit")
+        (trade,) = await p.trades()
+        assert is_virtual_pending(await _tickmill(p, trade.id))         # (the old behaviour: Binance's touch)
+        next(b for b in p.engine.configured_brokers if b.name == "tickmill").config.fx_only_from_fx_topic = True
+        p.binance.set_price("XAU", 3610.50, 3610.70)                    # Binance touches the entry
+        await p.engine.monitor.run_virtual_once()
+        assert p.tickmill_orders() == []
+        pos = await _tickmill(p, trade.id)
+        assert pos.status is PositionStatus.CANCELLED
+        assert any("bu hesapta artık açılmıyor (Fx konusundan alınır)" in t for t in p.texts())
+    finally:
+        await p.close()
+
+
+async def test_a_doubtful_kripto_gold_signal_never_names_tickmill_and_evet_leaves_it_out(env) -> None:
+    p = env.p
+    await env.gold(KRIPTO, confidence=0.5)
+    (conf,) = p.notifier.confirmations
+    assert conf.early is None                                         # tickmill takes nothing early
+    await p.engine.handle_confirmation(conf.id, True)
+    assert p.tickmill_orders() == []
+    for trade in await p.trades():
+        assert await _tickmill(p, trade.id) is None
+
+
+async def test_no_not_connected_notice_for_tickmill_on_kripto_gold(env) -> None:
+    p = env.p
+    tickmill = next(b for b in p.engine.brokers if b.name == "tickmill")
+    p.engine.brokers = [b for b in p.engine.brokers if b is not tickmill]
+    p.engine.optional_down["tickmill"] = "test"
+    await env.gold(KRIPTO)
+    assert not any("tickmill bağlı değil" in t for t in p.texts())
+
+
+async def test_unknown_route_and_a_base_carrying_its_quote_are_still_left_out(env) -> None:
+    p = env.p
+    await env.gold(KRIPTO)
+    (trade,) = await p.trades()
+    tickmill = next(b for b in p.engine.configured_brokers if b.name == "tickmill")
+    renamed = trade.plan.model_copy(update={"route": "eski-konu"})
+    assert renamed.market_type is MarketType.PERP and not p.engine._takes(tickmill, renamed)
+    assert not p.engine._takes(tickmill, trade.plan.model_copy(update={"base_asset": "XAUUSDT"}))
+    assert p.engine._takes(tickmill, trade.plan.model_copy(update={"base_asset": "BTC"}))
+    fx_renamed = trade.plan.model_copy(update={"route": "eski-konu", "market_type": MarketType.CFD})
+    assert p.engine._takes(tickmill, fx_renamed)
+
+
+def test_a_config_written_by_the_unreleased_build_still_loads(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    from test_preflight2_tools import PROD_YAML, prod_file, tickmill_block
+
+    from copytrader.config import load_config
+    for name in list(os.environ):
+        monkeypatch.setenv(name, os.environ[name])
+    text = PROD_YAML.replace("    risk_usd: 45\n", "    risk_usd: 45\n    fx_entry_rule_everywhere: true\n"
+                                                    "    one_position_per_signal: true\n")
+    t = tickmill_block(load_config(prod_file(tmp_path, text)))
+    assert t.fx_only_from_fx_topic is False

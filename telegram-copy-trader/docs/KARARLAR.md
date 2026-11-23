@@ -70,7 +70,8 @@ Diğer konular (Sohbet, Analiz, Duyuru...) yok sayılır.
   - Olay: aynı XAU short grafiği iki konuya atıldı (giriş 3610,49, fiyat 3602). Kripto konusu altını "XAUUSDT perp" okudu ve %0,5 yakınlık kuralıyla Tickmill'de piyasadan sattı.
   - Sahibinin sözü: "Xau zaten kripto değil fx e bağlı olacak … marketse market limit emirse kuralımızı uygulayacaksın tickmill için".
   - Kural: Tickmill altın/forex/endeksi yalnızca Fx konusundan alır, kripto konusundakini atlar (`fx_only_from_fx_topic: true`). Coinler ve sahibinin hesapları aynı.
-  - Bilinen risk (sahibine söylendi): altın yalnızca kripto konusuna atılırsa Tickmill açmaz.
+  - Bilinen riskler (sahibine söylendi): altın yalnızca kripto konusuna atılırsa Tickmill açmaz; altının yönetim mesajı (BE, stop, kapat) yalnızca kripto konusuna yazılırsa Tickmill'e uygulanmaz.
+  - Eski sürümün kripto konusundaki altın için bıraktığı bekleyen giriş, güncellemeden sonra açılmaz, iptal edilir.
 - **Lot:** sinyaldeki giriş fiyatına göre hesaplanır (sinyali yazan gibi). Stopta kayıp 1R'nin (50 USD) altına inmez, 1R + 10 USD'yi geçmez (`size_from_signal_entry: true`, `lot_rounding: up`, `fees_in_risk: false`).
 - Kanaldan gelen yönetim mesajları (stop taşı, TP değiştir, kapat) Tickmill'e de uygulanır.
 - Bir onay sorusunda sahibi yönü/pariteyi düzeltirse Tickmill'in ilk işlemi ayrı kalır; onu `/pozkapat` ile elle yönetmek gerekir.

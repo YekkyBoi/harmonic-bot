@@ -3390,8 +3390,17 @@ class Engine:
         if not getattr(broker.config, "fx_only_from_fx_topic", False):
             return False
         route = self._route_named(plan.route)
-        return (route is not None and route.kind == "crypto"
-                and fx_like(canonical_asset(plan.base_asset), None, None))
+        if route is not None:
+            crypto = route.kind == "crypto"
+        else:       # (a topic renamed meanwhile: a perpetual / spot plan came from a crypto topic)
+            crypto = plan.market_type in (MarketType.PERP, MarketType.SPOT)
+        base, _quote, _type = normalize_symbol(plan.base_asset)        # ("XAUUSDT" read as the base: XAU)
+        return crypto and fx_like(canonical_asset(base or plan.base_asset), None, None)
+
+    def _left_out_name(self, name: str, plan: TradePlan) -> bool:
+        """:meth:`_fx_left_to_fx_topic` for the configured account ``name`` (False for an unknown name)."""
+        broker = next((b for b in self.configured_brokers if b.name == name), None)
+        return broker is not None and self._fx_left_to_fx_topic(broker, plan)
 
     def _takes(self, broker: Broker, plan: TradePlan) -> bool:
         """Is ``plan`` traded on ``broker`` at all: its allowed_assets lists the asset, and it is not a crypto topic's
@@ -4021,7 +4030,7 @@ class Engine:
         """The configured accounts of ``plan`` (its route's; every enabled one without a route) that wait for the
         owner's answer: all but the ``early`` ones."""
         names = list(plan.broker_names) or [b.name for b in self.configured_brokers]
-        return [n for n in names if n not in early]
+        return [n for n in names if n not in early and not self._left_out_name(n, plan)]
 
     @staticmethod
     def _early_state(o: BrokerOutcome) -> str:
@@ -4821,7 +4830,7 @@ class Engine:
         one in ``skip`` (it took the signal earlier, without waiting for the owner)."""
         connected = {b.name for b in (routed if routed is not None else self.brokers)} | set(skip)
         names = [n for n in (plan.broker_names or list(self.optional_down))
-                 if n in self.optional_down and n not in connected]
+                 if n in self.optional_down and n not in connected and not self._left_out_name(n, plan)]
         for name in names:
             await self._notify(
                 f"ℹ️ {esc(name)} bağlı değil, bu işlem atlandı ({esc(plan.base_asset)} {plan.side.value.upper()}).",
@@ -5501,6 +5510,13 @@ class Engine:
                 trade, pos, PositionStatus.FAILED, "tetikleme yarıda kaldı (yeniden başlatma)",
                 "tetikleme sırasında sistem durdu; emrin gönderilip gönderilmediği bilinmiyor, tekrar "
                 "GÖNDERİLMEDİ. Brokerda elle kontrol edin.", Severity.ERROR)
+        if self._left_out_name(pos.broker, trade.plan):
+            # (a waiting entry an older version left on a crypto topic's gold / forex trade: this account takes such
+            # signals from its fx topic only now - never opened from here)
+            return await self._virtual_end(
+                trade, pos, PositionStatus.CANCELLED, "altın / forex yalnızca Fx konusundan",
+                "kripto konusundaki altın / forex sinyali bu hesapta artık açılmıyor (Fx konusundan alınır); bekleyen "
+                "sanal giriş iptal edildi, bu hesapta işlem AÇILMADI.", Severity.INFO)
         try:
             created = utc(datetime.fromisoformat(str(d.get("virtual_created_at"))))
         except (TypeError, ValueError):

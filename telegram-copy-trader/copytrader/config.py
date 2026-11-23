@@ -339,6 +339,9 @@ class _BrokerBase(_Base):
     # topic reads "Xau short" as the XAUUSDT perpetual): it takes such signals from its fx topic only - that topic's
     # reading, its entry rule (market or limit as the signal shows) and its reference_broker's price. Coins: unchanged.
     fx_only_from_fx_topic: bool = False
+    # Keys an unreleased build (23.11) wrote: accepted and ignored, so that a config it changed still loads.
+    fx_entry_rule_everywhere: bool | None = Field(None, exclude=True)
+    one_position_per_signal: bool | None = Field(None, exclude=True)
 
     @field_validator("reference_broker")
     @classmethod
