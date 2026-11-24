@@ -359,6 +359,9 @@ class BrokerOutcome:
     # open: the adapter refused the call before sending anything because the account is not connected or its link
     # is known down (BrokerUnavailableError): nothing exists there (an optional broker's miss may be caught up)
     unavailable: bool = False
+    # management: deliberately not applied as the trader wrote it (tp_at_r: his close held while the position waits
+    # for its fixed target) - the instruction counts as handled; the report says what was kept
+    held: bool = False
 
 
 @dataclass
@@ -985,6 +988,69 @@ def broker_virtual_wanted(broker: Broker, plan: TradePlan, route_kind: str | Non
         and bool(plan.entry_price)
         and not is_crypto_plan(plan, route_kind)
     )
+
+
+FIXED_TP = "fixed_tp"      # BrokerPosition.data: the basis of a tp_at_r account's targets (see fixed_r_targets)
+
+
+def fixed_r_basis(cfg: Any, side: Side, entry: float, sizing_entry: float, sizing_stop: float,
+                  signal_entry: float | None, signal_stop: float | None) -> dict[str, float] | None:
+    """``tp_at_r``: what this account's targets are measured from (venue scale and offset), or None (not set / no
+    usable distance). ``entry``: where the position enters (the live price of a market order, the limit's price);
+    ``dist``: the R the size was computed from; ``sig_*``: the trader's own R (his entry and stop) that decides which
+    of his targets are moved."""
+    r = getattr(cfg, "tp_at_r", None)
+    dist = abs(sizing_entry - sizing_stop)
+    if not r or not (math.isfinite(entry) and entry > 0 and math.isfinite(dist) and dist > 0):
+        return None
+    basis = {"r": float(r), "from": float(getattr(cfg, "tp_at_r_from", None) or 0.0), "entry": float(entry),
+             "dist": float(dist), "long": 1.0 if side is Side.LONG else 0.0}
+    if signal_entry and signal_stop and abs(signal_entry - signal_stop) > 0:
+        basis.update(sig_entry=float(signal_entry), sig_dist=float(abs(signal_entry - signal_stop)))
+    return basis
+
+
+def fixed_r_price(basis: dict[str, Any]) -> float:
+    """The ``tp_at_r`` target's price of ``basis``."""
+    move = float(basis["r"]) * float(basis["dist"])
+    return float(basis["entry"]) + (move if basis.get("long") else -move)
+
+
+def fixed_r_targets(tps: list[TakeProfit], basis: dict[str, Any]) -> list[TakeProfit]:
+    """The trader's targets ``tps`` (venue scale) for a ``tp_at_r`` account: those at ``from`` R or farther (his R)
+    become one target at ``r`` R from this account's entry with their summed share; nearer ones stay. None given:
+    that one target alone."""
+    target = fixed_r_price(basis)
+    if not tps:
+        return [TakeProfit(price=target, close_fraction=1.0)]
+    long = bool(basis.get("long"))
+    ref = float(basis.get("sig_entry") or basis["entry"])
+    dist = float(basis.get("sig_dist") or basis["dist"])
+    low = float(basis.get("from") or 0.0)
+    kept: list[TakeProfit] = []
+    moved = 0.0
+    for tp in tps:
+        r = (tp.price - ref) / dist if long else (ref - tp.price) / dist
+        if r >= low - 1e-9:
+            moved += tp.close_fraction
+        else:
+            kept.append(TakeProfit(price=tp.price, close_fraction=tp.close_fraction))
+    if moved > 0:
+        kept.append(TakeProfit(price=target, close_fraction=moved))
+    return kept
+
+
+def position_r(pos: BrokerPosition, basis: dict[str, Any], quote: Quote) -> float | None:
+    """How many R ``pos`` is in profit at ``quote`` (closing side: a long at the bid, a short at the ask), measured
+    from its fill and the R of ``basis``; None when unknown."""
+    entry = pos.avg_entry_price or float(basis.get("entry") or 0.0)
+    dist = float(basis.get("dist") or 0.0)
+    if not (entry and dist > 0):
+        return None
+    exit_px = quote.bid if pos.side is Side.LONG else quote.ask
+    if not (math.isfinite(exit_px) and exit_px > 0):
+        return None
+    return (exit_px - entry) / dist if pos.side is Side.LONG else (entry - exit_px) / dist
 
 
 def reference_leg_filled(pos: BrokerPosition) -> bool:
@@ -5115,6 +5181,10 @@ class Engine:
                     and getattr(broker.config, "size_from_signal_entry", False)):
                 size, signal_sized = await self._signal_entry_size(
                     broker, sym, plan.side, size, signal_entry, sizing_entry, sizing_stop, amount, trade_id=trade.id)
+            fixed = fixed_r_basis(broker.config, plan.side, entry, sizing_entry, sizing_stop, signal_entry,
+                                  shift_price(plan.stop_loss * mult, offset))
+            if fixed is not None:
+                tps = fixed_r_targets(tps, fixed)
             req = OpenRequest(
                 plan=plan,
                 symbol=sym,
@@ -5144,6 +5214,8 @@ class Engine:
             pos.data.setdefault("price_multiplier", mult)
             if offset:
                 pos.data["price_offset"] = offset
+            if fixed is not None:
+                pos.data[FIXED_TP] = fixed
             if getattr(broker.config, "daily_loss_include_open_risk", False):
                 # What risk_amount was sized for (guards.position_open_risk scales it to the current stop). "loss":
                 # what that size really loses there when it is MORE than the target (a size raised to the minimum
@@ -5172,6 +5244,8 @@ class Engine:
                 text += f" ({offset_text(offset)})"
             if signal_sized:
                 text += f"; {esc(signal_sized)}"
+            if fixed is not None:
+                text += f"; TP {fmt.fmt_number(fixed['r'])}R: {fmt_price(fixed_r_price(fixed))}"
             warnings = [*size.warnings, *(str(w) for w in pos.data.get("warnings") or [])]
             if size_capped:
                 # (what the quantity really sent loses - rounded to the broker's step, its fees counted as the sizing
@@ -6321,6 +6395,8 @@ class Engine:
                 head = f"⚠️ {label}: uygulanacak pozisyon yok"
             elif not outcomes:
                 head = f"⏳ {label}: " + "; ".join(follows)        # (no position yet: only brokers in flight)
+            elif ok and not failed and not follows and all(o.held for o in outcomes):
+                head = f"⏸ {label}: trader kapattı; hedef bekleniyor (aşağıda)"
             elif ok and not failed and not follows:
                 # The plan summary already starts with the trade label and is written before the fact
                 # ("#1 BTC SHORT: pozisyonun tamamı kapatılacak"): the outcome lines below say what was done.
@@ -6596,6 +6672,28 @@ class Engine:
                 leg.close_on_arrival = leg.close_on_arrival or why
                 marked.append(name)
         return marked
+
+    async def _held_close(self, plan: ManagementPlan, trade: TradeRecord, pos: BrokerPosition,
+                          broker: Broker) -> BrokerOutcome | None:
+        """``tp_at_r_from``: the trader's close of the whole position (his message - never the owner's /pozkapat or
+        closing every trade, which carry no source message or name their accounts) while ``pos`` is at least that many
+        R in profit is not followed: the position waits for its fixed target or its stop. None: close as usual (also
+        when the price cannot be read)."""
+        basis = (pos.data or {}).get(FIXED_TP)
+        if (plan.action is not ActionType.CLOSE or not isinstance(basis, dict) or not basis.get("from")
+                or plan.brokers or not plan.source_message_ids or pos.status is not PositionStatus.OPEN
+                or (plan.close_fraction is not None and plan.close_fraction < 0.999)):
+            return None
+        quote = await self._live_quote(broker, trade)
+        r = position_r(pos, basis, quote) if quote is not None else None
+        if r is None or not (float(basis["from"]) - 1e-9 <= r < float(basis["r"])):
+            return None
+        target = fixed_r_price(basis)
+        stop = fmt_price(pos.stop_loss) if pos.stop_loss is not None else "yok"
+        text = (f"{esc(pos.broker)}: trader kapattı ama pozisyon +{fmt.fmt_number(round(r, 2))}R; KAPATILMADI, "
+                f"{fmt.fmt_number(basis['r'])}R hedefi ({fmt_price(target)}) ya da stop ({stop}) bekleniyor")
+        await self._log("close_held", {"trade_id": trade.id, "broker": pos.broker, "r": r, "target": target})
+        return BrokerOutcome(pos.broker, "ok", text, held=True)
 
     async def _live_quote(self, broker: Broker, trade: TradeRecord) -> Quote | None:
         try:
@@ -7346,6 +7444,10 @@ class Engine:
         name = pos.broker
         virtual = is_virtual_pending(pos)
         broker: Any = _VirtualEntryOps() if virtual else self._broker(name)
+        if not retry and not virtual and broker is not None:
+            held = await self._held_close(plan, trade, pos, broker)
+            if held is not None:
+                return held
         # "Stop girişe" while this entry is still resting (the trader is at break-even): the entry is cancelled, not
         # given a stop at the entry - a fill there later would be a fresh full-risk trade the trader no longer has.
         be_cancel = (not virtual and plan.action is ActionType.MOVE_SL and plan.move_sl_to_entry
@@ -7428,6 +7530,9 @@ class Engine:
                     return BrokerOutcome(name, "skipped",
                                          f"{esc(name)}: hedeflerin hepsi bu hesapta zaten gerçekleşmiş; TP değişmedi")
                 tps = shifted_take_profits(scaled_take_profits(levels, mult), offset)
+                fixed = (pos.data or {}).get(FIXED_TP)
+                if isinstance(fixed, dict):
+                    tps = fixed_r_targets(tps, fixed)       # (tp_at_r: his far targets stay at the fixed one)
                 new = await broker.update_take_profits(pos, tps)
                 if virtual:
                     # The first target of a waiting virtual entry changed: whether the price has been between

@@ -339,6 +339,16 @@ class _BrokerBase(_Base):
     # topic reads "Xau short" as the XAUUSDT perpetual): it takes such signals from its fx topic only - that topic's
     # reading, its entry rule (market or limit as the signal shows) and its reference_broker's price. Coins: unchanged.
     fx_only_from_fx_topic: bool = False
+    # A fixed target in R (the owner's fx2, 24.11: "lavuklar genelde 1.8R'da kapatıyor, sen 1.9R'da kapat, geri kalanı
+    # aynen eskisi gibi"). R: the entry-to-stop distance this account's size was computed from. The trader's targets
+    # at ``tp_at_r_from`` R or farther (his R: from the signal's entry and stop) become ONE target at ``tp_at_r`` R
+    # from this account's entry, taking their share of the position; nearer targets stay as he gives them - also when
+    # he moves them. No target given: ``tp_at_r``. A CLOSE message of the trader (the whole position) while this
+    # account's position is at least ``tp_at_r_from`` R in profit is not followed: it waits for that target or its
+    # stop. Below that ("1R'da kapattık") and every partial close, stop move and the owner's own closes (/pozkapat,
+    # closing every trade) as before. None (default): the trader's targets and closes as always.
+    tp_at_r: float | None = Field(None, gt=0)
+    tp_at_r_from: float | None = Field(None, gt=0)
     # Keys an unreleased build (23.11) wrote: accepted and ignored, so that a config it changed still loads.
     fx_entry_rule_everywhere: bool | None = Field(None, exclude=True)
     one_position_per_signal: bool | None = Field(None, exclude=True)
@@ -358,6 +368,12 @@ class _BrokerBase(_Base):
         if not re.fullmatch(r"[A-Z]{3,5}", code):
             raise ValueError(f"risk_currency {v!r} geçersiz; para birimi kodu yazın (ör. GBP, EUR, USD)")
         return code
+
+    @model_validator(mode="after")
+    def _fixed_target(self) -> "_BrokerBase":
+        if self.tp_at_r_from is not None and (self.tp_at_r is None or self.tp_at_r_from >= self.tp_at_r):
+            raise ValueError(f"broker '{self.name}': tp_at_r_from yalnızca tp_at_r ile ve ondan küçük yazılır")
+        return self
 
     @model_validator(mode="after")
     def _touch_needs_reference(self) -> "_BrokerBase":
