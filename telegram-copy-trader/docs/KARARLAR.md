@@ -38,7 +38,7 @@ Gizli bilgiler (API anahtarları, şifreler, Telegram oturumu, hesap numaraları
 | `breakout` | Breakout (elle uygulanan) | 50 USD | Bot talimat verir. |
 | `fx` | FundingPips (MT5) | 100 USD | Günlük %3, açık riskler dahil. Kripto konusunda da var; referans fiyat Binance vadeli. ETH en fazla 1 lot (risk düşük kalır, kabul edildi). SOL bu hesapta yok: SOL sinyalinde atlanır, diğer hesaplarda açılır; güncellemede "SOL bulunamadı" uyarısı bilinen durumdur. |
 | `tickmill` | Arkadaşın Tickmill hesabı (MT5, yardımcı süreç) | 50 USD | Ayrıntılar aşağıda (bölüm 6). |
-| `fx2` | BEM (MT5, yardımcı süreç) | 1000 USD | Günlük %2,5, açık riskler dahil. no_hedge. Grubun TP'si korunur, grup kapatınca kapanır. 1,8R'de otomatik kapatma YOK (sahibi böyle kalsın dedi). Tutarlılık kuralı bot tarafından takip edilmez. |
+| `fx2` | BEM (MT5, yardımcı süreç) | 1000 USD | Günlük %2,5, açık riskler dahil. no_hedge. Hedef 1,9R (24.11): trader'ın 1,5R ve üstündeki hedefleri 1,9R'a çekilir (R: trader'ın grafiğindeki giriş-stop), daha yakın hedefler aynen kalır; trader +1,5R ve üstündeyken "kapat" derse fx2 kapanmaz, 1,9R'ı ya da stopu bekler, altında (ör. 1R) hemen kapanır; stop taşıma, kısmi kapatma ve /pozkapat eskisi gibi (`tp_at_r: 1.9`, `tp_at_r_from: 1.5`). Tutarlılık kuralı bot tarafından takip edilmez. |
 | `vantage` | Sahibinin kendi Vantage hesabı (MT5, yardımcı süreç, hesap para birimi GBP) | 20 GBP | Gerçek hesap. Günlük zarar freni yok (0). Ayrıntılar aşağıda (bölüm 7). |
 
 ## 4. Konular (hangi sinyal nereye gider)

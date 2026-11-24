@@ -178,7 +178,8 @@ async def test_a_challenge2_unsure_signal_opens_on_fx2_at_once_and_nobody_is_ask
     p = world
     await p.say(unsure(fx_pair("EURUSD", Side.LONG, 1.1620, 1.1600, 1.1660)), CHALLENGE2, "EUR LONG")
     assert p.asked() == []
-    assert orders(p.fx2) == [("BUY", "EURUSD", 4.87, 1.16205, 1.16, 1.166)]
+    # (migrate step 14: fx2's target at 1.9R of the trader's chart, 1.1620 + 1.9 x 0.0020 - his is 2R)
+    assert orders(p.fx2) == [("BUY", "EURUSD", 4.87, 1.16205, 1.16, 1.1658)]
     assert orders(p.terminal) == [] and p.tickmill_orders() == [] and p.binance.created() == []
     (trade,) = await p.trades()
     assert trade.status is TradeStatus.OPEN and list(await p.positions(trade.id)) == ["fx2"]
@@ -368,7 +369,7 @@ async def test_e_fx2_takes_up_to_its_limit_without_asking_then_nothing_more_whil
     await p.say(fx_pair("EURUSD", Side.LONG, 1.1620, 1.1600, 1.1660).model_copy(update={"risk_r": 2.5}),
                 CHALLENGE2, "EUR LONG 2.5R")                   # 2.5R > risk.max_r_per_trade: was asked before
     assert p.asked() == []
-    assert orders(p.fx2) == [("BUY", "EURUSD", 12.19, 1.16205, 1.16, 1.166)]
+    assert orders(p.fx2) == [("BUY", "EURUSD", 12.19, 1.16205, 1.16, 1.1658)]       # (step 14: 1.9R)
     (report,) = p.reports()
     assert "• fx2: 12.19 EURUSD (açık), risk 2 500.00 USD" in report
     await p.say(fx_pair("GBPUSD", Side.LONG, 1.3150, 1.3130, 1.3190), CHALLENGE2, "GBP LONG 1R")
@@ -413,7 +414,7 @@ async def test_f_no_target_opens_on_fx_tickmill_and_fx2_at_once_and_tp_1_1030_re
     assert p.asked() == []
     assert p.fx_orders() == [("BUY", "EURUSD", 0.48, 1.10005, 1.098, 0.0)]           # tp 0.0: none at MetaTrader
     assert p.tickmill_orders() == [("market_buy", "EURUSD", 0.25, 1.098, None)]
-    assert orders(p.fx2) == [("BUY", "EURUSD", 4.87, 1.10005, 1.098, 0.0)]
+    assert orders(p.fx2) == [("BUY", "EURUSD", 4.87, 1.10005, 1.098, 1.1038)]      # (step 14: no target -> 1.9R)
     first, second = p.reports()
     assert "🎯 TP: ❓ <i>yok</i>" in first and first.endswith(ALONE) and second.endswith(ALONE)
     p.notifier.notifications.clear()
@@ -428,11 +429,11 @@ async def test_f_no_target_opens_on_fx_tickmill_and_fx2_at_once_and_tp_1_1030_re
     assert applied.startswith("✅ #1 EUR LONG: uygulandı") and "• tickmill: TP 1.103" in applied
     assert "• fx: TP 1.103" in applied
     await p.say(move_tp(mid2, 1.1030), CHALLENGE2, "TP 1.1030", reply_to=mid2)
-    (fx2_pos,) = list(p.fx2.positions)                                 # type: ignore[attr-defined]
-    assert level_changes(p.fx2) == [("position", fx2_pos, 1.098, 1.103)]
+    # (step 14: 1.1030 is 1.5R on the trader's chart: fx2 keeps its 1.9R target)
+    assert all(c[3] == pytest.approx(1.1038) for c in level_changes(p.fx2))
     for trade_id in (1, 2):
         assert {n: [tp.price for tp in r.take_profits] for n, r in (await p.positions(trade_id)).items()} == (
-            {"fx": [1.103], "tickmill": [1.103]} if trade_id == 1 else {"fx2": [1.103]})
+            {"fx": [1.103], "tickmill": [1.103]} if trade_id == 1 else {"fx2": [pytest.approx(1.1038)]})
 
 
 async def test_f_no_target_limit_tickmills_reference_entry_takes_the_new_target_and_opens_with_it(world) -> None:

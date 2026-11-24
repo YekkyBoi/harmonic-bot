@@ -67,6 +67,8 @@ yazar.
 | `binance`, `fx`, `fx2` > `confirm_open` | `false` | Sizin Binance, FundingPips (fx) ve BEM (fx2) hesaplarınızda da bot emin olamayıp "açayım mı?" diye sorduğunda işlem beklemeden, okunduğu gibi açılır; soru yalnızca kalan hesaplar için (ör. breakout) gelir, hepsi açıldıysa soru sorulmaz. Stopsuz sinyal, aynı işlemin tekrarı / ters işlem ve hesapların kendi kuralları (günlük zarar, no_hedge) yine geçerlidir (yalnızca bu satır yoksa yazılır; breakout'a dokunulmaz) |
 | `tickmill` > `fees_in_risk` | `false` | Tickmill'de lot yalnızca stoptaki fiyat kaybına göre hesaplanır, komisyon 1R'nin üstüne ödenir (yalnızca bu satır yoksa yazılır) |
 | `tickmill` > `size_from_signal_entry` | `true` | Piyasa emrinde tickmill'in lotu sinyaldeki giriş fiyatına göre hesaplanır (trader'ın lotu gibi: 100 USD'ye 0.94 lot ise 50 USD'ye 0.47); stopta kayıp 1R'nin altına düşmez, gerçek giriş fiyatından en çok `lot_rounding_max_over` (varsayılan 10) üstüne çıkar. Girişi yazılmamış sinyaller her zamanki gibi (yalnızca bu satır yoksa yazılır) |
+| `fx2` > `tp_at_r` | `1.9` | fx2'de trader'ın 1,5R ve üstündeki hedefleri 1,9R'a çekilir (R: trader'ın grafiğindeki giriş-stop mesafesi); daha yakın hedefler aynen kalır, hedef yoksa 1,9R (yalnızca bu satır yoksa yazılır) |
+| `fx2` > `tp_at_r_from` | `1.5` | Trader +1,5R ya da üstündeyken "kapat" derse fx2 kapanmaz, 1,9R'ı ya da stopu bekler; altında (ör. 1R) hemen kapanır. Stop taşıma, kısmi kapatma ve sizin /pozkapat'ınız eskisi gibi (yalnızca `tp_at_r` satırı yoksa yazılır) |
 | `tickmill` > `fx_only_from_fx_topic` | `true` | Altın / forex Tickmill'de yalnızca Fx konusundan açılır; kripto konusuna atılan aynı sinyal Tickmill'de açılmaz (kripto konusu altını "kripto" diye okur). Fx konusunda sinyal ne gösteriyorsa o: piyasa ise piyasa, limit ise FundingPips fiyatı/emri girişe gelince. Coinler ve sizin hesaplarınız aynı (yalnızca bu satır yoksa ve tickmill bir Fx konusundaysa yazılır) |
 | `tickmill` > `reference_broker` | `fx` | FX konusundaki limit girişlerde tickmill'e limit emir konmaz: fx hesabınızdaki giriş emri dolunca, fx'te emir yoksa fx fiyatı seviyeye gelince tickmill'de piyasa emriyle açılır (yalnızca bu satır yoksa ve `fx` etkin bir MetaTrader hesabıysa yazılır) |
 | `tickmill` > `type` | `mt5_bridge` | Bilgisayarda Tickmill MT5 terminali bulunursa MetaApi yerine o terminal kullanılır (bir kez; bulunamazsa MetaApi'de kalır ve bunu bir satırla yazar) |
@@ -88,7 +90,8 @@ BU sürümde MetaApi'ye geri dönmek için bloktaki `type: mt5_bridge` satırın
 Eski bir sürüme dönmek için yalnızca `.\venv\Scripts\python.exe guncelle.py --geri-al` kullanın: kodla birlikte
 o zamanki `config.yaml` dosyasını da yedekten geri koyar. Eski kodu elle (yalnızca kod dosyalarını) geri koymayın:
 eski sürümler bu güncellemenin eklediği `lot_rounding`, `confirm_open`, `fees_in_risk`, `reference_broker`,
-`size_from_signal_entry`, `fx_only_from_fx_topic`, `terminal_path` ve `broker_company` ayarlarını tanımaz ve bot hiç açılmaz (sizin
+`size_from_signal_entry`, `fx_only_from_fx_topic`, `tp_at_r`, `tp_at_r_from`, `terminal_path` ve `broker_company`
+ayarlarını tanımaz ve bot hiç açılmaz (sizin
 hesaplarınız dahil). `type: metaapi` yazmak bunu çözmez; elle dönülecekse `config.yaml` da
 güncellemeden önceki yedeğiyle (`config.yaml.yedek-...` ya da `yedek\<tarih>\config.yaml`) değiştirilmelidir.
 Bu ayarlar Tickmill terminali bulunamasa da eklenir (`risk_usd`, `lot_rounding`, `confirm_open`, `fees_in_risk`,

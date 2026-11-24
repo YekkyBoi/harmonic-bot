@@ -205,6 +205,10 @@ risk:
 #                    sinyaldeki giriş ile stop arasındaki mesafeye göre hesaplanır (aşağı yuvarlanır); canlı
 #                    girişe göre hesaplanan lottan küçük olmaz (stopta kayıp 1R'nin altına düşmez) ve gerçek
 #                    girişten stopta kayıp en çok 1R + lot_rounding_max_over olur. Varsayılan false
+#   tp_at_r / tp_at_r_from  sabit hedef (R: trader'ın grafiğindeki giriş-stop mesafesi): trader'ın tp_at_r_from R ve
+#                    üstündeki hedefleri tp_at_r R'a çekilir, daha yakınları aynen kalır, hedef yoksa tp_at_r. Trader
+#                    +tp_at_r_from R ya da üstündeyken "kapat" derse bu hesap kapanmaz, hedefi ya da stopu bekler;
+#                    altında, kısmi kapatma, stop taşıma ve /pozkapat eskisi gibi. Örn. fx2: 1.9 / 1.5. Varsayılan yok
 #   fx_only_from_fx_topic  true = KRİPTO konusuna atılan altın / forex / endeks sinyali bu hesapta açılmaz;
 #                    bu hesap onları yalnızca Fx konusundan alır (oradaki okuma, piyasa/limit kuralı ve
 #                    reference_broker fiyatı). Kripto konusu "Xau short"u XAUUSDT perp okur. Coinler aynı. Varsayılan false

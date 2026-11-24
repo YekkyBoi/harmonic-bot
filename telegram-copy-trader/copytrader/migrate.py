@@ -42,6 +42,8 @@ FX_BROKER = "fx"
 TICKMILL_BROKER = "tickmill"      # the friend's account
 FX2_BROKER = "fx2"                # the owner's BEM Funding account
 # The owner's own accounts that open an unsure signal without his answer (step 11; the manual breakout account is not)
+FX2_TP_AT_R = 1.9               # step 14: fx2's fixed target (R) and the line above which the trader's close is held
+FX2_TP_AT_R_FROM = 1.5
 OWN_NO_CONFIRM_BROKERS = (BINANCE_BROKER, FX_BROKER, FX2_BROKER)
 TICKMILL_COMPANY = "Tickmill"
 # The friend's two requests the owner approved: 1R 45 -> 50 USD (only from exactly 45, and only together with the
@@ -489,6 +491,24 @@ def plan_changes(raw: dict[str, Any], config: AppConfig, *,
         else:
             notes.append(f"{TICKMILL_BROKER}: bir Fx konusunda değil; fx_only_from_fx_topic yazılmadı (altın / forex "
                          "kripto konusundan alınmaya devam eder)")
+
+    # 14. The owner's decision for fx2 (24.11): the trader's usual 1.8R target closes at 1.9R there, and his close at
+    #     +1.5R or more is not followed (the 1.9R target or the stop decides). Only when the keys are not there yet.
+    i = broker_index(FX2_BROKER)
+    if i is not None and _broker(config, FX2_BROKER) is not None:
+        model = type(_broker(config, FX2_BROKER))
+        setting(("brokers", i), brokers[i], model, "tp_at_r", FX2_TP_AT_R,
+                f"{FX2_BROKER}: trader'ın 1,5R ve üstündeki hedefleri {FX2_TP_AT_R}R'a çekilecek (R: trader'ın "
+                f"grafiğindeki giriş-stop mesafesi; daha yakın hedefler aynen kalır) (tp_at_r: {FX2_TP_AT_R})",
+                lambda c: getattr(_broker(c, FX2_BROKER), "tp_at_r", None) == FX2_TP_AT_R,
+                FX2_BROKER, wanted=lambda v: True)
+        if "tp_at_r" not in brokers[i]:
+            setting(("brokers", i), brokers[i], model, "tp_at_r_from", FX2_TP_AT_R_FROM,
+                    f"{FX2_BROKER}: trader +{FX2_TP_AT_R_FROM}R ya da üstündeyken 'kapat' derse fx2 kapanmaz, "
+                    f"{FX2_TP_AT_R}R hedefini ya da stopu bekler; altında (ör. 1R) hemen kapanır "
+                    f"(tp_at_r_from: {FX2_TP_AT_R_FROM})",
+                    lambda c: getattr(_broker(c, FX2_BROKER), "tp_at_r_from", None) == FX2_TP_AT_R_FROM,
+                    FX2_BROKER, wanted=lambda v: True)
     return changes, notes
 
 
