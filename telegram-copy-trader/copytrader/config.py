@@ -340,10 +340,11 @@ class _BrokerBase(_Base):
     # reading, its entry rule (market or limit as the signal shows) and its reference_broker's price. Coins: unchanged.
     fx_only_from_fx_topic: bool = False
     # A fixed target in R (the owner's fx2, 24.11: "lavuklar genelde 1.8R'da kapatıyor, sen 1.9R'da kapat, geri kalanı
-    # aynen eskisi gibi"). R: the trader's, on his chart (the signal's entry to its stop; a signal without an entry:
-    # this account's entry and the distance its size came from). His targets at ``tp_at_r_from`` R or farther are
-    # moved to ``tp_at_r`` R, each with its share; nearer targets stay as he gives them - also when he moves them. No
-    # target given: ``tp_at_r``. Without ``tp_at_r_from`` every target moves and closes are followed. A CLOSE message of the trader (the whole position) while this
+    # aynen eskisi gibi"; "R miktarını hesabın bakiyesine göre ölç"). R is money: this account's risk amount per R
+    # (fx2: 1,000 USD), fees counted. His targets at ``tp_at_r_from`` R or farther in HIS R (his chart: the signal's
+    # entry to its stop) move to where the position makes ``tp_at_r`` R, each with its share; nearer targets stay as he
+    # gives them - also when he moves them. No target given: ``tp_at_r``. Without ``tp_at_r_from`` every target moves
+    # and closes are followed. A CLOSE message of the trader (the whole position) while this
     # account's position is at least ``tp_at_r_from`` R in profit is not followed: it waits for that target or its
     # stop. Below that ("1R'da kapattık") and every partial close, stop move and the owner's own closes (/pozkapat,
     # closing every trade) as before. None (default): the trader's targets and closes as always.

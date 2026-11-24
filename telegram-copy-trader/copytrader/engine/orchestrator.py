@@ -994,40 +994,49 @@ FIXED_TP = "fixed_tp"      # BrokerPosition.data: the basis of a tp_at_r account
 CLOSE_HELD = "close_held"  # BrokerPosition.data: the trader's close was held there (tp_at_r_from): over for him
 
 
-def fixed_r_basis(cfg: Any, side: Side, entry: float, sizing_entry: float, sizing_stop: float,
+def fixed_r_basis(cfg: Any, side: Side, entry: float, size: SizingResult, sizing_entry: float, sizing_stop: float,
                   signal_entry: float | None, signal_stop: float | None) -> dict[str, float] | None:
-    """``tp_at_r``: what this account's targets are measured in (venue scale and offset), or None (not set / no usable
-    distance). R is the trader's own, on his chart (``signal_entry`` to ``signal_stop``: "he closes at 1.8R, you at
-    1.9R"); a signal without an entry price: this account's ``entry`` (the live price of a market order) and the
-    distance its size came from (``sizing_entry`` to ``sizing_stop``)."""
+    """``tp_at_r``: what this account's targets are measured in (venue scale and offset), or None (not set / nothing
+    usable). R is MONEY, the account's own (the owner, 24.11: "R miktarını hesabın bakiyesine göre ölç"): ``money`` =
+    the risk amount the size was computed for (fx2: 1,000 USD), ``unit`` = what the quantity really sent makes per
+    1.0 of price (its loss at the stop by the price move alone / that distance), ``fees`` = the broker's fee estimate
+    for it (counted, so that the balance gains the full R). Which of the trader's targets are moved is decided in
+    HIS R, on his chart (``sig_entry`` / ``sig_dist``: the signal's entry and stop; without an entry this account's)."""
     r = getattr(cfg, "tp_at_r", None)
     if not r:
         return None
-    if signal_entry and signal_stop and math.isfinite(signal_entry) and abs(signal_entry - signal_stop) > 0:
-        base, dist, chart = float(signal_entry), float(abs(signal_entry - signal_stop)), 1.0
-    else:
-        base, dist, chart = float(entry), float(abs(sizing_entry - sizing_stop)), 0.0
-    if not (math.isfinite(base) and base > 0 and math.isfinite(dist) and dist > 0):
+    dist = abs(sizing_entry - sizing_stop)
+    try:
+        money, fees = float(size.risk_amount), float(size.est_fees_at_sl)
+        loss = float(size.est_loss_at_sl) - fees
+    except (TypeError, ValueError):
         return None
-    return {"r": float(r), "from": float(getattr(cfg, "tp_at_r_from", None) or 0.0), "entry": base, "dist": dist,
-            "long": 1.0 if side is Side.LONG else 0.0, "chart": chart}
+    if not (math.isfinite(entry) and entry > 0 and math.isfinite(dist) and dist > 0 and math.isfinite(money)
+            and money > 0 and math.isfinite(loss) and loss > 0 and math.isfinite(fees) and fees >= 0):
+        return None
+    basis = {"r": float(r), "from": float(getattr(cfg, "tp_at_r_from", None) or 0.0), "entry": float(entry),
+             "money": money, "unit": loss / dist, "fees": fees, "long": 1.0 if side is Side.LONG else 0.0,
+             "sig_entry": float(entry), "sig_dist": float(dist)}
+    if signal_entry and signal_stop and math.isfinite(signal_entry) and abs(signal_entry - signal_stop) > 0:
+        basis.update(sig_entry=float(signal_entry), sig_dist=float(abs(signal_entry - signal_stop)))
+    return basis
 
 
 def fixed_r_price(basis: dict[str, Any]) -> float:
-    """The ``tp_at_r`` target's price of ``basis``."""
-    move = float(basis["r"]) * float(basis["dist"])
+    """The ``tp_at_r`` target's price of ``basis``: where the position has made ``r`` x its R in money, fees paid."""
+    move = (float(basis["r"]) * float(basis["money"]) + float(basis.get("fees") or 0.0)) / float(basis["unit"])
     return float(basis["entry"]) + (move if basis.get("long") else -move)
 
 
 def fixed_r_targets(tps: list[TakeProfit], basis: dict[str, Any]) -> list[TakeProfit]:
-    """The trader's targets ``tps`` (venue scale) for a ``tp_at_r`` account: each at ``from`` R or farther is moved to
-    the ``r`` R target (its share kept: as many targets as he gives, so that a later change of his maps onto the same
-    legs of a MetaTrader account); nearer ones stay. Nearest first. None given: that one target alone."""
+    """The trader's targets ``tps`` (venue scale) for a ``tp_at_r`` account: each at ``from`` R or farther in HIS R is
+    moved to the ``r`` R target (its share kept: as many targets as he gives, so that a later change of his maps onto
+    the same legs of a MetaTrader account); nearer ones stay. Nearest first. None given: that one target alone."""
     target = fixed_r_price(basis)
     if not tps:
         return [TakeProfit(price=target, close_fraction=1.0)]
     long = bool(basis.get("long"))
-    ref, dist, low = float(basis["entry"]), float(basis["dist"]), float(basis.get("from") or 0.0)
+    ref, dist, low = float(basis["sig_entry"]), float(basis["sig_dist"]), float(basis.get("from") or 0.0)
     out: list[TakeProfit] = []
     for tp in tps:
         r = (tp.price - ref) / dist if long else (ref - tp.price) / dist
@@ -1035,18 +1044,26 @@ def fixed_r_targets(tps: list[TakeProfit], basis: dict[str, Any]) -> list[TakePr
     return sorted(out, key=lambda tp: tp.price if long else -tp.price)
 
 
+def fixed_r_on(pos: BrokerPosition, basis: dict[str, Any]) -> float | None:
+    """The price of ``pos``'s target that is its ``tp_at_r`` target (as the venue rounded it), or None."""
+    target = fixed_r_price(basis)
+    tol = 0.01 * abs(target - float(basis["entry"]))
+    near = [tp.price for tp in pos.take_profits if abs(tp.price - target) <= tol]
+    return near[0] if near else None
+
+
 def position_r(pos: BrokerPosition, basis: dict[str, Any], quote: Quote) -> float | None:
-    """How many R ``pos`` is in profit at ``quote`` (closing side: a long at the bid, a short at the ask) in the R of
-    ``basis`` (the trader's: from his entry; else from this position's fill); None when unknown."""
-    entry = float(basis.get("entry") or 0.0) if basis.get("chart") else (pos.avg_entry_price
-                                                                          or float(basis.get("entry") or 0.0))
-    dist = float(basis.get("dist") or 0.0)
-    if not (entry and dist > 0):
+    """How many R (money: the account's R, fees counted) ``pos`` would make if it closed now (a long at the bid, a
+    short at the ask), for the size it was opened with; None when unknown."""
+    entry = pos.avg_entry_price or float(basis.get("entry") or 0.0)
+    unit, money = float(basis.get("unit") or 0.0), float(basis.get("money") or 0.0)
+    if not (entry and unit > 0 and money > 0):
         return None
     exit_px = quote.bid if pos.side is Side.LONG else quote.ask
     if not (math.isfinite(exit_px) and exit_px > 0):
         return None
-    return (exit_px - entry) / dist if pos.side is Side.LONG else (entry - exit_px) / dist
+    move = exit_px - entry if pos.side is Side.LONG else entry - exit_px
+    return (move * unit - float(basis.get("fees") or 0.0)) / money
 
 
 def close_held(pos: BrokerPosition) -> bool:
@@ -5183,7 +5200,8 @@ class Engine:
                 size, signal_sized = await self._signal_entry_size(
                     broker, sym, plan.side, size, signal_entry, sizing_entry, sizing_stop, amount, trade_id=trade.id)
             his_stop = shift_price((size_stop if size_stop is not None else plan.stop_loss) * mult, offset)
-            fixed = fixed_r_basis(broker.config, plan.side, entry, sizing_entry, sizing_stop, signal_entry, his_stop)
+            fixed = fixed_r_basis(broker.config, plan.side, entry, size, sizing_entry, sizing_stop, signal_entry,
+                                  his_stop)
             if fixed is not None:
                 tps = fixed_r_targets(tps, fixed)
             req = OpenRequest(
@@ -5245,8 +5263,10 @@ class Engine:
                 text += f" ({offset_text(offset)})"
             if signal_sized:
                 text += f"; {esc(signal_sized)}"
+            shown = fixed_r_on(pos, fixed) if fixed is not None else None
             if fixed is not None:
-                text += f"; TP {fmt.fmt_number(fixed['r'])}R: {fmt_price(fixed_r_price(fixed))}"
+                text += (f"; TP {fmt.fmt_number(fixed['r'])}R (+{_money(fixed['r'] * fixed['money'])} {esc(ccy)}): "
+                         f"{fmt_price(shown if shown is not None else fixed_r_price(fixed))}")
             warnings = [*size.warnings, *(str(w) for w in pos.data.get("warnings") or [])]
             if size_capped:
                 # (what the quantity really sent loses - rounded to the broker's step, its fees counted as the sizing
@@ -6685,8 +6705,8 @@ class Engine:
                 or plan.brokers or not plan.source_message_ids or pos.status is not PositionStatus.OPEN
                 or (plan.close_fraction is not None and plan.close_fraction < 0.999)):
             return None
-        target = fixed_r_price(basis)
-        if not any(abs(tp.price - target) <= 1e-9 * max(1.0, abs(target)) for tp in pos.take_profits):
+        target = fixed_r_on(pos, basis)
+        if target is None:
             return None         # (no target of his was moved there: nothing to wait for)
         quote = await self._live_quote(broker, trade)
         r = position_r(pos, basis, quote) if quote is not None else None

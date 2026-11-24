@@ -1,11 +1,12 @@
 """fx2 (the owner's BEM challenge), 24.11: "pozlar genelde 1.8R'lık setuplar, lavuklar genelde 1.8R'da kapatıyor, sen
 1.9R'da kapat, geri kalanı aynen eskisi gibi" - ``tp_at_r: 1.9``, ``tp_at_r_from: 1.5``.
 
-    targets     R is the trader's, on his chart (signal entry 1.1000 to stop 1.0980): his targets at 1.5R or farther
-                go to 1.9R (1.1038), each with its share; nearer ones stay; none given: 1.9R; his moves the same way
-    his close   while the price is at +1.5R or more (his R) and fx2 has the 1.9R target: not followed (the target or the
-                stop decides) and the trade is over for him; below it it closes as before; partial closes, stop moves
-                and the owner's own closes as before
+    targets     R is money, fx2's own ("R miktarını hesabın bakiyesine göre ölç": 1R = its 1,000 USD risk): his
+                targets at 1.5R or farther in HIS R (chart: entry 1.1000, stop 1.0980) go to where fx2 makes +1,900 USD
+                (fees counted), each with its share; nearer ones stay; none given: 1.9R; his moves the same way
+    his close   while fx2 is at +1.5R (1,500 USD) or more and has the 1.9R target: not followed (the target or the stop
+                decides) and the trade is over for him; below it it closes as before; partial closes, stop moves and
+                the owner's own closes as before
 
 On the replica of tests/test_own_accounts_no_confirm.py (the server's config after the update, fx2 on the
 "challenge2" topic, its MetaTrader adapter in process), signals and management read by the REAL parser.
@@ -95,8 +96,13 @@ async def _fx2(p: Prod, trade_id: int):
     return (await p.positions(trade_id))["fx2"]
 
 
-# 1.9R on the trader's chart: 1.1000 + 1.9 x 0.0020
-TARGET = 1.1038
+# fx2 buys 4.76 lots at 1.10010 (1,000 USD to the stop 1.0980): +1,900 USD at 1.10010 + 1900 / 476,000
+TARGET = 1.10409
+LOTS = 4.76
+
+
+def money_at(price: float, fill: float = 1.10010, lots: float = LOTS) -> float:
+    return (price - fill) * lots * 100_000
 
 
 # --------------------------------------------------------------------------------------------------------------------
@@ -109,26 +115,28 @@ async def test_a_18r_setup_gets_its_target_at_19r_from_fx2s_entry(w) -> None:
     pos = await _fx2(w.p, trade.id)
     assert [tp.price for tp in pos.take_profits] == [pytest.approx(TARGET, abs=1e-5)]
     assert pos.data["fixed_tp"]["r"] == 1.9
-    assert any("TP 1.9R: 1.1038" in t for t in w.p.texts())
+    assert deal[2] == LOTS and money_at(deal[5]) == pytest.approx(1900, abs=3)
+    assert any("TP 1.9R (+1 900.00 USD): 1.10409" in t or "TP 1.9R (+1,900.00 USD): 1.10409" in t
+               or ("TP 1.9R (+" in t and "): 1.10409" in t) for t in w.p.texts())
 
 
 async def test_his_close_at_18r_is_held_at_1r_it_closes(w) -> None:
     sig = await w.signal()
-    w.price(1.10370, 1.10380)                                     # +1.85R (bid)
+    w.price(1.10370, 1.10380)                                     # +1,714 USD = +1.71R (bid)
     await w.close(sig)
     assert len(w.deals()) == 1 and len(w.opened()) == 1          # nothing closed
     (trade,) = await w.p.trades()
     assert trade.status is TradeStatus.OPEN
     assert (await _fx2(w.p, trade.id)).status is PositionStatus.OPEN
     (note,) = [t for t in w.p.texts() if "KAPATILMADI" in t]
-    assert "trader kapattı" in note and "1.9R hedefi (1.1038)" in note and note.startswith("⏸")
-    assert (await _fx2(w.p, trade.id)).data["close_held"]["r"] == pytest.approx(1.85)
+    assert "trader kapattı" in note and "1.9R hedefi (1.10409)" in note and note.startswith("⏸")
+    assert (await _fx2(w.p, trade.id)).data["close_held"]["r"] == pytest.approx(money_at(1.10370) / 1000)
     # (the monitor never closes it on its own afterwards)
     for _ in range(2):
         await w.p.engine.monitor.run_once()
     assert len(w.opened()) == 1
     # the next close of his, at +1R: followed
-    w.price(1.10220, 1.10230)                                     # +1.0R
+    w.price(1.10220, 1.10230)                                     # +1,000 USD = +1.0R
     await w.close(sig, "1R'da kapattık")
     assert w.deals()[-1][0] == "SELL" and w.opened() == []
 
@@ -151,7 +159,7 @@ async def test_break_even_is_followed_then_his_close_at_18r_is_held_with_the_sto
     pos = await _fx2(w.p, trade.id)
     assert pos.stop_loss == pytest.approx(1.10010, abs=1e-5)
     assert [tp.price for tp in pos.take_profits] == [pytest.approx(TARGET, abs=1e-5)]     # target kept
-    w.price(1.10370, 1.10380)                                     # +1.85R measured on the original R
+    w.price(1.10370, 1.10380)                                     # +1.71R in money (the stop at the entry now)
     await w.close(sig)
     assert len(w.opened()) == 1
     assert any("KAPATILMADI" in t and "stop (1.1001)" in t for t in w.p.texts())
@@ -199,7 +207,8 @@ async def test_a_limit_entry_measures_from_its_limit(w) -> None:
     w.price(1.10100, 1.10110)                                     # above the entry: the limit rests
     await w.signal(entry_type="limit")
     (order,) = oa.orders(w.term)
-    assert order[0] == "BUY_LIMIT" and order[5] == pytest.approx(1.1000 + 1.9 * 0.0020, abs=1e-5)
+    # (a limit at 1.1000: 5 lots for 1,000 USD to the stop: +1,900 USD at 1.1000 + 1900 / 500,000)
+    assert order[0] == "BUY_LIMIT" and order[2] == 5.0 and order[5] == pytest.approx(1.1038, abs=1e-5)
 
 
 async def test_without_the_setting_everything_is_as_before(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
@@ -255,10 +264,10 @@ async def test_after_a_hold_the_trade_is_over_for_the_trader(w) -> None:
 
 
 async def test_no_hold_when_no_target_of_his_was_moved(w) -> None:
-    sig = await w.signal([{"price": 1.1028, "close_fraction": 1.0}])          # 1.4R: kept
+    sig = await w.signal([{"price": 1.1028, "close_fraction": 1.0}])          # 1.4R of his: kept
     (deal,) = w.deals()
     assert deal[5] == pytest.approx(1.1028)
-    w.price(1.10330, 1.10340)                                     # +1.65R, its target not (yet) filled here
+    w.price(1.10330, 1.10340)                                     # +1.52R in money, its target not (yet) filled
     await w.close(sig)
     assert w.opened() == []
 
