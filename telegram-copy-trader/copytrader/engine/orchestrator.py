@@ -7586,7 +7586,9 @@ class Engine:
                         if upto is not None:
                             new.data["ref_tp_msc"] = int(upto)
                         new.data.pop("ref_tp_bar", None)
-                text = f"{esc(name)}: TP " + " / ".join(fmt_price(tp.price) for tp in tps)
+                # (tp_at_r: the levels as the venue rounded them - the fixed target is computed, not a price of his)
+                shown = new.take_profits if isinstance(fixed, dict) and new.take_profits else tps
+                text = f"{esc(name)}: TP " + " / ".join(fmt_price(tp.price) for tp in shown)
                 if len(levels) < len(plan.take_profits):
                     text += " (gerçekleşen hedef tekrar konmadı)"
             elif plan.action is ActionType.CLOSE:

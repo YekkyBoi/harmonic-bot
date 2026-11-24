@@ -287,3 +287,27 @@ def test_the_update_sets_fx2_only_and_keeps_a_written_value(tmp_path: Path, monk
     assert migrate.migrate_config(path, terminal=(None, None)) == []
     assert ({b.name: b for b in load_config(path).brokers}["fx2"].tp_at_r,
             {b.name: b for b in load_config(path).brokers}["fx2"].tp_at_r_from) == (2.5, None)
+
+
+async def test_after_a_hold_an_unreplied_message_goes_to_his_live_trade_not_the_held_one(w) -> None:
+    sig = await w.signal()
+    w.price(1.10370, 1.10380)
+    await w.close(sig)                                            # held: #1 is over for him
+    w.price(1.10300, 1.10310)
+    await w.post("EUR long 1R", action="open", base_asset="EUR", side="long", entry_type="market",
+                 entry_price=1.1030, stop_loss=1.1010, take_profits=[{"price": 1.1066, "close_fraction": 1.0}],
+                 risk_r=1.0, summary_tr="EUR LONG")
+    one, two = await w.p.trades()
+    w.price(1.10390, 1.10400)                                     # (above #2's entry: a stop there is valid)
+    await w.post("eur stop girişe", action="move_sl", base_asset="EUR", side="long", move_sl_to_entry=True,
+                 summary_tr="EUR LONG BE")                        # no reply: found by its asset
+    assert w.p.asked() == []                                      # (with #1 still "his", it would be a question)
+    assert (await _fx2(w.p, two.id)).stop_loss == pytest.approx((await _fx2(w.p, two.id)).avg_entry_price)
+    assert (await _fx2(w.p, one.id)).stop_loss == pytest.approx(STOP)
+
+
+async def test_a_target_move_reports_the_rounded_fixed_target(w) -> None:
+    sig = await w.signal()
+    await w.post("TP 1.1040", reply_to=sig, action="move_tp", base_asset="EUR", side="long",
+                 take_profits=[{"price": 1.1040, "close_fraction": 1.0}], refers_to_message_id=sig, summary_tr="TP")
+    assert any("• fx2: TP 1.10409" in t and "1.10409159" not in t for t in w.p.texts())
