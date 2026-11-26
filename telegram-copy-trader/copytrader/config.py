@@ -182,6 +182,10 @@ class TelegramConfig(_Base):
     source_chats: list[int | str]                 # group/channel ids (-100...) or @usernames / t.me links
     allowed_sender_ids: list[int] = Field(default_factory=list)  # empty = any sender in source chats
     debounce_sec: float = 4.0                     # wait this long after a sender's last message before parsing
+    # A single message that already has both a picture and text (no album) is parsed after this many seconds
+    # instead of debounce_sec (None = off). In November only 1 of 64 such messages had a follow-up from the same
+    # sender within 4 s, and that was a result message, not a signal.
+    debounce_complete_sec: float | None = None
     context_window_sec: int = 300                 # unconsumed messages this recent are given to the parser together
     incomplete_timeout_sec: int = 180             # INCOMPLETE signal not completed in time -> ask the owner
     max_context_messages: int = 12
@@ -210,6 +214,12 @@ class LLMConfig(_Base):
     timeout_sec: float = 120.0
     prefilter: bool = True                        # skip the LLM for text-only chatter with no trading words/numbers
     api_key: str | None = None                    # default: ANTHROPIC_API_KEY env var
+    # Fast consensus read: two parallel reads in fast mode at fast_effort; when both give exactly the same, clean
+    # result it is used at once (~2-3 s), otherwise the normal read above runs (no guessing). Measured on the
+    # November signals: 39/42 decided fast, 0 wrong; the 3 others had a level label hidden in the screenshot.
+    fast_consensus: bool = False
+    fast_effort: Literal["low", "medium", "high", "xhigh", "max"] = "low"
+    fast_deadline_sec: float = 15.0
 
 
 # --------------------------------------------------------------------------- #
@@ -393,6 +403,9 @@ class _BrokerBase(_Base):
 
 class CcxtBrokerConfig(_BrokerBase):
     type: Literal["ccxt"]
+    # Entry speed: balance and quote reads are reused for up to 2 s while one trade is being opened (the engine
+    # asks for them several times before the entry order) and the quote is read at the same time as the balance.
+    fast_entry: bool = False
     exchange: str                                 # ccxt id: binanceusdm, bybit, okx, bitget, kucoinfutures, gate, mexc...
     api_key: str | None = None
     secret: str | None = None

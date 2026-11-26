@@ -5095,7 +5095,18 @@ class Engine:
                 return await self._register_virtual(broker, plan, trade, sym, raw_symbol, flow,
                                                     ref_broker=str(broker.config.reference_broker))
             entry_type = EntryType.MARKET if virtual is not None else plan.entry_type
-            equity = await broker.get_equity()
+            if getattr(broker.config, "fast_entry", False):
+                # read the quote at the same time as the balance; get_quote below then reuses it (2 s cache)
+                quote_task = asyncio.ensure_future(broker.get_quote(sym))
+                try:
+                    equity = await broker.get_equity()
+                finally:
+                    try:
+                        await quote_task
+                    except Exception:   # read again below, where an error is reported as before
+                        pass
+            else:
+                equity = await broker.get_equity()
             ccy = self._currency.get(name, "")
             loss_limit = getattr(broker.config, "daily_loss_limit_pct", None)
             if loss_limit is None:
