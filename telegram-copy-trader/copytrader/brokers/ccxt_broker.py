@@ -2099,6 +2099,37 @@ class CcxtBroker(Broker):
             logger.exception("%s: could not compare the trades of %s with its booked exits", self.name, pos.broker_symbol)
             pos.data[PNL_INCOMPLETE] = True
 
+    def _outside_result(self, pos: BrokerPosition, trades: list[Any], ids: set[str], close_side: str, cs: float,
+                        direction: float, ccy: str) -> None:
+        """Result of the part closed outside the bot's orders (by hand on the venue), read from the venue's own
+        trade list: the first close-side trades after the open that are not ours, up to the size closed outside,
+        commission included. Stored as data["closed_outside_pnl"] / ["closed_outside_qty"] only when that whole
+        size is found; realized_pnl keeps its meaning (the bot's own orders only)."""
+        d = pos.data
+        want = float(d.get("closed_outside") or 0.0)
+        entry = pos.avg_entry_price
+        opened = int(d.get("opened_at", 0) or 0)
+        if not entry or want <= 0:
+            return
+        taken = gross = fees = 0.0
+        for t in sorted(trades, key=lambda x: num(x.get("timestamp")) or 0):
+            if str(t.get("order")) in ids or t.get("side") != close_side or (num(t.get("timestamp")) or 0) < opened:
+                continue
+            amt, price = num(t.get("amount")) or 0.0, num(t.get("price"))
+            if amt <= 0 or price is None:
+                continue
+            use = min(amt, want - taken)
+            if use <= 0:
+                break
+            gross += (price - entry) * use * cs * direction
+            for fee in (t.get("fees") or ([t["fee"]] if t.get("fee") else [])):
+                if fee and str(fee.get("currency", "")).upper() == ccy:
+                    fees += (num(fee.get("cost")) or 0.0) * use / amt
+            taken += use
+        if taken >= want * (1.0 - 1e-6):
+            d["closed_outside_pnl"] = round(gross - fees, 8)
+            d["closed_outside_qty"] = taken
+
     async def _realized_pnl(self, pos: BrokerPosition) -> float | None:
         d = pos.data
         d.pop(PNL_INCOMPLETE, None)
@@ -2114,6 +2145,8 @@ class CcxtBroker(Broker):
             trades = await self.exchange.fetch_my_trades(pos.broker_symbol, int(d.get("opened_at", 0)) - 60_000)
             ours = [t for t in trades or [] if str(t.get("order")) in ids]
             close_side = self._close_side(pos.side)
+            if float(d.get("closed_outside") or 0.0) > 0:
+                self._outside_result(pos, trades or [], ids, close_side, cs, direction, ccy)
             exits = [t for t in ours if t.get("side") == close_side]
             entries = [t for t in ours if t.get("side") != close_side]
             if exits:
@@ -2735,6 +2768,10 @@ class CcxtBroker(Broker):
                      f"borsada bulunamayan önceki kapatma emrinin ({', '.join(dropped)}) sonradan gerçekleşmesi de "
                      f"olabilir. " + ("Kâr/zarar bilinmiyor." if pos.realized_pnl is None else
                                       "Kâr/zarar yalnızca botun kayda geçirdiği emirleri içerir."))
+        elif outside > 0 and d.get("closed_outside_pnl") is not None:   # read from the venue's own trade list
+            note += (f" {_fmt(outside)} botun emirleri dışında kapandı; o kapanışın kâr/zararı borsa kayıtlarından "
+                     f"hesaplandı: {float(d['closed_outside_pnl']):+.2f} {self.cfg.quote_currency.upper()} "
+                     f"(komisyon dahil).")
         elif outside > 0:                     # no order of ours closed that size: its result is not known to us
             note += (" Kapanış botun emirleriyle olmadığı için kâr/zarar bilinmiyor." if pos.realized_pnl is None else
                      f" {_fmt(outside)} botun emirleri dışında kapandı; kâr/zarar yalnızca botun kendi "

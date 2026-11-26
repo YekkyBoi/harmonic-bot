@@ -847,8 +847,11 @@ async def test_flat_on_venue_without_a_readable_stop_closes_instead_of_alarming_
     assert pos.status is PositionStatus.CLOSED and pos.data["closed_reason"] == "flat_on_exchange"
     assert pos.realized_pnl is None               # N8: unknown, not 0.0
     assert _posts(fake, n) == []                  # no stop / emergency-close attempts for a position that is gone
-    assert pos.error == ("binance: pozisyon borsada kapalı bulundu; kalan emirler iptal edildi. Kapanış botun "
-                         "emirleriyle olmadığı için kâr/zarar bilinmiyor.")
+    # the stop's fill is still in the venue's trade list: its result is read from there (commission included)
+    assert pos.data["closed_outside_pnl"] == pytest.approx((73288.0 - pos.avg_entry_price) * 0.012
+                                                           - 0.0005 * 0.012 * 73288.0, abs=0.05)
+    assert pos.error.startswith("binance: pozisyon borsada kapalı bulundu; kalan emirler iptal edildi. 0.012 botun "
+                                "emirleri dışında kapandı; o kapanışın kâr/zararı borsa kayıtlarından hesaplandı: -")
     assert _live(fake) == []
     await broker.close()
 
