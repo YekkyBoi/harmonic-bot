@@ -387,6 +387,9 @@ def _drop_error(old: str | None, marker: str) -> str | None:
 # --------------------------------------------------------------------------- #
 # Order state
 # --------------------------------------------------------------------------- #
+_FAST_TTL_SEC = 2.0             # fast_entry: how long a balance / quote read is reused while opening
+
+
 @dataclass
 class OrderState:
     status: str                      # "open" | "filled" | "canceled"
@@ -457,6 +460,7 @@ class CcxtBroker(Broker):
         self._clock_synced_ms = 0
         self.fill_poll_attempts = 6
         self.fill_poll_delay = 0.5
+        self._fast_cache: dict[Any, tuple[float, Any]] = {}  # fast_entry: (monotonic time, value)
         self.retry_delay = 1.0
 
     # ------------------------------------------------------------------ lifecycle
@@ -652,7 +656,25 @@ class CcxtBroker(Broker):
             )
 
     # ------------------------------------------------------------------ account
+    def _fast_get(self, key: Any) -> Any:
+        """fast_entry: a value read less than _FAST_TTL_SEC ago, else None."""
+        if not getattr(self.cfg, "fast_entry", False):
+            return None
+        hit = self._fast_cache.get(key)
+        return hit[1] if hit and time.monotonic() - hit[0] < _FAST_TTL_SEC else None
+
+    def _fast_put(self, key: Any, value: Any) -> Any:
+        if getattr(self.cfg, "fast_entry", False):
+            self._fast_cache[key] = (time.monotonic(), value)
+        return value
+
     async def _balance_figures(self) -> tuple[float | None, float | None]:
+        hit = self._fast_get("balance")
+        if hit is not None:
+            return hit
+        return self._fast_put("balance", await self._balance_figures_now())
+
+    async def _balance_figures_now(self) -> tuple[float | None, float | None]:
         await self._sync_clock()        # only when the last measurement is old
         try:
             bal = await self._ccxt("bakiye alınamadı", self.exchange.fetch_balance())
@@ -717,6 +739,12 @@ class CcxtBroker(Broker):
         return symbol_info_from_market(market, self.exchange.precisionMode, base_asset=base_asset, price_multiplier=multiplier)
 
     async def get_quote(self, symbol: SymbolInfo) -> Quote:
+        hit = self._fast_get(("quote", symbol.broker_symbol))
+        if hit is not None:
+            return hit
+        return self._fast_put(("quote", symbol.broker_symbol), await self._get_quote_now(symbol))
+
+    async def _get_quote_now(self, symbol: SymbolInfo) -> Quote:
         ticker = await self._ccxt("fiyat alınamadı", self.exchange.fetch_ticker(symbol.broker_symbol))
         quote = quote_from_ticker(ticker)
         if ticker and (num(ticker.get("bid")) is None or num(ticker.get("ask")) is None):
@@ -1412,6 +1440,7 @@ class CcxtBroker(Broker):
         the order may exist: it is looked up by its client id for a short while (_find_by_client_id) and adopted when
         found; otherwise OrderOutcomeUnknownError says that whether it exists is not known (the engine then reports
         "açılıp açılmadığı bilinmiyor", never "açılmadı")."""
+        self._fast_cache.clear()        # after an entry, balance and quote must be read again
         try:
             return await self.exchange.create_order(symbol, entry_type.value, side, qty, price, params)
         except cx.InsufficientFunds as e:

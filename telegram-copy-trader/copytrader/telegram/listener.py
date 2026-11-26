@@ -378,6 +378,7 @@ class TelegramListener:
         self._entities: dict[int, Any] = {}           # peer id -> entity
         self._allowed = set(config.allowed_sender_ids)
         self._timers: dict[DebounceKey, asyncio.Task[None]] = {}   # sleeping debounce timers
+        self._incomplete: set[DebounceKey] = set()   # streams whose pending batch has a message without picture+text
         self._inflight: dict[DebounceKey, int] = {}   # messages still being downloaded/saved
         self._tasks: set[asyncio.Task[Any]] = set()   # running handlers / callbacks
         self._seen: OrderedDict[tuple[int, int], None] = OrderedDict()
@@ -829,7 +830,9 @@ class TelegramListener:
         finally:
             late_edit = self._storing.pop(key, None)
             if trigger:
-                self._debounce_release(dkey)
+                complete = (bool((getattr(message, "message", None) or "").strip())
+                            and image_info(message) is not None and getattr(message, "grouped_id", None) is None)
+                self._debounce_release(dkey, complete=complete)
         await self._persist_last_id(chat_id)
         if late_edit is not None:
             # Arrived while the row was being written: apply it as a normal edit now.
@@ -1439,7 +1442,12 @@ class TelegramListener:
         if unpin is not None:
             unpin(chat_id, list(ids))
 
-    def _debounce_release(self, key: DebounceKey) -> None:
+    def _debounce_release(self, key: DebounceKey, complete: bool = False) -> None:
+        """``complete``: the message just stored has both a picture and text and is not part of an album; with
+        ``debounce_complete_sec`` set, the batch is then handed over after that shorter wait. Any other message
+        of the stream (even one still storing) keeps the normal wait."""
+        if not complete:
+            self._incomplete.add(key)
         left = self._inflight.get(key, 1) - 1
         if left > 0:
             self._inflight[key] = left
@@ -1450,10 +1458,14 @@ class TelegramListener:
         old = self._timers.pop(key, None)
         if old is not None:
             old.cancel()
-        self._timers[key] = asyncio.ensure_future(self._fire_later(key))
+        fast = self._config.debounce_complete_sec
+        delay = self._config.debounce_sec
+        if fast is not None and key not in self._incomplete:
+            delay = min(delay, fast)
+        self._timers[key] = asyncio.ensure_future(self._fire_later(key, delay))
 
-    async def _fire_later(self, key: DebounceKey) -> None:
-        await asyncio.sleep(self._config.debounce_sec)
+    async def _fire_later(self, key: DebounceKey, delay: float | None = None) -> None:
+        await asyncio.sleep(self._config.debounce_sec if delay is None else delay)
         await self._ready.wait()         # start-up: held until the engine is ready
         me = asyncio.current_task()
         if self._timers.get(key) is not me:
@@ -1461,6 +1473,7 @@ class TelegramListener:
         # Detach first: messages arriving while on_ready runs start a new timer
         # instead of cancelling a call that may be placing orders.
         del self._timers[key]
+        self._incomplete.discard(key)
         chat_id, topic_id, sender_id = key
         batch = self._batch.pop(key, None)
         if batch is not None and not batch:

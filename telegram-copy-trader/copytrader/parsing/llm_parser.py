@@ -260,6 +260,10 @@ class ClaudeSignalParser:
         messages = sorted(messages, key=lambda m: (_as_utc(m.date), m.message_id))
         unseen: set[int] = set()        # ids of messages whose picture could not be given to the model
         content = await self._build_content(messages, context, unseen)
+        if self._config.fast_consensus:
+            quick = await self._fast_consensus(content, messages, context, unseen)
+            if quick is not None:
+                return quick
         request = self.build_request(content)
 
         try:
@@ -306,6 +310,43 @@ class ClaudeSignalParser:
             raise ParserError(_ERR_NO_KEY, transient=False) from e
 
         return self._handle_response(response, messages, context, unseen)
+
+    # ------------------------------------------------------------------ #
+    async def _fast_consensus(
+        self, content: list[dict[str, Any]], messages: list[StoredMessage], context: ParseContext,
+        unseen: set[int],
+    ) -> ParseResult | None:
+        """Two identical fast-mode requests at ``fast_effort`` in parallel. Returns the result only when both
+        reads give exactly the same actions and every action is clean (no ambiguity, confidence at least
+        ``min_confidence``, not "incomplete"); None in every other case (difference, error, timeout), and the
+        caller then runs the normal read. Never guesses between two different reads."""
+        cfg = self._config
+        request = self.build_request(content)
+        request["output_config"] = {**request["output_config"], "effort": cfg.fast_effort}
+        request["speed"] = "fast"
+        started = asyncio.get_running_loop().time()
+        try:
+            r1, r2 = await asyncio.wait_for(
+                asyncio.gather(self._client.beta.messages.create(**request),
+                               self._client.beta.messages.create(**request)),
+                max(1.0, min(cfg.fast_deadline_sec, self._deadline_sec)),
+            )
+            a = self._handle_response(r1, messages, context, unseen)
+            b = self._handle_response(r2, messages, context, unseen)
+        except Exception as e:      # any failure of the fast path only means: use the normal read
+            logger.info("Fast consensus read not used (%s: %s)", type(e).__name__, e)
+            return None
+        took = asyncio.get_running_loop().time() - started
+        if _consensus_key(a.actions) != _consensus_key(b.actions):
+            logger.info("Fast consensus: the two reads differ (%.1fs); using the normal read", took)
+            return None
+        unclean = [x for x in a.actions
+                   if x.ambiguities or x.confidence < cfg.min_confidence or x.action is ActionType.INCOMPLETE]
+        if unclean:
+            logger.info("Fast consensus: reads agree but are not clean (%.1fs); using the normal read", took)
+            return None
+        logger.info("Fast consensus: both reads agree (%.1fs)", took)
+        return a
 
     # ------------------------------------------------------------------ #
     def build_request(self, content: list[dict[str, Any]]) -> dict[str, Any]:
@@ -502,6 +543,16 @@ class ClaudeSignalParser:
 # --------------------------------------------------------------------------- #
 # Client / error helpers
 # --------------------------------------------------------------------------- #
+def _consensus_key(actions: list[ParsedAction]) -> list[tuple[Any, ...]]:
+    """Everything of an action that changes what the engine does; two reads must match on all of it."""
+    return [
+        (a.action, a.base_asset, a.quote_asset, a.market_type, a.side, a.entry_type, a.entry_price, a.stop_loss,
+         tuple((t.price, t.close_fraction) for t in a.take_profits), a.risk_r, a.new_stop_loss, a.move_sl_to_entry,
+         a.close_fraction, a.refers_to_message_id, a.target_trade_id)
+        for a in actions
+    ]
+
+
 def _has_credentials(client: Any) -> bool:
     """True if the SDK client resolved an API key, auth token, credential provider or auth header."""
     if any(getattr(client, name, None) for name in ("api_key", "auth_token", "credentials")):
