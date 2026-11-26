@@ -3721,10 +3721,13 @@ class Engine:
     def _applied_key(chat_id: int) -> str:
         return f"msg_applied:{chat_id}"
 
-    async def _remember_applied(self, plan: ManagementPlan, trade: TradeRecord) -> None:
+    async def _remember_applied(self, plan: ManagementPlan, trade: TradeRecord,
+                                before: TradeRecord | None = None) -> None:
         """Remember which management instruction each source message ran (automatically or approved), so a
         re-read of that message (an edit, or a message an incomplete reading kept unconsumed) is never
-        applied a second time automatically. The trade's own signal messages are left out."""
+        applied a second time automatically. The trade's own signal messages are left out.
+        ``before`` (the trade as it was): its stop / targets and the ones after are kept too, so the change can be
+        put back when the message is deleted in the group (:meth:`on_message_deleted`)."""
         ids = [int(i) for i in dict.fromkeys(plan.source_message_ids)
                if i and i not in trade.plan.source_message_ids]
         if not ids:
@@ -3737,6 +3740,11 @@ class Engine:
             "take_profits": [[tp.price, tp.close_fraction] for tp in plan.take_profits],
             "close_fraction": plan.close_fraction, "at": now.isoformat(),
         }
+        if before is not None and not plan.brokers:
+            record["prev_stop_loss"] = before.current_stop_loss
+            record["prev_take_profits"] = [[tp.price, tp.close_fraction] for tp in before.current_take_profits]
+            record["after_stop_loss"] = trade.current_stop_loss
+            record["after_take_profits"] = [[tp.price, tp.close_fraction] for tp in trade.current_take_profits]
         chat_id = plan.source_chat_id
         async with self._outcome_lock:
             try:
@@ -3770,6 +3778,79 @@ class Engine:
                 if isinstance(r, dict) and all(r.get("plan_id") != o.get("plan_id") for o in out):
                     out.append(r)
         return sorted(out, key=lambda r: str(r.get("at", "")))
+
+    async def on_message_deleted(self, msg: StoredMessage) -> None:
+        """A message was deleted in the source group after the bot had read it. Every stop / target move it ran
+        is put back to the level before it, as long as the trade is still active and nothing changed that level
+        since (a later instruction wins). Closes cannot be undone: reported. Never raises."""
+        try:
+            await self._revert_deleted(msg)
+        except Exception:
+            logger.exception("Could not handle the deleted message %s/%s", msg.chat_id, msg.message_id)
+
+    async def _revert_deleted(self, msg: StoredMessage) -> None:
+        if not self.config.telegram.revert_deleted_instructions:
+            return
+        key = self._applied_key(msg.chat_id)
+        async with self._outcome_lock:
+            data = await self.db.get_state(key, {}) or {}
+            recs = data.get(str(msg.message_id)) if isinstance(data, dict) else None
+            todo = [r for r in recs if isinstance(r, dict) and not r.get("reverted")] if isinstance(recs, list) else []
+            if not todo:
+                return
+            for r in todo:
+                r["reverted"] = True            # once: a second deletion event never undoes it again
+            await self.db.set_state(key, data)
+        line = esc(_excerpt([msg]))
+        for rec in todo:
+            label = esc(f"#{rec.get('trade_id')} {rec.get('asset', '?')} {str(rec.get('side', '')).upper()}")
+            done = esc(self._applied_text(rec))
+            kind = rec.get("action")
+            trade = await self.db.get_trade(int(rec.get("trade_id") or 0))
+            if trade is None or trade.status not in ACTIVE_TRADE:
+                continue                        # over: nothing left to put back
+            if kind not in (ActionType.MOVE_SL.value, ActionType.MOVE_TP.value):
+                await self._notify(
+                    f"Grupta silinen bir mesajın talimatı daha önce uygulanmıştı: {done}\nMesaj: <i>{line}</i>\n"
+                    "Kapatma geri alınamaz; gerekiyorsa elle kontrol edin.", Severity.WARNING)
+                continue
+            is_sl = kind == ActionType.MOVE_SL.value
+            prev = rec.get("prev_stop_loss") if is_sl else rec.get("prev_take_profits")
+            after = rec.get("after_stop_loss") if is_sl else rec.get("after_take_profits")
+            if prev is None or after is None:
+                await self._notify(
+                    f"Grupta silinen mesajın talimatı ({done}) geri alınmadı: önceki seviye kayıtlı değil.\n"
+                    f"Mesaj: <i>{line}</i>\nGerekiyorsa elle kontrol edin.", Severity.WARNING)
+                continue
+            if is_sl:
+                unchanged = isinstance(after, (int, float)) and _same_price(float(after), trade.current_stop_loss)
+            else:
+                now_tps = [[tp.price, tp.close_fraction] for tp in trade.current_take_profits]
+                unchanged = len(now_tps) == len(after) and all(
+                    _same_price(float(a[0]), float(b[0])) for a, b in zip(after, now_tps))
+            if not unchanged:
+                await self._notify(
+                    f"Grupta silinen mesajın talimatı ({done}) geri alınmadı: {label} işleminde o seviye sonradan "
+                    f"yine değişti.\nMesaj: <i>{line}</i>", Severity.WARNING)
+                continue
+            if is_sl:
+                plan = ManagementPlan(
+                    plan_id=uuid.uuid4().hex[:10], action=ActionType.MOVE_SL, trade_id=trade.id, new_stop_loss=float(prev),
+                    source_chat_id=msg.chat_id, created_at=self._now(),
+                    summary_tr=f"silinen talimat geri alınıyor: stop {fmt_price(float(prev))}")
+            else:
+                plan = ManagementPlan(
+                    plan_id=uuid.uuid4().hex[:10], action=ActionType.MOVE_TP, trade_id=trade.id, source_chat_id=msg.chat_id,
+                    take_profits=[TakeProfit(price=float(p), close_fraction=float(f)) for p, f in prev],
+                    created_at=self._now(), summary_tr="silinen talimat geri alınıyor: hedefler eski haline")
+            logger.warning("Message %s/%s deleted in the group: undoing %s on trade #%s",
+                           msg.chat_id, msg.message_id, kind, trade.id)
+            await self._log("deleted_reverted", {"chat_id": msg.chat_id, "message_id": msg.message_id,
+                                                 "trade_id": trade.id, "plan_id": rec.get("plan_id")})
+            result_text = await self.execute_management(plan, notify=False)
+            await self._notify(
+                f"🗑️ Grupta mesaj silindi, talimatı geri alındı: {label}\nSilinen: <i>{line}</i>\n"
+                f"Uygulanmıştı: {done}\n{result_text}", Severity.WARNING)
 
     @staticmethod
     def _applied_text(rec: dict[str, Any]) -> str:
@@ -6389,7 +6470,7 @@ class Engine:
 
         try:
             if accepted:
-                await self._remember_applied(plan, trade)
+                await self._remember_applied(plan, trade, before)
             for o in outcomes:
                 if o.kind == "error":
                     await self._management_leg_failed(plan, trade.id, o)

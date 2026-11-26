@@ -191,6 +191,9 @@ class TelegramConfig(_Base):
     max_context_messages: int = 12
     catchup_max_age_sec: int = 120                # on restart, messages missed while offline and younger than this are processed
     topics: list[TopicRoute] = Field(default_factory=list)  # forum groups: follow only these topics; empty = every message
+    # A stop / target move the bot already applied is put back when the trader deletes its message in the group
+    # (closes cannot be undone: only reported). False = the deletion is only reported.
+    revert_deleted_instructions: bool = True
 
 
 class NotifierConfig(_Base):

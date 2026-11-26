@@ -342,6 +342,9 @@ def build_app(
     listener = listener_factory(
         config.telegram, db, str(data_dir), on_ready=engine.on_messages_ready, on_edit=engine.on_message_edited
     )
+    set_on_delete = getattr(listener, "set_on_delete", None)
+    if callable(set_on_delete):
+        set_on_delete(engine.on_message_deleted)
     set_notifier = getattr(listener, "set_notifier", None)
     if callable(set_notifier):
         set_notifier(notifier)           # the listener tells the owner about skipped messages, lost images...

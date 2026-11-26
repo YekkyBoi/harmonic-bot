@@ -373,6 +373,7 @@ class TelegramListener:
         self._media_dir = Path(data_dir) / "media"
         self._on_ready = on_ready
         self._on_edit = on_edit
+        self._on_delete: OnEdit | None = None   # a processed message deleted in the group (set_on_delete)
         self._client: TelegramClient | None = None
         self._self_id: int | None = None
         self._entities: dict[int, Any] = {}           # peer id -> entity
@@ -969,6 +970,10 @@ class TelegramListener:
             log.exception("Could not store the extras of message %s/%s", stored.chat_id, stored.message_id)
 
     # ---- deleted messages ---------------------------------------------------------------
+    def set_on_delete(self, on_delete: OnEdit | None) -> None:
+        """Called with a stored, already processed message that was deleted in the group."""
+        self._on_delete = on_delete
+
     async def handle_deleted(self, chat_id: int, message_ids: list[int]) -> None:
         """Messages were deleted in a source chat. A stored message that was not processed yet is
         closed (it is never executed); when the deleted message is the signal of an open trade the
@@ -996,6 +1001,11 @@ class TelegramListener:
             self._batch_discard(*key)
             log.info("Message %s/%s was deleted before it was processed; closed without action", *key)
             self._deleted_notice(row)
+        elif self._on_delete is not None:
+            try:
+                await self._on_delete(row)
+            except Exception:
+                log.exception("on_delete failed for %s/%s", *key)
         find = getattr(self._db, "find_trade_by_message", None)
         trade = await find(*key) if find is not None else None
         if trade is not None and trade.status in _ACTIVE_TRADE:

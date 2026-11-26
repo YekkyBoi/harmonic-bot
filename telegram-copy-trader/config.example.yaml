@@ -44,6 +44,10 @@ telegram:
   incomplete_timeout_sec: 180   # eksik sinyal (ör. sadece görsel) bu sürede tamamlanmazsa size sorulur
   max_context_messages: 12      # birlikte okunacak en fazla mesaj
   catchup_max_age_sec: 120      # bot kapalıyken gelen mesajlardan yalnızca bu kadar yeni olanlar işlenir
+  # Trader uygulanmış bir stop/hedef talimatının mesajını grupta silerse bot o değişikliği geri alır (stop/hedef
+  # eski seviyesine döner; sonradan aynı seviye yine değiştiyse dokunulmaz). Kapatmalar geri alınamaz: yalnızca
+  # bildirilir. false = silme yalnızca bildirilir.
+  revert_deleted_instructions: true
 
   # Konulu (forum) grup: SADECE bu konular takip edilir ve her konunun işlemleri
   # yalnızca kendi brokerlarında açılır. Diğer konular (Sohbet, Analiz, Duyuru...)
